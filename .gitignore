@@ -1,0 +1,12 @@
+.env
+.venv
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+speaker/*.wav
+speaker/manifest.json
+work/scenario_raw.txt
+work/scenario_prepared.json
+projects/*/work/
+projects/*/speaker/

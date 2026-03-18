@@ -3,201 +3,266 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Project {{ defaults.project }} · Stage 1</title>
+  <title>{{ defaults.project }} - Stage 1</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='stage1.css') }}">
 </head>
 <body>
-  <div class="bg-layer bg-1"></div>
-  <div class="bg-layer bg-2"></div>
+  <div class="noise"></div>
 
-  <main class="page">
-    <section class="hero card">
-      <p class="kicker">PROJECT · {{ defaults.project }}</p>
-      <h1>Этап 1: Анализ и Озвучка</h1>
-      <p class="sub">
-        <a href="/" class="link-back">← проекты</a>
-        Панель управления первым этапом: парсинг сценария, синтез TTS и валидация артефактов.
-      </p>
-      <div class="hero-flow">
-        <div class="flow-step is-active">
-          <span class="flow-index">01</span>
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">RC</div>
+      <div class="logo-text">
+        <strong>Rough Cut</strong>
+        <span>v3</span>
+      </div>
+    </div>
+    <nav>
+      <a href="/" class="nav-item">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+        <span>Проекты</span>
+      </a>
+      <a href="/project/{{ defaults.project }}" class="nav-item active">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span>{{ defaults.project }}</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <span class="version">Stage 1</span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1>{{ defaults.project }}</h1>
+        <p class="topbar-sub">Анализ сценария и синтез озвучки</p>
+      </div>
+      <button id="btn_refresh" class="btn-icon" title="Обновить статус">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
+    </header>
+
+    <!-- Pipeline Steps -->
+    <section class="pipeline">
+      <div class="step" id="step_analyze" data-state="pending">
+        <div class="step-num">1</div>
+        <div class="step-body">
           <strong>Analyze</strong>
-          <small>сценарий → блоки</small>
+          <small>Сценарий в блоки</small>
         </div>
-        <div class="flow-step">
-          <span class="flow-index">02</span>
+        <div class="step-check">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+        </div>
+      </div>
+      <div class="step-line"></div>
+      <div class="step" id="step_tts" data-state="pending">
+        <div class="step-num">2</div>
+        <div class="step-body">
           <strong>TTS</strong>
-          <small>блоки → wav</small>
+          <small>Блоки в WAV</small>
         </div>
-        <div class="flow-step">
-          <span class="flow-index">03</span>
+        <div class="step-check">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+        </div>
+      </div>
+      <div class="step-line"></div>
+      <div class="step" id="step_validate" data-state="pending">
+        <div class="step-num">3</div>
+        <div class="step-body">
           <strong>Validate</strong>
-          <small>проверка + manifest</small>
+          <small>Проверка + manifest</small>
+        </div>
+        <div class="step-check">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
         </div>
       </div>
     </section>
 
-    <section class="layout">
-      <section class="card controls">
-        <h2>Параметры</h2>
+    <!-- Stats -->
+    <section class="stats">
+      <div class="stat">
+        <div class="stat-value" id="m_prepared">0</div>
+        <div class="stat-label">Блоков</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="m_wav">0</div>
+        <div class="stat-label">WAV файлов</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value stat-warn" id="m_missing">0</div>
+        <div class="stat-label">Не хватает</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="m_progress">0%</div>
+        <div class="stat-label">Прогресс</div>
+      </div>
+    </section>
 
-        <div class="field-grid">
-          <label>
-            <span>Входной файл</span>
-            <input id="input_path" type="text" value="{{ defaults.input_path }}">
-          </label>
+    <!-- Progress bar -->
+    <div class="progress-wrap">
+      <div class="progress-bar" id="progress_bar"></div>
+    </div>
 
-          <label>
-            <span>Prepared JSON</span>
-            <input id="prepared_path" type="text" value="{{ defaults.prepared_path }}">
-          </label>
+    <!-- Two column layout -->
+    <div class="layout">
+      <!-- Controls -->
+      <section class="panel controls-panel">
+        <h2>Управление</h2>
 
-          <label>
-            <span>Raw TXT</span>
-            <input id="raw_output_path" type="text" value="{{ defaults.raw_output_path }}">
-          </label>
-
-          <label>
-            <span>Папка speaker</span>
-            <input id="speaker_dir" type="text" value="{{ defaults.speaker_dir }}">
-          </label>
-
-          <label>
-            <span>Manifest</span>
-            <input id="manifest_path" type="text" value="{{ defaults.manifest_path }}">
-          </label>
-
-          <label>
+        <div class="control-group">
+          <label class="field">
             <span>TTS Provider</span>
             <select id="provider">
-              <option value="openrouter" {% if defaults.provider == 'openrouter' %}selected{% endif %}>openrouter</option>
-              <option value="gemini" {% if defaults.provider == 'gemini' %}selected{% endif %}>gemini</option>
-              <option value="macos" {% if defaults.provider == 'macos' %}selected{% endif %}>macos (say)</option>
+              <option value="openrouter" {% if defaults.provider == 'openrouter' %}selected{% endif %}>OpenRouter</option>
+              <option value="gemini" {% if defaults.provider == 'gemini' %}selected{% endif %}>Gemini</option>
+              <option value="macos" {% if defaults.provider == 'macos' %}selected{% endif %}>macOS (say)</option>
             </select>
           </label>
-
-          <label>
+          <label class="field">
             <span>Пол голоса</span>
             <select id="gender">
-              <option value="female" {% if defaults.gender == 'female' %}selected{% endif %}>женский</option>
-              <option value="male" {% if defaults.gender == 'male' %}selected{% endif %}>мужской</option>
+              <option value="female" {% if defaults.gender == 'female' %}selected{% endif %}>Женский</option>
+              <option value="male" {% if defaults.gender == 'male' %}selected{% endif %}>Мужской</option>
             </select>
           </label>
-
-          <label>
-            <span>Override voice (опционально)</span>
-            <input id="voice_name" type="text" placeholder="например, shimmer / onyx / Kore">
-          </label>
         </div>
+
+        <label class="field">
+          <span>Override voice (опционально)</span>
+          <input id="voice_name" type="text" placeholder="shimmer / onyx / Kore">
+        </label>
 
         <div class="toggles">
           <label class="toggle">
             <input id="use_llm" type="checkbox">
-            <span>Использовать LLM при анализе</span>
+            <span class="toggle-slider"></span>
+            <span>LLM при анализе</span>
           </label>
           <label class="toggle">
             <input id="dry_run" type="checkbox">
-            <span>Dry-run для TTS (без API)</span>
+            <span class="toggle-slider"></span>
+            <span>Dry-run (без API)</span>
           </label>
         </div>
 
         <div class="actions">
-          <button id="btn_analyze" class="btn btn-main">1. Analyze</button>
-          <button id="btn_tts" class="btn">2. TTS</button>
-          <button id="btn_validate" class="btn">3. Validate</button>
+          <button id="btn_analyze" class="btn btn-primary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            Analyze
+          </button>
+          <button id="btn_tts" class="btn btn-accent">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+            TTS
+          </button>
+          <button id="btn_validate" class="btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+            Validate
+          </button>
           <button id="btn_run_all" class="btn btn-ghost">Run All</button>
-          <button id="btn_refresh" class="btn btn-ghost">Refresh</button>
         </div>
 
-        <div class="phrase-box">
-          <h3>Быстрая озвучка фразы</h3>
-          <label>
-            <span>Текст фразы</span>
-            <textarea id="phrase_text" rows="4" placeholder="Вставь короткий текст для проверки голоса"></textarea>
-          </label>
-          <div class="phrase-row">
-            <label>
-              <span>Имя файла (без .wav)</span>
-              <input id="phrase_file_name" type="text" value="phrase_preview">
+        <!-- Advanced Settings (collapsed) -->
+        <details class="advanced">
+          <summary>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            Расширенные настройки
+          </summary>
+          <div class="advanced-fields">
+            <label class="field">
+              <span>Входной файл</span>
+              <input id="input_path" type="text" value="{{ defaults.input_path }}">
             </label>
-            <button id="btn_phrase_tts" class="btn">Озвучить фразу</button>
+            <label class="field">
+              <span>Prepared JSON</span>
+              <input id="prepared_path" type="text" value="{{ defaults.prepared_path }}">
+            </label>
+            <label class="field">
+              <span>Raw TXT</span>
+              <input id="raw_output_path" type="text" value="{{ defaults.raw_output_path }}">
+            </label>
+            <label class="field">
+              <span>Папка speaker</span>
+              <input id="speaker_dir" type="text" value="{{ defaults.speaker_dir }}">
+            </label>
+            <label class="field">
+              <span>Manifest</span>
+              <input id="manifest_path" type="text" value="{{ defaults.manifest_path }}">
+            </label>
+          </div>
+        </details>
+
+        <!-- Quick Phrase -->
+        <div class="phrase-section">
+          <h3>Быстрая озвучка</h3>
+          <textarea id="phrase_text" rows="3" placeholder="Текст для проверки голоса..."></textarea>
+          <div class="phrase-row">
+            <input id="phrase_file_name" type="text" value="phrase_preview" placeholder="Имя файла">
+            <button id="btn_phrase_tts" class="btn btn-sm">Озвучить</button>
           </div>
           <audio id="phrase_player" controls preload="none"></audio>
         </div>
       </section>
 
-      <section class="card status">
-        <h2>Pipeline Status</h2>
-        <div class="metrics">
-          <div class="metric">
-            <p>Prepared blocks</p>
-            <strong id="m_prepared">0</strong>
+      <!-- Status & Live -->
+      <section class="panel status-panel">
+        <h2>Live TTS</h2>
+
+        <div class="live-status">
+          <span class="live-pill" id="live_job_status" data-state="idle">idle</span>
+        </div>
+
+        <div class="live-grid">
+          <div class="live-cell">
+            <span class="live-label">Событие</span>
+            <span class="live-value" id="live_event">&mdash;</span>
           </div>
-          <div class="metric">
-            <p>WAV files</p>
-            <strong id="m_wav">0</strong>
+          <div class="live-cell">
+            <span class="live-label">Текущий блок</span>
+            <span class="live-value" id="live_current">&mdash;</span>
           </div>
-          <div class="metric">
-            <p>Missing</p>
-            <strong id="m_missing">0</strong>
+          <div class="live-cell">
+            <span class="live-label">Повторы</span>
+            <span class="live-value" id="live_retries">0</span>
+          </div>
+          <div class="live-cell">
+            <span class="live-label">Прогресс</span>
+            <span class="live-value" id="live_done">0/0</span>
           </div>
         </div>
 
-        <div class="progress">
-          <div id="progress_bar"></div>
-        </div>
-        <p class="progress-label" id="progress_label">0%</p>
-
-        <div class="live-box">
-          <div class="live-head">
-            <h3>Live TTS</h3>
-            <span id="live_job_status" class="live-pill" data-state="idle">idle</span>
-          </div>
-          <div class="live-grid">
-            <div class="live-item">
-              <p>Событие</p>
-              <strong id="live_event">—</strong>
-            </div>
-            <div class="live-item">
-              <p>Текущий блок</p>
-              <strong id="live_current">—</strong>
-            </div>
-            <div class="live-item">
-              <p>Повторы</p>
-              <strong id="live_retries">0</strong>
-            </div>
-            <div class="live-item">
-              <p>Прогресс</p>
-              <strong id="live_done">0/0</strong>
-            </div>
-          </div>
-          <p id="live_error" class="live-error">—</p>
-        </div>
+        <p id="live_error" class="live-error">&mdash;</p>
 
         <div class="flags">
-          <p>LLM used: <strong id="f_llm">no</strong></p>
-          <p>Manual markers: <strong id="f_manual">no</strong></p>
-          <p>Manifest: <strong id="f_manifest">missing</strong></p>
+          <div class="flag"><span>LLM</span><strong id="f_llm">no</strong></div>
+          <div class="flag"><span>Маркеры</span><strong id="f_manual">no</strong></div>
+          <div class="flag"><span>Manifest</span><strong id="f_manifest">missing</strong></div>
+        </div>
+
+        <!-- Speaker files -->
+        <div class="speaker-section">
+          <div class="speaker-head">
+            <h3>Аудиофайлы</h3>
+            <span id="speaker_hint" class="speaker-count">0 файлов</span>
+          </div>
+          <div id="speaker_items" class="speaker-grid"></div>
         </div>
       </section>
-    </section>
+    </div>
 
-    <section class="card speaker-list">
-      <div class="speaker-header">
-        <h2>Speaker Files</h2>
-        <p id="speaker_hint">Файлы `zk*.wav`</p>
-      </div>
-      <div id="speaker_items" class="items"></div>
-    </section>
-
-    <section class="card logs">
-      <div class="log-head">
-        <h2>Лог</h2>
-        <button id="btn_clear_log" class="btn btn-mini">Clear</button>
+    <!-- Log -->
+    <section class="log-section">
+      <div class="log-header">
+        <h3>Лог</h3>
+        <button id="btn_clear_log" class="btn-icon btn-sm" title="Очистить">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
       </div>
       <pre id="log_box"></pre>
     </section>
   </main>
+
+  <div id="toast-container"></div>
 
   <script>
     window.__PROJECT_NAME__ = {{ defaults.project | tojson }};

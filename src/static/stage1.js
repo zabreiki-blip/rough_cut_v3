@@ -28,11 +28,11 @@
     m_prepared: el("m_prepared"),
     m_wav: el("m_wav"),
     m_missing: el("m_missing"),
+    m_progress: el("m_progress"),
     f_llm: el("f_llm"),
     f_manual: el("f_manual"),
     f_manifest: el("f_manifest"),
     progress_bar: el("progress_bar"),
-    progress_label: el("progress_label"),
     live_job_status: el("live_job_status"),
     live_event: el("live_event"),
     live_current: el("live_current"),
@@ -42,13 +42,18 @@
     speaker_items: el("speaker_items"),
     speaker_hint: el("speaker_hint"),
     log_box: el("log_box"),
+    step_analyze: el("step_analyze"),
+    step_tts: el("step_tts"),
+    step_validate: el("step_validate"),
   };
+
+  const toastContainer = document.getElementById("toast-container");
 
   let busy = false;
   const live = {
     status: "idle",
-    event: "—",
-    current: "—",
+    event: "\u2014",
+    current: "\u2014",
     retries: 0,
     done: 0,
     total: 0,
@@ -59,7 +64,21 @@
     return new Date().toLocaleTimeString("ru-RU");
   }
 
-  function appendLog(message, level = "info") {
+  function toast(message, type) {
+    if (!toastContainer) return;
+    const t = document.createElement("div");
+    t.className = "toast " + (type || "");
+    t.textContent = message;
+    toastContainer.appendChild(t);
+    setTimeout(() => {
+      t.style.opacity = "0";
+      t.style.transform = "translateX(20px)";
+      t.style.transition = "all 200ms";
+      setTimeout(() => t.remove(), 200);
+    }, 3500);
+  }
+
+  function appendLog(message, level) {
     const resolvedLevel = level === true ? "error" : level;
     const tag = resolvedLevel === "error" ? "ERR" : resolvedLevel === "warn" ? "WARN" : "INFO";
     const line = `[${now()}] [${tag}] ${message}`;
@@ -69,6 +88,10 @@
       ids.log_box.classList.add("log-error");
       setTimeout(() => ids.log_box.classList.remove("log-error"), 500);
     }
+  }
+
+  function setStepState(stepEl, state) {
+    if (stepEl) stepEl.dataset.state = state;
   }
 
   function eventTitle(event) {
@@ -82,7 +105,7 @@
       completed: "завершено",
       failed: "ошибка",
     };
-    return map[event] || event || "—";
+    return map[event] || event || "\u2014";
   }
 
   function renderLive() {
@@ -90,10 +113,10 @@
     ids.live_job_status.dataset.state = live.status || "idle";
     ids.live_job_status.textContent = live.status || "idle";
     ids.live_event.textContent = eventTitle(live.event);
-    ids.live_current.textContent = live.current || "—";
+    ids.live_current.textContent = live.current || "\u2014";
     ids.live_retries.textContent = String(live.retries || 0);
     ids.live_done.textContent = `${live.done || 0}/${live.total || 0}`;
-    ids.live_error.textContent = live.error ? `Ошибка: ${live.error}` : "—";
+    ids.live_error.textContent = live.error ? `${live.error}` : "\u2014";
     ids.live_error.classList.toggle("has-error", Boolean(live.error));
   }
 
@@ -135,12 +158,8 @@
 
   function assertRequiredPath(pathValue, label) {
     const value = (pathValue || "").trim();
-    if (!value) {
-      throw new Error(`${label} is required`);
-    }
-    if (!isLikelySafePath(value)) {
-      throw new Error(`${label} looks invalid: ${value}`);
-    }
+    if (!value) throw new Error(`${label} is required`);
+    if (!isLikelySafePath(value)) throw new Error(`${label} looks invalid: ${value}`);
   }
 
   async function postJSON(url, payload) {
@@ -151,8 +170,7 @@
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
-      const err = data.error || JSON.stringify(data);
-      throw new Error(err);
+      throw new Error(data.error || JSON.stringify(data));
     }
     return data.result || {};
   }
@@ -161,24 +179,31 @@
     const response = await fetch(url);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
-      const err = data.error || JSON.stringify(data);
-      throw new Error(err);
+      throw new Error(data.error || JSON.stringify(data));
     }
     return data.result || {};
   }
 
   function renderSpeaker(files) {
     ids.speaker_items.innerHTML = "";
+    if (!files.length) {
+      ids.speaker_items.innerHTML = '<p style="font-size:12px;color:var(--muted);padding:8px;">Нет файлов</p>';
+      return;
+    }
     files.forEach((file) => {
       const wrap = document.createElement("div");
       wrap.className = "audio-item";
-      const title = document.createElement("p");
-      title.textContent = file;
+
+      const name = document.createElement("span");
+      name.className = "audio-name";
+      name.textContent = file.replace(".wav", "");
+
       const audio = document.createElement("audio");
       audio.controls = true;
       audio.preload = "none";
       audio.src = `/speaker/${encodeURIComponent(project)}/${encodeURIComponent(file)}`;
-      wrap.appendChild(title);
+
+      wrap.appendChild(name);
       wrap.appendChild(audio);
       ids.speaker_items.appendChild(wrap);
     });
@@ -193,12 +218,25 @@
     ids.m_prepared.textContent = String(prepared);
     ids.m_wav.textContent = String(wav);
     ids.m_missing.textContent = String(missing);
+    ids.m_progress.textContent = `${pct}%`;
     ids.f_llm.textContent = status.used_llm ? "yes" : "no";
     ids.f_manual.textContent = status.manual_markers_used ? "yes" : "no";
     ids.f_manifest.textContent = status.manifest_exists ? "ready" : "missing";
     ids.progress_bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-    ids.progress_label.textContent = `${pct}%`;
-    ids.speaker_hint.textContent = `Файлы: ${wav}, не хватает: ${missing}`;
+    ids.speaker_hint.textContent = `${wav} файлов`;
+
+    // Update pipeline steps
+    if (prepared > 0) {
+      setStepState(ids.step_analyze, "completed");
+    }
+    if (wav > 0 && missing === 0 && prepared > 0) {
+      setStepState(ids.step_tts, "completed");
+    } else if (wav > 0) {
+      setStepState(ids.step_tts, "active");
+    }
+    if (status.manifest_exists) {
+      setStepState(ids.step_validate, "completed");
+    }
 
     renderSpeaker(Array.isArray(status.speaker_files) ? status.speaker_files : []);
   }
@@ -214,6 +252,7 @@
     assertRequiredPath(f.input_path, "input_path");
     assertRequiredPath(f.prepared_path, "prepared_path");
     assertRequiredPath(f.raw_output_path, "raw_output_path");
+    setStepState(ids.step_analyze, "active");
     appendLog(`Analyze: ${f.input_path}`);
     const result = await postJSON("/stage1/analyze", {
       project,
@@ -222,6 +261,8 @@
       raw_output_path: f.raw_output_path,
       use_llm: f.use_llm,
     });
+    setStepState(ids.step_analyze, "completed");
+    toast(`Анализ завершён: ${result.blocks_count} блоков`, "success");
     appendLog(`Analyze done: blocks=${result.blocks_count}, llm=${result.used_llm}`);
     await refreshStatus();
   }
@@ -230,14 +271,10 @@
     const f = formData();
     assertRequiredPath(f.prepared_path, "prepared_path");
     assertRequiredPath(f.speaker_dir, "speaker_dir");
+    setStepState(ids.step_tts, "active");
     setLive({
-      status: "queued",
-      event: "queued",
-      current: "—",
-      retries: 0,
-      done: 0,
-      total: 0,
-      error: "",
+      status: "queued", event: "queued",
+      current: "\u2014", retries: 0, done: 0, total: 0, error: "",
     });
     appendLog(`TTS job: provider=${f.provider}, gender=${f.gender}, dry=${f.dry_run}`);
     const start = await postJSON("/stage1/tts-jobs/start", {
@@ -251,9 +288,7 @@
     });
 
     const jobId = String(start.job_id || "").trim();
-    if (!jobId) {
-      throw new Error("TTS job start failed: empty job_id");
-    }
+    if (!jobId) throw new Error("TTS job start failed: empty job_id");
 
     appendLog(`TTS job queued: ${jobId}`);
     let lastMarker = "";
@@ -270,8 +305,8 @@
       if (total > 0) {
         const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
         ids.progress_bar.style.width = `${pct}%`;
-        ids.progress_label.textContent = `${pct}%`;
-        ids.speaker_hint.textContent = `TTS: ${done}/${total}` + (currentId ? ` · ${currentId}` : "");
+        ids.m_progress.textContent = `${pct}%`;
+        ids.speaker_hint.textContent = `TTS: ${done}/${total}`;
       }
 
       if (marker !== lastMarker) {
@@ -279,10 +314,9 @@
         setLive({
           status: String(state.status || "running"),
           event: event || "running",
-          current: currentId || "—",
+          current: currentId || "\u2014",
           retries: retryCount,
-          done,
-          total,
+          done, total,
           error: String(state.last_error || state.error || ""),
         });
         const level = event === "item_retrying" ? "warn" : event === "failed" ? "error" : "info";
@@ -292,26 +326,20 @@
 
       if (state.status === "completed") {
         const result = state.result || {};
-        setLive({
-          status: "completed",
-          event: "completed",
-          current: "—",
-          done: total,
-          total,
-          error: "",
-        });
-        appendLog(
-          `TTS done: generated=${result.files_count || state.generated || 0}, skipped=${result.skipped_count || state.skipped || 0}, voice=${result.voice || state.voice || ""}`
-        );
+        setStepState(ids.step_tts, "completed");
+        setLive({ status: "completed", event: "completed", current: "\u2014", done: total, total, error: "" });
+        const gen = result.files_count || state.generated || 0;
+        const skip = result.skipped_count || state.skipped || 0;
+        toast(`TTS завершён: ${gen} создано, ${skip} пропущено`, "success");
+        appendLog(`TTS done: generated=${gen}, skipped=${skip}, voice=${result.voice || state.voice || ""}`);
         break;
       }
       if (state.status === "failed") {
+        setStepState(ids.step_tts, "error");
         setLive({
-          status: "failed",
-          event: "failed",
+          status: "failed", event: "failed",
           error: String(state.last_error || state.error || "TTS job failed"),
-          done,
-          total,
+          done, total,
         });
         throw new Error(state.error || "TTS job failed");
       }
@@ -327,7 +355,7 @@
     assertRequiredPath(f.speaker_dir, "speaker_dir");
     const phrase = (f.phrase_text || "").trim();
     if (!phrase) {
-      appendLog("ERROR: Введи текст фразы для озвучки.", true);
+      toast("Введи текст фразы", "error");
       ids.phrase_text.focus();
       return;
     }
@@ -342,10 +370,10 @@
       file_name: f.phrase_file_name || null,
       dry_run: f.dry_run,
     });
+    toast("Фраза озвучена", "success");
     appendLog(`Phrase done: file=${result.file}, voice=${result.voice}`);
     if (result.playback_url && ids.phrase_player) {
-      const audioUrl = `${result.playback_url}?t=${Date.now()}`;
-      ids.phrase_player.src = audioUrl;
+      ids.phrase_player.src = `${result.playback_url}?t=${Date.now()}`;
       ids.phrase_player.load();
     }
     await refreshStatus();
@@ -356,14 +384,32 @@
     assertRequiredPath(f.prepared_path, "prepared_path");
     assertRequiredPath(f.speaker_dir, "speaker_dir");
     assertRequiredPath(f.manifest_path, "manifest_path");
+    setStepState(ids.step_validate, "active");
     appendLog("Validate...");
-    const result = await postJSON("/stage1/validate", {
-      project,
-      prepared_path: f.prepared_path,
-      speaker_dir: f.speaker_dir,
-      manifest_path: f.manifest_path,
+    const response = await fetch("/stage1/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project,
+        prepared_path: f.prepared_path,
+        speaker_dir: f.speaker_dir,
+        manifest_path: f.manifest_path,
+      }),
     });
-    appendLog(`Validate done: ok=${result.ok}, items=${result.items_count}`);
+    const data = await response.json().catch(() => ({}));
+    if (response.status >= 500) {
+      throw new Error(data.error || "Server error");
+    }
+    const result = data.result || {};
+    if (result.ok) {
+      setStepState(ids.step_validate, "completed");
+      toast(`Валидация пройдена: ${result.items_count} элементов`, "success");
+    } else {
+      setStepState(ids.step_validate, "error");
+      const errList = (result.errors || []).join("; ");
+      toast(`Валидация: ${errList || "есть ошибки"}`, "warn");
+    }
+    appendLog(`Validate done: ok=${result.ok}, items=${result.items_count}, errors=${(result.errors||[]).length}`);
     await refreshStatus();
   }
 
@@ -374,12 +420,10 @@
       await fn();
     } catch (err) {
       const msg = err.message || String(err);
+      toast(msg, "error");
       appendLog(`ERROR: ${msg}`, true);
       if (msg.includes("macOS TTS unavailable") || msg.includes("command 'say'")) {
-        appendLog(
-          "Подсказка: для macOS-озвучки запусти API локально на Mac или подними macOS-коннектор (MACOS_CONNECTOR_URL), либо выбери provider=openrouter/gemini.",
-          true
-        );
+        appendLog("Подсказка: выбери provider=openrouter/gemini или настрой macOS-коннектор.", true);
       }
     } finally {
       setBusy(false);

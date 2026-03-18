@@ -1,0 +1,23 @@
+services:
+  stage1-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rough_cut_stage1_api
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app/src
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/app
+    command: gunicorn -b 0.0.0.0:8000 --reload api:app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

@@ -97,6 +97,7 @@ def validate_stage1(
     prepared_path: Path,
     speaker_dir: Path,
     manifest_path: Path,
+    project_name: str | None = None,
 ) -> dict:
     payload = read_json(prepared_path)
     items = payload.get("items", [])
@@ -161,7 +162,7 @@ def validate_stage1(
 
     settings = get_settings()
     manifest = {
-        "project": settings.project_name,
+        "project": project_name or settings.project_name,
         "generated_at": datetime.now(UTC).isoformat(),
         "items": manifest_items,
     }

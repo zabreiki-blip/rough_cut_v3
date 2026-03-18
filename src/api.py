@@ -132,7 +132,10 @@ def _abs_path(value: str, fallback: Path) -> Path:
     candidate = Path(value)
     if not candidate.is_absolute():
         candidate = ROOT_DIR / candidate
-    return candidate
+    resolved = candidate.resolve()
+    if not str(resolved).startswith(str(PROJECTS_DIR)):
+        raise ValueError(f"Path must be inside projects/: {value}")
+    return resolved
 
 
 def _utc_now_iso() -> str:
@@ -406,18 +409,20 @@ def stage1_analyze():
     output_default = paths["work"] / "scenario_prepared.json"
     raw_default = paths["work"] / "scenario_raw.txt"
 
-    input_path = _abs_path(payload.get("input_path", input_default), ROOT_DIR / input_default)
-    output_path = _abs_path(payload.get("output_path", ""), output_default)
-    raw_output_path = _abs_path(payload.get("raw_output_path", ""), raw_default)
     use_llm = bool(payload.get("use_llm", True))
 
     try:
+        input_path = _abs_path(payload.get("input_path", input_default), ROOT_DIR / input_default)
+        output_path = _abs_path(payload.get("output_path", ""), output_default)
+        raw_output_path = _abs_path(payload.get("raw_output_path", ""), raw_default)
         result = analyze_script(
             input_path=input_path,
             output_path=output_path,
             raw_output_path=raw_output_path,
             use_llm=use_llm,
         )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:
@@ -446,12 +451,12 @@ def stage1_tts():
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return _json_error("gender must be 'female' or 'male'", 400)
 
-    prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
-    speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
     voice_name = payload.get("voice_name")
     dry_run = bool(payload.get("dry_run", False))
 
     try:
+        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
         result = synthesize_tts(
             prepared_path=prepared_path,
             speaker_dir=speaker_dir,
@@ -460,6 +465,8 @@ def stage1_tts():
             gender=gender,
             dry_run=dry_run,
         )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:
@@ -488,10 +495,14 @@ def stage1_tts_job_start():
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return _json_error("gender must be 'female' or 'male'", 400)
 
-    prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
-    speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
     voice_name = payload.get("voice_name")
     dry_run = bool(payload.get("dry_run", False))
+
+    try:
+        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
 
     job = _create_tts_job(project=project)
     worker = threading.Thread(
@@ -550,12 +561,12 @@ def stage1_tts_phrase():
         return _json_error("gender must be 'female' or 'male'", 400)
 
     text = str(payload.get("text", ""))
-    speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
     voice_name = payload.get("voice_name")
     file_name = payload.get("file_name")
     dry_run = bool(payload.get("dry_run", False))
 
     try:
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
         result = synthesize_phrase(
             text=text,
             speaker_dir=speaker_dir,
@@ -591,16 +602,18 @@ def stage1_validate():
 
     paths = _ensure_project(project)
 
-    prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
-    speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
-    manifest_path = _abs_path(payload.get("manifest_path", ""), paths["speaker"] / "manifest.json")
-
     try:
+        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+        manifest_path = _abs_path(payload.get("manifest_path", ""), paths["speaker"] / "manifest.json")
         result = validate_stage1(
             prepared_path=prepared_path,
             speaker_dir=speaker_dir,
             manifest_path=manifest_path,
+            project_name=project,
         )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rough Cut v3</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='projects.css') }}">
+</head>
+<body>
+  <div class="noise"></div>
+
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">RC</div>
+      <div class="logo-text">
+        <strong>Rough Cut</strong>
+        <span>v3</span>
+      </div>
+    </div>
+    <nav>
+      <a href="/" class="nav-item active">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span>Проекты</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <span class="version">v3.0</span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1>Проекты</h1>
+      <p class="topbar-sub">Управление проектами озвучки</p>
+    </header>
+
+    <section class="create-section">
+      <div class="create-card">
+        <div class="create-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </div>
+        <div class="create-body">
+          <h2>Новый проект</h2>
+          <p>Латинские буквы, цифры, дефис и подчёркивание</p>
+          <div class="create-row">
+            <input id="new_project" type="text" placeholder="greenland_ep01" maxlength="64" autocomplete="off" spellcheck="false">
+            <button id="btn_create">Создать</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="list-section">
+      <div class="list-header">
+        <h2>Существующие проекты <span id="project_count" class="badge">{{ projects|length }}</span></h2>
+        <button id="btn_reload" class="btn-icon" title="Обновить">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+      </div>
+      <div id="project_list" class="project-grid">
+        {% if projects %}
+          {% for project in projects %}
+            <a class="project-card" href="/project/{{ project }}">
+              <div class="card-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              </div>
+              <div class="card-body">
+                <span class="card-name">{{ project }}</span>
+                <span class="card-meta">Stage 1</span>
+              </div>
+              <svg class="card-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+            </a>
+          {% endfor %}
+        {% else %}
+          <div class="empty-state">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            <p>Пока нет проектов</p>
+            <span>Создай первый проект выше</span>
+          </div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="log-section">
+      <div class="log-header">
+        <h3>Лог</h3>
+        <button id="btn_clear_log" class="btn-icon btn-sm" title="Очистить">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <div id="toast-container"></div>
+
+  <script>
+    window.__PROJECT_LIST__ = {{ projects | tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='projects.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 install:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(find /Users/mac/Documents/AI/rough_cut_v3/src -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Read(//Users/mac/Documents/AI/rough_cut_v3/**)",
+      "Bash(PYTHONPATH=src python3 -c \":*)",
+      "Bash(python3 -m flask --version)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\(''projects/UIP_LEDOKOL/work/scenario_prepared.json''\\)\\); print\\(len\\(d[''items'']\\)\\)\")",
+      "Bash(python3 -m py_compile src/api.py)",
+      "Bash(python3 -m py_compile src/stage1/validator.py)",
+      "Bash(python3 -m py_compile src/stage1/analyzer.py)"
+    ]
+  }
+}

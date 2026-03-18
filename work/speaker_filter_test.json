@@ -1,0 +1,17 @@
+{
+  "source": "/tmp/speaker_filter_test.txt",
+  "used_llm": false,
+  "manual_markers_used": true,
+  "llm_errors": [],
+  "max_zk_blocks": 40,
+  "blocks_count_before_merge": 1,
+  "items": [
+    {
+      "id": "zk1",
+      "text_original": "Это закадровый текст номер один.",
+      "text_for_tts": "Это закадровый текст номер один.",
+      "pause_ms": 300,
+      "notes": "manual_prefix"
+    }
+  ]
+}

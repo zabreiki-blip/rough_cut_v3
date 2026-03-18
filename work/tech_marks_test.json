@@ -1,0 +1,24 @@
+{
+  "source": "/tmp/tech_marks_test.txt",
+  "used_llm": false,
+  "manual_markers_used": true,
+  "llm_errors": [],
+  "max_zk_blocks": 40,
+  "blocks_count_before_merge": 2,
+  "items": [
+    {
+      "id": "zk1",
+      "text_original": "Нормальный дикторский текст.",
+      "text_for_tts": "Нормальный дикторский текст.",
+      "pause_ms": 300,
+      "notes": "manual_prefix"
+    },
+    {
+      "id": "zk2",
+      "text_original": "Второй дикторский блок.",
+      "text_for_tts": "Второй дикторский блок.",
+      "pause_ms": 300,
+      "notes": "manual_prefix"
+    }
+  ]
+}

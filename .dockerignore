@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.env
+input
+work
+speaker
+projects/*/work
+projects/*/speaker
