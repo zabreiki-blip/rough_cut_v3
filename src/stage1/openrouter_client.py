@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
 try:
     import requests
+    from requests.exceptions import ConnectionError, Timeout
 except ImportError:
     requests = None
+    ConnectionError = OSError  # type: ignore[misc]
+    Timeout = OSError  # type: ignore[misc]
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+except ImportError:
+    retry = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 from .config import Settings
 from .models import NarrationBlock
@@ -123,13 +134,38 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
     }
-    response = requests.post(
-        f"{settings.openrouter_base_url}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=120,
-    )
-    response.raise_for_status()
+    def _do_request():
+        resp = requests.post(
+            f"{settings.openrouter_base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp
+
+    if retry is not None:
+        def _is_retryable(exc: BaseException) -> bool:
+            if isinstance(exc, (ConnectionError, Timeout)):
+                return True
+            import requests as _req
+            if isinstance(exc, _req.HTTPError):
+                code = exc.response.status_code if exc.response is not None else 0
+                return code in (429, 500, 502, 503, 504)
+            return False
+
+        _do_request_with_retry = retry(
+            retry=retry_if_exception(_is_retryable),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=2, min=4, max=30),
+            reraise=True,
+        )(_do_request)
+        logger.debug("OpenRouter: отправляю запрос (retry включён)")
+        response = _do_request_with_retry()
+    else:
+        logger.debug("OpenRouter: tenacity не установлен, retry отключён")
+        response = _do_request()
+
     data = response.json()
     content = data["choices"][0]["message"]["content"]
     parsed = _extract_json(content if isinstance(content, str) else json.dumps(content))

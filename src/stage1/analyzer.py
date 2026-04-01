@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 import re
 from typing import Iterable
 
 from .config import get_settings
 from .io_utils import (
-    DocxParagraph,
     extract_marked_blocks_from_docx,
     extract_paragraphs_from_docx,
     extract_text,
@@ -18,6 +16,16 @@ from .openrouter_client import analyze_with_openrouter
 
 # --- Regex patterns ---
 
+NARRATOR_TAG_RE = re.compile(
+    r"\[\[\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\](.*?)\[\[\s*/\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\]",
+    flags=re.I | re.S,
+)
+NARRATOR_MARKER_RE = re.compile(
+    r"^\s*(?P<label>VO|NARRATOR|ЗК|ЗАКАДР)(?=(?:\s|[:\-–]|$|\d))"
+    r"\s*(?P<suffix>\d+(?:\.\d+)?[A-ZА-Я]?|[A-ZА-Я])?"
+    r"\s*(?P<separator>[:\-–])?\s*(?P<rest>.*)$",
+    flags=re.I,
+)
 SPEAKER_PREFIX_RE = re.compile(
     r"^\s*(?:СПИКЕР|СНХ|ВЕДУЩИЙ)(?:\s*-?\s*\d+)?\s*[.:\-–]",
     flags=re.I,
@@ -27,12 +35,14 @@ SPEAKER_INLINE_RE = re.compile(
     flags=re.I,
 )
 TECH_PREFIX_RE = re.compile(
-    r"^\s*(?:ВОТ\s+ССЫЛКА|ВИДЕО(?:\s*-?\s*\d+)?|ЛАЙФ(?:\s*-?\s*\d+)?|ВНИМАНИЕ|"
-    r"ШАПКА|ОТБИВКА|ТИТР|ПЛАШКА|ГРАФИКА|КАРТА|ФОТО)\b",
+    r"^\s*(?:ВОТ\s+ССЫЛКА|ВИДЕО(?:\s*-?\s*\d+)?|ЛАЙ[ВФ](?:\s*-?\s*[\wА-Яа-яЁё]+)?|"
+    r"ВНИМАНИЕ|ШАПКА|ОТБИВКА|ТИТР|ПЛАШКА|ГРАФИКА|КАРТА|ФОТО|РЕКВИЗИТ|"
+    r"АНОНС(?:Ы|\s*Ы)?(?:\s*-?\s*\d+)?|ЭКСПЕРИМЕНТ(?:\s*-?\s*\d+)?|"
+    r"ШПИГЕЛЬ|СКЛЕЙКА|ВЖИК|НЕТ\s+ПЕРЕХОДА)\b",
     flags=re.I,
 )
 TECH_INLINE_RE = re.compile(
-    r"(?:^|\s)(?:ВОТ\s+ССЫЛКА|ВИДЕО(?:\s*-?\s*\d+)?|ЛАЙФ(?:\s*-?\s*\d+)?|ВНИМАНИЕ)\s*[:\-–]\s*[^.!?\n]*(?:[.!?]|$)",
+    r"(?:^|\s)(?:ВОТ\s+ССЫЛКА|ВИДЕО(?:\s*-?\s*\d+)?|ЛАЙ[ВФ](?:\s*-?\s*\d+)?|ВНИМАНИЕ)\s*[:\-–]\s*[^.!?\n]*(?:[.!?]|$)",
     flags=re.I,
 )
 # Timecoded interview fragments: [06:34] (...) text
@@ -47,6 +57,30 @@ SYNC_LINE_RE = re.compile(
 SNH_LABEL_RE = re.compile(
     r"^\s*СНХ\s+\S", flags=re.I,
 )
+INTERVIEW_SPEAKER_LINE_RE = re.compile(
+    r"^\s*(?:СНХ\s+)?"
+    r"[А-ЯЁ][А-ЯЁа-яё-]+(?:\s+[А-ЯЁ][А-ЯЁа-яё-]+){0,3}"
+    r"(?:,\s*[^.!?\n]{0,80})?"
+    r"[:\s\-–]*\b\d{1,2}:\d{2}(?::\d{2})?\b",
+    flags=re.I,
+)
+
+
+def _match_narrator_marker_line(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    match = NARRATOR_MARKER_RE.match(stripped)
+    if not match:
+        return None
+
+    suffix = (match.group("suffix") or "").strip()
+    separator = match.group("separator")
+    if not suffix and not separator:
+        return None
+
+    return match.group("rest").strip()
 
 
 def _is_sync_or_interview(text: str) -> bool:
@@ -58,6 +92,8 @@ def _is_sync_or_interview(text: str) -> bool:
         return True
     if stripped.startswith("(...)") or stripped.startswith("(…)"):
         return True
+    if INTERVIEW_SPEAKER_LINE_RE.match(stripped):
+        return True
     return False
 
 
@@ -67,7 +103,7 @@ def _is_technical(text: str) -> bool:
     if TECH_PREFIX_RE.match(stripped):
         return True
     # Very short ALL-CAPS lines are likely technical markers
-    if len(stripped) < 50 and stripped == stripped.upper() and not any(c.isdigit() for c in stripped):
+    if len(stripped) < 50 and stripped == stripped.upper() and _match_narrator_marker_line(stripped) is None:
         return True
     return False
 
@@ -175,6 +211,19 @@ def _from_marked_docx(input_path: Path) -> list[NarrationBlock]:
     """Highlighted blocks from .docx (highlight color / shading)."""
     if input_path.suffix.lower() != ".docx":
         return []
+
+    highlighted_paragraphs = [
+        para.text.strip()
+        for para in extract_paragraphs_from_docx(input_path)
+        if para.has_highlight and para.text.strip()
+    ]
+    if highlighted_paragraphs:
+        manual_blocks = _extract_manual_narrator_blocks("\n".join(highlighted_paragraphs))
+        if manual_blocks:
+            for block in manual_blocks:
+                block.notes = "manual_highlight_marker"
+            return manual_blocks
+
     marked_texts = extract_marked_blocks_from_docx(input_path)
     blocks: list[NarrationBlock] = []
     for text in marked_texts:
@@ -194,33 +243,48 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
     """Extract blocks wrapped in [[VO]]...[[/VO]] or prefixed with ЗК: etc."""
     found: list[tuple[int, str, str]] = []
 
-    tag_pattern = re.compile(
-        r"\[\[\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\](.*?)\[\[\s*/\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\]",
-        flags=re.I | re.S,
-    )
-    for match in tag_pattern.finditer(scenario_text):
+    for match in NARRATOR_TAG_RE.finditer(scenario_text):
         text = match.group(1).strip()
         if text:
             found.append((match.start(), text, "manual_tag"))
 
-    prefix_re = re.compile(
-        r"^\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*[:\-–]\s*(.+(?:\n(?!\s*\n|\s*(?:СПИКЕР|СНХ|ВЕДУЩИЙ|ЗК|ЗАКАДР|VO|NARRATOR)\s*[\d:\-–]).+)*)",
-        flags=re.I | re.M,
-    )
-    for match in prefix_re.finditer(scenario_text):
-        text = match.group(1).strip()
-        if text:
-            found.append((match.start(), text, "manual_prefix"))
+    current_start: int | None = None
+    current_note = "manual_prefix"
+    current_lines: list[str] = []
+    offset = 0
 
-    # Numbered narrator blocks: ЗК1, ЗК2, ЗК 3, etc. (with or without separator)
-    numbered_re = re.compile(
-        r"^\s*(?:ЗК|ЗАКАДР|VO)\s*(\d+)\s*[:\-–]?\s*(.+(?:\n(?!\s*(?:ЗК|ЗАКАДР|VO)\s*\d|\s*(?:СНХ|СПИКЕР|ВЕДУЩИЙ)\b|\s*\n).+)*)",
-        flags=re.I | re.M,
-    )
-    for match in numbered_re.finditer(scenario_text):
-        text = match.group(2).strip()
+    def flush_current() -> None:
+        nonlocal current_start, current_note, current_lines
+        if current_start is None:
+            return
+        text = "\n".join(line for line in current_lines if line).strip()
         if text:
-            found.append((match.start(), text, "manual_numbered"))
+            found.append((current_start, text, current_note))
+        current_start = None
+        current_note = "manual_prefix"
+        current_lines = []
+
+    for raw_line in scenario_text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        stripped = line.strip()
+        marker_rest = _match_narrator_marker_line(stripped)
+
+        if marker_rest is not None:
+            flush_current()
+            current_start = offset
+            current_note = "manual_numbered" if re.search(r"\d", stripped) else "manual_prefix"
+            current_lines = [marker_rest] if marker_rest else []
+        elif current_start is not None:
+            if not stripped:
+                flush_current()
+            elif _is_speaker_or_snh(stripped) or _is_sync_or_interview(stripped) or _is_technical(stripped):
+                flush_current()
+            else:
+                current_lines.append(stripped)
+
+        offset += len(raw_line)
+
+    flush_current()
 
     found.sort(key=lambda x: x[0])
 
@@ -235,8 +299,42 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
 def _strip_speaker_cues(text: str) -> str:
     if not text:
         return text
-    cleaned = SPEAKER_INLINE_RE.sub(" ", text)
+
+    kept_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _is_speaker_or_snh(line):
+            continue
+        if INTERVIEW_SPEAKER_LINE_RE.match(line):
+            continue
+        cleaned_line = SPEAKER_INLINE_RE.sub(" ", line).strip()
+        if cleaned_line:
+            kept_lines.append(cleaned_line)
+
+    cleaned = "\n".join(kept_lines)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _strip_narrator_markers(text: str) -> str:
+    if not text:
+        return text
+
+    kept_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        marker_rest = _match_narrator_marker_line(line)
+        if marker_rest is not None:
+            line = marker_rest
+        if line:
+            kept_lines.append(line)
+
+    cleaned = "\n".join(kept_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -268,6 +366,8 @@ def _cleanup_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
     for block in blocks:
         text_original = _strip_speaker_cues(block.text_original.strip())
         text_for_tts = _strip_speaker_cues(block.text_for_tts.strip())
+        text_original = _strip_narrator_markers(text_original)
+        text_for_tts = _strip_narrator_markers(text_for_tts)
         text_original = _strip_technical_cues(text_original)
         text_for_tts = _strip_technical_cues(text_for_tts)
         if not text_for_tts or len(text_for_tts) < 5:
@@ -361,6 +461,65 @@ def _renumber_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
     return blocks
 
 
+def _join_block_text(left: str, right: str, separator: str = " ") -> str:
+    left = left.strip()
+    right = right.strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    return f"{left}{separator}{right}"
+
+
+def _merge_block_notes(*note_values: str) -> str:
+    merged: list[str] = []
+    for note in note_values:
+        for part in note.split("|"):
+            cleaned = part.strip()
+            if cleaned and cleaned not in merged:
+                merged.append(cleaned)
+    return " | ".join(merged)
+
+
+def _merge_adjacent_pair(
+    left: NarrationBlock,
+    right: NarrationBlock,
+    separator: str = " ",
+) -> NarrationBlock:
+    return NarrationBlock(
+        id="",
+        text_original=_join_block_text(left.text_original, right.text_original, separator=separator),
+        text_for_tts=_join_block_text(left.text_for_tts, right.text_for_tts, separator=separator),
+        pause_ms=max(left.pause_ms, right.pause_ms),
+        notes=_merge_block_notes(left.notes, right.notes),
+    )
+
+
+def _merge_candidate_score(left: NarrationBlock, right: NarrationBlock) -> int:
+    left_text = left.text_for_tts.strip()
+    right_text = right.text_for_tts.strip()
+    score = len(left_text) + len(right_text)
+
+    # Prefer collapsing genuinely short neighbors before touching long narration chunks.
+    for text in (left_text, right_text):
+        if len(text) < 80:
+            score -= 40
+        elif len(text) < 140:
+            score -= 10
+
+    # If the left block clearly continues into the next one, merging is cheaper.
+    if left_text.endswith((",", ":", ";", "—", "-", "(")):
+        score -= 30
+    if right_text[:1].islower():
+        score -= 20
+
+    # Full sentence boundary is a slightly stronger signal to keep blocks separate.
+    if left_text.endswith((".", "!", "?", "…")) and right_text[:1].isupper():
+        score += 15
+
+    return score
+
+
 def _merge_short_blocks(blocks: list[NarrationBlock], min_len: int = 40) -> list[NarrationBlock]:
     """Merge very short blocks with the next block for natural flow."""
     if not blocks:
@@ -372,16 +531,7 @@ def _merge_short_blocks(blocks: list[NarrationBlock], min_len: int = 40) -> list
         # If block is very short and there's a next block, merge them
         if len(block.text_for_tts) < min_len and i + 1 < len(blocks):
             next_block = blocks[i + 1]
-            text_original = f"{block.text_original} {next_block.text_original}".strip()
-            text_for_tts = f"{block.text_for_tts} {next_block.text_for_tts}".strip()
-            notes = " | ".join(filter(None, [block.notes.strip(), next_block.notes.strip()]))
-            merged.append(NarrationBlock(
-                id="",
-                text_original=text_original,
-                text_for_tts=text_for_tts,
-                pause_ms=max(block.pause_ms, next_block.pause_ms),
-                notes=notes,
-            ))
+            merged.append(_merge_adjacent_pair(block, next_block))
             i += 2
         else:
             merged.append(block)
@@ -393,22 +543,21 @@ def _merge_blocks_to_limit(blocks: list[NarrationBlock], max_blocks: int) -> lis
     if max_blocks < 1 or len(blocks) <= max_blocks:
         return blocks
 
-    group_size = math.ceil(len(blocks) / float(max_blocks))
-    merged: list[NarrationBlock] = []
+    merged = list(blocks)
 
-    for i in range(0, len(blocks), group_size):
-        group = blocks[i : i + group_size]
-        text_original = " ".join(b.text_original.strip() for b in group if b.text_original.strip())
-        text_for_tts = " ".join(b.text_for_tts.strip() for b in group if b.text_for_tts.strip())
-        notes = " | ".join(b.notes.strip() for b in group if b.notes.strip())
-        pause_ms = max((b.pause_ms for b in group), default=300)
-        merged.append(NarrationBlock(
-            id="",
-            text_original=text_original,
-            text_for_tts=text_for_tts,
-            pause_ms=pause_ms,
-            notes=notes,
-        ))
+    while len(merged) > max_blocks:
+        best_idx = 0
+        best_score: int | None = None
+
+        for idx in range(len(merged) - 1):
+            score = _merge_candidate_score(merged[idx], merged[idx + 1])
+            if best_score is None or score < best_score:
+                best_score = score
+                best_idx = idx
+
+        merged_pair = _merge_adjacent_pair(merged[best_idx], merged[best_idx + 1])
+        merged = merged[:best_idx] + [merged_pair] + merged[best_idx + 2 :]
+
     return merged
 
 
@@ -434,19 +583,21 @@ def analyze_script(
     blocks: list[NarrationBlock]
     llm_errors: list[str] = []
 
-    # Strategy 1: Highlighted blocks from docx
-    marked_docx_blocks = _from_marked_docx(input_path)
-    if marked_docx_blocks:
-        blocks = marked_docx_blocks
+    # Strategy 1: Manual markers in text [[VO]]..[[/VO]] or ЗК:
+    # Must run before highlight check — explicit ЗК markers are more reliable
+    # than arbitrary highlight formatting which may capture non-voiceover blocks.
+    manual_blocks = _extract_manual_narrator_blocks(scenario_text)
+    if manual_blocks:
+        blocks = manual_blocks
         manual_markers_used = True
-        extraction_method = "highlight"
+        extraction_method = "manual_markers"
     else:
-        # Strategy 2: Manual markers in text [[VO]]..[[/VO]] or ЗК:
-        manual_blocks = _extract_manual_narrator_blocks(scenario_text)
-        if manual_blocks:
-            blocks = manual_blocks
+        # Strategy 2: Highlighted blocks from docx
+        marked_docx_blocks = _from_marked_docx(input_path)
+        if marked_docx_blocks:
+            blocks = marked_docx_blocks
             manual_markers_used = True
-            extraction_method = "manual_markers"
+            extraction_method = "highlight"
         else:
             # Strategy 3: Bold-aware formatting from .docx
             formatting_blocks, fmt_method = _from_docx_formatting(input_path)

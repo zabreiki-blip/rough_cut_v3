@@ -255,6 +255,10 @@ MACOS_CONNECTOR_URL=http://host.docker.internal:8001/synthesize
 ### macOS TTS не работает в Docker
 - Нужен коннектор: `src/macos_connector.py` (запускается на хосте).
 - Установи `MACOS_CONNECTOR_URL=http://host.docker.internal:8001/synthesize`.
+```bash
+cd /Users/mac/Documents/AI/rough_cut_v3
+python3 src/macos_connector.py
+```
 
 ### После правки кода Flask показывает старые данные
 - Перезапусти Flask-сервер (hot reload не всегда подхватывает изменения в `src/stage1/`).
