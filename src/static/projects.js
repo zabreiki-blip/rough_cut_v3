@@ -69,6 +69,35 @@
     btnClearLog.addEventListener("click", () => { log.textContent = ""; });
   }
 
+  async function deleteProject(name, btn) {
+    if (!confirm(`Удалить проект «${name}» и все его файлы? Это действие необратимо.`)) return;
+    btn.disabled = true;
+    try {
+      addLog(`Удаление проекта ${name}...`);
+      const res = await fetch(`/projects/${encodeURIComponent(name)}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok || data.ok === false) throw new Error(data.error || "Ошибка удаления");
+      toast(`Проект «${name}» удалён`, "success");
+      addLog(`Удалён: ${name}`);
+      const wrap = btn.closest(".project-card-wrap");
+      if (wrap) wrap.remove();
+      const badge = document.getElementById("project_count");
+      if (badge) badge.textContent = Math.max(0, parseInt(badge.textContent || "0") - 1);
+    } catch (err) {
+      toast(err.message || String(err), "error");
+      addLog(`ERROR: ${err.message || String(err)}`);
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById("project_list").addEventListener("click", (e) => {
+    const btn = e.target.closest(".btn-delete");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    deleteProject(btn.dataset.project, btn);
+  });
+
   const list = window.__PROJECT_LIST__ || [];
   addLog(`Проектов: ${list.length}`);
 })();

@@ -13,6 +13,9 @@ from stage1.analyzer import analyze_script
 from stage1.config import get_settings
 from stage1.gemini_tts import synthesize_phrase, synthesize_tts
 from stage1.validator import validate_stage1
+from stage2.timeline_parser import parse_timeline
+from stage2.placeholder import generate_placeholder
+from stage2.xml_export import build_xml
 
 
 app = Flask(__name__)
@@ -216,6 +219,7 @@ def _run_tts_job(
     voice_name: str | None,
     gender: str | None,
     dry_run: bool,
+    speed: float = 1.0,
 ) -> None:
     _update_tts_job(
         job_id,
@@ -274,6 +278,7 @@ def _run_tts_job(
             gender=gender,
             dry_run=dry_run,
             progress_callback=progress_callback,
+            speed=speed,
         )
     except Exception as exc:
         _update_tts_job(
@@ -332,6 +337,22 @@ def create_project():
 
     _ensure_project(project)
     return jsonify({"ok": True, "project": project, "url": f"/project/{project}"})
+
+
+@app.delete("/projects/<project>")
+def delete_project(project: str):
+    try:
+        project = _normalize_project_name(project)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
+    project_dir = PROJECTS_DIR / project
+    if not project_dir.exists():
+        return _json_error("Проект не найден", 404)
+
+    import shutil
+    shutil.rmtree(project_dir)
+    return jsonify({"ok": True, "project": project})
 
 
 @app.get("/project/<project>")
@@ -497,6 +518,11 @@ def stage1_tts_job_start():
 
     voice_name = payload.get("voice_name")
     dry_run = bool(payload.get("dry_run", False))
+    try:
+        speed = float(payload.get("speed", 1.0))
+    except (TypeError, ValueError):
+        return _json_error("speed must be a number between 0.5 and 1.5", 400)
+    speed = max(0.5, min(1.5, speed))
 
     try:
         prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
@@ -515,6 +541,7 @@ def stage1_tts_job_start():
             "voice_name": voice_name,
             "gender": gender,
             "dry_run": dry_run,
+            "speed": speed,
         },
         daemon=True,
     )
@@ -564,6 +591,11 @@ def stage1_tts_phrase():
     voice_name = payload.get("voice_name")
     file_name = payload.get("file_name")
     dry_run = bool(payload.get("dry_run", False))
+    try:
+        speed = float(payload.get("speed", 1.0))
+    except (TypeError, ValueError):
+        return _json_error("speed must be a number between 0.5 and 1.5", 400)
+    speed = max(0.5, min(1.5, speed))
 
     try:
         speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
@@ -575,6 +607,7 @@ def stage1_tts_phrase():
             gender=gender,
             file_name=file_name,
             dry_run=dry_run,
+            speed=speed,
         )
     except ValueError as exc:
         return _json_error(str(exc), 400)
@@ -622,3 +655,130 @@ def stage1_validate():
     result["project"] = project
     status_code = 200 if result.get("ok") else 422
     return jsonify({"ok": result.get("ok", False), "result": result}), status_code
+
+
+# ── Stage 2 ────────────────────────────────────────────────────────────────────
+
+@app.post("/stage2/build")
+def stage2_build():
+    """Parse raw scenario + speaker WAVs → full_timeline.json + placeholder PNGs."""
+    payload = request.get_json(silent=True) or {}
+
+    try:
+        project = _resolve_project_name(payload.get("project"))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
+    paths = _ensure_project(project)
+    raw_path = _abs_path(payload.get("raw_path", ""), paths["work"] / "scenario_raw.txt")
+    speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+    placeholder_dir = paths["work"] / "placeholders"
+    try:
+        fps = int(payload.get("fps", 25))
+    except (TypeError, ValueError):
+        return _json_error("fps must be an integer", 400)
+
+    if not raw_path.exists():
+        return _json_error(f"scenario_raw.txt not found: {raw_path}", 404)
+
+    raw_text = raw_path.read_text(encoding="utf-8")
+
+    try:
+        timeline = parse_timeline(
+            raw_text=raw_text,
+            speaker_dir=speaker_dir,
+            placeholder_dir=placeholder_dir,
+            project=project,
+            fps=fps,
+        )
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+    # Generate placeholder PNGs for SNH segments
+    for seg in timeline.segments:
+        if seg.type == "snh" and seg.placeholder_path:
+            from pathlib import Path as _Path
+            ph = _Path(seg.placeholder_path)
+            if not ph.exists():
+                try:
+                    generate_placeholder(
+                        seg_id=seg.id,
+                        speaker=seg.speaker,
+                        role=seg.role,
+                        timecode=seg.timecode,
+                        text=seg.text,
+                        out_path=ph,
+                        width=timeline.width,
+                        height=timeline.height,
+                    )
+                except Exception:
+                    pass  # non-fatal, XML still works without PNG
+
+    # Save full_timeline.json
+    timeline_path = paths["work"] / "full_timeline.json"
+    timeline_path.write_text(
+        __import__("json").dumps(timeline.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    zk_count = sum(1 for s in timeline.segments if s.type == "zk")
+    snh_count = sum(1 for s in timeline.segments if s.type == "snh")
+    tech_count = sum(1 for s in timeline.segments if s.type == "tech")
+    zk_missing_wav = [s.id for s in timeline.segments if s.type == "zk" and not s.wav_path]
+
+    return jsonify({
+        "ok": True,
+        "result": {
+            "project": project,
+            "segments": len(timeline.segments),
+            "zk": zk_count,
+            "snh": snh_count,
+            "tech": tech_count,
+            "total_duration_sec": timeline.total_duration_sec,
+            "timeline_path": str(timeline_path.relative_to(ROOT_DIR)),
+            "warnings": (
+                [f"ZK без WAV (будут пропущены в XML): {', '.join(zk_missing_wav)}"]
+                if zk_missing_wav else []
+            ),
+        },
+    })
+
+
+@app.get("/stage2/export/xml")
+def stage2_export_xml():
+    """Build and download FCP7 XML for Premiere Pro."""
+    project_name = request.args.get("project", "")
+    try:
+        project = _resolve_project_name(project_name)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
+    paths = _project_paths(project)
+    timeline_path = paths["work"] / "full_timeline.json"
+    if not timeline_path.exists():
+        return _json_error("full_timeline.json not found — run Build first", 404)
+
+    data = json.loads(timeline_path.read_text(encoding="utf-8"))
+
+    from stage2.models import FullTimeline, TimelineSegment
+    segs = [TimelineSegment(**{k: v for k, v in s.items() if k != "end_sec"})
+            for s in data["segments"]]
+    tl = FullTimeline(
+        project=data["project"],
+        segments=segs,
+        fps=data.get("fps", 25),
+        width=data.get("width", 1920),
+        height=data.get("height", 1080),
+    )
+
+    try:
+        xml_str = build_xml(tl)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+    from flask import Response
+    return Response(
+        xml_str,
+        mimetype="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{project}_timeline.xml"'},
+    )
