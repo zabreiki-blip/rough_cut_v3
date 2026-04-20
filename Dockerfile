@@ -6,7 +6,7 @@ WORKDIR /app
 
 # catdoc is used to extract legacy .doc files.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends catdoc \
+    && apt-get install -y --no-install-recommends catdoc curl fonts-dejavu-core ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

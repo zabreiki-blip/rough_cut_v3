@@ -136,7 +136,7 @@ def _abs_path(value: str, fallback: Path) -> Path:
     if not candidate.is_absolute():
         candidate = ROOT_DIR / candidate
     resolved = candidate.resolve()
-    if not str(resolved).startswith(str(PROJECTS_DIR)):
+    if not resolved.is_relative_to(PROJECTS_DIR):
         raise ValueError(f"Path must be inside projects/: {value}")
     return resolved
 

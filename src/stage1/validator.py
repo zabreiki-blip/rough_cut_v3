@@ -161,12 +161,14 @@ def validate_stage1(
         )
 
     settings = get_settings()
-    manifest = {
-        "project": project_name or settings.project_name,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "items": manifest_items,
-    }
-    write_json(manifest_path, manifest)
+    manifest_path.unlink(missing_ok=True)  # remove stale manifest before conditional write
+    if not errors:
+        manifest = {
+            "project": project_name or settings.project_name,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "items": manifest_items,
+        }
+        write_json(manifest_path, manifest)
 
     return {
         "ok": len(errors) == 0,

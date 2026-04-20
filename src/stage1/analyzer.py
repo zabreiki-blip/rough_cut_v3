@@ -574,7 +574,6 @@ def analyze_script(
 
     scenario_text = extract_text(input_path)
     raw_output_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_output_path.write_text(scenario_text + "\n", encoding="utf-8")
 
     settings = get_settings()
     used_llm = False
@@ -635,6 +634,21 @@ def analyze_script(
     before_merge_count = len(blocks)
     blocks = _merge_blocks_to_limit(blocks, settings.max_zk_blocks)
     blocks = _renumber_blocks(blocks)
+
+    # Write raw with explicit ЗК: markers so Stage 2 can locate voiceover segments.
+    # For manual_markers strategy the original text already contains them; for all
+    # other strategies we inject markers by replacing the first occurrence of each
+    # block's text.  This is best-effort: if a block was heavily cleaned the
+    # replacement silently fails and the line stays unmarked (same as before).
+    if extraction_method == "manual_markers":
+        raw_text = scenario_text
+    else:
+        raw_text = scenario_text
+        for block in blocks:
+            text = block.text.strip()
+            if text and text in raw_text:
+                raw_text = raw_text.replace(text, f"ЗК: {text}", 1)
+    raw_output_path.write_text(raw_text + "\n", encoding="utf-8")
 
     payload = {
         "source": str(input_path),
