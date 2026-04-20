@@ -21,7 +21,7 @@ _TC_PAT = r"\d{1,2}[:.]\d{2}(?:[:.]\d{2})?"
 # Flexible SNH: "NAME[_N][(ROLE)] TIMECODE[.] text"  (name and timecode on same line)
 _SNH_NAME_PAT = r"([А-ЯЁ]{2,}(?:\s[А-ЯЁ]{2,})+(?:_\d+)?)\s*(?:\(([^)]*)\))?"
 _SNH_FLEX_RE = re.compile(
-    r"^" + _SNH_NAME_PAT + r"\s+(" + _TC_PAT + r")[.\s–\-]*(.*)",
+    r"^" + _SNH_NAME_PAT + r"\s*:?\s*(" + _TC_PAT + r")[.\s–\-]*(.*)",
     re.DOTALL,
 )
 
