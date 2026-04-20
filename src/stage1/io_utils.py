@@ -167,21 +167,20 @@ def extract_paragraphs_from_docx(path: Path) -> list[DocxParagraph]:
 
 
 def extract_text_from_doc(path: Path) -> str:
-    try:
-        proc = subprocess.run(
-            ["catdoc", str(path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "catdoc is not installed. Install catdoc or convert .doc to .docx first."
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.strip() if exc.stderr else "unknown error"
-        raise RuntimeError(f"Failed to parse .doc with catdoc: {stderr}") from exc
-    return normalize_whitespace(proc.stdout)
+    # Try catdoc first, fall back to macOS textutil
+    last_error: str = ""
+    for cmd in (["catdoc", str(path)], ["textutil", "-convert", "txt", "-stdout", str(path)]):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return normalize_whitespace(proc.stdout)
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError as exc:
+            last_error = (exc.stderr or exc.stdout or "").strip() or "unknown error"
+            continue  # try next tool
+    if last_error:
+        raise RuntimeError(f"Failed to parse .doc: {last_error}")
+    raise RuntimeError("Neither catdoc nor textutil found. Convert .doc to .docx first.")
 
 
 def extract_text(input_path: Path) -> str:

@@ -45,6 +45,14 @@
     step_analyze: el("step_analyze"),
     step_tts: el("step_tts"),
     step_validate: el("step_validate"),
+    speed: el("speed"),
+    speed_val: el("speed_val"),
+    btn_build_timeline: el("btn_build_timeline"),
+    btn_export_xml: el("btn_export_xml"),
+    timeline_stats: el("timeline_stats"),
+    ts_zk: el("ts_zk"),
+    ts_snh: el("ts_snh"),
+    ts_dur: el("ts_dur"),
   };
 
   const toastContainer = document.getElementById("toast-container");
@@ -127,7 +135,7 @@
 
   function setBusy(state) {
     busy = state;
-    [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all].forEach((b) => {
+    [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline].forEach((b) => {
       if (b) b.disabled = state;
     });
   }
@@ -146,6 +154,7 @@
       phrase_file_name: ids.phrase_file_name.value.trim(),
       use_llm: ids.use_llm.checked,
       dry_run: ids.dry_run.checked,
+      speed: parseFloat(ids.speed.value),
     };
   }
 
@@ -276,7 +285,7 @@
       status: "queued", event: "queued",
       current: "\u2014", retries: 0, done: 0, total: 0, error: "",
     });
-    appendLog(`TTS job: provider=${f.provider}, gender=${f.gender}, dry=${f.dry_run}`);
+    appendLog(`TTS job: provider=${f.provider}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
     const start = await postJSON("/stage1/tts-jobs/start", {
       project,
       prepared_path: f.prepared_path,
@@ -285,6 +294,7 @@
       gender: f.gender,
       voice_name: f.voice_name || null,
       dry_run: f.dry_run,
+      speed: f.speed,
     });
 
     const jobId = String(start.job_id || "").trim();
@@ -359,7 +369,7 @@
       ids.phrase_text.focus();
       return;
     }
-    appendLog(`Phrase TTS: provider=${f.provider}, gender=${f.gender}, dry=${f.dry_run}`);
+    appendLog(`Phrase TTS: provider=${f.provider}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
     const result = await postJSON("/stage1/tts-phrase", {
       project,
       text: phrase,
@@ -369,6 +379,7 @@
       voice_name: f.voice_name || null,
       file_name: f.phrase_file_name || null,
       dry_run: f.dry_run,
+      speed: f.speed,
     });
     toast("Фраза озвучена", "success");
     appendLog(`Phrase done: file=${result.file}, voice=${result.voice}`);
@@ -430,6 +441,33 @@
     }
   }
 
+  // ── Stage 2 ──────────────────────────────────────────────────────────────
+  async function doBuildTimeline() {
+    appendLog("Stage 2: Building timeline...");
+    const f = formData();
+    const result = await postJSON("/stage2/build", {
+      project,
+      raw_path: f.raw_output_path,
+      speaker_dir: f.speaker_dir,
+      fps: 25,
+    });
+    const { zk, snh, total_duration_sec } = result;
+    appendLog(`Timeline built: ЗК=${zk}, Спикеры=${snh}, длит.=${Math.round(total_duration_sec)}с`);
+
+    ids.ts_zk.textContent = zk;
+    ids.ts_snh.textContent = snh;
+    const m = Math.floor(total_duration_sec / 60);
+    const s = Math.round(total_duration_sec % 60);
+    ids.ts_dur.textContent = `${m}:${String(s).padStart(2, "0")}`;
+    ids.timeline_stats.style.display = "flex";
+
+    ids.btn_export_xml.href = `/stage2/export/xml?project=${encodeURIComponent(project)}`;
+    ids.btn_export_xml.style.pointerEvents = "";
+    ids.btn_export_xml.style.opacity = "";
+  }
+
+  ids.btn_build_timeline.addEventListener("click", () => safely(doBuildTimeline));
+
   ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
   ids.btn_tts.addEventListener("click", () => safely(doTTS));
   ids.btn_phrase_tts.addEventListener("click", () => safely(doPhraseTTS));
@@ -444,6 +482,10 @@
   );
   ids.btn_clear_log.addEventListener("click", () => {
     ids.log_box.textContent = "";
+  });
+
+  ids.speed.addEventListener("input", () => {
+    ids.speed_val.textContent = parseFloat(ids.speed.value).toFixed(2);
   });
 
   ids.use_llm.checked = false;

@@ -17,6 +17,33 @@ from .config import get_settings
 from .io_utils import read_json
 
 
+def _apply_tempo(wav_bytes: bytes, speed: float) -> bytes:
+    """Stretch/compress WAV tempo via ffmpeg atempo filter. speed=1.0 = no-op."""
+    speed = round(max(0.5, min(2.0, speed)), 2)
+    if speed == 1.0:
+        return wav_bytes
+    if shutil.which("ffmpeg") is None:
+        return wav_bytes  # ffmpeg not available, skip silently
+    # atempo supports 0.5–2.0; chain filters for values outside that range
+    if 0.5 <= speed <= 2.0:
+        atempo = f"atempo={speed}"
+    elif speed < 0.5:
+        atempo = f"atempo=0.5,atempo={round(speed/0.5, 4)}"
+    else:
+        atempo = f"atempo=2.0,atempo={round(speed/2.0, 4)}"
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "in.wav"
+        dst = Path(td) / "out.wav"
+        src.write_bytes(wav_bytes)
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-filter:a", atempo, str(dst)],
+            capture_output=True,
+        )
+        if result.returncode != 0 or not dst.exists():
+            return wav_bytes  # fallback to original on error
+        return dst.read_bytes()
+
+
 def _provider_unavailable_message(provider: str, settings=None) -> str:
     if provider == "macos":
         connector = ""
@@ -474,6 +501,7 @@ def synthesize_tts(
     gender: str | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
+    speed: float = 1.0,
 ) -> dict:
     payload = read_json(prepared_path)
     items = payload.get("items", [])
@@ -580,6 +608,7 @@ def synthesize_tts(
             attempts += 1
             try:
                 wav_bytes = _synthesize_wav_bytes(provider, text, settings, voice, client, types)
+                wav_bytes = _apply_tempo(wav_bytes, speed)
                 out_file.write_bytes(wav_bytes)
                 generated.append(str(out_file))
                 _emit_progress(
@@ -649,6 +678,7 @@ def synthesize_phrase(
     gender: str | None = None,
     file_name: str | None = None,
     dry_run: bool = False,
+    speed: float = 1.0,
 ) -> dict:
     phrase = (text or "").strip()
     if not phrase:
@@ -694,6 +724,7 @@ def synthesize_phrase(
         attempts += 1
         try:
             wav_bytes = _synthesize_wav_bytes(provider, phrase, settings, voice, client, types)
+            wav_bytes = _apply_tempo(wav_bytes, speed)
             out_file.write_bytes(wav_bytes)
             break
         except Exception as exc:
