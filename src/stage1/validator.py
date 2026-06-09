@@ -141,7 +141,7 @@ def validate_stage1(
         else:
             duration_ms, rms, _peak = _audio_metrics_wav(file_path)
             if duration_ms == 0:
-                warnings.append(f"Could not read WAV duration: {file_path}")
+                errors.append(f"Invalid or unreadable WAV file: {file_path}")
             else:
                 if min_duration_ms > 0 and duration_ms < min_duration_ms:
                     warnings.append(

@@ -32,7 +32,7 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    max_blocks_raw = os.getenv("MAX_ZK_BLOCKS", "200").strip()
+    max_blocks_raw = os.getenv("MAX_ZK_BLOCKS", "40").strip()
     try:
         max_blocks = int(max_blocks_raw)
     except ValueError:

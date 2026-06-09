@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, UTC
+import hashlib
 from pathlib import Path
 import re
 import io
@@ -148,6 +149,34 @@ def _is_valid_wav(path: Path) -> bool:
             return True
     except Exception:
         return False
+
+
+def _synthesis_fingerprint(
+    text: str, provider: str, voice: str, gender: str, speed: float,
+    model: str = "", sample_rate: int = 0, extra_rate: int = 0,
+) -> str:
+    payload = f"{text}\n{provider}\n{voice}\n{gender}\n{round(speed, 4)}\n{model}\n{sample_rate}\n{extra_rate}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _meta_path(wav_path: Path) -> Path:
+    return wav_path.with_suffix(".wav.meta")
+
+
+def _read_meta_fingerprint(wav_path: Path) -> str | None:
+    p = _meta_path(wav_path)
+    try:
+        data = pyjson.loads(p.read_text(encoding="utf-8"))
+        return data.get("fingerprint")
+    except Exception:
+        return None
+
+
+def _write_meta_fingerprint(wav_path: Path, fingerprint: str) -> None:
+    _meta_path(wav_path).write_text(
+        pyjson.dumps({"fingerprint": fingerprint}),
+        encoding="utf-8",
+    )
 
 
 def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
@@ -542,6 +571,19 @@ def synthesize_tts(
             continue
         prepared_items.append((block_id, text))
 
+    # Collect extra params that affect audio output for fingerprinting
+    _fp_model = ""
+    _fp_sample_rate = 0
+    _fp_extra_rate = 0
+    if provider == "gemini":
+        _fp_model = settings.gemini_tts_model
+    elif provider == "openrouter":
+        _fp_model = settings.openrouter_tts_model
+        _fp_sample_rate = settings.openrouter_tts_sample_rate
+    elif provider == "macos":
+        _fp_sample_rate = settings.macos_tts_sample_rate
+        _fp_extra_rate = settings.macos_tts_rate
+
     total_items = len(prepared_items)
     _emit_progress(
         progress_callback,
@@ -556,6 +598,7 @@ def synthesize_tts(
 
     for index, (block_id, text) in enumerate(prepared_items, start=1):
         out_file = speaker_dir / f"{block_id}.wav"
+        fp = _synthesis_fingerprint(text, provider, voice, resolved_gender, speed, _fp_model, _fp_sample_rate, _fp_extra_rate)
         _emit_progress(
             progress_callback,
             {
@@ -568,7 +611,7 @@ def synthesize_tts(
                 "skipped": len(skipped),
             },
         )
-        if not dry_run and _is_valid_wav(out_file):
+        if not dry_run and _is_valid_wav(out_file) and _read_meta_fingerprint(out_file) == fp:
             skipped.append(str(out_file))
             _emit_progress(
                 progress_callback,
@@ -585,6 +628,21 @@ def synthesize_tts(
             continue
 
         if dry_run:
+            if _is_valid_wav(out_file):
+                skipped.append(str(out_file))
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "item_skipped",
+                        "id": block_id,
+                        "index": index,
+                        "total": total_items,
+                        "completed": index,
+                        "generated": len(generated),
+                        "skipped": len(skipped),
+                    },
+                )
+                continue
             est_duration_ms = max(900, int(len(text) * 55))
             _write_silence_wav(out_file, duration_ms=est_duration_ms)
             generated.append(str(out_file))
@@ -610,6 +668,7 @@ def synthesize_tts(
                 wav_bytes = _synthesize_wav_bytes(provider, text, settings, voice, client, types)
                 wav_bytes = _apply_tempo(wav_bytes, speed)
                 out_file.write_bytes(wav_bytes)
+                _write_meta_fingerprint(out_file, fp)
                 generated.append(str(out_file))
                 _emit_progress(
                     progress_callback,
@@ -705,6 +764,18 @@ def synthesize_phrase(
     out_file = speaker_dir / f"{stem}.wav"
 
     if dry_run:
+        if _is_valid_wav(out_file):
+            return {
+                "speaker_dir": str(speaker_dir),
+                "file": str(out_file),
+                "provider": provider,
+                "voice": voice,
+                "gender": resolved_gender,
+                "dry_run": True,
+                "skipped": True,
+                "text_chars": len(phrase),
+                "generated_at": datetime.now(UTC).isoformat(),
+            }
         est_duration_ms = max(900, int(len(phrase) * 55))
         _write_silence_wav(out_file, duration_ms=est_duration_ms)
         return {

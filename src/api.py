@@ -7,6 +7,12 @@ import re
 import threading
 import uuid
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
 from stage1.analyzer import analyze_script
@@ -25,6 +31,8 @@ PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _TTS_JOBS: dict[str, dict] = {}
 _TTS_JOBS_LOCK = threading.Lock()
 _TTS_JOBS_MAX = 200
+_TTS_CONCURRENT_MAX = 3
+_TTS_SEMAPHORE = threading.Semaphore(_TTS_CONCURRENT_MAX)
 
 
 def _json_error(message: str, status_code: int = 400):
@@ -129,15 +137,15 @@ def _resolve_project_name(raw: str | None) -> str:
     return "default"
 
 
-def _abs_path(value: str, fallback: Path) -> Path:
+def _abs_path(value: str, fallback: Path, root: Path = PROJECTS_DIR) -> Path:
     if not value:
         return fallback
     candidate = Path(value)
     if not candidate.is_absolute():
         candidate = ROOT_DIR / candidate
     resolved = candidate.resolve()
-    if not resolved.is_relative_to(PROJECTS_DIR):
-        raise ValueError(f"Path must be inside projects/: {value}")
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"Path must be inside {root.name}/: {value}")
     return resolved
 
 
@@ -221,6 +229,7 @@ def _run_tts_job(
     dry_run: bool,
     speed: float = 1.0,
 ) -> None:
+    _TTS_SEMAPHORE.acquire()
     _update_tts_job(
         job_id,
         status="running",
@@ -291,6 +300,8 @@ def _run_tts_job(
             finished_at=_utc_now_iso(),
         )
         return
+    finally:
+        _TTS_SEMAPHORE.release()
 
     total = int(result.get("items_total") or 0)
     generated = int(result.get("files_count") or 0)
@@ -433,9 +444,9 @@ def stage1_analyze():
     use_llm = bool(payload.get("use_llm", True))
 
     try:
-        input_path = _abs_path(payload.get("input_path", input_default), ROOT_DIR / input_default)
-        output_path = _abs_path(payload.get("output_path", ""), output_default)
-        raw_output_path = _abs_path(payload.get("raw_output_path", ""), raw_default)
+        input_path = _abs_path(payload.get("input_path", input_default), ROOT_DIR / input_default, paths["root"])
+        output_path = _abs_path(payload.get("output_path", ""), output_default, paths["root"])
+        raw_output_path = _abs_path(payload.get("raw_output_path", ""), raw_default, paths["root"])
         result = analyze_script(
             input_path=input_path,
             output_path=output_path,
@@ -476,8 +487,8 @@ def stage1_tts():
     dry_run = bool(payload.get("dry_run", False))
 
     try:
-        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
-        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json", paths["root"])
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
         result = synthesize_tts(
             prepared_path=prepared_path,
             speaker_dir=speaker_dir,
@@ -525,10 +536,20 @@ def stage1_tts_job_start():
     speed = max(0.5, min(1.5, speed))
 
     try:
-        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
-        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json", paths["root"])
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
     except ValueError as exc:
         return _json_error(str(exc), 400)
+
+    with _TTS_JOBS_LOCK:
+        running = [
+            j for j in _TTS_JOBS.values()
+            if j.get("project") == project and j.get("status") == "running"
+        ]
+        if running:
+            return _json_error(
+                f"TTS-задача уже выполняется для проекта {project}: {running[0]['id']}", 409
+            )
 
     job = _create_tts_job(project=project)
     worker = threading.Thread(
@@ -598,7 +619,7 @@ def stage1_tts_phrase():
     speed = max(0.5, min(1.5, speed))
 
     try:
-        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
         result = synthesize_phrase(
             text=text,
             speaker_dir=speaker_dir,
@@ -636,9 +657,9 @@ def stage1_validate():
     paths = _ensure_project(project)
 
     try:
-        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json")
-        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
-        manifest_path = _abs_path(payload.get("manifest_path", ""), paths["speaker"] / "manifest.json")
+        prepared_path = _abs_path(payload.get("prepared_path", ""), paths["work"] / "scenario_prepared.json", paths["root"])
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
+        manifest_path = _abs_path(payload.get("manifest_path", ""), paths["speaker"] / "manifest.json", paths["root"])
         result = validate_stage1(
             prepared_path=prepared_path,
             speaker_dir=speaker_dir,
@@ -670,8 +691,11 @@ def stage2_build():
         return _json_error(str(exc), 400)
 
     paths = _ensure_project(project)
-    raw_path = _abs_path(payload.get("raw_path", ""), paths["work"] / "scenario_raw.txt")
-    speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"])
+    try:
+        raw_path = _abs_path(payload.get("raw_path", ""), paths["work"] / "scenario_raw.txt", paths["root"])
+        speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
     placeholder_dir = paths["work"] / "placeholders"
     try:
         fps = int(payload.get("fps", 25))
@@ -695,6 +719,7 @@ def stage2_build():
         return _json_error(str(exc), 500)
 
     # Generate placeholder PNGs for SNH segments
+    placeholder_warnings: list[str] = []
     for seg in timeline.segments:
         if seg.type == "snh" and seg.placeholder_path:
             from pathlib import Path as _Path
@@ -711,8 +736,11 @@ def stage2_build():
                         width=timeline.width,
                         height=timeline.height,
                     )
-                except Exception:
-                    pass  # non-fatal, XML still works without PNG
+                except Exception as _ph_exc:
+                    placeholder_warnings.append(
+                        f"Placeholder не создан для {seg.id}: {_ph_exc}"
+                    )
+                    seg.placeholder_path = ""
 
     # Save full_timeline.json
     timeline_path = paths["work"] / "full_timeline.json"
@@ -737,8 +765,8 @@ def stage2_build():
             "total_duration_sec": timeline.total_duration_sec,
             "timeline_path": str(timeline_path.relative_to(ROOT_DIR)),
             "warnings": (
-                [f"ZK без WAV (будут пропущены в XML): {', '.join(zk_missing_wav)}"]
-                if zk_missing_wav else []
+                ([f"ZK без WAV (будут пропущены в XML): {', '.join(zk_missing_wav)}"] if zk_missing_wav else [])
+                + placeholder_warnings
             ),
         },
     })

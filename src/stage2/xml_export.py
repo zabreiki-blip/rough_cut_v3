@@ -3,9 +3,19 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from urllib.request import pathname2url
+import wave
 from xml.etree import ElementTree as ET
 
 from .models import FullTimeline, TimelineSegment
+
+
+def _wav_audio_params(path: str) -> tuple[int, int, int]:
+    """Return (sample_rate, bit_depth, channels) from WAV file, or TTS defaults on error."""
+    try:
+        with wave.open(path, "rb") as wf:
+            return wf.getframerate(), wf.getsampwidth() * 8, wf.getnchannels()
+    except Exception:
+        return 24000, 16, 1
 
 
 def _path_to_url(path: str) -> str:
@@ -36,12 +46,13 @@ def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
     _sub(file_el, "pathurl", _path_to_url(seg.wav_path))
     _rate_el(file_el, fps)
     _sub(file_el, "duration", str(_frames(seg.duration_sec, fps)))
+    sample_rate, bit_depth, channels = _wav_audio_params(seg.wav_path)
     media = _sub(file_el, "media")
     audio = _sub(media, "audio")
     sc = _sub(audio, "samplecharacteristics")
-    _sub(sc, "depth", "16")
-    _sub(sc, "samplerate", "48000")
-    _sub(audio, "channelcount", "2")
+    _sub(sc, "depth", str(bit_depth))
+    _sub(sc, "samplerate", str(sample_rate))
+    _sub(audio, "channelcount", str(channels))
 
 
 def _video_file_el(parent: ET.Element, seg: TimelineSegment, fps: int,

@@ -36,7 +36,8 @@ SPEAKER_INLINE_RE = re.compile(
 )
 TECH_PREFIX_RE = re.compile(
     r"^\s*(?:ВОТ\s+ССЫЛКА|ВИДЕО(?:\s*-?\s*\d+)?|ЛАЙ[ВФ](?:\s*-?\s*[\wА-Яа-яЁё]+)?|"
-    r"ВНИМАНИЕ|ШАПКА|ОТБИВКА|ТИТР|ПЛАШКА|ГРАФИКА|КАРТА|ФОТО|РЕКВИЗИТ|"
+    r"ВНИМАНИЕ|ШАПКА|ОТБИВКА|ТИТР|ПЛАШКА|ГРАФИКА|ИНФОГРАФИКА|КАРТА|"
+    r"ФОТОГРАФИ[ЯИ]|ФОТО|АРХИВН\w*|РЕКВИЗИТ|"
     r"АНОНС(?:Ы|\s*Ы)?(?:\s*-?\s*\d+)?|ЭКСПЕРИМЕНТ(?:\s*-?\s*\d+)?|"
     r"ШПИГЕЛЬ|СКЛЕЙКА|ВЖИК|НЕТ\s+ПЕРЕХОДА)\b",
     flags=re.I,
@@ -61,7 +62,7 @@ INTERVIEW_SPEAKER_LINE_RE = re.compile(
     r"^\s*(?:СНХ\s+)?"
     r"[А-ЯЁ][А-ЯЁа-яё-]+(?:\s+[А-ЯЁ][А-ЯЁа-яё-]+){0,3}"
     r"(?:,\s*[^.!?\n]{0,80})?"
-    r"[:\s\-–]*\b\d{1,2}:\d{2}(?::\d{2})?\b",
+    r"[:\s\-–]*\b\d{2}[:.]\d{2}(?:[:.]\d{2})?\b",
     flags=re.I,
 )
 
@@ -635,19 +636,34 @@ def analyze_script(
     blocks = _merge_blocks_to_limit(blocks, settings.max_zk_blocks)
     blocks = _renumber_blocks(blocks)
 
-    # Write raw with explicit ЗК: markers so Stage 2 can locate voiceover segments.
-    # For manual_markers strategy the original text already contains them; for all
-    # other strategies we inject markers by replacing the first occurrence of each
-    # block's text.  This is best-effort: if a block was heavily cleaned the
-    # replacement silently fails and the line stays unmarked (same as before).
-    if extraction_method == "manual_markers":
-        raw_text = scenario_text
-    else:
-        raw_text = scenario_text
-        for block in blocks:
-            text = block.text.strip()
-            if text and text in raw_text:
-                raw_text = raw_text.replace(text, f"ЗК: {text}", 1)
+    # Inject canonical ЗКN: markers so Stage 2 finds voiceover segments.
+    # For manual_markers: original text may contain [[VO]], VO:, NARRATOR:, ЗК:, etc.
+    # We replace those original markers with canonical ЗКN: so Stage 2 counter aligns with
+    # renumbered IDs.  Fall back to plain inject if the pattern isn't found verbatim.
+    # For other strategies: raw text has no markers yet — just inject before source text.
+    # Merged blocks whose joined text is absent in raw_text are silently skipped (known limitation).
+    _MARKER_PREFIX = (
+        r"(?:\[\[\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\]\s*"
+        r"|(?:VO|NARRATOR|ЗК\w*|ЗАКАДР\b\w*)\s*[:\-–]?\s*\n?)"
+    )
+    raw_text = scenario_text
+    for block in blocks:
+        num = block.id[2:]
+        text_original = block.text_original.strip()
+        text_for_tts = block.text_for_tts.strip()
+        source_text = text_original if text_original in raw_text else text_for_tts
+        if not source_text or source_text not in raw_text:
+            continue
+        if extraction_method == "manual_markers":
+            escaped = re.escape(source_text)
+            pattern = _MARKER_PREFIX + escaped + r"(?:\s*\[\[\s*/\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\])?"
+            new_raw, count = re.subn(
+                pattern, f"ЗК{num}: {source_text}", raw_text, count=1, flags=re.IGNORECASE | re.DOTALL
+            )
+            if count:
+                raw_text = new_raw
+                continue
+        raw_text = raw_text.replace(source_text, f"ЗК{num}: {source_text}", 1)
     raw_output_path.write_text(raw_text + "\n", encoding="utf-8")
 
     payload = {

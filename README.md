@@ -22,12 +22,6 @@
 
 ## Переменные окружения
 
-Скопировать пример:
-
-```bash
-cp .env.example .env
-```
-
 Обязательные ключи:
 - `OPENROUTER_API_KEY`
 - `GEMINI_API_KEY`
@@ -38,7 +32,7 @@ cp .env.example .env
 В Docker/Linux команда `say` недоступна напрямую.
 
 Опционально:
-- `MAX_ZK_BLOCKS=40` (верхняя граница количества блоков `zkN` после анализа)
+- `MAX_ZK_BLOCKS=40` (верхняя граница количества блоков `zkN` после анализа; по умолчанию `40`)
 - `VALIDATE_MIN_WAV_DURATION_MS=350` (warning, если WAV короче порога; `0` отключает)
 - `VALIDATE_SILENCE_RMS_THRESHOLD=120` (warning, если RMS слишком низкий; `0` отключает)
 - `TTS_PROVIDER=gemini|openrouter|macos` (какой движок синтеза использовать)
@@ -89,6 +83,7 @@ extra_hosts:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # заполни API-ключи
 export PYTHONPATH=src
 ```
 
@@ -155,7 +150,7 @@ scripts/validate-stage1 --in projects/my_project/work/scenario_prepared.json --s
 
 ## API (Flask)
 
-Запуск:
+Запуск (`.env` загружается автоматически через `python-dotenv`):
 
 ```bash
 export PYTHONPATH=src
@@ -190,5 +185,5 @@ curl http://localhost:8000/health
 ```bash
 curl -X POST http://localhost:8000/stage1/analyze \
   -H "Content-Type: application/json" \
-  -d '{"input_path":"input/scenario.docx","use_llm":true}'
+  -d '{"project":"my_project","input_path":"projects/my_project/input/scenario.docx","use_llm":true}'
 ```
