@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLIST_NAME="com.roughcut.macos-connector"
 PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
-LOG_DIR="${ROOT_DIR}/logs"
+LOG_DIR="${HOME}/Library/Logs/RoughCut"
 CONNECTOR_ENV="${HOME}/Library/Application Support/RoughCut/macos-connector.env"
 PYTHON_BIN="${ROOT_DIR}/.venv/bin/python3"
 
@@ -55,7 +55,7 @@ cat > "${PLIST_DST}" <<PLIST
   </dict>
 
   <key>WorkingDirectory</key>
-  <string>${ROOT_DIR}</string>
+  <string>${HOME}/Library/Application Support/RoughCut</string>
 
   <key>RunAtLoad</key>
   <true/>
