@@ -1,11 +1,11 @@
 # rough_cut_v3 — Stage 1
 
-Этап 1: анализ сценария (`.doc/.docx`) -> подготовка блоков `zkN` -> синтез TTS -> манифест для сборки в Premiere.
+Пайплайн: нормализация сценария (`.doc/.docx`) → подтверждение блоков → синтез TTS → сборка в Premiere.
 
 ## Структура
 
 - `projects/<project>/input/` — исходный сценарий проекта.
-- `projects/<project>/work/` — промежуточные артефакты (`scenario_raw.txt`, `scenario_prepared.json`).
+- `projects/<project>/work/` — canonical `scenario_normalized.json` и производные `scenario_raw.txt`/`scenario_prepared.json`.
 - `projects/<project>/speaker/` — файлы озвучки `zk1.wav`, `zk2.wav`, ...
 - `src/stage1/` — core-логика и CLI.
 - `src/api.py` — Flask API.
@@ -87,6 +87,8 @@ cp .env.example .env   # заполни API-ключи
 export PYTHONPATH=src
 ```
 
+В основном веб-потоке сначала открой вкладку «Нормализация», проверь типы всех блоков и подтверди сценарий. TTS и Stage 2 недоступны для черновика. Подтверждённые пользовательские обозначения сохраняются в общей локальной SQLite-памяти; точные совпадения применяются автоматически, а решения LLM становятся активным правилом после двух независимых подтверждений.
+
 1. Анализ сценария:
 
 ```bash
@@ -162,6 +164,11 @@ flask --app api run --host 0.0.0.0 --port 8000
 - `GET /project/<project>` — UI первого этапа для конкретного проекта.
 - `GET /health`
 - `GET /stage1/status?project=<project>`
+- `POST /stage1/normalization/generate`
+- `GET|PUT /stage1/normalization`
+- `POST /stage1/normalization/confirm`
+- `GET|POST /stage1/normalization/memory`
+- `PATCH|DELETE /stage1/normalization/memory/<rule_id>`
 - `POST /stage1/analyze`
 - `POST /stage1/tts`
 - `POST /stage1/tts-jobs/start` (асинхронный запуск TTS с live-прогрессом)

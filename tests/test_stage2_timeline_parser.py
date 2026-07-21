@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from stage2.timeline_parser import parse_timeline
+from stage2.timeline_parser import parse_normalized_timeline, parse_timeline
 
 
 class ZkIdContractTest(unittest.TestCase):
@@ -54,6 +54,48 @@ class ZkIdContractTest(unittest.TestCase):
             zk_segs = [s for s in tl.segments if s.type == "zk"]
             self.assertEqual(len(zk_segs), 1)
             self.assertGreater(zk_segs[0].duration_sec, 0, "WAV must be found via canonical ID")
+
+
+class NormalizedTimelineTest(unittest.TestCase):
+    def test_confirmed_blocks_build_without_regex_reparse(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {"order": 1, "type": "voiceover", "normalized_text": "Закадр"},
+                    {
+                        "order": 2,
+                        "type": "sync",
+                        "normalized_text": "Ответ героя",
+                        "original_label": "ГЕРОЙ",
+                        "speaker": "Иван Иванов",
+                        "role": "эксперт",
+                        "timecode_start": "01:02:03",
+                    },
+                    {
+                        "order": 3,
+                        "type": "host",
+                        "normalized_text": "Реплика ведущего",
+                        "speaker": "Ведущий",
+                    },
+                    {"order": 4, "type": "technical", "normalized_text": "ОТБИВКА"},
+                ],
+            }
+
+            timeline = parse_normalized_timeline(document, base, base, "TEST")
+
+            self.assertEqual([item.type for item in timeline.segments], ["zk", "snh", "host", "tech"])
+            self.assertEqual(timeline.segments[1].speaker, "Иван Иванов")
+            self.assertEqual(timeline.segments[1].timecode, "01:02:03")
+            self.assertEqual(timeline.segments[2].id, "host1")
+
+    def test_draft_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                parse_normalized_timeline(
+                    {"status": "draft", "blocks": []}, Path(tmp), Path(tmp), "TEST"
+                )
 
 
 if __name__ == "__main__":

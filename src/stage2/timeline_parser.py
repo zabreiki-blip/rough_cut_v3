@@ -238,3 +238,70 @@ def parse_timeline(
             cursor += seg.duration_sec
 
     return FullTimeline(project=project, segments=segments, fps=fps)
+
+
+def parse_normalized_timeline(
+    normalization: dict,
+    speaker_dir: Path,
+    placeholder_dir: Path,
+    project: str,
+    fps: int = 25,
+) -> FullTimeline:
+    """Build a timeline directly from a confirmed canonical normalization."""
+    if str(normalization.get("status", "")).lower() != "confirmed":
+        raise ValueError("normalized scenario must be confirmed")
+
+    segments: list[TimelineSegment] = []
+    counters = {"voiceover": 0, "sync": 0, "host": 0, "tech": 0}
+    blocks = sorted(
+        normalization.get("blocks", []),
+        key=lambda item: int(item.get("order", 0) or 0),
+    )
+
+    for block in blocks:
+        block_type = str(block.get("type", "unknown")).lower()
+        text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
+
+        if block_type == "voiceover":
+            counters["voiceover"] += 1
+            seg_id = f"zk{counters['voiceover']}"
+            wav_path = speaker_dir / f"{seg_id}.wav"
+            segments.append(TimelineSegment(
+                id=seg_id,
+                type="zk",
+                text=text,
+                duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
+                wav_path=str(wav_path) if wav_path.exists() else "",
+            ))
+            continue
+
+        if block_type in {"sync", "host"}:
+            counters[block_type] += 1
+            prefix = "snh" if block_type == "sync" else "host"
+            seg_id = f"{prefix}{counters[block_type]}"
+            segments.append(TimelineSegment(
+                id=seg_id,
+                type="snh" if block_type == "sync" else "host",
+                text=text,
+                duration_sec=SNH_PLACEHOLDER_DURATION,
+                speaker=str(block.get("speaker") or block.get("original_label") or prefix).strip(),
+                role=str(block.get("role") or ("СНХ" if block_type == "sync" else "ВЕДУЩИЙ")).strip(),
+                timecode=str(block.get("timecode_start") or "").strip(),
+                placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+            ))
+            continue
+
+        counters["tech"] += 1
+        segments.append(TimelineSegment(
+            id=f"tech{counters['tech']}",
+            type="tech",
+            text=text,
+            duration_sec=0.0,
+        ))
+
+    cursor = 0.0
+    for segment in segments:
+        segment.start_sec = cursor
+        if segment.type != "tech":
+            cursor += segment.duration_sec
+    return FullTimeline(project=project, segments=segments, fps=fps)

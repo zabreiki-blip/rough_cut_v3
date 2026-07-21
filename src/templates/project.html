@@ -36,20 +36,102 @@
     <header class="topbar">
       <div class="topbar-left">
         <h1>{{ defaults.project }}</h1>
-        <p class="topbar-sub">Анализ сценария и синтез озвучки</p>
+        <p class="topbar-sub">Нормализация сценария, озвучка и сборка</p>
       </div>
       <button id="btn_refresh" class="btn-icon" title="Обновить статус">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
       </button>
     </header>
 
+    <nav class="workspace-tabs" aria-label="Этапы проекта">
+      <button class="workspace-tab active" data-tab="normalization" type="button">Нормализация</button>
+      <button class="workspace-tab" data-tab="voiceover" type="button">Озвучка <span id="voiceover_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
+      <button class="workspace-tab" data-tab="assembly" type="button">Сборка <span id="assembly_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
+    </nav>
+
+    <section id="tab_normalization" class="workspace-panel active" data-tab-panel="normalization">
+      <div class="normalization-toolbar panel">
+        <div>
+          <div class="normalization-title-row">
+            <h2>Нормализация сценария</h2>
+            <span id="normalization_status" class="status-badge" data-state="empty">не создан</span>
+          </div>
+          <p class="section-copy">Приведите авторские обозначения закадра, синхронов и ведущих к единой структуре перед озвучкой.</p>
+        </div>
+        <div class="normalization-actions">
+          <button id="btn_normalize" class="btn btn-primary" type="button">Нормализовать</button>
+          <button id="btn_save_normalization" class="btn" type="button" disabled>Сохранить черновик</button>
+          <button id="btn_confirm_normalization" class="btn btn-accent" type="button" disabled>Подтвердить сценарий</button>
+        </div>
+      </div>
+
+      <div class="normalization-inputs panel">
+        <label class="field">
+          <span>Исходный сценарий</span>
+          <input id="normalization_input_path" type="text" value="{{ defaults.input_path }}">
+        </label>
+        <label class="field normalization-hint-field">
+          <span>Подсказка об обозначениях автора (необязательно)</span>
+          <textarea id="normalization_hint" rows="2" placeholder="Например: «Голос диктора» — закадр, «ИНТ» — синхрон"></textarea>
+        </label>
+        <label class="toggle normalization-llm-toggle">
+          <input id="normalization_use_llm" type="checkbox" checked>
+          <span class="toggle-slider"></span>
+          <span>Распознавать нестандартные обозначения с LLM</span>
+        </label>
+      </div>
+
+      <div id="normalization_summary" class="normalization-summary" aria-live="polite">
+        <div class="summary-stat"><strong id="norm_count_total">0</strong><span>Всего</span></div>
+        <div class="summary-stat"><strong id="norm_count_voiceover">0</strong><span>Закадр</span></div>
+        <div class="summary-stat"><strong id="norm_count_sync">0</strong><span>Синхрон</span></div>
+        <div class="summary-stat"><strong id="norm_count_unknown">0</strong><span>Требует проверки</span></div>
+      </div>
+
+      <div id="normalization_warnings" class="normalization-warnings" hidden></div>
+
+      <div class="normalization-workspace">
+        <section class="normalization-editor panel">
+          <div class="panel-heading">
+            <div><h2>Блоки сценария</h2><p class="section-copy">Тип, текст и TTS можно исправить перед подтверждением.</p></div>
+            <button id="btn_add_normalization_block" class="btn btn-sm" type="button" disabled>+ Добавить блок</button>
+          </div>
+          <div id="normalization_empty" class="empty-state">Выберите сценарий и нажмите «Нормализовать».</div>
+          <div id="normalization_blocks" class="normalization-blocks"></div>
+        </section>
+
+        <aside class="memory-panel panel">
+          <div class="panel-heading"><div><h2>Память обозначений</h2><p class="section-copy">Подтверждённые обозначения применяются в следующих проектах.</p></div></div>
+          <div class="memory-create">
+            <input id="memory_alias" type="text" placeholder="Например: голос диктора">
+            <select id="memory_type" aria-label="Тип обозначения">
+              <option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="technical">Технический</option><option value="other">Прочее</option>
+            </select>
+            <button id="btn_add_memory" class="btn btn-sm" type="button">Запомнить</button>
+          </div>
+          <input id="memory_search" class="memory-search" type="search" placeholder="Поиск обозначения">
+          <div class="memory-filters">
+            <select id="memory_filter_type" aria-label="Фильтр по типу">
+              <option value="">Все типы</option><option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="technical">Технический</option><option value="other">Прочее</option>
+            </select>
+            <select id="memory_filter_status" aria-label="Фильтр по статусу">
+              <option value="">Все статусы</option><option value="active">Активные</option><option value="candidate">Кандидаты</option><option value="conflict">Конфликты</option><option value="disabled">Отключённые</option>
+            </select>
+          </div>
+          <div id="memory_rules" class="memory-rules"><div class="empty-state compact">Память пока пуста.</div></div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="tab_voiceover" class="workspace-panel" data-tab-panel="voiceover" hidden>
+
     <!-- Pipeline Steps -->
     <section class="pipeline">
       <div class="step" id="step_analyze" data-state="pending">
         <div class="step-num">1</div>
         <div class="step-body">
-          <strong>Analyze</strong>
-          <small>Сценарий в блоки</small>
+          <strong>Нормализация</strong>
+          <small>Сценарий подтверждён</small>
         </div>
         <div class="step-check">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
@@ -140,11 +222,6 @@
 
         <div class="toggles">
           <label class="toggle">
-            <input id="use_llm" type="checkbox">
-            <span class="toggle-slider"></span>
-            <span>LLM при анализе</span>
-          </label>
-          <label class="toggle">
             <input id="dry_run" type="checkbox">
             <span class="toggle-slider"></span>
             <span>Dry-run (без API)</span>
@@ -152,10 +229,6 @@
         </div>
 
         <div class="actions">
-          <button id="btn_analyze" class="btn btn-primary">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-            Analyze
-          </button>
           <button id="btn_tts" class="btn btn-accent">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
             TTS
@@ -164,25 +237,6 @@
             Validate
           </button>
           <button id="btn_run_all" class="btn btn-ghost">Run All</button>
-        </div>
-
-        <div class="stage2-section">
-          <h3>Stage 2 — Сборка</h3>
-          <div class="actions">
-            <button id="btn_build_timeline" class="btn btn-primary">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="4" rx="1"/><rect x="3" y="10" width="11" height="4" rx="1"/><rect x="3" y="17" width="15" height="4" rx="1"/></svg>
-              Build Timeline
-            </button>
-            <a id="btn_export_xml" class="btn btn-ghost" style="pointer-events:none;opacity:.4">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Export XML
-            </a>
-          </div>
-          <div id="timeline_stats" class="timeline-stats" style="display:none">
-            <span>ЗК: <strong id="ts_zk">0</strong></span>
-            <span>Спикеры: <strong id="ts_snh">0</strong></span>
-            <span>Длит.: <strong id="ts_dur">0:00</strong></span>
-          </div>
         </div>
 
         <!-- Advanced Settings (collapsed) -->
@@ -198,11 +252,11 @@
             </label>
             <label class="field">
               <span>Prepared JSON</span>
-              <input id="prepared_path" type="text" value="{{ defaults.prepared_path }}">
+              <input id="prepared_path" type="text" value="{{ defaults.prepared_path }}" readonly>
             </label>
             <label class="field">
               <span>Raw TXT</span>
-              <input id="raw_output_path" type="text" value="{{ defaults.raw_output_path }}">
+              <input id="raw_output_path" type="text" value="{{ defaults.raw_output_path }}" readonly>
             </label>
             <label class="field">
               <span>Папка speaker</span>
@@ -272,6 +326,30 @@
         </div>
       </section>
     </div>
+    </section>
+
+    <section id="tab_assembly" class="workspace-panel" data-tab-panel="assembly" hidden>
+      <section class="panel assembly-panel">
+        <h2>Сборка таймлайна</h2>
+        <p class="section-copy">Соберите подтверждённый сценарий и готовые WAV-файлы в монтажный таймлайн.</p>
+        <div id="assembly_gate_message" class="gate-message">Подтвердите нормализацию сценария, чтобы открыть сборку.</div>
+        <div class="actions assembly-actions">
+          <button id="btn_build_timeline" class="btn btn-primary" disabled>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="4" rx="1"/><rect x="3" y="10" width="11" height="4" rx="1"/><rect x="3" y="17" width="15" height="4" rx="1"/></svg>
+            Build Timeline
+          </button>
+          <a id="btn_export_xml" class="btn btn-ghost" style="pointer-events:none;opacity:.4">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Export XML
+          </a>
+        </div>
+        <div id="timeline_stats" class="timeline-stats" style="display:none">
+          <span>ЗК: <strong id="ts_zk">0</strong></span>
+          <span>Спикеры: <strong id="ts_snh">0</strong></span>
+          <span>Длит.: <strong id="ts_dur">0:00</strong></span>
+        </div>
+      </section>
+    </section>
 
     <!-- Log -->
     <section class="log-section">

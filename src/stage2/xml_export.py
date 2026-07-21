@@ -145,7 +145,7 @@ def build_xml(timeline: FullTimeline) -> str:
             _sub(st, "trackindex", "1")
             clip_idx += 1
 
-        elif seg.type == "snh" and seg.placeholder_path:
+        elif seg.type in {"snh", "host"} and seg.placeholder_path:
             ci = ET.SubElement(vtrack, "clipitem")
             ci.set("id", f"clipitem-{clip_idx}")
             label = f"{seg.speaker} [{seg.timecode}]"

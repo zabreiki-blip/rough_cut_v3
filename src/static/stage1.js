@@ -53,11 +53,40 @@
     ts_zk: el("ts_zk"),
     ts_snh: el("ts_snh"),
     ts_dur: el("ts_dur"),
+    normalization_input_path: el("normalization_input_path"),
+    normalization_hint: el("normalization_hint"),
+    normalization_use_llm: el("normalization_use_llm"),
+    normalization_status: el("normalization_status"),
+    normalization_warnings: el("normalization_warnings"),
+    normalization_empty: el("normalization_empty"),
+    normalization_blocks: el("normalization_blocks"),
+    btn_normalize: el("btn_normalize"),
+    btn_save_normalization: el("btn_save_normalization"),
+    btn_confirm_normalization: el("btn_confirm_normalization"),
+    btn_add_normalization_block: el("btn_add_normalization_block"),
+    norm_count_total: el("norm_count_total"),
+    norm_count_voiceover: el("norm_count_voiceover"),
+    norm_count_sync: el("norm_count_sync"),
+    norm_count_unknown: el("norm_count_unknown"),
+    memory_alias: el("memory_alias"),
+    memory_type: el("memory_type"),
+    memory_search: el("memory_search"),
+    memory_filter_type: el("memory_filter_type"),
+    memory_filter_status: el("memory_filter_status"),
+    memory_rules: el("memory_rules"),
+    btn_add_memory: el("btn_add_memory"),
+    voiceover_lock: el("voiceover_lock"),
+    assembly_lock: el("assembly_lock"),
+    assembly_gate_message: el("assembly_gate_message"),
   };
 
   const toastContainer = document.getElementById("toast-container");
 
   let busy = false;
+  let normalization = null;
+  let memoryRules = [];
+  let normalizationDirty = false;
+  let normalizationEligible = initialStatus.normalization_confirmed !== false;
   const live = {
     status: "idle",
     event: "\u2014",
@@ -135,9 +164,38 @@
 
   function setBusy(state) {
     busy = state;
-    [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline].forEach((b) => {
+    [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline,
+      ids.btn_normalize, ids.btn_save_normalization, ids.btn_confirm_normalization, ids.btn_add_normalization_block,
+      ids.btn_add_memory].forEach((b) => {
       if (b) b.disabled = state;
     });
+    if (!state) updateActionAvailability();
+  }
+
+  function isNormalizationConfirmed() {
+    return Boolean(normalizationEligible && normalization && String(normalization.status || "").toLowerCase() === "confirmed");
+  }
+
+  function updateActionAvailability() {
+    if (busy) return;
+    const hasDraft = Boolean(normalization && Array.isArray(normalization.blocks));
+    const confirmed = isNormalizationConfirmed();
+    const blocked = !confirmed;
+    if (ids.btn_save_normalization) ids.btn_save_normalization.disabled = !hasDraft || !normalizationDirty;
+    if (ids.btn_confirm_normalization) {
+      ids.btn_confirm_normalization.disabled = !hasDraft || (confirmed && !normalizationDirty);
+    }
+    if (ids.btn_add_normalization_block) ids.btn_add_normalization_block.disabled = !hasDraft;
+    [ids.btn_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline].forEach((button) => {
+      if (button) button.disabled = blocked;
+    });
+    if (ids.voiceover_lock) ids.voiceover_lock.hidden = !blocked;
+    if (ids.assembly_lock) ids.assembly_lock.hidden = !blocked;
+    if (ids.assembly_gate_message) ids.assembly_gate_message.hidden = !blocked;
+    if (blocked && ids.btn_export_xml) {
+      ids.btn_export_xml.style.pointerEvents = "none";
+      ids.btn_export_xml.style.opacity = ".4";
+    }
   }
 
   function formData() {
@@ -152,7 +210,7 @@
       voice_name: ids.voice_name.value.trim(),
       phrase_text: ids.phrase_text.value,
       phrase_file_name: ids.phrase_file_name.value.trim(),
-      use_llm: ids.use_llm.checked,
+      use_llm: ids.use_llm ? ids.use_llm.checked : false,
       dry_run: ids.dry_run.checked,
       speed: parseFloat(ids.speed.value),
     };
@@ -193,6 +251,201 @@
     return data.result || {};
   }
 
+  async function requestJSON(url, method, payload) {
+    const options = { method, headers: { "Content-Type": "application/json" } };
+    if (payload !== undefined) options.body = JSON.stringify(payload);
+    const response = await fetch(url, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      const detail = data.message || data.error || JSON.stringify(data);
+      throw new Error(detail || `HTTP ${response.status}`);
+    }
+    return data.result !== undefined ? data.result : data;
+  }
+
+  const blockTypeLabels = {
+    voiceover: "Закадр", sync: "Синхрон", host: "Ведущий",
+    technical: "Технический", other: "Прочее", unknown: "Не определён",
+  };
+  const sourceLabels = {
+    builtin_rule: "правило", rule: "правило", memory: "память",
+    llm: "LLM", manual: "исправлено вручную", unknown: "не определено",
+  };
+
+  function escaped(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+
+  function canonicalDocument(value) {
+    if (!value) return null;
+    const doc = value.normalization || value.document || value;
+    if (!Array.isArray(doc.blocks)) doc.blocks = [];
+    if (!doc.status) doc.status = "draft";
+    if (doc.revision == null) doc.revision = 0;
+    doc.warnings = Array.isArray(doc.warnings) ? doc.warnings : [];
+    return doc;
+  }
+
+  function markNormalizationDirty() {
+    if (!normalization) return;
+    normalizationDirty = true;
+    normalizationEligible = false;
+    if (normalization.status === "confirmed") normalization.status = "draft";
+    renderNormalizationStatus();
+    updateActionAvailability();
+  }
+
+  function blockValue(block, ...names) {
+    for (const name of names) if (block[name] != null) return block[name];
+    return "";
+  }
+
+  function renderNormalizationStatus() {
+    let state = normalization ? (normalization.status || "draft") : "empty";
+    if (state === "confirmed" && !normalizationEligible) state = "stale";
+    const labels = { empty: "не создан", draft: "черновик", confirmed: "подтверждён", stale: "нужно подтвердить заново" };
+    ids.normalization_status.dataset.state = state;
+    ids.normalization_status.textContent = labels[state] || state;
+  }
+
+  function renderNormalization() {
+    renderNormalizationStatus();
+    const blocks = normalization && Array.isArray(normalization.blocks) ? normalization.blocks : [];
+    const counts = blocks.reduce((acc, block) => {
+      const type = block.type || block.block_type || "unknown";
+      acc[type] = (acc[type] || 0) + 1;
+      return acc;
+    }, {});
+    ids.norm_count_total.textContent = String(blocks.length);
+    ids.norm_count_voiceover.textContent = String(counts.voiceover || 0);
+    ids.norm_count_sync.textContent = String(counts.sync || 0);
+    ids.norm_count_unknown.textContent = String(counts.unknown || 0);
+
+    const warnings = (normalization && normalization.warnings ? normalization.warnings : []).concat(
+      blocks.flatMap((block) => Array.isArray(block.warnings) ? block.warnings : [])
+    ).filter(Boolean);
+    ids.normalization_warnings.hidden = warnings.length === 0;
+    ids.normalization_warnings.innerHTML = warnings.length
+      ? `<strong>Требует внимания:</strong><br>${warnings.map(escaped).join("<br>")}` : "";
+    ids.normalization_empty.hidden = blocks.length > 0;
+    ids.normalization_blocks.innerHTML = "";
+
+    blocks.forEach((block, index) => {
+      const type = block.type || block.block_type || "unknown";
+      const source = block.source || block.decision_source || "unknown";
+      const blockWarnings = Array.isArray(block.warnings) ? block.warnings : [];
+      const card = document.createElement("article");
+      card.className = `normalization-block${type === "unknown" || blockWarnings.length ? " has-warning" : ""}`;
+      card.dataset.index = String(index);
+      card.innerHTML = `
+        <div class="block-head">
+          <span class="block-order">#${index + 1}</span>
+          <select data-field="type" aria-label="Тип блока">
+            ${Object.entries(blockTypeLabels).map(([value, label]) => `<option value="${value}"${value === type ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+          <span class="decision-badge" data-source="${escaped(source)}">${escaped(sourceLabels[source] || source)}</span>
+          <button class="btn btn-sm" data-action="remember-block" type="button" title="Добавить обозначение в память">Запомнить</button>
+          <button class="btn btn-sm" data-action="move-up" type="button" title="Переместить выше"${index === 0 ? " disabled" : ""}>↑</button>
+          <button class="btn btn-sm" data-action="move-down" type="button" title="Переместить ниже"${index === blocks.length - 1 ? " disabled" : ""}>↓</button>
+          <button class="btn block-delete" data-action="delete-block" type="button" title="Удалить блок">×</button>
+        </div>
+        <div class="block-fields">
+          <label class="field block-original"><span>Исходный текст</span><textarea data-field="original_text"${blockValue(block, "original_text", "text_original", "source_text") ? " readonly" : ""}>${escaped(blockValue(block, "original_text", "text_original", "source_text"))}</textarea></label>
+          <label class="field"><span>Нормализованный текст</span><textarea data-field="normalized_text">${escaped(blockValue(block, "normalized_text", "text"))}</textarea></label>
+          <label class="field"><span>Текст для TTS</span><textarea data-field="text_for_tts">${escaped(blockValue(block, "text_for_tts", "tts_text"))}</textarea></label>
+        </div>
+        <div class="block-meta">
+          <label class="field"><span>Исходное обозначение</span><input data-field="original_label" value="${escaped(blockValue(block, "original_label", "original_marker", "marker"))}"></label>
+          <label class="field"><span>Спикер</span><input data-field="speaker" value="${escaped(blockValue(block, "speaker", "speaker_name"))}"></label>
+          <label class="field"><span>Роль / должность</span><input data-field="role" value="${escaped(blockValue(block, "role"))}"></label>
+          <label class="field"><span>Таймкод начала</span><input data-field="timecode_start" value="${escaped(blockValue(block, "timecode_start", "timecode", "start_timecode"))}"></label>
+          <label class="field"><span>Таймкод конца</span><input data-field="timecode_end" value="${escaped(blockValue(block, "timecode_end", "end_timecode"))}"></label>
+          <label class="field"><span>Заметка</span><input data-field="notes" value="${escaped(blockValue(block, "notes"))}"></label>
+        </div>
+        ${blockWarnings.length ? `<div class="block-warning">${blockWarnings.map(escaped).join(" · ")}</div>` : ""}`;
+      ids.normalization_blocks.appendChild(card);
+    });
+    updateActionAvailability();
+  }
+
+  function updateBlockFromControl(control) {
+    const card = control.closest(".normalization-block");
+    if (!card || !normalization) return;
+    const block = normalization.blocks[Number(card.dataset.index)];
+    if (!block) return;
+    block[control.dataset.field] = control.value;
+    if (control.dataset.field === "type") block.block_type = control.value;
+    block.source = "manual";
+    block.decision_source = "manual";
+    if (control.dataset.field === "type") {
+      block.warnings = [];
+      if (control.value === "voiceover" && !block.text_for_tts) {
+        block.text_for_tts = block.normalized_text || "";
+      }
+    }
+    markNormalizationDirty();
+    if (control.dataset.field === "type") renderNormalization();
+  }
+
+  async function loadNormalization(quiet) {
+    try {
+      const result = await requestJSON(`/stage1/normalization?project=${encodeURIComponent(project)}`, "GET");
+      normalization = canonicalDocument(result);
+      normalizationDirty = false;
+      renderNormalization();
+    } catch (err) {
+      if (!quiet && !String(err.message).includes("404")) throw err;
+      normalization = null;
+      renderNormalization();
+    }
+  }
+
+  async function generateNormalization() {
+    const inputPath = ids.normalization_input_path.value.trim();
+    assertRequiredPath(inputPath, "input_path");
+    appendLog(`Нормализация: ${inputPath}`);
+    const result = await requestJSON("/stage1/normalization/generate", "POST", {
+      project, input_path: inputPath, hint: ids.normalization_hint.value.trim(),
+      use_llm: ids.normalization_use_llm.checked,
+    });
+    normalization = canonicalDocument(result);
+    normalizationEligible = false;
+    normalizationDirty = false;
+    renderNormalization();
+    toast(`Черновик создан: ${normalization.blocks.length} блоков`, "success");
+  }
+
+  function normalizationPayload() {
+    normalization.blocks.forEach((block, index) => { block.order = index + 1; });
+    return { project, revision: normalization.revision, status: "draft", blocks: normalization.blocks };
+  }
+
+  async function saveNormalization() {
+    const result = await requestJSON("/stage1/normalization", "PUT", normalizationPayload());
+    normalization = canonicalDocument(result);
+    normalizationDirty = false;
+    renderNormalization();
+    toast("Черновик сохранён", "success");
+  }
+
+  async function confirmNormalization() {
+    const unknown = normalization.blocks.filter((block) => (block.type || block.block_type) === "unknown").length;
+    if (unknown) throw new Error(`Исправьте неопределённые блоки: ${unknown}`);
+    const result = await requestJSON("/stage1/normalization/confirm", "POST", {
+      ...normalizationPayload(),
+    });
+    normalization = canonicalDocument(result);
+    normalization.status = "confirmed";
+    normalizationEligible = true;
+    normalizationDirty = false;
+    renderNormalization();
+    toast("Сценарий подтверждён. Озвучка и сборка доступны.", "success");
+    await loadMemory(true);
+    await refreshStatus();
+  }
+
   function renderSpeaker(files) {
     ids.speaker_items.innerHTML = "";
     if (!files.length) {
@@ -216,6 +469,87 @@
       wrap.appendChild(audio);
       ids.speaker_items.appendChild(wrap);
     });
+  }
+
+  function renderMemory() {
+    const query = (ids.memory_search.value || "").trim().toLocaleLowerCase("ru");
+    const typeFilter = ids.memory_filter_type.value;
+    const statusFilter = ids.memory_filter_status.value;
+    const rules = memoryRules.filter((rule) => {
+      const alias = String(rule.alias || rule.marker || rule.normalized_marker || "");
+      const type = rule.block_type || rule.target_type || rule.type || "unknown";
+      const status = rule.status || "active";
+      return (!query || alias.toLocaleLowerCase("ru").includes(query))
+        && (!typeFilter || type === typeFilter)
+        && (!statusFilter || status === statusFilter);
+    });
+    ids.memory_rules.innerHTML = "";
+    if (!rules.length) {
+      ids.memory_rules.innerHTML = '<div class="empty-state compact">Нет подходящих обозначений.</div>';
+      return;
+    }
+    rules.forEach((rule) => {
+      const id = rule.id || rule.rule_id;
+      const alias = rule.alias || rule.marker || rule.normalized_marker || "";
+      const type = rule.block_type || rule.target_type || rule.type || "unknown";
+      const status = rule.status || "active";
+      const confirmations = Number(rule.confirmations || rule.confirmation_count || 0);
+      const corrections = Number(rule.corrections || rule.correction_count || 0);
+      const row = document.createElement("div");
+      row.className = "memory-rule";
+      row.dataset.ruleId = String(id || "");
+      row.innerHTML = `
+        <div class="memory-rule-head">
+          <input class="memory-rule-name" data-memory-field="alias" value="${escaped(alias)}" aria-label="Обозначение">
+          <select data-memory-field="block_type" aria-label="Тип обозначения">
+            ${Object.entries(blockTypeLabels).filter(([value]) => value !== "unknown").map(([value, label]) => `<option value="${value}"${value === type ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="memory-rule-meta">${escaped(status)} · подтверждений ${confirmations} · исправлений ${corrections}</div>
+        <div class="memory-rule-actions">
+          ${status !== "active" ? '<button class="btn btn-sm" data-action="activate-memory" type="button">Активировать</button>' : '<button class="btn btn-sm" data-action="disable-memory" type="button">Отключить</button>'}
+          <button class="btn btn-sm" data-action="delete-memory" type="button">Удалить</button>
+        </div>`;
+      ids.memory_rules.appendChild(row);
+    });
+  }
+
+  async function loadMemory(quiet) {
+    try {
+      const result = await requestJSON(`/stage1/normalization/memory?project=${encodeURIComponent(project)}`, "GET");
+      memoryRules = Array.isArray(result) ? result : (result.rules || result.items || []);
+      renderMemory();
+    } catch (err) {
+      if (!quiet) throw err;
+      memoryRules = [];
+      renderMemory();
+    }
+  }
+
+  async function addMemoryRule() {
+    const alias = ids.memory_alias.value.trim();
+    if (!alias) {
+      ids.memory_alias.focus();
+      throw new Error("Введите обозначение");
+    }
+    await requestJSON("/stage1/normalization/memory", "POST", {
+      project, alias, marker: alias, block_type: ids.memory_type.value, status: "active", source: "manual",
+    });
+    ids.memory_alias.value = "";
+    await loadMemory(false);
+    toast("Обозначение добавлено в память", "success");
+  }
+
+  async function updateMemoryRule(ruleId, patch) {
+    await requestJSON(`/stage1/normalization/memory/${encodeURIComponent(ruleId)}`, "PATCH", patch);
+    await loadMemory(false);
+  }
+
+  async function deleteMemoryRule(ruleId) {
+    if (!window.confirm("Удалить это правило из общей памяти обозначений?")) return;
+    await requestJSON(`/stage1/normalization/memory/${encodeURIComponent(ruleId)}?project=${encodeURIComponent(project)}`, "DELETE");
+    await loadMemory(false);
+    toast("Правило памяти удалено", "success");
   }
 
   function applyStatus(status) {
@@ -248,6 +582,13 @@
     }
 
     renderSpeaker(Array.isArray(status.speaker_files) ? status.speaker_files : []);
+    const normalizationStatus = status.normalization_status || (status.normalization && status.normalization.status);
+    if (typeof status.normalization_confirmed === "boolean") normalizationEligible = status.normalization_confirmed;
+    if (normalizationStatus && normalization && !normalizationDirty) {
+      normalization.status = normalizationStatus;
+      renderNormalizationStatus();
+    }
+    updateActionAvailability();
   }
 
   async function refreshStatus() {
@@ -408,8 +749,8 @@
       }),
     });
     const data = await response.json().catch(() => ({}));
-    if (response.status >= 500) {
-      throw new Error(data.error || "Server error");
+    if (!response.ok && response.status !== 422) {
+      throw new Error(data.message || data.error || `HTTP ${response.status}`);
     }
     const result = data.result || {};
     if (result.ok) {
@@ -441,6 +782,90 @@
     }
   }
 
+  function openTab(tabName) {
+    document.querySelectorAll(".workspace-tab").forEach((tab) => {
+      tab.classList.toggle("active", tab.dataset.tab === tabName);
+    });
+    document.querySelectorAll("[data-tab-panel]").forEach((panel) => {
+      const active = panel.dataset.tabPanel === tabName;
+      panel.classList.toggle("active", active);
+      panel.hidden = !active;
+    });
+  }
+
+  document.querySelectorAll(".workspace-tab").forEach((tab) => {
+    tab.addEventListener("click", () => openTab(tab.dataset.tab));
+  });
+
+  ids.normalization_blocks.addEventListener("input", (event) => {
+    if (event.target.dataset.field) updateBlockFromControl(event.target);
+  });
+  ids.normalization_blocks.addEventListener("change", (event) => {
+    if (event.target.dataset.field) updateBlockFromControl(event.target);
+  });
+  ids.normalization_blocks.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action]");
+    if (!button || !normalization) return;
+    const card = button.closest(".normalization-block");
+    const block = normalization.blocks[Number(card.dataset.index)];
+    if (button.dataset.action === "remember-block") {
+      ids.memory_alias.value = block.original_label || "";
+      ids.memory_type.value = block.type || "voiceover";
+      ids.memory_alias.focus();
+      return;
+    }
+    if (button.dataset.action === "move-up" || button.dataset.action === "move-down") {
+      const index = Number(card.dataset.index);
+      const target = index + (button.dataset.action === "move-up" ? -1 : 1);
+      if (target >= 0 && target < normalization.blocks.length) {
+        [normalization.blocks[index], normalization.blocks[target]] =
+          [normalization.blocks[target], normalization.blocks[index]];
+        markNormalizationDirty();
+        renderNormalization();
+      }
+      return;
+    }
+    if (button.dataset.action !== "delete-block") return;
+    normalization.blocks.splice(Number(card.dataset.index), 1);
+    markNormalizationDirty();
+    renderNormalization();
+  });
+  ids.btn_add_normalization_block.addEventListener("click", () => {
+    if (!normalization) return;
+    normalization.blocks.push({
+      uid: (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : `manual-${Date.now()}`,
+      order: normalization.blocks.length + 1,
+      type: "unknown", original_text: "", normalized_text: "", text_for_tts: "",
+      original_label: "", source: "manual", confidence: 1,
+      warnings: ["Укажите тип и текст блока"],
+    });
+    markNormalizationDirty();
+    renderNormalization();
+  });
+  ids.btn_normalize.addEventListener("click", () => safely(generateNormalization));
+  ids.btn_save_normalization.addEventListener("click", () => safely(saveNormalization));
+  ids.btn_confirm_normalization.addEventListener("click", () => safely(confirmNormalization));
+  ids.btn_add_memory.addEventListener("click", () => safely(addMemoryRule));
+  ids.memory_search.addEventListener("input", renderMemory);
+  ids.memory_filter_type.addEventListener("change", renderMemory);
+  ids.memory_filter_status.addEventListener("change", renderMemory);
+  ids.memory_rules.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action]");
+    if (!button) return;
+    const ruleId = button.closest(".memory-rule").dataset.ruleId;
+    if (!ruleId) return;
+    if (button.dataset.action === "delete-memory") safely(() => deleteMemoryRule(ruleId));
+    if (button.dataset.action === "activate-memory") safely(() => updateMemoryRule(ruleId, { status: "active" }));
+    if (button.dataset.action === "disable-memory") safely(() => updateMemoryRule(ruleId, { status: "disabled" }));
+  });
+  ids.memory_rules.addEventListener("change", (event) => {
+    const control = event.target.closest("[data-memory-field]");
+    if (!control) return;
+    const ruleId = control.closest(".memory-rule").dataset.ruleId;
+    if (!ruleId) return;
+    safely(() => updateMemoryRule(ruleId, { [control.dataset.memoryField]: control.value.trim() }));
+  });
+
   // ── Stage 2 ──────────────────────────────────────────────────────────────
   async function doBuildTimeline() {
     appendLog("Stage 2: Building timeline...");
@@ -468,14 +893,13 @@
 
   ids.btn_build_timeline.addEventListener("click", () => safely(doBuildTimeline));
 
-  ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
+  if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
   ids.btn_tts.addEventListener("click", () => safely(doTTS));
   ids.btn_phrase_tts.addEventListener("click", () => safely(doPhraseTTS));
   ids.btn_validate.addEventListener("click", () => safely(doValidate));
   ids.btn_refresh.addEventListener("click", () => safely(refreshStatus));
   ids.btn_run_all.addEventListener("click", () =>
     safely(async () => {
-      await doAnalyze();
       await doTTS();
       await doValidate();
     })
@@ -488,11 +912,12 @@
     ids.speed_val.textContent = parseFloat(ids.speed.value).toFixed(2);
   });
 
-  ids.use_llm.checked = false;
+  if (ids.use_llm) ids.use_llm.checked = false;
   ids.dry_run.checked = false;
   ids.provider.value = defaults.provider || "openrouter";
   ids.gender.value = defaults.gender || "female";
   applyStatus(initialStatus);
   renderLive();
   appendLog(`UI ready. project=${project}`);
+  Promise.all([loadNormalization(true), loadMemory(true)]).catch((err) => appendLog(`Normalization init: ${err.message}`, "warn"));
 })();

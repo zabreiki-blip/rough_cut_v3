@@ -2,6 +2,9 @@
 .venv
 __pycache__/
 *.pyc
+.DS_Store
+logs/
+data/*.sqlite3
 
 # Runtime artifacts
 speaker/*.wav
@@ -10,3 +13,4 @@ work/scenario_raw.txt
 work/scenario_prepared.json
 projects/*/work/
 projects/*/speaker/
+projects/*/input/

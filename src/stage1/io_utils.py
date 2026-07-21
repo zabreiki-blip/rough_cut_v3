@@ -23,8 +23,34 @@ def extract_text_from_docx(path: Path) -> str:
             "python-docx is not installed. Install dependencies from requirements.txt."
         ) from exc
     doc = Document(str(path))
-    lines = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+    lines = list(_iter_docx_text_blocks(doc))
     return normalize_whitespace("\n".join(lines))
+
+
+def _iter_docx_text_blocks(document: Any):
+    """Yield body paragraphs and table-cell paragraphs in document order."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    seen_cells: set[int] = set()
+    for child in document.element.body.iterchildren():
+        tag = str(child.tag)
+        if tag.endswith("}p"):
+            text = (Paragraph(child, document).text or "").strip()
+            if text:
+                yield text
+        elif tag.endswith("}tbl"):
+            table = Table(child, document)
+            for row in table.rows:
+                for cell in row.cells:
+                    cell_key = id(cell._tc)
+                    if cell_key in seen_cells:
+                        continue
+                    seen_cells.add(cell_key)
+                    for paragraph in cell.paragraphs:
+                        text = (paragraph.text or "").strip()
+                        if text:
+                            yield text
 
 
 def _run_is_marked(run: Any) -> bool:
