@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 import json
 import os
@@ -139,14 +140,38 @@ def _generate_normalization_unlocked(
 
         if unresolved and use_llm:
             llm = classifier or _openrouter_classifier
-            for batch in _llm_batches(unresolved):
-                try:
-                    results = llm([block.to_dict() for block in batch], hint)
-                    _apply_llm_results(batch, results)
-                except Exception as exc:
-                    message = f"LLM classification failed: {type(exc).__name__}: {exc}"
-                    for block in batch:
-                        block.warnings.append(message)
+            batches = _llm_batches(unresolved)
+            payloads = [[_llm_input(block) for block in batch] for batch in batches]
+
+            # A large documentary script can contain hundreds of unresolved
+            # paragraphs. OpenRouter calls are independent, so bounded
+            # concurrency keeps the HTTP request practical without flooding the
+            # provider. Injected classifiers remain sequential for deterministic
+            # tests and custom integrations.
+            if classifier is None and len(batches) > 1:
+                with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+                    futures = [pool.submit(llm, payload, hint) for payload in payloads]
+                    batch_results = []
+                    for future in futures:
+                        try:
+                            batch_results.append((future.result(), None))
+                        except Exception as exc:
+                            batch_results.append((None, exc))
+            else:
+                batch_results = []
+                for payload in payloads:
+                    try:
+                        batch_results.append((llm(payload, hint), None))
+                    except Exception as exc:
+                        batch_results.append((None, exc))
+
+            for batch, (results, error) in zip(batches, batch_results):
+                if error is None:
+                    _apply_llm_results(batch, results or [])
+                    continue
+                message = f"LLM classification failed: {type(error).__name__}: {error}"
+                for block in batch:
+                    block.warnings.append(message)
 
     scenario = NormalizedScenario(
         source=str(input_path),
@@ -558,7 +583,7 @@ def _llm_batches(
     current: list[NormalizedBlock] = []
     current_size = 0
     for block in blocks:
-        block_size = len(json.dumps(block.to_dict(), ensure_ascii=False))
+        block_size = len(json.dumps(_llm_input(block), ensure_ascii=False))
         if current and current_size + block_size > max_chars:
             batches.append(current)
             current = []
@@ -568,6 +593,17 @@ def _llm_batches(
     if current:
         batches.append(current)
     return batches
+
+
+def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
+    """Return only classification context, avoiding duplicated draft fields."""
+    return {
+        "uid": block.uid,
+        "original_text": block.original_text,
+        "original_label": block.original_label,
+        "suggested_type": block.suggested_type,
+        "suggested_label": block.suggested_label,
+    }
 
 
 def _openrouter_classifier(blocks: list[dict[str, Any]], hint: str) -> list[dict[str, Any]]:

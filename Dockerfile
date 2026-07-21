@@ -21,4 +21,4 @@ RUN chmod +x ./scripts/analyze-script ./scripts/synthesize-tts ./scripts/validat
 ENV PYTHONPATH=/app/src
 EXPOSE 8000
 
-CMD ["gunicorn", "-b", "0.0.0.0:8000", "api:app"]
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "--timeout", "600", "api:app"]

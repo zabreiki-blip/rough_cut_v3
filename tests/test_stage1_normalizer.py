@@ -265,6 +265,34 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(len(result["blocks"]), 3)
             self.assertEqual([item["type"] for item in result["blocks"]], ["other"] * 3)
 
+    def test_default_llm_classifier_handles_multiple_compact_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "\n".join(f"Абзац {index} " + "текст " * 90 for index in range(80)),
+                encoding="utf-8",
+            )
+
+            def classifier(items, _hint):
+                self.assertTrue(items)
+                self.assertNotIn("normalized_text", items[0])
+                return [
+                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
+                    for item in items
+                ]
+
+            with patch.object(
+                normalizer_module, "_openrouter_classifier", side_effect=classifier
+            ) as mocked:
+                result = generate_normalization(
+                    source, root / "out.json", memory_path=root / "memory.sqlite3"
+                )
+
+            self.assertGreater(mocked.call_count, 1)
+            self.assertEqual(len(result["blocks"]), 80)
+            self.assertTrue(all(item["type"] == "other" for item in result["blocks"]))
+
     def test_save_revision_and_confirm_projections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

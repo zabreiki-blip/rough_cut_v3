@@ -14,7 +14,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./:/app
-    command: gunicorn -b 0.0.0.0:8000 --reload api:app
+    command: gunicorn -b 0.0.0.0:8000 --timeout 600 --reload api:app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

@@ -255,10 +255,20 @@
     const options = { method, headers: { "Content-Type": "application/json" } };
     if (payload !== undefined) options.body = JSON.stringify(payload);
     const response = await fetch(url, options);
-    const data = await response.json().catch(() => ({}));
+    const raw = await response.text();
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch (_err) {
+      data = {};
+    }
     if (!response.ok || data.ok === false) {
-      const detail = data.message || data.error || JSON.stringify(data);
-      throw new Error(detail || `HTTP ${response.status}`);
+      const plainText = raw && !raw.trimStart().startsWith("<") ? raw.trim().slice(0, 500) : "";
+      const detail = data.message || data.error || plainText;
+      throw new Error(detail || `HTTP ${response.status}: сервер прервал запрос без JSON-ответа`);
+    }
+    if (raw && Object.keys(data).length === 0) {
+      throw new Error(`HTTP ${response.status}: сервер вернул некорректный JSON`);
     }
     return data.result !== undefined ? data.result : data;
   }
