@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import hmac
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -45,12 +47,57 @@ PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _TTS_JOBS: dict[str, dict] = {}
 _TTS_JOBS_LOCK = threading.Lock()
 _TTS_JOBS_MAX = 200
+_TTS_JOBS_TTL_SECONDS = 24 * 60 * 60
 _TTS_CONCURRENT_MAX = 3
 _TTS_SEMAPHORE = threading.Semaphore(_TTS_CONCURRENT_MAX)
+_TTS_ACTIVE_PROJECTS: set[str] = set()
+_SOURCE_HASH_CACHE: dict[str, tuple[int, int, str]] = {}
+_SOURCE_HASH_CACHE_LOCK = threading.Lock()
+
+
+def _api_token() -> str:
+    configured = app.config.get("API_TOKEN")
+    if configured is not None:
+        return str(configured).strip()
+    return os.getenv("ROUGH_CUT_API_TOKEN", "").strip()
+
+
+def _request_token() -> str:
+    auth = request.authorization
+    if auth and auth.type.lower() == "basic":
+        return str(auth.password or "")
+    header = request.headers.get("Authorization", "").strip()
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return request.headers.get("X-API-Token", "").strip()
+
+
+@app.before_request
+def require_api_authentication():
+    if request.endpoint == "health":
+        return None
+    expected = _api_token()
+    # Tests must opt into auth explicitly; production always fails closed.
+    if app.config.get("TESTING") and app.config.get("API_TOKEN") is None:
+        return None
+    if not expected:
+        return _json_error("ROUGH_CUT_API_TOKEN is not configured", 503)
+    supplied = _request_token()
+    if supplied and hmac.compare_digest(supplied, expected):
+        return None
+    response = jsonify({"ok": False, "error": "unauthorized"})
+    response.status_code = 401
+    response.headers["WWW-Authenticate"] = 'Basic realm="Rough Cut", charset="UTF-8"'
+    return response
 
 
 def _json_error(message: str, status_code: int = 400):
     return jsonify({"ok": False, "error": message}), status_code
+
+
+def _internal_error(exc: Exception):
+    app.logger.exception("Unhandled API error", exc_info=exc)
+    return _json_error("internal server error", 500)
 
 
 def _normalize_project_name(name: str) -> str:
@@ -121,7 +168,16 @@ def _normalization_source_is_current(document: dict, project_root: Path) -> bool
         source_path = _abs_path(str(source_value), project_root / "input" / "scenario.docx", project_root)
         if not source_path.is_file():
             return False
-        current_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        stat = source_path.stat()
+        cache_key = str(source_path)
+        with _SOURCE_HASH_CACHE_LOCK:
+            cached = _SOURCE_HASH_CACHE.get(cache_key)
+        if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+            current_hash = cached[2]
+        else:
+            current_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            with _SOURCE_HASH_CACHE_LOCK:
+                _SOURCE_HASH_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, current_hash)
     except (OSError, ValueError):
         return False
     return current_hash == expected_hash
@@ -262,10 +318,25 @@ def _utc_now_iso() -> str:
 
 
 def _trim_tts_jobs_locked() -> None:
-    if len(_TTS_JOBS) <= _TTS_JOBS_MAX:
-        return
+    now = datetime.now(UTC)
+    terminal_ids = [
+        job_id for job_id, job in _TTS_JOBS.items()
+        if job.get("status") in {"completed", "failed"}
+    ]
+    for job_id in terminal_ids:
+        stamp = _TTS_JOBS[job_id].get("finished_at") or ""
+        try:
+            expired = (now - datetime.fromisoformat(stamp)).total_seconds() > _TTS_JOBS_TTL_SECONDS
+        except (TypeError, ValueError):
+            expired = False
+        if expired:
+            _TTS_JOBS.pop(job_id, None)
+    terminal_ids = [
+        job_id for job_id, job in _TTS_JOBS.items()
+        if job.get("status") in {"completed", "failed"}
+    ]
     ordered_ids = sorted(
-        _TTS_JOBS.keys(),
+        terminal_ids,
         key=lambda job_id: (
             _TTS_JOBS[job_id].get("finished_at") or _TTS_JOBS[job_id].get("created_at") or "",
             job_id,
@@ -274,6 +345,19 @@ def _trim_tts_jobs_locked() -> None:
     drop_count = max(0, len(_TTS_JOBS) - _TTS_JOBS_MAX)
     for job_id in ordered_ids[:drop_count]:
         _TTS_JOBS.pop(job_id, None)
+
+
+def _reserve_tts_project(project: str) -> bool:
+    with _TTS_JOBS_LOCK:
+        if project in _TTS_ACTIVE_PROJECTS:
+            return False
+        _TTS_ACTIVE_PROJECTS.add(project)
+        return True
+
+
+def _release_tts_project(project: str) -> None:
+    with _TTS_JOBS_LOCK:
+        _TTS_ACTIVE_PROJECTS.discard(project)
 
 
 def _create_tts_job(project: str) -> dict:
@@ -329,6 +413,7 @@ def _get_tts_job(job_id: str) -> dict | None:
 def _run_tts_job(
     *,
     job_id: str,
+    project: str,
     prepared_path: Path,
     speaker_dir: Path,
     provider: str | None,
@@ -407,6 +492,7 @@ def _run_tts_job(
             last_error=str(exc),
             finished_at=_utc_now_iso(),
         )
+        _release_tts_project(project)
         return
     finally:
         _TTS_SEMAPHORE.release()
@@ -434,6 +520,7 @@ def _run_tts_job(
         dry_run=bool(result.get("dry_run", False)),
         result=result,
     )
+    _release_tts_project(project)
 
 
 @app.get("/")
@@ -566,10 +653,13 @@ def stage1_analyze():
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:
-        return _json_error(str(exc), 500)
+        return _internal_error(exc)
 
     result["project"] = project
-    return jsonify({"ok": True, "result": result})
+    response = jsonify({"ok": True, "result": result})
+    response.headers["Deprecation"] = "true"
+    response.headers["Warning"] = '299 - "Legacy analyzer; use /stage1/normalization/generate"'
+    return response
 
 
 def _normalization_exception(exc: Exception):
@@ -590,7 +680,7 @@ def _normalization_exception(exc: Exception):
         return _json_error("normalization memory rule not found", 404)
     if isinstance(exc, (NormalizationError, ValueError)):
         return _json_error(str(exc), 400)
-    return _json_error(str(exc), 500)
+    return _internal_error(exc)
 
 
 def _normalization_payload_for_save(payload: dict, normalized_path: Path) -> dict:
@@ -822,6 +912,8 @@ def stage1_tts():
     voice_name = payload.get("voice_name")
     dry_run = bool(payload.get("dry_run", False))
 
+    if not _reserve_tts_project(project):
+        return _json_error(f"TTS already active for project {project}", 409)
     try:
         prepared_path = _confirmed_prepared_path(payload, paths)
         speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
@@ -838,7 +930,9 @@ def stage1_tts():
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:
-        return _json_error(str(exc), 500)
+        return _internal_error(exc)
+    finally:
+        _release_tts_project(project)
 
     result["project"] = project
     return jsonify({"ok": True, "result": result})
@@ -883,32 +977,30 @@ def stage1_tts_job_start():
     except ValueError as exc:
         return _json_error(str(exc), 400)
 
-    with _TTS_JOBS_LOCK:
-        running = [
-            j for j in _TTS_JOBS.values()
-            if j.get("project") == project and j.get("status") == "running"
-        ]
-        if running:
-            return _json_error(
-                f"TTS-задача уже выполняется для проекта {project}: {running[0]['id']}", 409
-            )
+    if not _reserve_tts_project(project):
+        return _json_error(f"TTS already active for project {project}", 409)
 
-    job = _create_tts_job(project=project)
-    worker = threading.Thread(
-        target=_run_tts_job,
-        kwargs={
-            "job_id": job["id"],
-            "prepared_path": prepared_path,
-            "speaker_dir": speaker_dir,
-            "provider": provider,
-            "voice_name": voice_name,
-            "gender": gender,
-            "dry_run": dry_run,
-            "speed": speed,
-        },
-        daemon=True,
-    )
-    worker.start()
+    try:
+        job = _create_tts_job(project=project)
+        worker = threading.Thread(
+            target=_run_tts_job,
+            kwargs={
+                "job_id": job["id"],
+                "project": project,
+                "prepared_path": prepared_path,
+                "speaker_dir": speaker_dir,
+                "provider": provider,
+                "voice_name": voice_name,
+                "gender": gender,
+                "dry_run": dry_run,
+                "speed": speed,
+            },
+            daemon=True,
+        )
+        worker.start()
+    except Exception:
+        _release_tts_project(project)
+        raise
 
     return jsonify(
         {
@@ -960,6 +1052,8 @@ def stage1_tts_phrase():
         return _json_error("speed must be a number between 0.5 and 1.5", 400)
     speed = max(0.5, min(1.5, speed))
 
+    if not _reserve_tts_project(project):
+        return _json_error(f"TTS already active for project {project}", 409)
     try:
         speaker_dir = _abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
         result = synthesize_phrase(
@@ -977,7 +1071,9 @@ def stage1_tts_phrase():
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:
-        return _json_error(str(exc), 500)
+        return _internal_error(exc)
+    finally:
+        _release_tts_project(project)
 
     result["project"] = project
     out_file = Path(result.get("file", ""))
@@ -1019,7 +1115,7 @@ def stage1_validate():
     except FileNotFoundError as exc:
         return _json_error(str(exc), 404)
     except Exception as exc:
-        return _json_error(str(exc), 500)
+        return _internal_error(exc)
 
     result["project"] = project
     status_code = 200 if result.get("ok") else 422
@@ -1062,7 +1158,7 @@ def stage2_build():
             fps=fps,
         )
     except Exception as exc:
-        return _json_error(str(exc), 500)
+        return _internal_error(exc)
 
     # Generate placeholder PNGs for speaker and presenter segments.
     placeholder_warnings: list[str] = []
@@ -1161,7 +1257,7 @@ def stage2_export_xml():
     try:
         xml_str = build_xml(tl)
     except Exception as exc:
-        return _json_error(str(exc), 500)
+        return _internal_error(exc)
 
     from flask import Response
     return Response(

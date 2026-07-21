@@ -132,11 +132,11 @@ Timeline ID:          zk10
 
 ### Частично закрыто. Тестовое покрытие
 
-Добавлено 14 новых тестов за счёт P0/P1-работы:
+Покрытие расширено security-, normalization-, TTS concurrency- и atomic-write тестами:
 - `test_p0_p1_regressions.py` — dry-run, повреждённый WAV, fingerprint (9 тестов).
 - `test_stage2_timeline_parser.py` — ZK ID-контракт (5 тестов).
 
-Итого: 21/21 тест проходит. Нет тестов для API workflow, конкурентных TTS-job и импорта XML в Premiere — остаётся как backlog.
+Итого: 82/82 теста проходят. Импорт XML непосредственно в Premiere остаётся ручной интеграционной проверкой.
 
 ## Сильные стороны
 
@@ -149,9 +149,20 @@ Timeline ID:          zk10
 
 ## Результаты проверок
 
+### Актуализация безопасности и конкурентности
+
+- API закрыт обязательным `ROUGH_CUT_API_TOKEN`; публичным оставлен только liveness `/health`.
+- macOS connector работает fail-closed и по умолчанию слушает `127.0.0.1`.
+- Docker публикует API только на localhost, работает без root, без `--reload`, с одним worker и узкими mounts `projects/data`.
+- Для каждого проекта разрешён только один TTS-поток; queued job резервирует проект атомарно.
+- WAV и fingerprint metadata публикуются через временный файл и `os.replace`.
+- Job trim сохраняет queued/running и удаляет terminal jobs по TTL.
+- SQLite memory использует WAL/busy timeout; проверка source hash кэшируется по mtime/size.
+- Legacy `/stage1/analyze` сохранён, но помечен deprecated; объединение pipeline вынесено отдельно.
+
 Успешно:
 
-- `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`: 21/21 тестов.
+- `PYTHONPATH=src .venv/bin/python -m pytest -q`: 82/82 теста.
 - Реальный LLM-анализ через OpenRouter: успешно, `used_llm=true`, `llm_errors_count=0`.
 - `.venv/bin/python -m pip check`: зависимости не сломаны.
 - `python -m compileall -q src tests`: успешно.
@@ -160,10 +171,10 @@ Timeline ID:          zk10
 
 Не выполнено или отсутствует:
 
-- Расширенный набор тестов отсутствует.
+- Live-тесты платных TTS/LLM провайдеров не входят в автоматический набор.
 - Live-тесты Gemini/OpenRouter/macOS TTS: не запускались, чтобы не расходовать API и не изменять рабочие данные.
 - Импорт экспортированного XML в Premiere Pro: не проверялся.
-- Полная Docker-сборка: не запускалась.
+- Docker-образ пересобран; контейнер проверен как non-root, single-worker и healthy на `127.0.0.1:8000`.
 
 ## План исправлений
 

@@ -9,6 +9,7 @@ import io
 import time
 import wave
 import json as pyjson
+import os
 import shutil
 import subprocess
 import tempfile
@@ -127,6 +128,32 @@ def _ensure_wav_bytes(audio_bytes: bytes, mime_type: str) -> bytes:
     )
 
 
+def _atomic_write_bytes(path: Path, data: bytes, *, validate_wav: bool = False) -> None:
+    """Publish bytes atomically, preserving the old target if publication fails."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(data)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        if validate_wav and not _is_valid_wav(temp_path):
+            raise ValueError(f"Generated audio is not a valid WAV: {path.name}")
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _write_silence_wav(path: Path, duration_ms: int = 1500) -> None:
     sample_rate = 24000
     n_channels = 1
@@ -134,11 +161,13 @@ def _write_silence_wav(path: Path, duration_ms: int = 1500) -> None:
     frames = int(sample_rate * (duration_ms / 1000.0))
     silence = b"\x00\x00" * frames
 
-    with wave.open(str(path), "wb") as wf:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
         wf.setnchannels(n_channels)
         wf.setsampwidth(sample_width)
         wf.setframerate(sample_rate)
         wf.writeframes(silence)
+    _atomic_write_bytes(path, buf.getvalue(), validate_wav=True)
 
 
 def _is_valid_wav(path: Path) -> bool:
@@ -173,9 +202,9 @@ def _read_meta_fingerprint(wav_path: Path) -> str | None:
 
 
 def _write_meta_fingerprint(wav_path: Path, fingerprint: str) -> None:
-    _meta_path(wav_path).write_text(
-        pyjson.dumps({"fingerprint": fingerprint}),
-        encoding="utf-8",
+    _atomic_write_bytes(
+        _meta_path(wav_path),
+        pyjson.dumps({"fingerprint": fingerprint}).encode("utf-8"),
     )
 
 
@@ -667,7 +696,7 @@ def synthesize_tts(
             try:
                 wav_bytes = _synthesize_wav_bytes(provider, text, settings, voice, client, types)
                 wav_bytes = _apply_tempo(wav_bytes, speed)
-                out_file.write_bytes(wav_bytes)
+                _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
                 _write_meta_fingerprint(out_file, fp)
                 generated.append(str(out_file))
                 _emit_progress(
@@ -796,7 +825,7 @@ def synthesize_phrase(
         try:
             wav_bytes = _synthesize_wav_bytes(provider, phrase, settings, voice, client, types)
             wav_bytes = _apply_tempo(wav_bytes, speed)
-            out_file.write_bytes(wav_bytes)
+            _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
             break
         except Exception as exc:
             if attempts >= 4 or not _is_retryable_tts_error(provider, exc):

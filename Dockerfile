@@ -16,9 +16,14 @@ COPY src ./src
 COPY scripts ./scripts
 COPY STAGE_1_PLAN.md ./STAGE_1_PLAN.md
 
-RUN chmod +x ./scripts/analyze-script ./scripts/synthesize-tts ./scripts/validate-stage1
+RUN chmod +x ./scripts/analyze-script ./scripts/synthesize-tts ./scripts/validate-stage1 \
+    && mkdir -p /app/projects /app/data \
+    && useradd --system --uid 10001 --home-dir /app --no-create-home roughcut \
+    && chown -R roughcut:roughcut /app
 
 ENV PYTHONPATH=/app/src
 EXPOSE 8000
+
+USER roughcut
 
 CMD ["gunicorn", "-b", "0.0.0.0:8000", "--timeout", "600", "api:app"]

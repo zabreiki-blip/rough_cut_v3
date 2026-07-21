@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -624,18 +625,32 @@ def _openrouter_classifier(blocks: list[dict[str, Any]], hint: str) -> list[dict
         "Use unknown when unsure. Do not rewrite original content. "
         f"Author hint: {hint or '(none)'}. Items: {json.dumps(blocks, ensure_ascii=False)}"
     )
-    response = requests.post(
-        f"{settings.openrouter_base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
-        json={
+    request_kwargs = {
+        "headers": {"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
+        "json": {
             "model": settings.openrouter_model,
             "messages": [{"role": "system", "content": "You normalize TV production scripts."},
                          {"role": "user", "content": prompt}],
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         },
-        timeout=120,
-    )
+        "timeout": 120,
+    }
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{settings.openrouter_base_url}/chat/completions", **request_kwargs
+            )
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
+            break
+        time.sleep(2 ** attempt)
+    assert response is not None
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
     if not isinstance(content, str):

@@ -23,6 +23,7 @@
 ## Переменные окружения
 
 Обязательные ключи:
+- `ROUGH_CUT_API_TOKEN` — обязательный токен веб-интерфейса и API
 - `OPENROUTER_API_KEY`
 - `GEMINI_API_KEY`
 
@@ -41,7 +42,7 @@
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
   - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
   - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
-  - для коннектора macOS из Docker: `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TOKEN`, `MACOS_CONNECTOR_TIMEOUT`
+  - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`
 
 ### macOS Connector (для Docker backend)
 
@@ -53,6 +54,7 @@
 TTS_PROVIDER=macos
 MACOS_CONNECTOR_URL=http://host.docker.internal:8001/synthesize
 MACOS_CONNECTOR_TOKEN=change_me
+MACOS_CONNECTOR_BIND=0.0.0.0
 ```
 
 2. На Mac (вне Docker) запусти коннектор:
@@ -67,7 +69,9 @@ scripts/run-macos-connector
 curl -s http://localhost:8001/health
 ```
 
-Примечание по безопасности: `http://host.docker.internal` нормален для локальной машины.
+По умолчанию коннектор слушает только `127.0.0.1`. Доступ из Docker требует явного
+`MACOS_CONNECTOR_BIND=0.0.0.0`; используйте его только с сильным токеном и локальным firewall.
+Примечание по безопасности: `http://host.docker.internal` предназначен для локальной машины.
 Для удаленного контура поднимай коннектор за HTTPS (TLS, reverse proxy) и не отправляй токен в открытой сети.
 
 Если backend в Docker не видит `host.docker.internal`, проверь что в `docker-compose.yml` есть:
@@ -82,7 +86,7 @@ extra_hosts:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env   # заполни API-ключи
 export PYTHONPATH=src
 ```
@@ -159,6 +163,14 @@ export PYTHONPATH=src
 flask --app api run --host 0.0.0.0 --port 8000
 ```
 
+Все маршруты, кроме минимального `GET /health`, требуют токен. Браузер покажет
+стандартный Basic Auth prompt: имя пользователя произвольное, пароль — значение
+`ROUGH_CUT_API_TOKEN`. Для CLI используйте `Authorization: Bearer`:
+
+```bash
+curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage1/status?project=my_project
+```
+
 Эндпоинты:
 - `GET /` — стартовая страница: создать проект / выбрать проект.
 - `GET /project/<project>` — UI первого этапа для конкретного проекта.
@@ -175,9 +187,19 @@ flask --app api run --host 0.0.0.0 --port 8000
 - `GET /stage1/tts-jobs/<job_id>` (получение статуса job)
 - `POST /stage1/tts-phrase` (озвучка одной фразы)
 - `POST /stage1/validate`
+- `POST /stage2/build`
+- `GET /stage2/export/xml?project=<project>`
 
-Примечание: статусы `tts-jobs` хранятся в памяти процесса API.
+Примечание: статусы `tts-jobs` хранятся в памяти одного процесса API; Docker
+явно запускает один worker. Завершённые статусы удаляются через 24 часа.
 После рестарта backend активные/исторические job-статусы сбрасываются.
+
+## Тесты
+
+```bash
+pip install -r requirements-dev.txt
+PYTHONPATH=src pytest -q
+```
 
 ## Docker
 
@@ -191,6 +213,10 @@ curl http://localhost:8000/health
 
 ```bash
 curl -X POST http://localhost:8000/stage1/analyze \
+  -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"project":"my_project","input_path":"projects/my_project/input/scenario.docx","use_llm":true}'
 ```
+
+`/stage1/analyze` оставлен только для legacy CLI/API и помечен deprecated.
+Новый workflow начинается с `/stage1/normalization/generate`.

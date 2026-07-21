@@ -9,11 +9,13 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from stage1.gemini_tts import (
+    _atomic_write_bytes,
     _meta_path,
     _read_meta_fingerprint,
     _synthesis_fingerprint,
     _write_meta_fingerprint,
     _write_silence_wav,
+    synthesize_phrase,
     synthesize_tts,
 )
 from stage1.validator import validate_stage1
@@ -24,6 +26,107 @@ def _make_prepared_json(path: Path, block_id: str = "zk1", text: str = "Тест
         json.dumps({"items": [{"id": block_id, "text_for_tts": text}]}),
         encoding="utf-8",
     )
+
+
+def _make_wav_bytes(duration_ms: int = 1000) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(b"\x00\x00" * int(24000 * duration_ms / 1000))
+    return buf.getvalue()
+
+
+class AtomicTtsPublicationTest(unittest.TestCase):
+    def _assert_no_temps(self, directory: Path) -> None:
+        self.assertEqual(list(directory.glob(".*.tmp")), [])
+
+    def test_atomic_helper_preserves_old_file_when_replace_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = directory / "zk1.wav"
+            old_bytes = _make_wav_bytes(500)
+            target.write_bytes(old_bytes)
+
+            with unittest.mock.patch(
+                "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    _atomic_write_bytes(target, _make_wav_bytes(1000), validate_wav=True)
+
+            self.assertEqual(target.read_bytes(), old_bytes)
+            self._assert_no_temps(directory)
+
+    def test_silence_and_meta_preserve_old_files_when_replace_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            wav = directory / "zk1.wav"
+            old_wav = _make_wav_bytes(500)
+            wav.write_bytes(old_wav)
+            meta = _meta_path(wav)
+            meta.write_text('{"fingerprint":"old"}', encoding="utf-8")
+
+            with unittest.mock.patch(
+                "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaises(OSError):
+                    _write_silence_wav(wav, duration_ms=1000)
+                with self.assertRaises(OSError):
+                    _write_meta_fingerprint(wav, "new")
+
+            self.assertEqual(wav.read_bytes(), old_wav)
+            self.assertEqual(meta.read_text(encoding="utf-8"), '{"fingerprint":"old"}')
+            self._assert_no_temps(directory)
+
+    def test_batch_preserves_old_wav_when_atomic_publish_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            prepared = directory / "prepared.json"
+            _make_prepared_json(prepared)
+            wav = directory / "zk1.wav"
+            old_bytes = _make_wav_bytes(500)
+            wav.write_bytes(old_bytes)
+
+            with unittest.mock.patch(
+                "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
+            ), unittest.mock.patch(
+                "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    synthesize_tts(
+                        prepared, directory, provider="macos", voice_name="Yuri", gender="male"
+                    )
+
+            self.assertEqual(wav.read_bytes(), old_bytes)
+            self._assert_no_temps(directory)
+
+    def test_phrase_preserves_old_wav_when_atomic_publish_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            wav = directory / "preview.wav"
+            old_bytes = _make_wav_bytes(500)
+            wav.write_bytes(old_bytes)
+
+            with unittest.mock.patch(
+                "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
+            ), unittest.mock.patch(
+                "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    synthesize_phrase(
+                        "Фраза",
+                        directory,
+                        provider="macos",
+                        voice_name="Yuri",
+                        gender="male",
+                        file_name="preview.wav",
+                    )
+
+            self.assertEqual(wav.read_bytes(), old_bytes)
+            self._assert_no_temps(directory)
 
 
 class DryRunPreservesExistingWavTest(unittest.TestCase):

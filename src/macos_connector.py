@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hmac
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,6 +10,14 @@ from flask import Flask, Response, jsonify, request
 
 
 app = Flask(__name__)
+
+_env_file = os.getenv("MACOS_CONNECTOR_ENV_FILE", "").strip()
+if _env_file:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file, override=False)
+    except ImportError:
+        pass
 
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
@@ -35,11 +44,12 @@ def _to_int(value, default: int, min_value: int, max_value: int) -> int:
 def _auth_ok() -> bool:
     token = os.getenv("MACOS_CONNECTOR_TOKEN", "").strip()
     if not token:
-        return True
+        return False
     auth = request.headers.get("Authorization", "").strip()
-    if auth == f"Bearer {token}":
+    if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].strip(), token):
         return True
-    return request.headers.get("X-Connector-Token", "").strip() == token
+    supplied = request.headers.get("X-Connector-Token", "").strip()
+    return bool(supplied) and hmac.compare_digest(supplied, token)
 
 
 def _voice_exists(voice: str) -> bool:
@@ -105,6 +115,8 @@ def shutil_which(cmd: str) -> str | None:
 
 @app.post("/synthesize")
 def synthesize():
+    if not os.getenv("MACOS_CONNECTOR_TOKEN", "").strip():
+        return jsonify({"ok": False, "error": "MACOS_CONNECTOR_TOKEN is not configured"}), 503
     if not _auth_ok():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
@@ -145,5 +157,8 @@ def synthesize():
 
 
 if __name__ == "__main__":
+    if not os.getenv("MACOS_CONNECTOR_TOKEN", "").strip():
+        raise SystemExit("MACOS_CONNECTOR_TOKEN is required")
     port = _env_int("MACOS_CONNECTOR_PORT", 8001, 1, 65535)
-    app.run(host="0.0.0.0", port=port)
+    host = os.getenv("MACOS_CONNECTOR_BIND", "127.0.0.1").strip() or "127.0.0.1"
+    app.run(host=host, port=port)

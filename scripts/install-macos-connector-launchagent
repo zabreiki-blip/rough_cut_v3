@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLIST_NAME="com.roughcut.macos-connector"
 PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
 LOG_DIR="${ROOT_DIR}/logs"
+CONNECTOR_ENV="${HOME}/Library/Application Support/RoughCut/macos-connector.env"
 PYTHON_BIN="${ROOT_DIR}/.venv/bin/python3"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -13,6 +14,21 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 mkdir -p "${LOG_DIR}"
+mkdir -p "$(dirname "${CONNECTOR_ENV}")"
+
+# Keep only connector-specific settings in a separate mode-600 file. Never copy
+# cloud API keys or the complete project .env into a world-readable plist.
+: > "${CONNECTOR_ENV}"
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  while IFS= read -r line; do
+    case "${line}" in
+      MACOS_CONNECTOR_TOKEN=*|MACOS_CONNECTOR_BIND=*|MACOS_CONNECTOR_PORT=*|MACOS_TTS_*=*)
+        printf '%s\n' "${line}" >> "${CONNECTOR_ENV}"
+        ;;
+    esac
+  done < "${ROOT_DIR}/.env"
+fi
+chmod 600 "${CONNECTOR_ENV}"
 
 cat > "${PLIST_DST}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -34,6 +50,8 @@ cat > "${PLIST_DST}" <<PLIST
   <dict>
     <key>PYTHONPATH</key>
     <string>${ROOT_DIR}/src</string>
+    <key>MACOS_CONNECTOR_ENV_FILE</key>
+    <string>${CONNECTOR_ENV}</string>
   </dict>
 
   <key>WorkingDirectory</key>
@@ -53,21 +71,6 @@ cat > "${PLIST_DST}" <<PLIST
 </dict>
 </plist>
 PLIST
-
-# Load .env vars into plist EnvironmentVariables if .env exists
-if [[ -f "${ROOT_DIR}/.env" ]]; then
-  # inject env vars into already-written plist via PlistBuddy
-  while IFS='=' read -r key value; do
-    [[ -z "$key" || "$key" == \#* ]] && continue
-    value="${value%$'\r'}"
-    /usr/libexec/PlistBuddy -c \
-      "Add :EnvironmentVariables:${key} string ${value}" \
-      "${PLIST_DST}" 2>/dev/null || \
-    /usr/libexec/PlistBuddy -c \
-      "Set :EnvironmentVariables:${key} ${value}" \
-      "${PLIST_DST}" 2>/dev/null || true
-  done < <(grep -v '^\s*#' "${ROOT_DIR}/.env" | grep -v '^\s*$')
-fi
 
 # Unload if already loaded (ignore errors)
 launchctl unload "${PLIST_DST}" 2>/dev/null || true

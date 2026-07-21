@@ -9,12 +9,13 @@ services:
     environment:
       - PYTHONPATH=/app/src
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./:/app
-    command: gunicorn -b 0.0.0.0:8000 --timeout 600 --reload api:app
+      - ./projects:/app/projects
+      - ./data:/app/data
+    command: gunicorn -b 0.0.0.0:8000 --workers 1 --timeout 600 api:app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
