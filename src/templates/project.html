@@ -122,6 +122,16 @@
           <div id="memory_rules" class="memory-rules"><div class="empty-state compact">Память пока пуста.</div></div>
         </aside>
       </div>
+      <dialog id="normalization_learning_dialog" class="learning-dialog">
+        <div class="learning-dialog-head">
+          <div><h2>Что запомнить из исправлений?</h2><p class="section-copy">Правило станет активным после подтверждения в двух разных сценариях.</p></div>
+        </div>
+        <div id="learning_rule_list" class="learning-rule-list"></div>
+        <div class="learning-dialog-actions">
+          <button id="btn_cancel_learning" class="btn" type="button">Отмена</button>
+          <button id="btn_confirm_with_learning" class="btn btn-accent" type="button">Продолжить подтверждение</button>
+        </div>
+      </dialog>
     </section>
 
     <section id="tab_voiceover" class="workspace-panel" data-tab-panel="voiceover" hidden>

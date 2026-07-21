@@ -18,6 +18,7 @@ from stage1.normalizer import (
     import_legacy_normalization,
     is_normalization_confirmed,
     load_normalization,
+    preview_learning_candidates,
     reset_normalization,
     save_normalization,
 )
@@ -92,6 +93,67 @@ class NormalizationMemoryTests(unittest.TestCase):
 
 
 class NormalizerTests(unittest.TestCase):
+    def test_docx_soft_line_break_stays_inside_voiceover_block(self) -> None:
+        from docx import Document
+        from docx.enum.text import WD_BREAK
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.docx"
+            document = Document()
+            paragraph = document.add_paragraph("ДИКТОР: Первая строка")
+            paragraph.add_run().add_break(WD_BREAK.LINE)
+            paragraph.add_run("Вторая строка")
+            document.save(source)
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+
+            self.assertEqual(len(result["blocks"]), 1)
+            self.assertEqual(result["blocks"][0]["type"], "voiceover")
+            self.assertEqual(result["blocks"][0]["normalized_text"], "Первая строка\nВторая строка")
+
+    def test_docx_new_paragraph_continues_voiceover_without_repeating_marker(self) -> None:
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.docx"
+            document = Document()
+            document.add_paragraph("ДИКТОР: Первый абзац")
+            document.add_paragraph("Второй абзац того же закадра")
+            document.add_paragraph("СНХ: Ответ героя")
+            document.save(source)
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                use_llm=False,
+            )
+
+            self.assertEqual(
+                [block["type"] for block in result["blocks"]],
+                ["voiceover", "voiceover", "sync"],
+            )
+            self.assertEqual(
+                result["blocks"][1]["text_for_tts"],
+                "Второй абзац того же закадра",
+            )
+
+    def test_unlabelled_paragraph_is_voiceover_continuation_without_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("ДИКТОР: Первый абзац\nПродолжение закадра\n", encoding="utf-8")
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                use_llm=False,
+            )
+            self.assertEqual([block["type"] for block in result["blocks"]], ["voiceover", "voiceover"])
+            self.assertEqual(result["blocks"][1]["continuation_of_type"], "voiceover")
+            self.assertEqual(result["blocks"][1]["text_for_tts"], "Продолжение закадра")
+
     def test_generate_preserves_every_paragraph_and_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -123,6 +185,85 @@ class NormalizerTests(unittest.TestCase):
             result = generate_normalization(source, root / "out.json", memory_path=db, use_llm=False)
             self.assertEqual(result["blocks"][0]["type"], "voiceover")
             self.assertEqual(result["blocks"][0]["source"], "memory")
+
+    def test_text_only_edit_does_not_create_learning_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            normalized = root / "normalized.json"
+            db = root / "memory.sqlite3"
+            source.write_text("ДИКТОР: Исходный текст\n", encoding="utf-8")
+            draft = generate_normalization(source, normalized, memory_path=db, use_llm=False)
+            draft["blocks"][0]["normalized_text"] = "Исправленный текст"
+            saved = save_normalization(normalized, draft, expected_revision=1)
+            self.assertEqual(saved["blocks"][0]["source"], "builtin_rule")
+            self.assertEqual(
+                preview_learning_candidates(normalized, memory_path=db, expected_revision=2), []
+            )
+
+    def test_two_accepted_corrections_activate_learned_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "memory.sqlite3"
+            for index in (1, 2):
+                source = root / f"scenario-{index}.txt"
+                normalized = root / f"normalized-{index}.json"
+                source.write_text(f"ГОЛОС ХРОНИКИ: Текст {index}\n", encoding="utf-8")
+                draft = generate_normalization(source, normalized, memory_path=db, use_llm=False)
+                draft["blocks"][0]["type"] = "voiceover"
+                draft["blocks"][0]["text_for_tts"] = f"Текст {index}"
+                saved = save_normalization(normalized, draft, expected_revision=1)
+                candidates = preview_learning_candidates(
+                    normalized, memory_path=db, expected_revision=saved["revision"]
+                )
+                self.assertEqual(len(candidates), 1)
+                confirm_normalization(
+                    normalized, root / f"prepared-{index}.json", root / f"raw-{index}.txt",
+                    memory_path=db, expected_revision=saved["revision"],
+                    learning_decisions=[{
+                        "candidate_id": candidates[0]["id"], "action": "remember",
+                    }],
+                )
+
+            with NormalizationMemory(db) as memory:
+                resolved = memory.resolve_exact("Голос хроники")
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved["rule"]["source"], "correction")
+                self.assertEqual(resolved["rule"]["confirmations"], 2)
+
+    def test_never_decision_suppresses_future_learning_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "memory.sqlite3"
+
+            def corrected_draft(index: int):
+                source = root / f"never-{index}.txt"
+                normalized = root / f"never-{index}.json"
+                source.write_text(f"ГОЛОС ЭПОХИ: Текст {index}\n", encoding="utf-8")
+                draft = generate_normalization(source, normalized, memory_path=db, use_llm=False)
+                draft["blocks"][0]["type"] = "voiceover"
+                draft["blocks"][0]["text_for_tts"] = f"Текст {index}"
+                saved = save_normalization(normalized, draft, expected_revision=1)
+                return normalized, saved
+
+            normalized, saved = corrected_draft(1)
+            candidates = preview_learning_candidates(
+                normalized, memory_path=db, expected_revision=saved["revision"]
+            )
+            confirm_normalization(
+                normalized, root / "never-prepared.json", root / "never-raw.txt",
+                memory_path=db, expected_revision=saved["revision"],
+                learning_decisions=[{
+                    "candidate_id": candidates[0]["id"], "action": "never",
+                }],
+            )
+            second_path, second = corrected_draft(2)
+            self.assertEqual(
+                preview_learning_candidates(
+                    second_path, memory_path=db, expected_revision=second["revision"]
+                ),
+                [],
+            )
 
     def test_sync_metadata_is_normalized_from_known_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,8 +453,15 @@ class NormalizerTests(unittest.TestCase):
             with self.assertRaises(RevisionConflictError):
                 save_normalization(normalized, saved, expected_revision=1)
 
+            candidates = preview_learning_candidates(
+                normalized, memory_path=db, expected_revision=2
+            )
+            self.assertEqual(len(candidates), 1)
             confirmed = confirm_normalization(
-                normalized, prepared, raw, memory_path=db, expected_revision=2
+                normalized, prepared, raw, memory_path=db, expected_revision=2,
+                learning_decisions=[{
+                    "candidate_id": candidates[0]["id"], "action": "remember",
+                }],
             )
             self.assertEqual(confirmed["status"], "confirmed")
             self.assertTrue(is_normalization_confirmed(normalized))
@@ -322,7 +470,10 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(payload["normalization_revision"], confirmed["revision"])
             self.assertIn("ЗК1: Текст", raw.read_text(encoding="utf-8"))
             with NormalizationMemory(db) as memory:
-                self.assertEqual(memory.resolve_exact("Необычный голос")["rule"]["target_type"], "voiceover")
+                rules = [r for r in memory.list_rules() if r["source"] == "correction"]
+                self.assertEqual(len(rules), 1)
+                self.assertEqual(rules[0]["target_type"], "voiceover")
+                self.assertEqual(rules[0]["status"], "candidate")
 
     def test_reset_clears_blocks_and_is_revision_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -376,7 +527,10 @@ class NormalizerTests(unittest.TestCase):
             draft = generate_normalization(source, normalized, memory_path=db, use_llm=False)
             draft["blocks"][0]["type"] = "voiceover"
             draft["blocks"][0]["text_for_tts"] = "Текст"
-            save_normalization(normalized, draft, expected_revision=1)
+            saved = save_normalization(normalized, draft, expected_revision=1)
+            candidates = preview_learning_candidates(
+                normalized, memory_path=db, expected_revision=saved["revision"]
+            )
             original_write = normalizer_module._atomic_write_text
 
             def fail_raw(path, content):
@@ -387,7 +541,10 @@ class NormalizerTests(unittest.TestCase):
             with patch("stage1.normalizer._atomic_write_text", side_effect=fail_raw):
                 with self.assertRaises(OSError):
                     confirm_normalization(
-                        normalized, prepared, raw, memory_path=db, expected_revision=2
+                        normalized, prepared, raw, memory_path=db, expected_revision=2,
+                        learning_decisions=[{
+                            "candidate_id": candidates[0]["id"], "action": "remember",
+                        }],
                     )
 
             with NormalizationMemory(db) as memory:

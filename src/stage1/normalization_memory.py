@@ -74,6 +74,11 @@ class NormalizationMemory:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(alias_id, source_hash)
             );
+            CREATE TABLE IF NOT EXISTS alias_suppressions (
+                normalized_marker TEXT PRIMARY KEY,
+                marker TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -107,8 +112,8 @@ class NormalizationMemory:
         normalized = normalize_marker(marker)
         if not normalized:
             raise ValueError("Marker cannot be empty")
-        if source not in {"manual", "llm"}:
-            raise ValueError("Memory source must be manual or llm")
+        if source not in {"manual", "llm", "correction"}:
+            raise ValueError("Memory source must be manual, llm or correction")
         now = _utcnow()
         rule_status = status or ("active" if source == "manual" else "candidate")
         confirmations = 1 if source == "manual" else 0
@@ -181,7 +186,23 @@ class NormalizationMemory:
     def record_llm_confirmation(
         self, marker: str, target_type: str, source_hash: str
     ) -> dict[str, Any]:
-        rule = self.create_rule(marker, target_type, source="llm", status="candidate")
+        return self.record_candidate_confirmation(
+            marker, target_type, source_hash, source="llm"
+        )
+
+    def record_correction_confirmation(
+        self, marker: str, target_type: str, source_hash: str
+    ) -> dict[str, Any]:
+        return self.record_candidate_confirmation(
+            marker, target_type, source_hash, source="correction"
+        )
+
+    def record_candidate_confirmation(
+        self, marker: str, target_type: str, source_hash: str, *, source: str
+    ) -> dict[str, Any]:
+        if source not in {"llm", "correction"}:
+            raise ValueError("Candidate source must be llm or correction")
+        rule = self.create_rule(marker, target_type, source=source, status="candidate")
         now = _utcnow()
         with self.transaction():
             inserted = self._conn.execute(
@@ -204,6 +225,29 @@ class NormalizationMemory:
         result = self.get_rule(int(rule["id"]))
         assert result is not None
         return result
+
+    def suppress_marker(self, marker: str) -> dict[str, Any]:
+        normalized = normalize_marker(marker)
+        if not normalized:
+            raise ValueError("Marker cannot be empty")
+        now = _utcnow()
+        with self.transaction():
+            self._conn.execute(
+                """INSERT INTO alias_suppressions(normalized_marker, marker, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(normalized_marker) DO UPDATE SET marker=excluded.marker""",
+                (normalized, marker.strip(), now),
+            )
+        return {"marker": marker.strip(), "normalized_marker": normalized, "created_at": now}
+
+    def is_suppressed(self, marker: str) -> bool:
+        normalized = normalize_marker(marker)
+        if not normalized:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM alias_suppressions WHERE normalized_marker=?", (normalized,)
+        ).fetchone()
+        return row is not None
 
     def record_correction(self, rule_id: int) -> dict[str, Any]:
         with self.transaction():
@@ -282,7 +326,7 @@ class NormalizationMemory:
                      WHEN confirmations >= 2 THEN 'active'
                      ELSE 'candidate' END,
                    updated_at=?
-                   WHERE normalized_marker=? AND source='llm' AND status!='disabled'""",
+                   WHERE normalized_marker=? AND source IN ('llm', 'correction') AND status!='disabled'""",
                 (manual_target, now, normalized_marker),
             )
             return

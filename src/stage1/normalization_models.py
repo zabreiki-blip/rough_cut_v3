@@ -48,6 +48,12 @@ class NormalizedBlock:
     timecode_start: str = ""
     timecode_end: str = ""
     notes: str = ""
+    proposed_type: str = ""
+    proposed_label: str = ""
+    proposed_label_confirmed: bool = False
+    proposed_source: str = ""
+    proposed_memory_rule_id: int | None = None
+    continuation_of_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

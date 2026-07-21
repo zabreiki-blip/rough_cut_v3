@@ -27,6 +27,25 @@ def extract_text_from_docx(path: Path) -> str:
     return normalize_whitespace("\n".join(lines))
 
 
+def extract_paragraphs(path: Path) -> list[str]:
+    """Extract logical paragraphs while preserving soft line breaks in DOCX."""
+    path = Path(path)
+    if path.suffix.lower() == ".docx":
+        try:
+            from docx import Document
+        except ImportError as exc:
+            raise RuntimeError(
+                "python-docx is not installed. Install dependencies from requirements.txt."
+            ) from exc
+        return [
+            normalized
+            for text in _iter_docx_text_blocks(Document(str(path)))
+            if (normalized := normalize_whitespace(text))
+        ]
+    text = extract_text(path)
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 def _iter_docx_text_blocks(document: Any):
     """Yield body paragraphs and table-cell paragraphs in document order."""
     from docx.table import Table

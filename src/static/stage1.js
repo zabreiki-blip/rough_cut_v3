@@ -76,6 +76,10 @@
     memory_filter_status: el("memory_filter_status"),
     memory_rules: el("memory_rules"),
     btn_add_memory: el("btn_add_memory"),
+    learning_dialog: el("normalization_learning_dialog"),
+    learning_rule_list: el("learning_rule_list"),
+    btn_cancel_learning: el("btn_cancel_learning"),
+    btn_confirm_with_learning: el("btn_confirm_with_learning"),
     voiceover_lock: el("voiceover_lock"),
     assembly_lock: el("assembly_lock"),
     assembly_gate_message: el("assembly_gate_message"),
@@ -284,7 +288,8 @@
   };
   const sourceLabels = {
     builtin_rule: "правило", rule: "правило", memory: "память",
-    llm: "LLM", manual: "исправлено вручную", unknown: "не определено",
+    llm: "LLM", manual: "исправлено вручную", correction: "ручное обучение",
+    unknown: "не определено",
   };
 
   function escaped(value) {
@@ -392,8 +397,10 @@
     if (!block) return;
     block[control.dataset.field] = control.value;
     if (control.dataset.field === "type") block.block_type = control.value;
-    block.source = "manual";
-    block.decision_source = "manual";
+    if (["type", "original_label"].includes(control.dataset.field)) {
+      block.source = "manual";
+      block.decision_source = "manual";
+    }
     if (control.dataset.field === "type") {
       block.warnings = [];
       if (control.value === "voiceover" && !block.text_for_tts) {
@@ -443,6 +450,41 @@
     normalizationDirty = false;
     renderNormalization();
     toast("Черновик сохранён", "success");
+    return normalization;
+  }
+
+  function chooseLearningDecisions(candidates) {
+    ids.learning_rule_list.innerHTML = candidates.map((candidate) => {
+      const fromLabel = blockTypeLabels[candidate.from_type] || candidate.from_type;
+      const toLabel = blockTypeLabels[candidate.target_type] || candidate.target_type;
+      const snippet = (candidate.snippets || [])[0] || "";
+      const progress = Number(candidate.confirmations || 0);
+      return `<div class="learning-rule" data-candidate-id="${escaped(candidate.id)}">
+        <div><strong>«${escaped(candidate.marker)}» · ${escaped(fromLabel)} → ${escaped(toLabel)}</strong>
+        <small>${escaped(snippet)}${progress ? `<br>Подтверждений: ${progress}/2` : ""}</small></div>
+        <select data-learning-action aria-label="Действие с правилом ${escaped(candidate.marker)}">
+          <option value="this_time" selected>Только в этом сценарии</option>
+          <option value="remember">Запомнить</option>
+        </select>
+      </div>`;
+    }).join("");
+    return new Promise((resolve) => {
+      const cancel = () => {
+        ids.learning_dialog.close();
+        resolve(null);
+      };
+      ids.btn_cancel_learning.onclick = cancel;
+      ids.learning_dialog.oncancel = (event) => { event.preventDefault(); cancel(); };
+      ids.btn_confirm_with_learning.onclick = () => {
+        const decisions = Array.from(ids.learning_rule_list.querySelectorAll(".learning-rule")).map((row) => ({
+          candidate_id: row.dataset.candidateId,
+          action: row.querySelector("[data-learning-action]").value,
+        }));
+        ids.learning_dialog.close();
+        resolve(decisions);
+      };
+      ids.learning_dialog.showModal();
+    });
   }
 
   async function resetNormalization() {
@@ -468,8 +510,15 @@
   async function confirmNormalization() {
     const unknown = normalization.blocks.filter((block) => (block.type || block.block_type) === "unknown").length;
     if (unknown) throw new Error(`Исправьте неопределённые блоки: ${unknown}`);
+    if (normalizationDirty) await saveNormalization();
+    const preview = await requestJSON("/stage1/normalization/confirm/preview", "POST", {
+      project, revision: normalization.revision,
+    });
+    const candidates = preview.candidates || [];
+    const learningDecisions = candidates.length ? await chooseLearningDecisions(candidates) : [];
+    if (learningDecisions === null) return;
     const result = await requestJSON("/stage1/normalization/confirm", "POST", {
-      ...normalizationPayload(),
+      project, revision: normalization.revision, learning_decisions: learningDecisions,
     });
     normalization = canonicalDocument(result);
     normalization.status = "confirmed";
@@ -528,6 +577,7 @@
       const alias = rule.alias || rule.marker || rule.normalized_marker || "";
       const type = rule.block_type || rule.target_type || rule.type || "unknown";
       const status = rule.status || "active";
+      const source = rule.source || "manual";
       const confirmations = Number(rule.confirmations || rule.confirmation_count || 0);
       const corrections = Number(rule.corrections || rule.correction_count || 0);
       const row = document.createElement("div");
@@ -540,7 +590,7 @@
             ${Object.entries(blockTypeLabels).filter(([value]) => value !== "unknown").map(([value, label]) => `<option value="${value}"${value === type ? " selected" : ""}>${label}</option>`).join("")}
           </select>
         </div>
-        <div class="memory-rule-meta">${escaped(status)} · подтверждений ${confirmations} · исправлений ${corrections}</div>
+        <div class="memory-rule-meta">${escaped(sourceLabels[source] || source)} · ${escaped(status)} · подтверждений ${confirmations} · исправлений ${corrections}</div>
         <div class="memory-rule-actions">
           ${status !== "active" ? '<button class="btn btn-sm" data-action="activate-memory" type="button">Активировать</button>' : '<button class="btn btn-sm" data-action="disable-memory" type="button">Отключить</button>'}
           <button class="btn btn-sm" data-action="delete-memory" type="button">Удалить</button>

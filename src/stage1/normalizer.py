@@ -14,7 +14,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .config import get_settings
-from .io_utils import extract_text, read_json
+from .io_utils import extract_paragraphs, extract_text, read_json
 from .normalization_memory import DEFAULT_MEMORY_PATH, NormalizationMemory, normalize_marker
 from .normalization_models import (
     BlockType,
@@ -115,7 +115,6 @@ def _generate_normalization_unlocked(
     paragraphs = _extract_paragraphs(input_path)
     now = _utcnow()
     blocks: list[NormalizedBlock] = []
-    unresolved: list[NormalizedBlock] = []
 
     with NormalizationMemory(memory_path or DEFAULT_MEMORY_PATH) as memory:
         for order, original in enumerate(paragraphs, start=1):
@@ -135,10 +134,10 @@ def _generate_normalization_unlocked(
             _extract_block_metadata(block)
             if block.type == BlockType.VOICEOVER.value:
                 block.text_for_tts = block.normalized_text
-            if block.type == BlockType.UNKNOWN.value:
-                unresolved.append(block)
             blocks.append(block)
 
+        _annotate_continuation_context(blocks)
+        unresolved = [block for block in blocks if block.type == BlockType.UNKNOWN.value]
         if unresolved and use_llm:
             llm = classifier or _openrouter_classifier
             batches = _llm_batches(unresolved)
@@ -174,6 +173,7 @@ def _generate_normalization_unlocked(
                 for block in batch:
                     block.warnings.append(message)
 
+    _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
         source=str(input_path),
         source_hash=source_hash,
@@ -255,6 +255,12 @@ def _save_normalization_unlocked(
         previous = {block.uid: block for block in current.blocks}
         for block in incoming.blocks:
             old = previous.get(block.uid)
+            if old is not None:
+                block.proposed_type = old.proposed_type
+                block.proposed_label = old.proposed_label
+                block.proposed_label_confirmed = old.proposed_label_confirmed
+                block.proposed_source = old.proposed_source
+                block.proposed_memory_rule_id = old.proposed_memory_rule_id
             if old is not None and block.original_label and not old.label_confirmed:
                 _label, content = _split_label(old.original_text)
                 if block.original_label != old.original_label:
@@ -267,8 +273,6 @@ def _save_normalization_unlocked(
             if old is not None and (
                 block.type != old.type
                 or block.original_label != old.original_label
-                or block.normalized_text != old.normalized_text
-                or block.text_for_tts != old.text_for_tts
             ):
                 block.source = DecisionSource.MANUAL.value
                 block.confidence = 1.0
@@ -296,6 +300,7 @@ def confirm_normalization(
     *,
     memory_path: Path | None = None,
     expected_revision: int | None = None,
+    learning_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     with _path_lock(normalized_path):
         return _confirm_normalization_unlocked(
@@ -304,6 +309,7 @@ def confirm_normalization(
             raw_path,
             memory_path=memory_path,
             expected_revision=expected_revision,
+            learning_decisions=learning_decisions,
         )
 
 
@@ -314,6 +320,7 @@ def _confirm_normalization_unlocked(
     *,
     memory_path: Path | None = None,
     expected_revision: int | None = None,
+    learning_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate, learn confirmed aliases, and atomically publish projections."""
     normalized_path = Path(normalized_path)
@@ -329,18 +336,26 @@ def _confirm_normalization_unlocked(
     if errors:
         raise NormalizationValidationError(errors)
 
+    resolved_memory_path = memory_path or DEFAULT_MEMORY_PATH
+    with NormalizationMemory(resolved_memory_path) as memory:
+        learning_candidates = _infer_learning_candidates(scenario, memory)
+    decisions = _validate_learning_decisions(learning_candidates, learning_decisions)
+
     scenario.status = NormalizationStatus.CONFIRMED.value
     scenario.revision += 1
     scenario.updated_at = _utcnow()
     scenario.confirmed_at = scenario.updated_at
     prepared = _prepared_projection(scenario)
     raw_text = _raw_projection(scenario)
+    _snapshot_proposals(scenario.blocks)
     _atomic_write_json(Path(prepared_path), prepared)
     _atomic_write_text(Path(raw_path), raw_text)
     result = scenario.to_dict()
     _atomic_write_json(normalized_path, result)
     try:
-        _learn_from_confirmation(scenario, memory_path or DEFAULT_MEMORY_PATH)
+        _learn_from_confirmation(
+            scenario, resolved_memory_path, learning_candidates, decisions
+        )
     except Exception as exc:
         # Publishing the confirmed scenario is authoritative. A memory failure
         # must not roll it back or make downstream projections inconsistent.
@@ -348,6 +363,22 @@ def _confirm_normalization_unlocked(
             f"Normalization memory was not updated: {type(exc).__name__}: {exc}"
         )
     return result
+
+
+def preview_learning_candidates(
+    normalized_path: Path,
+    *,
+    memory_path: Path | None = None,
+    expected_revision: int | None = None,
+) -> list[dict[str, Any]]:
+    with _path_lock(normalized_path):
+        scenario = NormalizedScenario.from_dict(read_json(Path(normalized_path)))
+        if expected_revision is not None and scenario.revision != expected_revision:
+            raise RevisionConflictError(
+                f"Expected revision {expected_revision}, current revision is {scenario.revision}"
+            )
+        with NormalizationMemory(memory_path or DEFAULT_MEMORY_PATH) as memory:
+            return _infer_learning_candidates(scenario, memory)
 
 
 def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> list[str]:
@@ -467,6 +498,7 @@ def import_legacy_normalization(
                 notes="imported_from_legacy",
             ))
     now = _utcnow()
+    _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
         source=str(source), source_hash=source_hash, blocks=blocks,
         status=NormalizationStatus.DRAFT.value, created_at=now, updated_at=now,
@@ -478,8 +510,40 @@ def import_legacy_normalization(
 
 
 def _extract_paragraphs(input_path: Path) -> list[str]:
-    text = extract_text(input_path)
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    return extract_paragraphs(input_path)
+
+
+def _snapshot_proposals(blocks: list[NormalizedBlock]) -> None:
+    for block in blocks:
+        block.proposed_type = block.type
+        block.proposed_label = block.original_label
+        block.proposed_label_confirmed = block.label_confirmed
+        block.proposed_source = block.source
+        block.proposed_memory_rule_id = block.memory_rule_id
+
+
+def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
+    continuation_type = ""
+    for block in blocks:
+        if block.type == BlockType.VOICEOVER.value:
+            continuation_type = BlockType.VOICEOVER.value
+            continue
+        if block.type != BlockType.UNKNOWN.value or block.original_label:
+            continuation_type = ""
+            continue
+        if continuation_type:
+            block.continuation_of_type = continuation_type
+            if not block.suggested_type:
+                block.suggested_type = continuation_type
+            # A plain paragraph after an explicitly recognized voiceover marker
+            # is part of the same voiceover section. Classify this locally so a
+            # paragraph boundary does not make the result depend on the LLM.
+            _apply_type(
+                block,
+                BlockType.VOICEOVER.value,
+                DecisionSource.BUILTIN_RULE.value,
+                0.9,
+            )
 
 
 def _split_label(text: str) -> tuple[str, str]:
@@ -487,7 +551,7 @@ def _split_label(text: str) -> tuple[str, str]:
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
         return "", text.strip()
-    generic = re.match(r"^\s*([^:–—\n]{1,60}?)\s*[:–—]\s*(.+)$", text)
+    generic = re.match(r"^\s*([^:–—\n]{1,60}?)\s*[:–—]\s*(.+)$", text, flags=re.DOTALL)
     if generic:
         candidate = generic.group(1).strip()
         if len(candidate.split()) <= 6:
@@ -498,7 +562,7 @@ def _split_label(text: str) -> tuple[str, str]:
         match = re.match(
             rf"^\s*({re.escape(marker)})(?:\s*[-.]?\s*\d+[A-Za-zА-Яа-я]?)?\s*[.:\-–—]?\s*(.*)$",
             text,
-            flags=re.I,
+            flags=re.I | re.DOTALL,
         )
         if match and normalize_marker(match.group(1)) == marker:
             return match.group(1).strip(), match.group(2).strip()
@@ -636,6 +700,7 @@ def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
         "original_label": block.original_label,
         "suggested_type": block.suggested_type,
         "suggested_label": block.suggested_label,
+        "continuation_of_type": block.continuation_of_type,
     }
 
 
@@ -655,6 +720,8 @@ def _openrouter_classifier(blocks: list[dict[str, Any]], hint: str) -> list[dict
         "\"text_for_tts\":...,\"speaker\":...,\"role\":...,"
         "\"timecode_start\":...,\"timecode_end\":...,\"notes\":...}]}. "
         "Use unknown when unsure. Do not rewrite original content. "
+        "An item with continuation_of_type=voiceover is an unlabelled paragraph "
+        "continuing the preceding voiceover unless its text clearly starts a new speaker or technical cue. "
         f"Author hint: {hint or '(none)'}. Items: {json.dumps(blocks, ensure_ascii=False)}"
     )
     request_kwargs = {
@@ -791,8 +858,96 @@ def _path_lock(path: Path) -> threading.RLock:
         return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
-def _learn_from_confirmation(scenario: NormalizedScenario, memory_path: Path) -> None:
+def _infer_learning_candidates(
+    scenario: NormalizedScenario, memory: NormalizationMemory
+) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    rules = memory.list_rules()
+    for block in scenario.blocks:
+        from_type = block.proposed_type
+        if (
+            not from_type
+            or block.type == from_type
+            or block.type in {BlockType.UNKNOWN.value, BlockType.OTHER.value}
+            or not block.original_label
+            or not block.label_confirmed
+        ):
+            continue
+        source_label, content = _split_label(block.original_text)
+        normalized = normalize_marker(block.original_label)
+        if not content or normalize_marker(source_label) != normalized:
+            continue
+        if memory.is_suppressed(block.original_label):
+            continue
+        matching = [r for r in rules if r["normalized_marker"] == normalized]
+        if any(
+            r["target_type"] == block.type and r["status"] == "active"
+            for r in matching
+        ):
+            continue
+        candidate_id = sha256(
+            f"correction-v1\n{normalized}\n{from_type}\n{block.type}".encode("utf-8")
+        ).hexdigest()[:20]
+        item = candidates.setdefault(candidate_id, {
+            "id": candidate_id,
+            "marker": block.original_label,
+            "normalized_marker": normalized,
+            "from_type": from_type,
+            "target_type": block.type,
+            "reason": "manual_type_change",
+            "block_uids": [],
+            "orders": [],
+            "snippets": [],
+            "status": "new",
+            "confirmations": 0,
+            "required_confirmations": 2,
+        })
+        item["block_uids"].append(block.uid)
+        item["orders"].append(block.order)
+        item["snippets"].append(content[:160])
+        existing = next(
+            (r for r in matching if r["target_type"] == block.type and r["source"] == "correction"),
+            None,
+        )
+        if existing:
+            item["status"] = existing["status"]
+            item["confirmations"] = int(existing["confirmations"])
+    return list(candidates.values())
+
+
+def _validate_learning_decisions(
+    candidates: list[dict[str, Any]], decisions: list[dict[str, Any]] | None
+) -> dict[str, str]:
+    valid_ids = {item["id"] for item in candidates}
+    result = {item["id"]: "this_time" for item in candidates}
+    seen: set[str] = set()
+    for decision in decisions or []:
+        candidate_id = str(decision.get("candidate_id") or decision.get("id") or "")
+        action = str(decision.get("action") or "")
+        if candidate_id in seen or candidate_id not in valid_ids:
+            raise ValueError("Invalid or duplicate learning candidate decision")
+        if action not in {"remember", "this_time", "never"}:
+            raise ValueError("Learning action must be remember, this_time or never")
+        seen.add(candidate_id)
+        result[candidate_id] = action
+    return result
+
+
+def _learn_from_confirmation(
+    scenario: NormalizedScenario,
+    memory_path: Path,
+    candidates: list[dict[str, Any]],
+    decisions: dict[str, str],
+) -> None:
     with NormalizationMemory(memory_path) as memory:
+        for candidate in candidates:
+            action = decisions.get(candidate["id"], "this_time")
+            if action == "remember":
+                memory.record_correction_confirmation(
+                    candidate["marker"], candidate["target_type"], scenario.source_hash
+                )
+            elif action == "never":
+                memory.suppress_marker(candidate["marker"])
         for block in scenario.blocks:
             if not block.original_label or not block.label_confirmed or block.type in {
                 BlockType.UNKNOWN.value,
@@ -805,7 +960,6 @@ def _learn_from_confirmation(scenario: NormalizedScenario, memory_path: Path) ->
                         memory.record_correction(block.memory_rule_id)
                     except KeyError:
                         pass
-                memory.record_manual(block.original_label, block.type)
             elif block.source == DecisionSource.LLM.value:
                 memory.record_llm_confirmation(
                     block.original_label, block.type, scenario.source_hash

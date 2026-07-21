@@ -7,6 +7,7 @@ import json
 import unittest
 
 import api
+from stage1.normalization_memory import NormalizationMemory
 
 
 class NormalizationApiTest(unittest.TestCase):
@@ -65,7 +66,7 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(saved_response.status_code, 200, saved_response.get_json())
         saved = saved_response.get_json()["result"]
         self.assertEqual(saved["revision"], 2)
-        self.assertEqual(saved["blocks"][0]["source"], "manual")
+        self.assertEqual(saved["blocks"][0]["source"], "builtin_rule")
 
         confirmed_response = self.client.post(
             "/stage1/normalization/confirm",
@@ -258,6 +259,74 @@ class NormalizationApiTest(unittest.TestCase):
         deleted = self.client.delete(f"/stage1/normalization/memory/{rule_id}")
         self.assertEqual(deleted.status_code, 200, deleted.get_json())
         self.assertTrue(deleted.get_json()["result"])
+
+    def test_learning_preview_is_read_only_and_this_time_does_not_learn(self) -> None:
+        source = self.projects / "demo" / "input" / "scenario.txt"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("ГОЛОС ЛЕТОПИСЦА: Текст\n", encoding="utf-8")
+        draft = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "demo", "input_path": str(source), "use_llm": False},
+        ).get_json()["result"]
+        draft["blocks"][0]["type"] = "voiceover"
+        draft["blocks"][0]["text_for_tts"] = "Текст"
+        saved = self.client.put(
+            "/stage1/normalization",
+            json={"project": "demo", "revision": 1, "blocks": draft["blocks"]},
+        ).get_json()["result"]
+        normalized_path = self.projects / "demo" / "work" / "scenario_normalized.json"
+        before = normalized_path.read_bytes()
+
+        preview = self.client.post(
+            "/stage1/normalization/confirm/preview",
+            json={"project": "demo", "revision": saved["revision"]},
+        )
+        self.assertEqual(preview.status_code, 200, preview.get_json())
+        candidates = preview.get_json()["result"]["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(normalized_path.read_bytes(), before)
+        confirmed = self.client.post(
+            "/stage1/normalization/confirm",
+            json={
+                "project": "demo", "revision": saved["revision"],
+                "learning_decisions": [{
+                    "candidate_id": candidates[0]["id"], "action": "this_time",
+                }],
+            },
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
+        with NormalizationMemory(self.memory) as memory:
+            self.assertEqual(memory.list_rules(), [])
+
+    def test_confirm_rejects_forged_learning_candidate(self) -> None:
+        source = self.projects / "demo" / "input" / "scenario.txt"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("ГОЛОС ЛЕТОПИСЦА: Текст\n", encoding="utf-8")
+        draft = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "demo", "input_path": str(source), "use_llm": False},
+        ).get_json()["result"]
+        draft["blocks"][0]["type"] = "voiceover"
+        draft["blocks"][0]["text_for_tts"] = "Текст"
+        saved = self.client.put(
+            "/stage1/normalization",
+            json={"project": "demo", "revision": 1, "blocks": draft["blocks"]},
+        ).get_json()["result"]
+
+        response = self.client.post(
+            "/stage1/normalization/confirm",
+            json={
+                "project": "demo",
+                "revision": saved["revision"],
+                "learning_decisions": [{
+                    "candidate_id": "forged-candidate", "action": "remember",
+                }],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        with NormalizationMemory(self.memory) as memory:
+            self.assertEqual(memory.list_rules(), [])
 
 
 if __name__ == "__main__":

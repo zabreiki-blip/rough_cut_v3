@@ -31,6 +31,7 @@ from stage1.normalizer import (
     generate_normalization,
     import_legacy_normalization,
     load_normalization,
+    preview_learning_candidates,
     reset_normalization,
     save_normalization,
 )
@@ -805,10 +806,34 @@ def stage1_normalization_confirm():
             paths["raw"],
             memory_path=NORMALIZATION_MEMORY_PATH,
             expected_revision=expected_revision,
+            learning_decisions=payload.get("learning_decisions"),
         )
     except Exception as exc:
         return _normalization_exception(exc)
     return jsonify({"ok": True, "project": project, "result": result})
+
+
+@app.post("/stage1/normalization/confirm/preview")
+def stage1_normalization_learning_preview():
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = _resolve_project_name(payload.get("project"))
+        paths = _ensure_project(project)
+        revision_value = payload.get("revision", payload.get("expected_revision"))
+        if revision_value is None:
+            return _json_error("revision is required", 400)
+        candidates = preview_learning_candidates(
+            paths["normalized"],
+            memory_path=NORMALIZATION_MEMORY_PATH,
+            expected_revision=int(revision_value),
+        )
+    except Exception as exc:
+        return _normalization_exception(exc)
+    return jsonify({
+        "ok": True,
+        "project": project,
+        "result": {"revision": int(revision_value), "candidates": candidates},
+    })
 
 
 def _memory_instance() -> NormalizationMemory:
