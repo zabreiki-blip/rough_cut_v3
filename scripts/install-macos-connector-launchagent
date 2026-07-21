@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Installs macOS connector as a LaunchAgent (auto-start on login)
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PLIST_NAME="com.roughcut.macos-connector"
+PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
+LOG_DIR="${ROOT_DIR}/logs"
+PYTHON_BIN="${ROOT_DIR}/.venv/bin/python3"
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+mkdir -p "${LOG_DIR}"
+
+cat > "${PLIST_DST}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_NAME}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>${PYTHON_BIN}</string>
+    <string>-m</string>
+    <string>macos_connector</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>${ROOT_DIR}/src</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>${ROOT_DIR}</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/macos-connector.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/macos-connector.error.log</string>
+</dict>
+</plist>
+PLIST
+
+# Load .env vars into plist EnvironmentVariables if .env exists
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  # inject env vars into already-written plist via PlistBuddy
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    value="${value%$'\r'}"
+    /usr/libexec/PlistBuddy -c \
+      "Add :EnvironmentVariables:${key} string ${value}" \
+      "${PLIST_DST}" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c \
+      "Set :EnvironmentVariables:${key} ${value}" \
+      "${PLIST_DST}" 2>/dev/null || true
+  done < <(grep -v '^\s*#' "${ROOT_DIR}/.env" | grep -v '^\s*$')
+fi
+
+# Unload if already loaded (ignore errors)
+launchctl unload "${PLIST_DST}" 2>/dev/null || true
+
+# Load
+launchctl load "${PLIST_DST}"
+
+echo "✓ LaunchAgent установлен: ${PLIST_DST}"
+echo "✓ Коннектор запущен на порту 8001"
+echo ""
+echo "Управление:"
+echo "  Остановить:    launchctl unload ${PLIST_DST}"
+echo "  Запустить:     launchctl load   ${PLIST_DST}"
+echo "  Статус:        curl http://localhost:8001/health"
+echo "  Удалить:       rm ${PLIST_DST}"
+echo "  Логи:          tail -f ${LOG_DIR}/macos-connector.log"
