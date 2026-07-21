@@ -339,8 +339,10 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
 
     voice = _resolve_macos_voice(voice)
     with tempfile.TemporaryDirectory() as td:
+        src_text = Path(td) / "tts.txt"
         src_aiff = Path(td) / "tts.aiff"
         out_wav = Path(td) / "tts.wav"
+        src_text.write_text(text, encoding="utf-8")
 
         say_cmd = [
             "say",
@@ -350,7 +352,8 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
             str(settings.macos_tts_rate),
             "-o",
             str(src_aiff),
-            text,
+            "-f",
+            str(src_text),
         ]
         try:
             subprocess.run(say_cmd, check=True, capture_output=True, text=True)
@@ -362,7 +365,8 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
                 str(settings.macos_tts_rate),
                 "-o",
                 str(src_aiff),
-                text,
+                "-f",
+                str(src_text),
             ]
             try:
                 subprocess.run(fallback_cmd, check=True, capture_output=True, text=True)

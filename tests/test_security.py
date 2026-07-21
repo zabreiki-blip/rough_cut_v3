@@ -4,12 +4,15 @@ import base64
 import os
 from pathlib import Path
 import re
+import subprocess
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import api
 import macos_connector
+import stage1.gemini_tts as gemini_tts
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -131,6 +134,65 @@ class MacosConnectorAuthenticationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, fake_wav)
         synthesize.assert_called_once()
+
+    def test_multiline_dash_text_is_read_from_file_not_argv(self) -> None:
+        commands = []
+        file_contents = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            if command[0] == "say":
+                path = Path(command[command.index("-f") + 1])
+                file_contents.append(path.read_text(encoding="utf-8"))
+            if command[0] == "afconvert":
+                Path(command[-1]).write_bytes(b"RIFF-test")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        text = "-\nПервая строка\n\nВторой абзац"
+        with patch.object(macos_connector.subprocess, "run", side_effect=fake_run):
+            result = macos_connector._run_say_and_convert(text, "Milena", 175, 24000)
+
+        self.assertEqual(result, b"RIFF-test")
+        say_command = commands[0]
+        self.assertNotIn(text, say_command)
+        self.assertIn("-f", say_command)
+        input_path = Path(say_command[say_command.index("-f") + 1])
+        self.assertEqual(input_path.name, "tts.txt")
+        self.assertEqual(file_contents, [text])
+
+    def test_local_macos_fallback_also_reads_multiline_dash_text_from_file(self) -> None:
+        commands = []
+        file_contents = []
+        say_calls = 0
+
+        def fake_run(command, **_kwargs):
+            nonlocal say_calls
+            commands.append(command)
+            if command[0] == "say":
+                path = Path(command[command.index("-f") + 1])
+                file_contents.append(path.read_text(encoding="utf-8"))
+                say_calls += 1
+                if say_calls == 1:
+                    raise subprocess.CalledProcessError(1, command, stderr="voice unavailable")
+            if command[0] == "afconvert":
+                Path(command[-1]).write_bytes(b"RIFF-local")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        settings = SimpleNamespace(macos_tts_rate=175, macos_tts_sample_rate=24000)
+        text = "-\nПервая строка\n\nВторой абзац"
+        with (
+            patch.object(gemini_tts.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(gemini_tts, "_resolve_macos_voice", return_value="Milena"),
+            patch.object(gemini_tts.subprocess, "run", side_effect=fake_run),
+        ):
+            result = gemini_tts._synthesize_macos_wav(text, settings, "Milena")
+
+        self.assertEqual(result, b"RIFF-local")
+        say_commands = [command for command in commands if command[0] == "say"]
+        self.assertEqual(len(say_commands), 2)
+        self.assertTrue(all("-f" in command for command in say_commands))
+        self.assertTrue(all(text not in command for command in say_commands))
+        self.assertEqual(file_contents, [text, text])
 
 
 class ContainerSecurityConfigurationTest(unittest.TestCase):

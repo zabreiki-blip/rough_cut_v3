@@ -67,10 +67,17 @@ def _voice_exists(voice: str) -> bool:
 
 def _run_say_and_convert(text: str, voice: str, rate: int, sample_rate: int) -> bytes:
     with tempfile.TemporaryDirectory() as td:
+        src_text = Path(td) / "tts.txt"
         src_aiff = Path(td) / "tts.aiff"
         out_wav = Path(td) / "tts.wav"
+        src_text.write_text(text, encoding="utf-8")
 
-        say_cmd = ["say", "-r", str(rate), "-o", str(src_aiff), text]
+        # Passing text as the final positional argument makes `say` parse a
+        # phrase beginning with `-` (common for screenplay dashes) as an option.
+        # A UTF-8 input file keeps arbitrary multiline text out of argv.
+        say_cmd = [
+            "say", "-r", str(rate), "-o", str(src_aiff), "-f", str(src_text)
+        ]
         if voice:
             say_cmd[1:1] = ["-v", voice]
         try:
