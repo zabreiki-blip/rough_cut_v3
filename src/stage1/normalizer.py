@@ -191,6 +191,46 @@ def load_normalization(path: Path) -> dict[str, Any]:
     return NormalizedScenario.from_dict(read_json(Path(path))).to_dict()
 
 
+def reset_normalization(
+    path: Path,
+    *,
+    expected_revision: int | None = None,
+    source_root: Path | None = None,
+) -> dict[str, Any]:
+    """Restore a draft to the current source paragraphs without classification."""
+    with _path_lock(path):
+        path = Path(path)
+        scenario = NormalizedScenario.from_dict(read_json(path))
+        if expected_revision is not None and scenario.revision != expected_revision:
+            raise RevisionConflictError(
+                f"Expected revision {expected_revision}, current revision is {scenario.revision}"
+            )
+        source_path = Path(scenario.source).resolve()
+        if source_root is not None and not source_path.is_relative_to(Path(source_root).resolve()):
+            raise SourceChangedError("Normalization source is outside the project")
+        if not source_path.exists() or _file_hash(source_path) != scenario.source_hash:
+            raise SourceChangedError("Source scenario changed after normalization")
+
+        scenario.blocks = [
+            NormalizedBlock(
+                uid=f"block-{order}-{uuid4().hex[:8]}",
+                order=order,
+                original_text=text,
+                normalized_text=text,
+            )
+            for order, text in enumerate(_extract_paragraphs(source_path), start=1)
+        ]
+        scenario.status = NormalizationStatus.DRAFT.value
+        scenario.revision += 1
+        scenario.hint = ""
+        scenario.warnings = []
+        scenario.updated_at = _utcnow()
+        scenario.confirmed_at = ""
+        result = scenario.to_dict()
+        _atomic_write_json(path, result)
+        return result
+
+
 def save_normalization(
     path: Path,
     payload: dict[str, Any],

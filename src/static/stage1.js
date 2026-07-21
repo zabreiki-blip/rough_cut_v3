@@ -61,6 +61,7 @@
     normalization_empty: el("normalization_empty"),
     normalization_blocks: el("normalization_blocks"),
     btn_normalize: el("btn_normalize"),
+    btn_reset_normalization: el("btn_reset_normalization"),
     btn_save_normalization: el("btn_save_normalization"),
     btn_confirm_normalization: el("btn_confirm_normalization"),
     btn_add_normalization_block: el("btn_add_normalization_block"),
@@ -166,6 +167,7 @@
     busy = state;
     [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline,
       ids.btn_normalize, ids.btn_save_normalization, ids.btn_confirm_normalization, ids.btn_add_normalization_block,
+      ids.btn_reset_normalization,
       ids.btn_add_memory].forEach((b) => {
       if (b) b.disabled = state;
     });
@@ -182,6 +184,7 @@
     const confirmed = isNormalizationConfirmed();
     const blocked = !confirmed;
     if (ids.btn_save_normalization) ids.btn_save_normalization.disabled = !hasDraft || !normalizationDirty;
+    if (ids.btn_reset_normalization) ids.btn_reset_normalization.disabled = !hasDraft;
     if (ids.btn_confirm_normalization) {
       ids.btn_confirm_normalization.disabled = !hasDraft || (confirmed && !normalizationDirty);
     }
@@ -438,6 +441,26 @@
     normalizationDirty = false;
     renderNormalization();
     toast("Черновик сохранён", "success");
+  }
+
+  async function resetNormalization() {
+    if (!normalization) return;
+    const accepted = window.confirm(
+      "Очистить всю разметку и вернуть блоки к исходному сценарию? " +
+      "Ручные правки текущей нормализации будут потеряны. Исходник, WAV и память обозначений не изменятся."
+    );
+    if (!accepted) return;
+    const result = await requestJSON("/stage1/normalization/reset", "POST", {
+      project, revision: normalization.revision,
+    });
+    normalization = canonicalDocument(result);
+    normalizationEligible = false;
+    normalizationDirty = false;
+    ids.normalization_hint.value = "";
+    renderNormalization();
+    toast("Разметка очищена. Блоки восстановлены из исходного сценария.", "success");
+    appendLog(`Нормализация очищена: ${normalization.blocks.length} исходных блоков`);
+    await refreshStatus();
   }
 
   async function confirmNormalization() {
@@ -853,6 +876,7 @@
     renderNormalization();
   });
   ids.btn_normalize.addEventListener("click", () => safely(generateNormalization));
+  ids.btn_reset_normalization.addEventListener("click", () => safely(resetNormalization));
   ids.btn_save_normalization.addEventListener("click", () => safely(saveNormalization));
   ids.btn_confirm_normalization.addEventListener("click", () => safely(confirmNormalization));
   ids.btn_add_memory.addEventListener("click", () => safely(addMemoryRule));

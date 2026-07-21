@@ -126,6 +126,49 @@ class NormalizationApiTest(unittest.TestCase):
         )
         self.assertEqual(conflict.status_code, 409)
 
+    def test_reset_restores_source_without_touching_outputs_or_wav(self) -> None:
+        source = self._source()
+        generated = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "demo", "input_path": str(source), "use_llm": False},
+        ).get_json()["result"]
+        confirmed_response = self.client.post(
+            "/stage1/normalization/confirm",
+            json={"project": "demo", "revision": generated["revision"]},
+        )
+        confirmed = confirmed_response.get_json()["result"]
+        project = self.projects / "demo"
+        prepared = project / "work" / "scenario_prepared.json"
+        raw = project / "work" / "scenario_raw.txt"
+        wav = project / "speaker" / "zk1.wav"
+        wav.parent.mkdir(parents=True, exist_ok=True)
+        wav.write_bytes(b"existing wav sentinel")
+        prepared_before = prepared.read_bytes()
+        raw_before = raw.read_bytes()
+
+        response = self.client.post(
+            "/stage1/normalization/reset",
+            json={"project": "demo", "revision": confirmed["revision"]},
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        reset = response.get_json()["result"]
+        self.assertEqual(reset["status"], "draft")
+        self.assertEqual(reset["revision"], confirmed["revision"] + 1)
+        self.assertEqual([block["type"] for block in reset["blocks"]], ["unknown", "unknown"])
+        self.assertEqual(prepared.read_bytes(), prepared_before)
+        self.assertEqual(raw.read_bytes(), raw_before)
+        self.assertEqual(wav.read_bytes(), b"existing wav sentinel")
+        self.assertEqual(
+            self.client.post("/stage1/tts", json={"project": "demo", "dry_run": True}).status_code,
+            409,
+        )
+        stale = self.client.post(
+            "/stage1/normalization/reset",
+            json={"project": "demo", "revision": confirmed["revision"]},
+        )
+        self.assertEqual(stale.status_code, 409)
+
     def test_get_imports_legacy_outputs_as_unconfirmed_draft(self) -> None:
         source = self._source()
         work = source.parent.parent / "work"

@@ -18,6 +18,7 @@ from stage1.normalizer import (
     import_legacy_normalization,
     is_normalization_confirmed,
     load_normalization,
+    reset_normalization,
     save_normalization,
 )
 
@@ -322,6 +323,38 @@ class NormalizerTests(unittest.TestCase):
             self.assertIn("ЗК1: Текст", raw.read_text(encoding="utf-8"))
             with NormalizationMemory(db) as memory:
                 self.assertEqual(memory.resolve_exact("Необычный голос")["rule"]["target_type"], "voiceover")
+
+    def test_reset_restores_unclassified_source_and_is_revision_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            normalized = root / "normalized.json"
+            source.write_text("ДИКТОР: Исходный текст\nСНХ: Исходный ответ\n", encoding="utf-8")
+            draft = generate_normalization(
+                source, normalized, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            draft["blocks"].reverse()
+            for index, block in enumerate(draft["blocks"], start=1):
+                block["order"] = index
+                block["normalized_text"] = "Ручная правка"
+            saved = save_normalization(normalized, draft, expected_revision=1)
+
+            reset = reset_normalization(
+                normalized, expected_revision=saved["revision"], source_root=root
+            )
+
+            self.assertEqual(reset["revision"], saved["revision"] + 1)
+            self.assertEqual(reset["status"], "draft")
+            self.assertEqual(reset["hint"], "")
+            self.assertEqual(
+                [block["original_text"] for block in reset["blocks"]],
+                ["ДИКТОР: Исходный текст", "СНХ: Исходный ответ"],
+            )
+            self.assertTrue(all(block["normalized_text"] == block["original_text"] for block in reset["blocks"]))
+            self.assertTrue(all(block["type"] == "unknown" for block in reset["blocks"]))
+            self.assertTrue(all(block["source"] == "unknown" for block in reset["blocks"]))
+            with self.assertRaises(RevisionConflictError):
+                reset_normalization(normalized, expected_revision=saved["revision"], source_root=root)
 
     def test_unknown_blocks_prevent_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

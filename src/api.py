@@ -31,6 +31,7 @@ from stage1.normalizer import (
     generate_normalization,
     import_legacy_normalization,
     load_normalization,
+    reset_normalization,
     save_normalization,
 )
 from stage1.validator import validate_stage1
@@ -754,6 +755,25 @@ def stage1_normalization_save():
         document = _normalization_payload_for_save(payload, paths["normalized"])
         result = save_normalization(
             paths["normalized"], document, expected_revision=expected_revision
+        )
+    except Exception as exc:
+        return _normalization_exception(exc)
+    return jsonify({"ok": True, "project": project, "result": result})
+
+
+@app.post("/stage1/normalization/reset")
+def stage1_normalization_reset():
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = _resolve_project_name(payload.get("project"))
+        paths = _ensure_project(project)
+        revision_value = payload.get("revision", payload.get("expected_revision"))
+        if revision_value is None:
+            return _json_error("revision is required", 400)
+        result = reset_normalization(
+            paths["normalized"],
+            expected_revision=int(revision_value),
+            source_root=paths["root"],
         )
     except Exception as exc:
         return _normalization_exception(exc)
