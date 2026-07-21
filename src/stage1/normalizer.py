@@ -197,7 +197,7 @@ def reset_normalization(
     expected_revision: int | None = None,
     source_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Restore a draft to the current source paragraphs without classification."""
+    """Clear all normalization blocks while preserving source identity and revision history."""
     with _path_lock(path):
         path = Path(path)
         scenario = NormalizedScenario.from_dict(read_json(path))
@@ -211,15 +211,7 @@ def reset_normalization(
         if not source_path.exists() or _file_hash(source_path) != scenario.source_hash:
             raise SourceChangedError("Source scenario changed after normalization")
 
-        scenario.blocks = [
-            NormalizedBlock(
-                uid=f"block-{order}-{uuid4().hex[:8]}",
-                order=order,
-                original_text=text,
-                normalized_text=text,
-            )
-            for order, text in enumerate(_extract_paragraphs(source_path), start=1)
-        ]
+        scenario.blocks = []
         scenario.status = NormalizationStatus.DRAFT.value
         scenario.revision += 1
         scenario.hint = ""

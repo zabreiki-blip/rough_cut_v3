@@ -324,7 +324,7 @@ class NormalizerTests(unittest.TestCase):
             with NormalizationMemory(db) as memory:
                 self.assertEqual(memory.resolve_exact("Необычный голос")["rule"]["target_type"], "voiceover")
 
-    def test_reset_restores_unclassified_source_and_is_revision_safe(self) -> None:
+    def test_reset_clears_blocks_and_is_revision_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "scenario.txt"
@@ -346,13 +346,7 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(reset["revision"], saved["revision"] + 1)
             self.assertEqual(reset["status"], "draft")
             self.assertEqual(reset["hint"], "")
-            self.assertEqual(
-                [block["original_text"] for block in reset["blocks"]],
-                ["ДИКТОР: Исходный текст", "СНХ: Исходный ответ"],
-            )
-            self.assertTrue(all(block["normalized_text"] == block["original_text"] for block in reset["blocks"]))
-            self.assertTrue(all(block["type"] == "unknown" for block in reset["blocks"]))
-            self.assertTrue(all(block["source"] == "unknown" for block in reset["blocks"]))
+            self.assertEqual(reset["blocks"], [])
             with self.assertRaises(RevisionConflictError):
                 reset_normalization(normalized, expected_revision=saved["revision"], source_root=root)
 

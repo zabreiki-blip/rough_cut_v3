@@ -180,7 +180,9 @@
 
   function updateActionAvailability() {
     if (busy) return;
-    const hasDraft = Boolean(normalization && Array.isArray(normalization.blocks));
+    const hasDraft = Boolean(
+      normalization && Array.isArray(normalization.blocks) && normalization.blocks.length > 0
+    );
     const confirmed = isNormalizationConfirmed();
     const blocked = !confirmed;
     if (ids.btn_save_normalization) ids.btn_save_normalization.disabled = !hasDraft || !normalizationDirty;
@@ -446,8 +448,8 @@
   async function resetNormalization() {
     if (!normalization) return;
     const accepted = window.confirm(
-      "Очистить всю разметку и вернуть блоки к исходному сценарию? " +
-      "Ручные правки текущей нормализации будут потеряны. Исходник, WAV и память обозначений не изменятся."
+      "Очистить всю нормализацию? Все блоки и ручные правки будут удалены. " +
+      "Исходник, WAV и память обозначений не изменятся."
     );
     if (!accepted) return;
     const result = await requestJSON("/stage1/normalization/reset", "POST", {
@@ -458,8 +460,8 @@
     normalizationDirty = false;
     ids.normalization_hint.value = "";
     renderNormalization();
-    toast("Разметка очищена. Блоки восстановлены из исходного сценария.", "success");
-    appendLog(`Нормализация очищена: ${normalization.blocks.length} исходных блоков`);
+    toast("Нормализация очищена. Можно запустить её заново.", "success");
+    appendLog("Нормализация очищена: блоки удалены");
     await refreshStatus();
   }
 

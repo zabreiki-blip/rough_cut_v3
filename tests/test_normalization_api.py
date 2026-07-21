@@ -155,7 +155,7 @@ class NormalizationApiTest(unittest.TestCase):
         reset = response.get_json()["result"]
         self.assertEqual(reset["status"], "draft")
         self.assertEqual(reset["revision"], confirmed["revision"] + 1)
-        self.assertEqual([block["type"] for block in reset["blocks"]], ["unknown", "unknown"])
+        self.assertEqual(reset["blocks"], [])
         self.assertEqual(prepared.read_bytes(), prepared_before)
         self.assertEqual(raw.read_bytes(), raw_before)
         self.assertEqual(wav.read_bytes(), b"existing wav sentinel")
