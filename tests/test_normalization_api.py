@@ -41,6 +41,19 @@ class NormalizationApiTest(unittest.TestCase):
         )
         return source
 
+    def test_list_projects_returns_only_valid_directories_sorted(self) -> None:
+        for name in ("zeta", "alpha_02", "invalid project"):
+            (self.projects / name).mkdir()
+        (self.projects / "plain-file").write_text("not a project", encoding="utf-8")
+
+        response = self.client.get("/projects")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"ok": True, "projects": ["alpha_02", "zeta"]},
+        )
+
     def test_generate_save_confirm_and_get(self) -> None:
         source = self._source()
         generated_response = self.client.post(

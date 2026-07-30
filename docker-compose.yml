@@ -8,6 +8,14 @@ services:
       - .env
     environment:
       - PYTHONPATH=/app/src
+      - SYNC_WHISPER_BACKEND=faster-whisper
+      - SYNC_WHISPER_MODEL=${SYNC_WHISPER_MODEL:-medium}
+      - SYNC_WHISPER_DEVICE=cpu
+      - SYNC_WHISPER_COMPUTE_TYPE=int8
+      - SYNC_WHISPER_TIMEOUT_SECONDS=${SYNC_WHISPER_TIMEOUT_SECONDS:-14400}
+      - SYNC_AUDIO_MAX_BYTES=${SYNC_AUDIO_MAX_BYTES:-4294967296}
+      - HF_HOME=/app/.cache/huggingface
+      - ROUGH_CUT_CEP_CORS=1
     ports:
       - "127.0.0.1:8000:8000"
     extra_hosts:
@@ -15,6 +23,7 @@ services:
     volumes:
       - ./projects:/app/projects
       - ./data:/app/data
+      - whisper_cache:/app/.cache/huggingface
     command: gunicorn -b 0.0.0.0:8000 --workers 1 --timeout 600 api:app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -22,3 +31,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 5s
+
+volumes:
+  whisper_cache:

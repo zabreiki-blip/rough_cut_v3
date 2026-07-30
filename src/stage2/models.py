@@ -13,10 +13,23 @@ class TimelineSegment:
     text: str
     duration_sec: float
     start_sec: float = 0.0
+    # Stable canonical normalization block identifier.
+    block_uid: str = ""
+    # Parent normalization block when one speaker block expands into fragments.
+    parent_block_uid: str = ""
     # SNH-specific
     speaker: str = ""
     role: str = ""
     timecode: str = ""
+    timecode_end: str = ""
+    # Registered synchronized Premiere sequence and aligned source range.
+    source_id: str = ""
+    sequence_name: str = ""
+    sequence_id: str = ""
+    source_in_sec: float = 0.0
+    source_out_sec: float = 0.0
+    match_status: str = ""
+    match_confidence: float = 0.0
     # ZK-specific
     wav_path: str = ""
     # placeholder PNG (generated for SNH)

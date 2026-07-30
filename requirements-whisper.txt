@@ -1,0 +1,2 @@
+# Local Stage 2 transcription backend used by the Docker service.
+faster-whisper>=1.1.0,<2

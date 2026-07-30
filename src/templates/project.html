@@ -344,6 +344,79 @@
         <h2>Сборка таймлайна</h2>
         <p class="section-copy">Соберите подтверждённый сценарий и готовые WAV-файлы в монтажный таймлайн.</p>
         <div id="assembly_gate_message" class="gate-message">Подтвердите нормализацию сценария, чтобы открыть сборку.</div>
+
+        <section class="sync-workspace" aria-labelledby="sync_workspace_title">
+          <div class="sync-heading">
+            <div>
+              <h3 id="sync_workspace_title">Автоматическое сопоставление СНХ</h3>
+              <p class="section-copy">Распознавание аудиогидов и поиск реплик в зарегистрированных синхронизированных секвенциях.</p>
+            </div>
+            <span id="sync_job_status" class="live-pill" data-state="idle">не запускалось</span>
+          </div>
+
+          <div class="sync-source-summary">
+            <div>
+              <span class="sync-summary-label">Источники Premiere</span>
+              <strong id="sync_sources_count">0</strong>
+              <span id="sync_sources_names" class="sync-source-names">Нет зарегистрированных секвенций</span>
+            </div>
+            <div class="sync-source-actions">
+              <label class="sync-timecode-mode">
+                <span>Таймкоды</span>
+                <select id="sync_timecode_mode">
+                  <option value="relative">От начала секвенции</option>
+                  <option value="display">Экранный timecode Premiere</option>
+                </select>
+              </label>
+              <button id="btn_sync_align" class="btn btn-accent" type="button" disabled>
+                Найти СНХ автоматически
+              </button>
+            </div>
+          </div>
+
+          <div id="sync_job_progress" class="sync-job-progress" hidden aria-live="polite">
+            <div class="sync-progress-copy">
+              <span id="sync_job_message">Подготовка…</span>
+              <span id="sync_job_numbers">0/0</span>
+            </div>
+            <div class="progress-wrap sync-progress-wrap">
+              <div id="sync_progress_bar" class="progress-bar"></div>
+            </div>
+          </div>
+
+          <div class="sync-stats" aria-label="Статус сопоставления СНХ">
+            <div class="sync-stat" data-state="auto">
+              <strong id="sync_count_auto">0</strong>
+              <span>Найдено</span>
+            </div>
+            <div class="sync-stat" data-state="confirmed">
+              <strong id="sync_count_confirmed">0</strong>
+              <span>Подтверждено</span>
+            </div>
+            <div class="sync-stat" data-state="review">
+              <strong id="sync_count_review">0</strong>
+              <span>Проверить</span>
+            </div>
+            <div class="sync-stat" data-state="unmatched">
+              <strong id="sync_count_unmatched">0</strong>
+              <span>Не найдено</span>
+            </div>
+          </div>
+
+          <div class="sync-review">
+            <div class="sync-review-heading">
+              <div>
+                <h3>Требуют проверки</h3>
+                <p class="section-copy">Прослушайте диапазон, выберите альтернативу или поправьте in/out перед подтверждением.</p>
+              </div>
+              <span id="sync_review_count" class="speaker-count">0 фрагментов</span>
+            </div>
+            <div id="sync_review_list" class="sync-review-list">
+              <div class="empty-state compact">Результатов сопоставления пока нет.</div>
+            </div>
+          </div>
+        </section>
+
         <div class="actions assembly-actions">
           <button id="btn_build_timeline" class="btn btn-primary" disabled>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="4" rx="1"/><rect x="3" y="10" width="11" height="4" rx="1"/><rect x="3" y="17" width="15" height="4" rx="1"/></svg>

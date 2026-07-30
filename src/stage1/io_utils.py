@@ -212,9 +212,16 @@ def extract_paragraphs_from_docx(path: Path) -> list[DocxParagraph]:
 
 
 def extract_text_from_doc(path: Path) -> str:
-    # Try catdoc first, fall back to macOS textutil
+    # ``catdoc`` wraps output to the document's visual line width by default,
+    # turning one Word paragraph into many fake scenario blocks. Prefer
+    # antiword with unlimited line width; keep catdoc ``-w`` and macOS textutil
+    # as fallbacks for unusual legacy files.
     last_error: str = ""
-    for cmd in (["catdoc", str(path)], ["textutil", "-convert", "txt", "-stdout", str(path)]):
+    for cmd in (
+        ["antiword", "-w", "0", str(path)],
+        ["catdoc", "-w", str(path)],
+        ["textutil", "-convert", "txt", "-stdout", str(path)],
+    ):
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return normalize_whitespace(proc.stdout)

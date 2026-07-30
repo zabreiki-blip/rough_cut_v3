@@ -22,6 +22,7 @@ from .normalization_models import (
     NormalizationStatus,
     NormalizedBlock,
     NormalizedScenario,
+    SyncFragment,
     VALID_BLOCK_TYPES,
 )
 
@@ -71,6 +72,22 @@ _SYNC_METADATA = re.compile(
     r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*"
     r"([^,]{2,80}),\s*(\d{1,2}[:.]\d{2}(?:[:.]\d{2})?)"
     r"[.\s–\-]*(.*)$",
+    re.DOTALL,
+)
+_SYNC_LABEL_METADATA = re.compile(
+    r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*([^,]{2,160})$"
+)
+_SYNC_NAME_ONLY_LABEL = re.compile(
+    r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)+$"
+)
+_SYNC_CONTINUATION_NOTE = re.compile(
+    r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE
+)
+_TIMECODE_TOKEN = r"\[?\d{1,2}[:.]\d{2}(?:[:.]\d{2})?\]?"
+_SYNC_FRAGMENT = re.compile(
+    rf"(?P<start>{_TIMECODE_TOKEN})"
+    rf"(?:\s*[-–—]\s*(?P<end>{_TIMECODE_TOKEN}))?"
+    rf"[.\s]*(?P<text>.*?)(?=(?:{_TIMECODE_TOKEN})|$)",
     re.DOTALL,
 )
 _LLM_CONFIDENCE_THRESHOLD = 0.65
@@ -551,6 +568,19 @@ def _split_label(text: str) -> tuple[str, str]:
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
         return "", text.strip()
+    # A formal speaker credit can be much longer than an ordinary marker. It
+    # is safe to accept only when its content starts with a structural timecode
+    # (optionally after a "Продолжение синхрона" note).
+    speaker = re.match(r"^\s*([^:\n]{2,240}?)\s*:\s*(.+)$", text, flags=re.DOTALL)
+    if speaker:
+        candidate = speaker.group(1).strip()
+        content = speaker.group(2).strip()
+        sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
+        if (
+            _SYNC_LABEL_METADATA.match(candidate)
+            or _SYNC_NAME_ONLY_LABEL.match(candidate)
+        ) and _TIMECODE.match(sync_content):
+            return candidate, content
     generic = re.match(r"^\s*([^:–—\n]{1,60}?)\s*[:–—]\s*(.+)$", text, flags=re.DOTALL)
     if generic:
         candidate = generic.group(1).strip()
@@ -603,8 +633,20 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
                 f"Possible learned alias '{block.suggested_label}' ({suggestion['score']:.0%})"
             )
     stripped = block.original_text.strip()
-    if re.match(r"^(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\(…\)|\(\.\.\.\))", stripped):
+    _label, content = _split_label(block.original_text)
+    sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
+    if (
+        (
+            _SYNC_LABEL_METADATA.match(block.original_label)
+            or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
+        )
+        and _TIMECODE.match(sync_content)
+    ):
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif re.match(r"^(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\(…\)|\(\.\.\.\))", stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+    elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
     elif stripped.startswith("(") and stripped.endswith(")"):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.8)
 
@@ -618,7 +660,7 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
     timecodes = _TIMECODE.findall(block.original_text)
     if timecodes:
         block.timecode_start = timecodes[0]
-        if len(timecodes) > 1:
+        if len(timecodes) > 1 and block.type != BlockType.SYNC.value:
             block.timecode_end = timecodes[1]
 
 
@@ -627,15 +669,53 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         block.speaker = block.original_label or "ВЕДУЩИЙ"
     if block.type != BlockType.SYNC.value:
         return
+    fragment_source = _SYNC_CONTINUATION_NOTE.sub("", block.normalized_text)
+    has_sync_metadata = False
     match = _SYNC_METADATA.match(block.normalized_text)
-    if not match:
+    if match:
+        block.speaker = match.group(1).strip()
+        block.role = match.group(2).strip()
+        fragment_source = block.normalized_text[match.start(3):].strip()
+        has_sync_metadata = True
+    else:
+        label_match = _SYNC_LABEL_METADATA.match(block.original_label)
+        name_only_match = _SYNC_NAME_ONLY_LABEL.match(block.original_label)
+        if label_match and _TIMECODE.match(fragment_source):
+            block.speaker = label_match.group(1).strip()
+            block.role = label_match.group(2).strip()
+            has_sync_metadata = True
+        elif name_only_match and _TIMECODE.match(fragment_source):
+            block.speaker = block.original_label.strip()
+            has_sync_metadata = True
+
+    # A bare timecoded paragraph is an older supported sync form whose
+    # normalized_text intentionally retains the leading timecode. Structured
+    # fragments apply only when the block also has explicit speaker metadata.
+    if not has_sync_metadata:
         return
-    block.speaker = match.group(1).strip()
-    block.role = match.group(2).strip()
-    block.timecode_start = match.group(3).strip()
-    remaining = match.group(4).strip()
-    if remaining:
-        block.normalized_text = remaining
+    fragments = _extract_sync_fragments(fragment_source)
+    if not fragments:
+        return
+    block.sync_fragments = fragments
+    block.timecode_start = fragments[0].timecode_start
+    block.timecode_end = fragments[0].timecode_end
+    block.normalized_text = " ".join(fragment.text for fragment in fragments if fragment.text)
+
+
+def _extract_sync_fragments(text: str) -> list[SyncFragment]:
+    fragments: list[SyncFragment] = []
+    for match in _SYNC_FRAGMENT.finditer(text):
+        # The punctuation belongs to the quote; only structural whitespace and
+        # separators around the next timecode are discarded.
+        fragment_text = match.group("text").strip(" \t\r\n–—-")
+        if not fragment_text:
+            continue
+        fragments.append(SyncFragment(
+            text=fragment_text,
+            timecode_start=match.group("start").strip("[]"),
+            timecode_end=(match.group("end") or "").strip("[]"),
+        ))
+    return fragments
 
 
 def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, Any]]) -> None:

@@ -284,6 +284,152 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["role"], "эксперт")
             self.assertEqual(block["timecode_start"], "01.02.03")
             self.assertEqual(block["normalized_text"], "Ответ героя")
+            self.assertEqual(block["sync_fragments"], [{
+                "text": "Ответ героя",
+                "timecode_start": "01.02.03",
+            }])
+
+    def test_sync_speaker_block_can_contain_multiple_timecoded_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "ИРИНА КОТОВА, ИСТОРИК: 01:22:29. Шодэ приехал к нам из Одессы, где его "
+                "семья жила с середины 19-ого века. Образование он получил во Франции "
+                "художественное. 01:23:36. Был он человеком очень восприимчивым к разным "
+                "стилям. 01:24:11. Он строил особняки многофасадные.\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["speaker"], "ИРИНА КОТОВА")
+            self.assertEqual(block["role"], "ИСТОРИК")
+            self.assertEqual(block["timecode_start"], "01:22:29")
+            self.assertEqual(block["timecode_end"], "")
+            self.assertEqual(block["sync_fragments"], [
+                {
+                    "text": (
+                        "Шодэ приехал к нам из Одессы, где его семья жила с середины "
+                        "19-ого века. Образование он получил во Франции художественное."
+                    ),
+                    "timecode_start": "01:22:29",
+                },
+                {
+                    "text": "Был он человеком очень восприимчивым к разным стилям.",
+                    "timecode_start": "01:23:36",
+                },
+                {
+                    "text": "Он строил особняки многофасадные.",
+                    "timecode_start": "01:24:11",
+                },
+            ])
+
+    def test_sync_fragments_survive_docx_soft_line_breaks(self) -> None:
+        from docx import Document
+        from docx.enum.text import WD_BREAK
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.docx"
+            document = Document()
+            paragraph = document.add_paragraph(
+                "ИРИНА КОТОВА, ИСТОРИК: 01:22:29. Первый фрагмент"
+            )
+            paragraph.add_run().add_break(WD_BREAK.LINE)
+            paragraph.add_run("01:23:36. Второй фрагмент")
+            paragraph.add_run().add_break(WD_BREAK.LINE)
+            paragraph.add_run("01:24:11. Третий фрагмент")
+            document.save(source)
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+
+            self.assertEqual(len(result["blocks"]), 1)
+            self.assertEqual(
+                [item["timecode_start"] for item in result["blocks"][0]["sync_fragments"]],
+                ["01:22:29", "01:23:36", "01:24:11"],
+            )
+
+    def test_long_formal_speaker_role_is_sync_without_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "ЕЛЕНА САДОВНИК, СТАРШИЙ НАУЧНЫЙ СОТРУДНИК МУЗЕЯ "
+                "СИМБИРСКОГО КУПЕЧЕСТВА: 00:24:54. Образование он получил дома.\n",
+                encoding="utf-8",
+            )
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["speaker"], "ЕЛЕНА САДОВНИК")
+            self.assertEqual(block["timecode_start"], "00:24:54")
+
+    def test_name_only_and_continuation_note_speaker_forms_are_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "ЕЛЕНА САДОВНИК: 00:31:16. Семейная история.\n"
+                "ИРИНА КОТОВА: (Продолжение синхрона) 01:25:03. Продолжение ответа.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
+            self.assertEqual([block["speaker"] for block in blocks], ["ЕЛЕНА САДОВНИК", "ИРИНА КОТОВА"])
+            self.assertEqual([block["timecode_start"] for block in blocks], ["00:31:16", "01:25:03"])
+
+    def test_unprefixed_shot_plan_is_technical_not_voiceover_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "ЗАКАДР: Основной текст.\nПланы дома Шатрова\nПортреты архитектора Шодэ\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], [
+                "voiceover", "technical", "technical",
+            ])
+
+    def test_sync_fragment_explicit_range_has_optional_end_timecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, эксперт, 01:02:03–01:02:08 Ответ героя\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["timecode_start"], "01:02:03")
+            self.assertEqual(block["timecode_end"], "01:02:08")
+            self.assertEqual(block["sync_fragments"], [{
+                "text": "Ответ героя",
+                "timecode_start": "01:02:03",
+                "timecode_end": "01:02:08",
+            }])
 
     def test_llm_classifies_only_unresolved_without_drops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

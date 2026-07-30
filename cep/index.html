@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rough Cut v3 — Sync</title>
+    <link rel="stylesheet" href="css/panel.css">
+  </head>
+  <body>
+    <header class="panel-header">
+      <div>
+        <div class="eyebrow">ROUGH CUT v3</div>
+        <h1>Sync automation</h1>
+      </div>
+      <span id="hostBadge" class="badge badge-muted">host…</span>
+    </header>
+
+    <main>
+      <details class="card config-card">
+        <summary>Подключение к проекту</summary>
+        <div class="card-body grid">
+          <div class="field-group">
+            <label for="projectName">Проект</label>
+            <div class="input-action">
+              <select id="projectName">
+                <option value="">Введите API token и обновите список</option>
+              </select>
+              <button
+                id="refreshProjects"
+                class="button button-secondary icon-button"
+                type="button"
+                title="Обновить список проектов"
+                aria-label="Обновить список проектов">↻</button>
+            </div>
+          </div>
+          <label>
+            Backend URL
+            <input id="apiBaseUrl" type="url" value="http://127.0.0.1:8000" autocomplete="off">
+          </label>
+          <label>
+            API token
+            <input id="apiToken" type="password" placeholder="Не сохраняется" autocomplete="off">
+          </label>
+          <label>
+            Общий каталог projects
+            <input id="projectsRoot" type="text" placeholder="/path/to/rough_cut_v3/projects" autocomplete="off">
+          </label>
+          <label>
+            Маршрут Whisper job
+            <input id="transcribePath" type="text" value="/stage2/sync-jobs/start" autocomplete="off">
+          </label>
+          <button id="saveConfig" class="button button-secondary">Сохранить настройки</button>
+        </div>
+      </details>
+
+      <section class="card">
+        <div class="card-heading">
+          <div>
+            <div class="step">1 · ИСТОЧНИК</div>
+            <h2>Sync-секвенция</h2>
+          </div>
+          <button id="inspectActive" class="button button-secondary">Считать активную</button>
+        </div>
+        <div class="card-body">
+          <div id="activeSequence" class="sequence-summary empty">Активная секвенция ещё не считана.</div>
+          <label>
+            Source ID
+            <input id="sourceId" type="text" placeholder="vasilieva_01" autocomplete="off">
+          </label>
+          <label>
+            Спикеры
+            <input id="speakerName" type="text" placeholder="Татьяна Васильева, Иван Иванов" autocomplete="off">
+          </label>
+          <label class="checkbox-label">
+            <input id="allSpeakers" type="checkbox">
+            В этой секвенции находятся все спикеры проекта
+          </label>
+          <div class="button-row">
+            <button id="registerSequence" class="button button-primary" disabled>Зарегистрировать</button>
+            <button id="resolveSequence" class="button button-secondary" disabled>Проверить ссылку</button>
+          </div>
+          <hr>
+          <label>
+            Guide WAV
+            <input id="guideOutputPath" type="text" placeholder="Заполнится из общего каталога projects" autocomplete="off">
+          </label>
+          <label>
+            Encoder preset (.epr, необязательно)
+            <input id="presetPath" type="text" placeholder="Автопоиск Wave48mono24.epr" autocomplete="off">
+          </label>
+          <label class="checkbox-label">
+            <input id="overwriteGuide" type="checkbox">
+            Перезаписать существующий guide WAV
+          </label>
+          <button id="exportAndTranscribe" class="button button-primary full-width" disabled>Экспортировать звук → Whisper</button>
+          <p class="hint">Регистрация: <code>POST /stage2/sync-sources</code>. Видео остаётся в Premiere.</p>
+        </div>
+      </section>
+
+      <section class="card whisper-card">
+        <div class="card-heading">
+          <div>
+            <div class="step">WHISPER</div>
+            <h2>Распознавание и поиск СНХ</h2>
+          </div>
+          <span id="whisperStatus" class="badge badge-muted">ожидание</span>
+        </div>
+        <div class="card-body">
+          <div class="whisper-stage" aria-live="polite">
+            <div>
+              <div id="whisperMessage" class="whisper-message">Задача ещё не запущена.</div>
+              <div id="whisperCurrent" class="whisper-current">Источник: —</div>
+            </div>
+            <div class="whisper-progress" id="whisperProgress" role="progressbar" aria-label="Прогресс Whisper">
+              <div id="whisperProgressFill" class="whisper-progress-fill"></div>
+            </div>
+            <div class="whisper-progress-meta">
+              <span id="whisperProgressText">—</span>
+              <span id="whisperEta">Осталось: —</span>
+            </div>
+          </div>
+          <div class="whisper-stats">
+            <div><span>Источники</span><strong id="whisperSources">0 / 0</strong></div>
+            <div><span>Реплики</span><strong id="whisperSegments">0 / 0</strong></div>
+            <div><span>Найдено</span><strong id="whisperMatched">0</strong></div>
+            <div><span>Проверить</span><strong id="whisperReview">0</strong></div>
+            <div><span>Не найдено</span><strong id="whisperUnmatched">0</strong></div>
+          </div>
+          <button id="refreshWhisper" class="button button-secondary full-width" type="button">Обновить статус</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-heading">
+          <div>
+            <div class="step">2 · ПРОВЕРКА</div>
+            <h2>Вставка диапазона</h2>
+          </div>
+        </div>
+        <div class="card-body grid">
+          <p class="hint full-width">Активная секвенция в момент нажатия — целевая. Зарегистрированная выше — источник.</p>
+          <div class="field-row">
+            <label>
+              Source in, сек
+              <input id="sourceIn" type="number" min="0" step="0.001" value="0">
+            </label>
+            <label>
+              Source out, сек
+              <input id="sourceOut" type="number" min="0" step="0.001" value="10">
+            </label>
+          </div>
+          <div class="field-row">
+            <label>
+              Timeline, сек
+              <input id="timelineAt" type="number" min="0" step="0.001" value="0">
+            </label>
+            <label>
+              Режим
+              <select id="insertMode">
+                <option value="ripple_replace">Sync-safe replace placeholder</option>
+                <option value="insert">Insert</option>
+                <option value="overwrite">Overwrite (диагностика)</option>
+              </select>
+            </label>
+          </div>
+          <label class="full-width">
+            Имя плейсхолдера для ripple replace
+            <input id="placeholderName" type="text" value="snh1_placeholder.png">
+          </label>
+          <div class="field-row">
+            <label>
+              Видеодорожка
+              <input id="videoTrack" type="number" min="1" step="1" value="1">
+            </label>
+            <label>
+              Аудиодорожка
+              <input id="audioTrack" type="number" min="1" step="1" value="1">
+            </label>
+          </div>
+          <button id="insertRange" class="button button-danger full-width" disabled>Вставить тестовый диапазон</button>
+          <p class="warning full-width">Операция меняет активную целевую секвенцию. Для первого теста используйте её копию.</p>
+          <hr>
+          <button id="inspectLayout" class="button button-secondary full-width">Снимок дорожек 0–40 с</button>
+          <button id="conformAll" class="button button-primary full-width">Подтянуть все подтверждённые СНХ</button>
+          <p class="warning full-width">One-pass conform: каждый существующий клип перемещается не более одного раза. Используйте копию секвенции.</p>
+          <p class="hint full-width">Удаляет соответствующий PNG без ripple, одинаково сдвигает все последующие дорожки и вставляет nested sequence.</p>
+        </div>
+      </section>
+
+      <section class="card log-card">
+        <div class="card-heading">
+          <div>
+            <div class="step">ЖУРНАЛ</div>
+            <h2>Результат</h2>
+          </div>
+          <button id="clearLog" class="button button-link">Очистить</button>
+        </div>
+        <pre id="log" aria-live="polite">Панель загружается…</pre>
+      </section>
+    </main>
+
+    <script src="js/CSInterface.js"></script>
+    <script src="js/main.js"></script>
+  </body>
+</html>

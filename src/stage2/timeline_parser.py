@@ -45,6 +45,36 @@ _TIMECODE_LINE_RE = re.compile(r"^(" + _TC_PAT + r")[.\s–\-]*(.*)", re.DOTALL)
 SNH_PLACEHOLDER_DURATION = 10.0  # seconds
 
 
+def sync_fragment_id(block_uid: str, index: int, count: int) -> str:
+    """Return a stable match id while preserving legacy ids for one-part blocks."""
+    return block_uid if count <= 1 else f"{block_uid}::fragment:{index + 1}"
+
+
+def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
+    """Read canonical speaker fragments with a backward-compatible fallback."""
+    raw_fragments = block.get("sync_fragments")
+    fragments: list[dict[str, str]] = []
+    if isinstance(raw_fragments, list):
+        for value in raw_fragments:
+            if not isinstance(value, dict):
+                continue
+            text = str(value.get("text") or "").strip()
+            if not text:
+                continue
+            fragments.append({
+                "text": text,
+                "timecode_start": str(value.get("timecode_start") or "").strip(),
+                "timecode_end": str(value.get("timecode_end") or "").strip(),
+            })
+    if fragments:
+        return fragments
+    return [{
+        "text": str(block.get("normalized_text") or block.get("original_text") or "").strip(),
+        "timecode_start": str(block.get("timecode_start") or "").strip(),
+        "timecode_end": str(block.get("timecode_end") or "").strip(),
+    }]
+
+
 def _wav_duration(path: Path) -> float:
     try:
         with wave.open(str(path), "rb") as f:
@@ -246,6 +276,8 @@ def parse_normalized_timeline(
     placeholder_dir: Path,
     project: str,
     fps: int = 25,
+    sync_matches: dict[str, object] | None = None,
+    sync_sources: dict[str, object] | None = None,
 ) -> FullTimeline:
     """Build a timeline directly from a confirmed canonical normalization."""
     if str(normalization.get("status", "")).lower() != "confirmed":
@@ -257,10 +289,20 @@ def parse_normalized_timeline(
         normalization.get("blocks", []),
         key=lambda item: int(item.get("order", 0) or 0),
     )
+    matches = sync_matches or {}
+    sources = sync_sources or {}
+
+    def field(item: object | None, name: str, default: object = "") -> object:
+        if item is None:
+            return default
+        if isinstance(item, dict):
+            return item.get(name, default)
+        return getattr(item, name, default)
 
     for block in blocks:
         block_type = str(block.get("type", "unknown")).lower()
         text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
+        block_uid = str(block.get("uid") or "").strip()
 
         if block_type == "voiceover":
             counters["voiceover"] += 1
@@ -271,24 +313,67 @@ def parse_normalized_timeline(
                 type="zk",
                 text=text,
                 duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
+                block_uid=block_uid,
                 wav_path=str(wav_path) if wav_path.exists() else "",
             ))
             continue
 
         if block_type in {"sync", "host"}:
-            counters[block_type] += 1
             prefix = "snh" if block_type == "sync" else "host"
-            seg_id = f"{prefix}{counters[block_type]}"
-            segments.append(TimelineSegment(
-                id=seg_id,
-                type="snh" if block_type == "sync" else "host",
-                text=text,
-                duration_sec=SNH_PLACEHOLDER_DURATION,
-                speaker=str(block.get("speaker") or block.get("original_label") or prefix).strip(),
-                role=str(block.get("role") or ("СНХ" if block_type == "sync" else "ВЕДУЩИЙ")).strip(),
-                timecode=str(block.get("timecode_start") or "").strip(),
-                placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
-            ))
+            fragments = (
+                normalized_sync_fragments(block)
+                if block_type == "sync"
+                else [{
+                    "text": text,
+                    "timecode_start": str(block.get("timecode_start") or "").strip(),
+                    "timecode_end": str(block.get("timecode_end") or "").strip(),
+                }]
+            )
+            for fragment_index, fragment in enumerate(fragments):
+                counters[block_type] += 1
+                seg_id = f"{prefix}{counters[block_type]}"
+                fragment_uid = sync_fragment_id(block_uid, fragment_index, len(fragments))
+                # Ordinal legacy ids (snh1, snh2, ...) become ambiguous as soon
+                # as one canonical block expands into multiple timeline items.
+                # Keep that fallback only for a one-part block.
+                match = matches.get(fragment_uid)
+                if match is None and len(fragments) == 1:
+                    match = matches.get(seg_id)
+                match_status = str(field(match, "status", "") or "")
+                source_id = str(field(match, "source_id", "") or "")
+                source = sources.get(source_id)
+                source_in = float(field(match, "source_in_sec", 0.0) or 0.0)
+                source_out = float(field(match, "source_out_sec", 0.0) or 0.0)
+                matched = (
+                    match_status in {"auto_matched", "confirmed"}
+                    and source_id
+                    and source_out > source_in >= 0
+                )
+                segments.append(TimelineSegment(
+                    id=seg_id,
+                    type="snh" if block_type == "sync" else "host",
+                    text=fragment["text"],
+                    duration_sec=(
+                        source_out - source_in if matched else SNH_PLACEHOLDER_DURATION
+                    ),
+                    block_uid=fragment_uid,
+                    parent_block_uid=block_uid,
+                    speaker=str(block.get("speaker") or block.get("original_label") or prefix).strip(),
+                    role=str(block.get("role") or ("СНХ" if block_type == "sync" else "ВЕДУЩИЙ")).strip(),
+                    timecode=fragment["timecode_start"],
+                    timecode_end=fragment["timecode_end"],
+                    source_id=source_id,
+                    sequence_name=str(
+                        field(source, "premiere_sequence", field(source, "sequence_name", ""))
+                        or ""
+                    ),
+                    sequence_id=str(field(source, "sequence_id", "") or ""),
+                    source_in_sec=source_in,
+                    source_out_sec=source_out,
+                    match_status=match_status,
+                    match_confidence=float(field(match, "confidence", 0.0) or 0.0),
+                    placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+                ))
             continue
 
         counters["tech"] += 1
@@ -297,6 +382,7 @@ def parse_normalized_timeline(
             type="tech",
             text=text,
             duration_sec=0.0,
+            block_uid=block_uid,
         ))
 
     cursor = 0.0

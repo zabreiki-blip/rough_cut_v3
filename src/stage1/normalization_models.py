@@ -28,6 +28,30 @@ class NormalizationStatus(str, Enum):
 
 
 @dataclass
+class SyncFragment:
+    text: str
+    timecode_start: str
+    timecode_end: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        payload = {
+            "text": self.text,
+            "timecode_start": self.timecode_start,
+        }
+        if self.timecode_end:
+            payload["timecode_end"] = self.timecode_end
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SyncFragment":
+        return cls(
+            text=str(value.get("text", "")),
+            timecode_start=str(value.get("timecode_start", "")),
+            timecode_end=str(value.get("timecode_end", "")),
+        )
+
+
+@dataclass
 class NormalizedBlock:
     uid: str
     order: int
@@ -47,6 +71,7 @@ class NormalizedBlock:
     role: str = ""
     timecode_start: str = ""
     timecode_end: str = ""
+    sync_fragments: list[SyncFragment] = field(default_factory=list)
     notes: str = ""
     proposed_type: str = ""
     proposed_label: str = ""
@@ -56,12 +81,20 @@ class NormalizedBlock:
     continuation_of_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["sync_fragments"] = [fragment.to_dict() for fragment in self.sync_fragments]
+        return payload
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NormalizedBlock":
         fields = cls.__dataclass_fields__
-        return cls(**{key: value[key] for key in fields if key in value})
+        kwargs = {key: value[key] for key in fields if key in value and key != "sync_fragments"}
+        kwargs["sync_fragments"] = [
+            SyncFragment.from_dict(item)
+            for item in (value.get("sync_fragments") or [])
+            if isinstance(item, dict)
+        ]
+        return cls(**kwargs)
 
 
 @dataclass

@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+import importlib.util
+from math import isfinite
+import os
+from pathlib import Path
+import platform
+import threading
+from typing import Any, Callable
+
+
+class WhisperUnavailableError(RuntimeError):
+    """Raised when none of the supported local Whisper backends is installed."""
+
+
+class WhisperTranscriptionError(RuntimeError):
+    """Raised when a backend did not return usable word timestamps."""
+
+
+SUPPORTED_BACKENDS = ("mlx-whisper", "faster-whisper", "openai-whisper")
+_MODEL_CACHE: dict[tuple[str, ...], tuple[Any, threading.Lock]] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+ProgressCallback = Callable[[float, float, int], None]
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    processed_sec: float,
+    duration_sec: float,
+    word_count: int,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(
+            max(0.0, float(processed_sec)),
+            max(0.0, float(duration_sec)),
+            max(0, int(word_count)),
+        )
+    except Exception:
+        # A UI/status update must never abort an expensive transcription.
+        pass
+
+
+def _cached_model(key: tuple[str, ...], loader) -> tuple[Any, threading.Lock]:
+    """Load each heavyweight model once per API process."""
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.get(key)
+        if cached is None:
+            cached = (loader(), threading.Lock())
+            _MODEL_CACHE[key] = cached
+        return cached
+
+
+def _module_available(module: str) -> bool:
+    return importlib.util.find_spec(module) is not None
+
+
+def available_backends() -> list[str]:
+    available: list[str] = []
+    if _module_available("mlx_whisper"):
+        available.append("mlx-whisper")
+    if _module_available("faster_whisper"):
+        available.append("faster-whisper")
+    if _module_available("whisper"):
+        available.append("openai-whisper")
+    return available
+
+
+def resolve_backend(requested: str | None = None) -> str:
+    value = (requested or os.getenv("SYNC_WHISPER_BACKEND", "auto")).strip().lower()
+    aliases = {
+        "mlx": "mlx-whisper",
+        "faster": "faster-whisper",
+        "openai": "openai-whisper",
+        "whisper": "openai-whisper",
+    }
+    value = aliases.get(value, value)
+    installed = available_backends()
+
+    if value != "auto":
+        if value not in SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"unsupported Whisper backend '{value}'; "
+                f"expected auto or one of {', '.join(SUPPORTED_BACKENDS)}"
+            )
+        if value not in installed:
+            raise WhisperUnavailableError(
+                f"Whisper backend '{value}' is not installed"
+            )
+        return value
+
+    preferred = list(SUPPORTED_BACKENDS)
+    if platform.system() != "Darwin" or platform.machine() not in {"arm64", "aarch64"}:
+        preferred = ["faster-whisper", "openai-whisper", "mlx-whisper"]
+    for backend in preferred:
+        if backend in installed:
+            return backend
+    raise WhisperUnavailableError(
+        "No local Whisper backend is installed. Install mlx-whisper on Apple "
+        "Silicon, faster-whisper, or openai-whisper."
+    )
+
+
+def _default_model(backend: str) -> str:
+    configured = os.getenv("SYNC_WHISPER_MODEL", "").strip()
+    if configured:
+        if backend == "mlx-whisper" and "/" not in configured:
+            return f"mlx-community/whisper-{configured}-mlx"
+        return configured
+    if backend == "mlx-whisper":
+        return "mlx-community/whisper-medium-mlx"
+    return "medium"
+
+
+def _clean_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for item in words:
+        text = str(item.get("word") or item.get("text") or "").strip()
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not text or not isfinite(start) or not isfinite(end) or start < 0 or end < start:
+            continue
+        cleaned.append({
+            "word": text,
+            "start": round(start, 3),
+            "end": round(end, 3),
+        })
+    cleaned.sort(key=lambda item: (item["start"], item["end"]))
+    return cleaned
+
+
+def _words_from_mapping(result: dict[str, Any]) -> list[dict[str, Any]]:
+    direct = result.get("words")
+    if isinstance(direct, list):
+        words = _clean_words([item for item in direct if isinstance(item, dict)])
+        if words:
+            return words
+
+    flattened: list[dict[str, Any]] = []
+    for segment in result.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        for word in segment.get("words") or []:
+            if isinstance(word, dict):
+                flattened.append(word)
+    return _clean_words(flattened)
+
+
+def _transcribe_mlx(
+    audio_path: Path, model: str, language: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    import mlx_whisper  # type: ignore[import-not-found]
+
+    result = mlx_whisper.transcribe(
+        str(audio_path),
+        path_or_hf_repo=model,
+        language=language,
+        word_timestamps=True,
+    )
+    words = _words_from_mapping(result)
+    return words, {"detected_language": result.get("language", language)}
+
+
+def _transcribe_faster(
+    audio_path: Path,
+    model: str,
+    language: str,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+
+    device = os.getenv("SYNC_WHISPER_DEVICE", "auto").strip() or "auto"
+    compute_type = os.getenv("SYNC_WHISPER_COMPUTE_TYPE", "default").strip() or "default"
+    whisper_model, model_lock = _cached_model(
+        ("faster-whisper", model, device, compute_type),
+        lambda: WhisperModel(model, device=device, compute_type=compute_type),
+    )
+    # Backend model instances are not guaranteed to be thread-safe.
+    raw_words: list[dict[str, Any]] = []
+    with model_lock:
+        segments, info = whisper_model.transcribe(
+            str(audio_path),
+            language=language,
+            word_timestamps=True,
+            vad_filter=True,
+        )
+        duration_sec = float(getattr(info, "duration", 0.0) or 0.0)
+        _emit_progress(progress_callback, 0.0, duration_sec, 0)
+        for segment in segments:
+            for word in segment.words or []:
+                raw_words.append({
+                    "word": word.word,
+                    "start": word.start,
+                    "end": word.end,
+                })
+            _emit_progress(
+                progress_callback,
+                float(getattr(segment, "end", 0.0) or 0.0),
+                duration_sec,
+                len(raw_words),
+            )
+    return _clean_words(raw_words), {
+        "detected_language": getattr(info, "language", language),
+        "language_probability": getattr(info, "language_probability", None),
+        "duration_sec": duration_sec,
+    }
+
+
+def _transcribe_openai(
+    audio_path: Path, model: str, language: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    import whisper  # type: ignore[import-not-found]
+
+    whisper_model, model_lock = _cached_model(
+        ("openai-whisper", model),
+        lambda: whisper.load_model(model),
+    )
+    with model_lock:
+        result = whisper_model.transcribe(
+            str(audio_path),
+            language=language,
+            word_timestamps=True,
+            verbose=False,
+        )
+    words = _words_from_mapping(result)
+    return words, {"detected_language": result.get("language", language)}
+
+
+def transcribe_audio(
+    audio_path: str | Path,
+    *,
+    backend: str | None = None,
+    model: str | None = None,
+    language: str = "ru",
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Transcribe a sequence guide WAV into the canonical word-index format."""
+    path = Path(audio_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"audio guide not found: {path}")
+
+    selected = resolve_backend(backend)
+    selected_model = (model or _default_model(selected)).strip()
+    if not selected_model:
+        raise ValueError("Whisper model must not be empty")
+
+    if selected == "mlx-whisper":
+        words, backend_meta = _transcribe_mlx(path, selected_model, language)
+    elif selected == "faster-whisper":
+        words, backend_meta = _transcribe_faster(
+            path,
+            selected_model,
+            language,
+            progress_callback,
+        )
+    else:
+        words, backend_meta = _transcribe_openai(path, selected_model, language)
+
+    if not words:
+        raise WhisperTranscriptionError(
+            f"{selected} returned no usable word timestamps for {path.name}"
+        )
+
+    completed_duration = float(
+        backend_meta.get("duration_sec") or words[-1]["end"]
+    )
+    _emit_progress(
+        progress_callback,
+        completed_duration,
+        completed_duration,
+        len(words),
+    )
+
+    return {
+        "schema_version": 1,
+        "audio_path": str(path),
+        "backend": selected,
+        "model": selected_model,
+        "language": language,
+        "created_at": datetime.now(UTC).isoformat(),
+        "duration_sec": words[-1]["end"],
+        "word_count": len(words),
+        "words": words,
+        "backend_metadata": backend_meta,
+    }

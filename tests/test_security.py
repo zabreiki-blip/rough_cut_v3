@@ -81,6 +81,49 @@ class ApiAuthenticationTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_local_cep_cors_preflight_is_explicit_and_auth_remains_required(self) -> None:
+        api.app.config["API_TOKEN"] = "correct-token"
+        api.app.config["CEP_CORS_ENABLED"] = True
+        self.addCleanup(api.app.config.pop, "CEP_CORS_ENABLED", None)
+
+        preflight = self.client.options(
+            "/stage2/sync-sources",
+            headers={
+                "Origin": "null",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        self.assertEqual(preflight.status_code, 200)
+        self.assertEqual(preflight.headers["Access-Control-Allow-Origin"], "null")
+        self.assertIn(
+            "Authorization",
+            preflight.headers["Access-Control-Allow-Headers"],
+        )
+
+        unauthenticated = self.client.get(
+            "/stage2/sync-sources?project=demo",
+            headers={"Origin": "null"},
+        )
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(
+            unauthenticated.headers["Access-Control-Allow-Origin"],
+            "null",
+        )
+
+        untrusted_origin = self.client.options(
+            "/stage2/sync-sources",
+            headers={
+                "Origin": "https://example.invalid",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertEqual(untrusted_origin.status_code, 401)
+        self.assertNotIn(
+            "Access-Control-Allow-Origin",
+            untrusted_origin.headers,
+        )
+
     def test_health_is_public_when_token_is_not_configured(self) -> None:
         api.app.config["API_TOKEN"] = ""
 
@@ -218,7 +261,11 @@ class ContainerSecurityConfigurationTest(unittest.TestCase):
         }
         self.assertEqual(
             mounts,
-            {"./projects:/app/projects", "./data:/app/data"},
+            {
+                "./projects:/app/projects",
+                "./data:/app/data",
+                "whisper_cache:/app/.cache/huggingface",
+            },
         )
 
     def test_dockerfile_runs_as_non_root_user(self) -> None:

@@ -8,7 +8,9 @@ import os
 from pathlib import Path
 import re
 import threading
+from typing import BinaryIO
 import uuid
+import wave
 
 try:
     from dotenv import load_dotenv
@@ -36,8 +38,17 @@ from stage1.normalizer import (
     save_normalization,
 )
 from stage1.validator import validate_stage1
-from stage2.timeline_parser import parse_normalized_timeline
+from stage2.timeline_parser import (
+    normalized_sync_fragments,
+    parse_normalized_timeline,
+    sync_fragment_id,
+)
 from stage2.placeholder import generate_placeholder
+from stage2.sync_matcher import MatcherConfig, SyncMatcher
+from stage2.sync_models import AlignmentRequest, SyncMatch, SyncSource
+from stage2.sync_storage import SyncMatchStore, SyncSourceStore
+from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
+from stage2.whisper_process import transcribe_audio_in_process as transcribe_audio
 from stage2.xml_export import build_xml
 
 
@@ -46,6 +57,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = ROOT_DIR / "projects"
 NORMALIZATION_MEMORY_PATH = ROOT_DIR / "data" / "normalization_memory.sqlite3"
 PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SYNC_SOURCE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,96}$")
 _TTS_JOBS: dict[str, dict] = {}
 _TTS_JOBS_LOCK = threading.Lock()
 _TTS_JOBS_MAX = 200
@@ -55,6 +67,14 @@ _TTS_SEMAPHORE = threading.Semaphore(_TTS_CONCURRENT_MAX)
 _TTS_ACTIVE_PROJECTS: set[str] = set()
 _SOURCE_HASH_CACHE: dict[str, tuple[int, int, str]] = {}
 _SOURCE_HASH_CACHE_LOCK = threading.Lock()
+_SYNC_JOBS: dict[str, dict] = {}
+_SYNC_JOBS_LOCK = threading.Lock()
+_SYNC_ACTIVE_PROJECTS: set[str] = set()
+_SYNC_DATA_LOCK = threading.Lock()
+
+
+class AudioUploadTooLargeError(ValueError):
+    """Raised after the actual uploaded stream exceeds its byte limit."""
 
 
 def _api_token() -> str:
@@ -74,9 +94,30 @@ def _request_token() -> str:
     return request.headers.get("X-API-Token", "").strip()
 
 
+def _cep_cors_enabled() -> bool:
+    configured = app.config.get("CEP_CORS_ENABLED")
+    if configured is not None:
+        return bool(configured)
+    return os.getenv("ROUGH_CUT_CEP_CORS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _cep_cors_origin() -> str:
+    if not _cep_cors_enabled():
+        return ""
+    origin = request.headers.get("Origin", "").strip()
+    return origin if origin in {"null", "file://"} else ""
+
+
 @app.before_request
 def require_api_authentication():
     if request.endpoint == "health":
+        return None
+    # CEP panels run from a local file origin. Let an explicitly enabled local
+    # preflight reach Flask's automatic OPTIONS response; actual requests still
+    # require the normal Bearer token below.
+    if request.method == "OPTIONS" and _cep_cors_origin():
         return None
     expected = _api_token()
     # Tests must opt into auth explicitly; production always fails closed.
@@ -90,6 +131,23 @@ def require_api_authentication():
     response = jsonify({"ok": False, "error": "unauthorized"})
     response.status_code = 401
     response.headers["WWW-Authenticate"] = 'Basic realm="Rough Cut", charset="UTF-8"'
+    return response
+
+
+@app.after_request
+def add_cep_cors_headers(response):
+    origin = _cep_cors_origin()
+    if not origin:
+        return response
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Authorization, Content-Type, X-API-Token"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    )
+    response.headers["Access-Control-Max-Age"] = "600"
+    response.headers.add("Vary", "Origin")
     return response
 
 
@@ -121,6 +179,11 @@ def _project_paths(project: str) -> dict[str, Path]:
         "normalized": root / "work" / "scenario_normalized.json",
         "prepared": root / "work" / "scenario_prepared.json",
         "raw": root / "work" / "scenario_raw.txt",
+        "sync_sources": root / "work" / "sync_sources.json",
+        "sync_matches": root / "work" / "sync_matches.json",
+        "sync_audio": root / "work" / "sync_audio",
+        "sync_transcripts": root / "work" / "transcripts",
+        "timeline": root / "work" / "full_timeline.json",
     }
 
 
@@ -129,6 +192,8 @@ def _ensure_project(project: str) -> dict[str, Path]:
     paths["input"].mkdir(parents=True, exist_ok=True)
     paths["work"].mkdir(parents=True, exist_ok=True)
     paths["speaker"].mkdir(parents=True, exist_ok=True)
+    paths["sync_audio"].mkdir(parents=True, exist_ok=True)
+    paths["sync_transcripts"].mkdir(parents=True, exist_ok=True)
     return paths
 
 
@@ -529,6 +594,12 @@ def _run_tts_job(
 def project_home():
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     return render_template("index.html", projects=_list_projects())
+
+
+@app.get("/projects")
+def list_projects():
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    return jsonify({"ok": True, "projects": _list_projects()})
 
 
 @app.post("/projects")
@@ -1169,6 +1240,988 @@ def stage1_validate():
 
 # ── Stage 2 ────────────────────────────────────────────────────────────────────
 
+def _sync_source_id(raw: object) -> str:
+    source_id = str(raw or "").strip()
+    if not SYNC_SOURCE_ID_RE.fullmatch(source_id):
+        raise ValueError("source id must match ^[a-zA-Z0-9_-]{1,96}$")
+    return source_id
+
+
+def _sync_stores(paths: dict[str, Path]) -> tuple[SyncSourceStore, SyncMatchStore]:
+    return SyncSourceStore(paths["sync_sources"]), SyncMatchStore(paths["sync_matches"])
+
+
+def _source_api_dict(source: SyncSource) -> dict:
+    result = source.to_dict()
+    result["sequence_name"] = source.premiere_sequence
+    return result
+
+
+def _match_api_dict(match: SyncMatch) -> dict:
+    result = match.to_dict()
+    result["block_uid"] = str(
+        match.metadata.get("parent_block_uid") or match.segment_id
+    )
+    return result
+
+
+def _word_index_path(paths: dict[str, Path], source_id: str) -> Path:
+    return paths["sync_transcripts"] / f"{_sync_source_id(source_id)}.words.json"
+
+
+def _canonical_audio_path(paths: dict[str, Path], source_id: str) -> Path:
+    return paths["sync_audio"] / f"{_sync_source_id(source_id)}.wav"
+
+
+def _resolve_sync_audio_path(source: SyncSource, paths: dict[str, Path]) -> Path:
+    """Resolve configured guide audio without allowing a project-root escape."""
+    canonical = _canonical_audio_path(paths, source.id)
+    if canonical.is_file():
+        return canonical
+    value = str(source.guide_audio or "").strip()
+    if not value:
+        return canonical
+    configured = Path(value)
+    candidates = (
+        [configured]
+        if configured.is_absolute()
+        else [paths["root"] / configured, paths["work"] / configured]
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(paths["root"].resolve()):
+            raise ValueError("guide_audio must be inside the project directory")
+        if resolved.is_file():
+            return resolved
+    return candidates[0].resolve()
+
+
+def _copy_stream_limited(
+    source: BinaryIO,
+    destination: Path,
+    max_bytes: int,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> int:
+    """Copy a binary stream while enforcing the limit on bytes actually read."""
+    if max_bytes <= 0:
+        raise ValueError("audio upload limit must be positive")
+    if chunk_size <= 0:
+        raise ValueError("chunk size must be positive")
+    written = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("xb") as output:
+        while True:
+            chunk = source.read(min(chunk_size, max_bytes - written + 1))
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                raise AudioUploadTooLargeError("audio upload is too large")
+            output.write(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    return written
+
+
+def _sync_quote(block: dict) -> str:
+    """Remove a scenario speaker/role/timecode prefix before fuzzy matching."""
+    text = str(
+        block.get("normalized_text") or block.get("original_text") or ""
+    ).strip()
+    if not text:
+        return ""
+
+    timecode = str(block.get("timecode_start") or "").strip()
+    timecode_end = str(block.get("timecode_end") or "").strip()
+    if timecode:
+        position = text.find(timecode)
+        # Only a timestamp in the scenario prefix is structural. A timestamp
+        # mentioned later in the quote must remain part of the quote.
+        if 0 <= position <= 180:
+            end = position + len(timecode)
+            if timecode_end:
+                end_position = text.find(timecode_end, end, end + 32)
+                if end_position >= 0:
+                    between = text[end:end_position]
+                    if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", between):
+                        end = end_position + len(timecode_end)
+            quote = text[end:].lstrip(" \t\r\n:;,.…—–-")
+            if quote:
+                return quote
+
+    speaker = str(block.get("speaker") or "").strip()
+    role = str(block.get("role") or "").strip()
+    if speaker and text.casefold().startswith(speaker.casefold()):
+        remainder = text[len(speaker):].lstrip(" \t,")
+        if role and remainder.casefold().startswith(role.casefold()):
+            remainder = remainder[len(role):]
+        quote = remainder.lstrip(" \t\r\n:;,.…—–-")
+        if quote:
+            return quote
+    return text
+
+
+def _sync_alignment_units(blocks: list[dict]) -> list[dict[str, object]]:
+    """Expand a canonical speaker block into independently matchable pieces."""
+    units: list[dict[str, object]] = []
+    last_speaker = {"sync": "", "host": ""}
+    for block in blocks:
+        block_type = str(block.get("type") or "").lower()
+        parent_uid = str(block.get("uid") or "").strip()
+        if not parent_uid:
+            units.append({"segment_id": "", "parent_block_uid": "", "block": block})
+            continue
+        speaker = str(block.get("speaker") or "").strip()
+        if speaker:
+            last_speaker[block_type] = speaker
+        else:
+            speaker = last_speaker.get(block_type, "")
+        raw_fragments = block.get("sync_fragments")
+        fragments = (
+            normalized_sync_fragments(block)
+            if block_type == "sync" and isinstance(raw_fragments, list) and raw_fragments
+            else [{
+                "text": _sync_quote(block),
+                "timecode_start": str(block.get("timecode_start") or "").strip(),
+                "timecode_end": str(block.get("timecode_end") or "").strip(),
+            }]
+        )
+        for index, fragment in enumerate(fragments):
+            units.append({
+                "segment_id": sync_fragment_id(parent_uid, index, len(fragments)),
+                "parent_block_uid": parent_uid,
+                "fragment_index": index,
+                "fragment_count": len(fragments),
+                "text": fragment["text"],
+                "timecode_start": fragment["timecode_start"],
+                "speaker": speaker,
+                "block": block,
+            })
+    return units
+
+
+def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
+    auto_matched = sum(item.status == "auto_matched" for item in matches)
+    confirmed = sum(item.status == "confirmed" for item in matches)
+    needs_review = sum(item.status == "needs_review" for item in matches)
+    not_found = sum(item.status == "not_found" for item in matches)
+    return {
+        "auto_matched": auto_matched,
+        "confirmed": confirmed,
+        "needs_review": needs_review,
+        "not_found": not_found,
+        "matched": auto_matched + confirmed,
+        "review": needs_review,
+        "unmatched": not_found,
+    }
+
+
+def _create_sync_job(project: str) -> dict:
+    now = _utc_now_iso()
+    job = {
+        "id": uuid.uuid4().hex,
+        "project": project,
+        "status": "queued",
+        "message": "Queued",
+        "total_sources": 0,
+        "transcribed": 0,
+        "reused_indexes": 0,
+        "source_failures": [],
+        "total_segments": 0,
+        "total": 0,
+        "done": 0,
+        "matched": 0,
+        "review": 0,
+        "unmatched": 0,
+        "segment_failures": [],
+        "current_source_id": "",
+        "current_segment_id": "",
+        "transcription_processed_sec": 0.0,
+        "transcription_duration_sec": 0.0,
+        "transcription_words": 0,
+        "transcription_source_started_at": "",
+        "matching_started_at": "",
+        "transcription_timeout_seconds": 0.0,
+        "created_at": now,
+        "started_at": "",
+        "finished_at": "",
+        "error": "",
+    }
+    with _SYNC_JOBS_LOCK:
+        _SYNC_JOBS[job["id"]] = job
+    return dict(job)
+
+
+def _update_sync_job(job_id: str, **updates) -> dict | None:
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        if job is None:
+            return None
+        job.update(updates)
+        return dict(job)
+
+
+def _get_sync_job(job_id: str) -> dict | None:
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def _reserve_sync_project(project: str) -> bool:
+    with _SYNC_JOBS_LOCK:
+        if project in _SYNC_ACTIVE_PROJECTS:
+            return False
+        _SYNC_ACTIVE_PROJECTS.add(project)
+        return True
+
+
+def _release_sync_project(project: str) -> None:
+    with _SYNC_JOBS_LOCK:
+        _SYNC_ACTIVE_PROJECTS.discard(project)
+
+
+def _run_sync_job(
+    *,
+    job_id: str,
+    project: str,
+    backend: str | None,
+    model: str | None,
+    language: str,
+    timecode_mode: str,
+    rematch_confirmed: bool,
+    source_ids: tuple[str, ...],
+    force_transcribe: bool,
+    search_window_sec: float,
+) -> None:
+    paths = _project_paths(project)
+    source_store, match_store = _sync_stores(paths)
+    _update_sync_job(
+        job_id,
+        status="running",
+        message="Preparing word indexes",
+        started_at=_utc_now_iso(),
+    )
+    try:
+        all_sources = source_store.list()
+        # ``source_ids`` scopes forced transcription, not the matching pool.
+        # This lets the CEP panel export one guide at a time while every
+        # already-indexed source remains eligible for scenario matching.
+        sources = all_sources
+        indexes = []
+        source_failures: list[dict[str, str]] = []
+        transcribed = 0
+        reused = 0
+        _update_sync_job(job_id, total_sources=len(sources))
+
+        for source in sources:
+            _update_sync_job(job_id, current_source_id=source.id)
+            index_path = _word_index_path(paths, source.id)
+            selected_for_transcription = not source_ids or source.id in source_ids
+            try:
+                if index_path.is_file() and not (
+                    force_transcribe and selected_for_transcription
+                ):
+                    index = load_word_index(index_path, source.id)
+                    reused += 1
+                elif source_ids and not selected_for_transcription:
+                    # Another registered sequence has not been exported yet.
+                    # It becomes part of the pool after its own CEP run.
+                    continue
+                else:
+                    if force_transcribe and selected_for_transcription:
+                        index_path.unlink(missing_ok=True)
+                    audio_path = _resolve_sync_audio_path(source, paths)
+                    source_duration = max(0.0, float(source.duration_sec or 0.0))
+                    _update_sync_job(
+                        job_id,
+                        message="Transcribing audio",
+                        transcription_processed_sec=0.0,
+                        transcription_duration_sec=source_duration,
+                        transcription_words=0,
+                        transcription_source_started_at=_utc_now_iso(),
+                        transcription_timeout_seconds=float(
+                            app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS")
+                            or os.getenv("SYNC_WHISPER_TIMEOUT_SECONDS")
+                            or 4 * 60 * 60
+                        ),
+                    )
+
+                    def report_progress(
+                        processed_sec: float,
+                        duration_sec: float,
+                        word_count: int,
+                    ) -> None:
+                        _update_sync_job(
+                            job_id,
+                            transcription_processed_sec=processed_sec,
+                            transcription_duration_sec=(duration_sec or source_duration),
+                            transcription_words=word_count,
+                        )
+
+                    result = transcribe_audio(
+                        audio_path,
+                        backend=backend,
+                        model=model,
+                        language=language,
+                        progress_callback=report_progress,
+                        timeout_seconds=(
+                            app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS")
+                            or None
+                        ),
+                    )
+                    index = ingest_word_index(
+                        result,
+                        source.id,
+                        model=str(result.get("model") or model or ""),
+                        language=str(result.get("language") or language),
+                    )
+                    save_word_index(index_path, index)
+                    transcribed += 1
+                indexes.append(index)
+            except Exception as exc:
+                source_failures.append({"source_id": source.id, "error": str(exc)})
+            _update_sync_job(
+                job_id,
+                transcribed=transcribed,
+                reused_indexes=reused,
+                source_failures=list(source_failures),
+            )
+
+        normalization = load_normalization(paths["normalized"])
+        normalization_revision = normalization.get("revision")
+        blocks = [
+            block
+            for block in sorted(
+                normalization.get("blocks", []),
+                key=lambda item: int(item.get("order", 0) or 0),
+            )
+            if str(block.get("type") or "").lower() in {"sync", "host"}
+        ]
+        units = _sync_alignment_units(blocks)
+        indexed_source_ids = {item.source_id for item in indexes}
+        matching_sources = [
+            item for item in sources if item.id in indexed_source_ids
+        ]
+        matcher = SyncMatcher(
+            matching_sources,
+            indexes,
+            MatcherConfig(search_window_sec=search_window_sec),
+        )
+        existing = {item.segment_id: item for item in match_store.list()}
+        current_ids = {
+            str(unit.get("segment_id") or "").strip()
+            for unit in units
+            if str(unit.get("segment_id") or "").strip()
+        }
+        total_segments = len(current_ids)
+        _update_sync_job(
+            job_id,
+            message="Matching scenario quotes",
+            total_segments=total_segments,
+            total=total_segments,
+            current_source_id="",
+            matching_started_at=_utc_now_iso(),
+        )
+
+        segment_failures: list[dict[str, str]] = []
+        processed = 0
+        for unit in units:
+            segment_id = str(unit.get("segment_id") or "").strip()
+            if not segment_id:
+                segment_failures.append({
+                    "segment_id": "",
+                    "error": "sync/host block has no stable uid",
+                })
+                continue
+            _update_sync_job(job_id, current_segment_id=segment_id)
+            prior = existing.get(segment_id)
+            prior_revision = (
+                prior.metadata.get("normalization_revision") if prior else None
+            )
+            prior_is_current = (
+                prior_revision in (None, "", normalization_revision)
+            )
+            if (
+                prior
+                and prior.status == "confirmed"
+                and prior_is_current
+                and not rematch_confirmed
+            ):
+                processed += 1
+                current = [
+                    item for key, item in existing.items()
+                    if key in current_ids
+                ]
+                _update_sync_job(
+                    job_id,
+                    done=processed,
+                    **_sync_summary(current),
+                    segment_failures=list(segment_failures),
+                )
+                continue
+            try:
+                match = matcher.match(
+                    AlignmentRequest(
+                        segment_id=segment_id,
+                        text=str(unit.get("text") or ""),
+                        speaker=str(unit.get("speaker") or ""),
+                        approximate_timecode=unit.get("timecode_start"),
+                        timecode_mode=timecode_mode,  # type: ignore[arg-type]
+                    )
+                )
+                match.metadata["normalization_revision"] = normalization_revision
+                match.metadata["parent_block_uid"] = str(
+                    unit.get("parent_block_uid") or segment_id
+                )
+                match.metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
+                match.metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
+                with _SYNC_DATA_LOCK:
+                    latest = match_store.get(segment_id)
+                    if latest and latest.status == "confirmed":
+                        # Manual editor decisions always win, including when
+                        # they arrive while this background match was running.
+                        existing[segment_id] = latest
+                    else:
+                        match_store.save(match)
+                        existing[segment_id] = match
+            except Exception as exc:
+                segment_failures.append({
+                    "segment_id": segment_id,
+                    "error": str(exc),
+                })
+            processed += 1
+            current = [
+                item for key, item in existing.items() if key in current_ids
+            ]
+            _update_sync_job(
+                job_id,
+                done=processed,
+                **_sync_summary(current),
+                segment_failures=list(segment_failures),
+            )
+
+        all_matches = [
+            item for item in match_store.list() if item.segment_id in current_ids
+        ]
+        summary = _sync_summary(all_matches)
+        _update_sync_job(
+            job_id,
+            status="completed",
+            message="Completed",
+            finished_at=_utc_now_iso(),
+            current_segment_id="",
+            source_failures=source_failures,
+            segment_failures=segment_failures,
+            **summary,
+        )
+    except Exception as exc:
+        _update_sync_job(
+            job_id,
+            status="failed",
+            message="Failed",
+            error=str(exc),
+            finished_at=_utc_now_iso(),
+        )
+    finally:
+        _release_sync_project(project)
+
+
+@app.route("/stage2/sync-sources", methods=["GET", "POST", "DELETE"])
+def stage2_sync_sources():
+    payload = request.get_json(silent=True) or {}
+    raw_project = (
+        request.args.get("project")
+        if request.method == "GET"
+        else payload.get("project")
+    )
+    try:
+        project = _resolve_project_name(raw_project)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    paths = _ensure_project(project)
+    source_store, match_store = _sync_stores(paths)
+
+    try:
+        if request.method == "GET":
+            sources = source_store.list()
+            return jsonify({
+                "ok": True,
+                "result": {
+                    "project": project,
+                    "sources": [_source_api_dict(item) for item in sources],
+                },
+            })
+
+        if request.method == "POST":
+            source_payload = payload.get("source", payload)
+            if not isinstance(source_payload, dict):
+                return _json_error("source must be a JSON object", 400)
+            source_payload = dict(source_payload)
+            source_payload.pop("project", None)
+            source_payload["id"] = _sync_source_id(source_payload.get("id"))
+            existing = source_store.get(source_payload["id"])
+            if (
+                existing
+                and existing.sequence_id
+                and source_payload.get("sequence_id")
+                and existing.sequence_id != str(source_payload["sequence_id"])
+            ):
+                return _json_error(
+                    "source id already belongs to another Premiere sequence", 409
+                )
+            if existing:
+                merged = existing.to_dict()
+                incoming_metadata = dict(source_payload.get("metadata") or {})
+                merged_metadata = dict(merged.get("metadata") or {})
+                merged_metadata.update({
+                    key: value for key, value in incoming_metadata.items()
+                    if value not in (None, "")
+                })
+                merged.update(source_payload)
+                # An older client may still send only the legacy singular
+                # field. Do not let a previously saved list override that edit.
+                if "speaker" in source_payload and "speakers" not in source_payload:
+                    merged["speakers"] = []
+                merged["metadata"] = merged_metadata
+                if not str(source_payload.get("guide_audio") or "").strip():
+                    merged["guide_audio"] = existing.guide_audio
+                source_payload = merged
+            source = SyncSource.from_dict(source_payload)
+            with _SYNC_DATA_LOCK:
+                source_store.save(source)
+            return jsonify({
+                "ok": True,
+                "result": {"project": project, "source": _source_api_dict(source)},
+            }), 201
+
+        source_id = _sync_source_id(
+            payload.get("source_id") or request.args.get("source_id")
+        )
+        with _SYNC_DATA_LOCK:
+            deleted = source_store.delete(source_id)
+            if deleted:
+                remaining_matches = [
+                    item for item in match_store.list() if item.source_id != source_id
+                ]
+                match_store.replace_all(remaining_matches)
+        if not deleted:
+            return _json_error("sync source not found", 404)
+        # Regenerable artifacts are removed with the source record. These are
+        # exact server-owned paths and never derived from an uploaded filename.
+        for artifact in (
+            _canonical_audio_path(paths, source_id),
+            _word_index_path(paths, source_id),
+        ):
+            artifact.unlink(missing_ok=True)
+        return jsonify({
+            "ok": True,
+            "result": {"project": project, "source_id": source_id, "deleted": True},
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        return _internal_error(exc)
+
+
+@app.route("/stage2/sync-sources/<source_id>/audio", methods=["GET", "PUT"])
+def stage2_sync_source_audio(source_id: str):
+    try:
+        source_id = _sync_source_id(source_id)
+        project = _resolve_project_name(
+            request.args.get("project")
+            if request.method == "GET"
+            else request.form.get("project")
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    paths = _ensure_project(project)
+    source_store, _match_store = _sync_stores(paths)
+    try:
+        source = source_store.get(source_id)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    if source is None:
+        return _json_error("sync source not found", 404)
+    if request.method == "GET":
+        try:
+            audio_path = _resolve_sync_audio_path(source, paths)
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
+        if not audio_path.is_file():
+            return _json_error("sync guide audio not found", 404)
+        return send_from_directory(
+            audio_path.parent, audio_path.name, as_attachment=False
+        )
+    uploaded = request.files.get("audio") or request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return _json_error("multipart WAV field 'audio' is required", 400)
+    max_bytes = int(
+        app.config.get("SYNC_AUDIO_MAX_BYTES")
+        or os.getenv("SYNC_AUDIO_MAX_BYTES")
+        or 4 * 1024 * 1024 * 1024
+    )
+    if request.content_length is not None and request.content_length > max_bytes:
+        return _json_error("audio upload is too large", 413)
+    if Path(uploaded.filename).suffix.lower() != ".wav":
+        return _json_error("audio must be a WAV file", 415)
+
+    destination = _canonical_audio_path(paths, source_id)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.upload")
+    duration = 0.0
+    try:
+        _copy_stream_limited(uploaded.stream, temporary, max_bytes)
+        with wave.open(str(temporary), "rb") as stream:
+            frames = stream.getnframes()
+            rate = stream.getframerate()
+            if rate <= 0 or stream.getnchannels() <= 0:
+                raise ValueError("invalid WAV stream")
+            duration = frames / rate
+        os.replace(temporary, destination)
+        updated_payload = source.to_dict()
+        updated_payload["guide_audio"] = str(destination.relative_to(paths["root"]))
+        if not float(updated_payload.get("duration_sec") or 0):
+            updated_payload["duration_sec"] = duration
+        updated = SyncSource.from_dict(updated_payload)
+        with _SYNC_DATA_LOCK:
+            source_store.save(updated)
+        # Uploaded audio invalidates only its regenerable transcript; manually
+        # reviewed matches remain available until the next job is started.
+        _word_index_path(paths, source_id).unlink(missing_ok=True)
+    except AudioUploadTooLargeError as exc:
+        temporary.unlink(missing_ok=True)
+        return _json_error(str(exc), 413)
+    except (EOFError, wave.Error, ValueError) as exc:
+        temporary.unlink(missing_ok=True)
+        return _json_error(f"invalid WAV file: {exc}", 415)
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        return _internal_error(exc)
+    return jsonify({
+        "ok": True,
+        "result": {
+            "project": project,
+            "source": _source_api_dict(updated),
+            "audio_path": str(destination.relative_to(ROOT_DIR)),
+            "duration_sec": duration,
+        },
+    })
+
+
+@app.put("/stage2/sync-sources/<source_id>/words")
+def stage2_sync_source_words(source_id: str):
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return _json_error("JSON word timestamp payload is required", 400)
+    try:
+        source_id = _sync_source_id(source_id)
+        project = _resolve_project_name(
+            payload.get("project") if isinstance(payload, dict) else request.args.get("project")
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    paths = _ensure_project(project)
+    source_store, _match_store = _sync_stores(paths)
+    try:
+        if source_store.get(source_id) is None:
+            return _json_error("sync source not found", 404)
+        transcript_payload = dict(payload) if isinstance(payload, dict) else payload
+        if isinstance(transcript_payload, dict):
+            transcript_payload.pop("project", None)
+        index = ingest_word_index(transcript_payload, source_id)
+        index_path = _word_index_path(paths, source_id)
+        save_word_index(index_path, index)
+    except (TypeError, ValueError) as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        return _internal_error(exc)
+    return jsonify({
+        "ok": True,
+        "result": {
+            "project": project,
+            "source_id": source_id,
+            "word_count": len(index.words),
+            "duration_sec": index.duration_sec,
+            "words_path": str(index_path.relative_to(ROOT_DIR)),
+        },
+    })
+
+
+@app.post("/stage2/sync-jobs/start")
+def stage2_sync_job_start():
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = _resolve_project_name(payload.get("project"))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    paths = _ensure_project(project)
+    gate = _normalization_required(project)
+    if gate:
+        return gate
+    timecode_mode = str(payload.get("timecode_mode") or "relative").strip().lower()
+    if timecode_mode not in {"relative", "display"}:
+        return _json_error("timecode_mode must be 'relative' or 'display'", 400)
+    language = str(payload.get("language") or "ru").strip()
+    if not language:
+        return _json_error("language must not be empty", 400)
+    try:
+        sources = SyncSourceStore(paths["sync_sources"]).list()
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    if not sources:
+        return _json_error("no sync sources configured", 409)
+    raw_source_ids = payload.get("source_ids") or []
+    if not isinstance(raw_source_ids, list):
+        return _json_error("source_ids must be a JSON list", 400)
+    try:
+        source_ids = tuple(_sync_source_id(item) for item in raw_source_ids)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    known_source_ids = {item.id for item in sources}
+    unknown_source_ids = sorted(set(source_ids) - known_source_ids)
+    if unknown_source_ids:
+        return _json_error(
+            f"unknown sync sources: {', '.join(unknown_source_ids)}", 400
+        )
+    try:
+        search_window_sec = float(payload.get("search_window_sec", 180.0))
+    except (TypeError, ValueError):
+        return _json_error("search_window_sec must be a positive number", 400)
+    if search_window_sec <= 0:
+        return _json_error("search_window_sec must be a positive number", 400)
+    if not _reserve_sync_project(project):
+        return _json_error(f"sync job already active for project {project}", 409)
+
+    try:
+        job = _create_sync_job(project)
+        worker = threading.Thread(
+            target=_run_sync_job,
+            kwargs={
+                "job_id": job["id"],
+                "project": project,
+                "backend": (
+                    str(payload.get("backend")).strip()
+                    if payload.get("backend") is not None
+                    else None
+                ),
+                "model": (
+                    str(payload.get("model")).strip()
+                    if payload.get("model") is not None
+                    else None
+                ),
+                "language": language,
+                "timecode_mode": timecode_mode,
+                "rematch_confirmed": bool(payload.get("rematch_confirmed", False)),
+                "source_ids": source_ids,
+                "force_transcribe": bool(payload.get("force_transcribe", False)),
+                "search_window_sec": search_window_sec,
+            },
+            daemon=True,
+        )
+        worker.start()
+    except Exception:
+        _release_sync_project(project)
+        raise
+    return jsonify({
+        "ok": True,
+        "result": {
+            "project": project,
+            "job_id": job["id"],
+            "status": "queued",
+            "status_url": f"/stage2/sync-jobs/{job['id']}",
+        },
+    })
+
+
+@app.get("/stage2/sync-jobs/<job_id>")
+def stage2_sync_job_status(job_id: str):
+    job = _get_sync_job(job_id)
+    if not job:
+        return _json_error("job not found", 404)
+    return jsonify({"ok": True, "result": job})
+
+
+@app.get("/stage2/sync-jobs/status")
+def stage2_sync_job_status_alias():
+    job_id = str(request.args.get("job_id") or "").strip()
+    if job_id:
+        return stage2_sync_job_status(job_id)
+    try:
+        project = _resolve_project_name(request.args.get("project"))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    with _SYNC_JOBS_LOCK:
+        candidates = [
+            dict(item) for item in _SYNC_JOBS.values() if item.get("project") == project
+        ]
+    if not candidates:
+        return _json_error("job not found", 404)
+    latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
+    return jsonify({"ok": True, "result": latest})
+
+
+@app.route("/stage2/sync-matches", methods=["GET", "PATCH"])
+@app.patch("/stage2/sync-matches/<block_uid>")
+def stage2_sync_matches(block_uid: str | None = None):
+    payload = request.get_json(silent=True) or {}
+    raw_project = (
+        request.args.get("project")
+        if request.method == "GET"
+        else payload.get("project")
+    )
+    try:
+        project = _resolve_project_name(raw_project)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    paths = _ensure_project(project)
+    source_store, match_store = _sync_stores(paths)
+    try:
+        if request.method == "GET":
+            matches = match_store.list()
+            confirmed, _reason = _confirmed_normalization(project)
+            normalization_document = confirmed or _read_json_safe(paths["normalized"])
+            if isinstance(normalization_document.get("blocks"), list):
+                confirmed_blocks = [
+                    block for block in normalization_document.get("blocks", [])
+                    if str(block.get("type") or "").lower() in {"sync", "host"}
+                ]
+                valid_ids = {
+                    str(unit.get("segment_id") or "")
+                    for unit in _sync_alignment_units(confirmed_blocks)
+                    if str(unit.get("segment_id") or "")
+                }
+                revision = normalization_document.get("revision")
+                matches = [
+                    item for item in matches
+                    if item.segment_id in valid_ids
+                    and item.metadata.get("normalization_revision") in (None, "", revision)
+                ]
+            return jsonify({
+                "ok": True,
+                "result": {
+                    "project": project,
+                    "matches": [_match_api_dict(item) for item in matches],
+                    **_sync_summary(matches),
+                },
+            })
+
+        updates = payload.get("matches")
+        if updates is None:
+            updates = [payload.get("match", payload)]
+        if not isinstance(updates, list) or not all(
+            isinstance(item, dict) for item in updates
+        ):
+            return _json_error("matches must be a JSON list of objects", 400)
+        confirmed, _reason = _confirmed_normalization(project)
+        if confirmed is None:
+            gate = _normalization_required(project)
+            if gate:
+                return gate
+        assert confirmed is not None
+        confirmed_blocks = [
+            block for block in confirmed.get("blocks", [])
+            if str(block.get("type") or "").lower() in {"sync", "host"}
+        ]
+        valid_units = {
+            str(unit.get("segment_id") or ""): unit
+            for unit in _sync_alignment_units(confirmed_blocks)
+            if str(unit.get("segment_id") or "")
+        }
+        sources_by_id = {item.id: item for item in source_store.list()}
+        source_ids = set(sources_by_id)
+        revision = confirmed.get("revision")
+        saved: list[SyncMatch] = []
+        with _SYNC_DATA_LOCK:
+            for update in updates:
+                values = dict(update)
+                values.pop("project", None)
+                segment_id = str(
+                    block_uid
+                    or values.get("block_uid")
+                    or values.get("segment_id")
+                    or ""
+                ).strip()
+                if not segment_id:
+                    raise ValueError("block_uid (segment_id) is required")
+                if segment_id not in valid_units:
+                    raise ValueError(
+                        f"segment_id is not a confirmed sync/host fragment: {segment_id}"
+                    )
+                supplied_segment_id = str(values.get("segment_id") or segment_id).strip()
+                if supplied_segment_id != segment_id:
+                    raise ValueError("segment_id must match block_uid path")
+                values.pop("block_uid", None)
+                values["segment_id"] = segment_id
+                current = match_store.get(segment_id)
+                merged = current.to_dict() if current else {
+                    "segment_id": segment_id,
+                    "query_text": "",
+                }
+                merged.update(values)
+                metadata = dict(merged.get("metadata") or {})
+                metadata["normalization_revision"] = revision
+                unit = valid_units[segment_id]
+                metadata["parent_block_uid"] = str(
+                    unit.get("parent_block_uid") or segment_id
+                )
+                metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
+                metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
+                merged["metadata"] = metadata
+                source_id = str(merged.get("source_id") or "")
+                if source_id and source_id not in source_ids:
+                    raise ValueError(f"unknown sync source: {source_id}")
+                match = SyncMatch.from_dict(merged)
+                source = sources_by_id.get(match.source_id)
+                if (
+                    source
+                    and source.duration_sec > 0
+                    and match.source_out_sec is not None
+                    and match.source_out_sec > source.duration_sec
+                ):
+                    raise ValueError(
+                        f"source_out_sec exceeds source duration ({source.duration_sec})"
+                    )
+                match_store.save(match)
+                saved.append(match)
+        return jsonify({
+            "ok": True,
+            "result": {
+                "project": project,
+                "matches": [_match_api_dict(item) for item in saved],
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        return _internal_error(exc)
+
+
+@app.get("/stage2/timeline")
+def stage2_timeline():
+    try:
+        project = _resolve_project_name(request.args.get("project"))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    paths = _project_paths(project)
+    timeline_path = paths["timeline"]
+    if not timeline_path.is_file():
+        return _json_error("full_timeline.json not found — run Build first", 404)
+    try:
+        timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _json_error(f"invalid full_timeline.json: {exc}", 500)
+    confirmed, _reason = _confirmed_normalization(project)
+    if (
+        confirmed is None
+        or timeline.get("normalization_revision") != confirmed.get("revision")
+    ):
+        return _json_error(
+            "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
+            409,
+        )
+    return jsonify({"ok": True, "result": timeline})
+
+
 @app.post("/stage2/build")
 def stage2_build():
     """Build full_timeline.json from confirmed normalization + speaker WAVs."""
@@ -1195,13 +2248,29 @@ def stage2_build():
 
     try:
         normalization = load_normalization(paths["normalized"])
+        source_store, match_store = _sync_stores(paths)
+        sources = source_store.list()
+        stored_matches = match_store.list()
+        normalization_revision = normalization.get("revision")
+        stale_match_ids: list[str] = []
+        current_matches: list[SyncMatch] = []
+        for match in stored_matches:
+            match_revision = match.metadata.get("normalization_revision")
+            if match_revision not in (None, "", normalization_revision):
+                stale_match_ids.append(match.segment_id)
+                continue
+            current_matches.append(match)
         timeline = parse_normalized_timeline(
             normalization=normalization,
             speaker_dir=speaker_dir,
             placeholder_dir=placeholder_dir,
             project=project,
             fps=fps,
+            sync_matches={item.segment_id: item for item in current_matches},
+            sync_sources={item.id: item for item in sources},
         )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
     except Exception as exc:
         return _internal_error(exc)
 
@@ -1243,6 +2312,14 @@ def stage2_build():
     host_count = sum(1 for s in timeline.segments if s.type == "host")
     tech_count = sum(1 for s in timeline.segments if s.type == "tech")
     zk_missing_wav = [s.id for s in timeline.segments if s.type == "zk" and not s.wav_path]
+    sync_segments = [s for s in timeline.segments if s.type in {"snh", "host"}]
+    matched_count = sum(
+        s.match_status in {"auto_matched", "confirmed"}
+        and s.source_out_sec > s.source_in_sec
+        for s in sync_segments
+    )
+    review_count = sum(s.match_status == "needs_review" for s in sync_segments)
+    unmatched_count = len(sync_segments) - matched_count - review_count
 
     return jsonify({
         "ok": True,
@@ -1255,8 +2332,20 @@ def stage2_build():
             "tech": tech_count,
             "total_duration_sec": timeline.total_duration_sec,
             "timeline_path": str(timeline_path.relative_to(ROOT_DIR)),
+            "matched": matched_count,
+            "review": review_count,
+            "unmatched": unmatched_count,
+            "sync_summary": {
+                "matched": matched_count,
+                "review": review_count,
+                "unmatched": unmatched_count,
+            },
             "warnings": (
                 ([f"ZK без WAV (будут пропущены в XML): {', '.join(zk_missing_wav)}"] if zk_missing_wav else [])
+                + (
+                    [f"Устаревшие sync matches пропущены: {', '.join(stale_match_ids)}"]
+                    if stale_match_ids else []
+                )
                 + placeholder_warnings
             ),
         },

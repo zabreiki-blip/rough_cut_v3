@@ -1,6 +1,7 @@
 # rough_cut_v3 — Stage 1
 
-Пайплайн: нормализация сценария (`.doc/.docx`) → подтверждение блоков → синтез TTS → сборка в Premiere.
+Пайплайн: нормализация сценария (`.doc/.docx`) → подтверждение блоков →
+синтез TTS → Whisper-сопоставление СНХ → сборка в Premiere.
 
 ## Структура
 
@@ -8,6 +9,8 @@
 - `projects/<project>/work/` — canonical `scenario_normalized.json` и производные `scenario_raw.txt`/`scenario_prepared.json`.
 - `projects/<project>/speaker/` — файлы озвучки `zk1.wav`, `zk2.wav`, ...
 - `src/stage1/` — core-логика и CLI.
+- `src/stage2/` — таймлайн, sync-источники, Whisper word index и fuzzy matching.
+- `cep/` — панель Premiere для регистрации, экспорта аудиогида и conform.
 - `src/api.py` — Flask API.
 - `scripts/` — shell-обертки для CLI.
 
@@ -41,8 +44,16 @@
 - для `openrouter`: `OPENROUTER_TTS_MODEL`, `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
   - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
-  - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
+- для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
   - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`
+- для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper`,
+  `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
+  одна транскрипция выполняется в отдельном процессе с hard timeout
+  `SYNC_WHISPER_TIMEOUT_SECONDS` (по умолчанию 14400 секунд)
+- `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV
+  (по умолчанию 4 ГБ), работающий и без `Content-Length`
+- `ROUGH_CUT_CEP_CORS=1` — разрешить аутентифицированные запросы только из
+  локального Premiere CEP file origin
 
 ### macOS Connector (для Docker backend)
 
@@ -192,10 +203,57 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `POST /stage1/validate`
 - `POST /stage2/build`
 - `GET /stage2/export/xml?project=<project>`
+- `GET|POST|DELETE /stage2/sync-sources`
+- `GET|PUT /stage2/sync-sources/<source_id>/audio`
+- `PUT /stage2/sync-sources/<source_id>/words`
+- `POST /stage2/sync-jobs/start`
+- `GET /stage2/sync-jobs/<job_id>`
+- `GET|PATCH /stage2/sync-matches`
+- `PATCH /stage2/sync-matches/<block_uid>`
+- `GET /stage2/timeline?project=<project>`
 
 Примечание: статусы `tts-jobs` хранятся в памяти одного процесса API; Docker
 явно запускает один worker. Завершённые статусы удаляются через 24 часа.
 После рестарта backend активные/исторические job-статусы сбрасываются.
+
+## Stage 2.1: автоматическое подключение синхронов
+
+Готовые синхронизированные секвенции Premiere являются источником координат.
+Видео остаётся в Premiere и не загружается в backend.
+
+1. Установить development CEP-панель по инструкции в `cep/README.md`.
+2. Открыть sync-секвенцию и нажать «Считать активную».
+3. Указать одного или нескольких спикеров через запятую и стабильный ASCII
+   Source ID. Если секвенция общая, включить «все спикеры проекта».
+4. Нажать «Экспортировать звук → Whisper». Панель:
+   - экспортирует полный WAV через Adobe Media Encoder;
+   - регистрирует sequence ID/name;
+   - ждёт готовности WAV;
+   - запускает фоновое распознавание и сопоставление.
+5. Во вкладке «Сборка» прослушать жёлтые совпадения, выбрать альтернативу или
+   поправить `source in/out`, затем подтвердить.
+6. Нажать Build Timeline и импортировать XML в Premiere.
+7. Сделать Rough Cut активным и в CEP нажать
+   «Подтянуть все подтверждённые СНХ».
+
+Артефакты хранятся отдельно от подтверждённого сценария:
+
+```text
+projects/<project>/work/sync_sources.json
+projects/<project>/work/sync_audio/<source_id>.wav
+projects/<project>/work/transcripts/<source_id>.words.json
+projects/<project>/work/sync_matches.json
+projects/<project>/work/full_timeline.json
+```
+
+В автоматическую сборку идут только `auto_matched` и `confirmed`. Результаты
+`needs_review` и `not_found` остаются плейсхолдерами. Последовательный экспорт
+нескольких секвенций не перетирает предыдущие результаты: поиск выполняется по
+общему пулу готовых word indexes.
+
+Docker устанавливает `faster-whisper` и хранит модели в named volume
+`whisper_cache`. При локальном запуске на Apple Silicon можно установить
+`mlx-whisper`; адаптер выбирается автоматически.
 
 ## Тесты
 

@@ -97,6 +97,163 @@ class NormalizedTimelineTest(unittest.TestCase):
                     {"status": "draft", "blocks": []}, Path(tmp), Path(tmp), "TEST"
                 )
 
+    def test_confirmed_sync_match_uses_real_range_and_sequence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "stable-sync-uid",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Ответ героя",
+                        "speaker": "Иван Иванов",
+                        "timecode_start": "01:02",
+                        "timecode_end": "01:09",
+                    },
+                    {
+                        "uid": "fallback-sync-uid",
+                        "order": 2,
+                        "type": "sync",
+                        "normalized_text": "Не найдено",
+                        "speaker": "Иван Иванов",
+                    },
+                ],
+            }
+            matches = {
+                "stable-sync-uid": {
+                    "source_id": "ivan_01",
+                    "source_in_sec": 61.5,
+                    "source_out_sec": 69.25,
+                    "confidence": 0.93,
+                    "status": "confirmed",
+                },
+                "fallback-sync-uid": {
+                    "source_id": "ivan_01",
+                    "source_in_sec": 80.0,
+                    "source_out_sec": 90.0,
+                    "confidence": 0.55,
+                    "status": "needs_review",
+                },
+            }
+            sources = {
+                "ivan_01": {
+                    "premiere_sequence": "SYNC_IVAN_01",
+                    "sequence_id": "premiere-id",
+                },
+            }
+
+            timeline = parse_normalized_timeline(
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=matches,
+                sync_sources=sources,
+            )
+
+            first, second = timeline.segments
+            self.assertEqual(first.block_uid, "stable-sync-uid")
+            self.assertEqual(first.timecode_end, "01:09")
+            self.assertEqual(first.duration_sec, 7.75)
+            self.assertEqual(first.sequence_name, "SYNC_IVAN_01")
+            self.assertEqual(first.sequence_id, "premiere-id")
+            self.assertEqual(first.start_sec, 0.0)
+            self.assertEqual(second.duration_sec, 10.0)
+            self.assertEqual(second.start_sec, 7.75)
+
+    def test_one_sync_block_expands_to_independently_matched_fragments(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [{
+                    "uid": "irina-block",
+                    "order": 1,
+                    "type": "sync",
+                    "speaker": "ИРИНА КОТОВА",
+                    "role": "ИСТОРИК",
+                    "normalized_text": "Первая цитата Вторая цитата Третья цитата",
+                    "sync_fragments": [
+                        {"timecode_start": "01:22:29", "text": "Первая цитата"},
+                        {"timecode_start": "01:23:36", "text": "Вторая цитата"},
+                        {"timecode_start": "01:24:11", "text": "Третья цитата"},
+                    ],
+                }],
+            }
+            matches = {
+                f"irina-block::fragment:{index}": {
+                    "source_id": "irina_01",
+                    "source_in_sec": float(index * 10),
+                    "source_out_sec": float(index * 10 + index),
+                    "confidence": 0.95,
+                    "status": "confirmed",
+                }
+                for index in (1, 2, 3)
+            }
+            sources = {
+                "irina_01": {
+                    "premiere_sequence": "SYNC_IRINA_01",
+                    "sequence_id": "premiere-irina",
+                }
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST",
+                sync_matches=matches, sync_sources=sources,
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2", "snh3"])
+            self.assertEqual(
+                [item.block_uid for item in timeline.segments],
+                [
+                    "irina-block::fragment:1",
+                    "irina-block::fragment:2",
+                    "irina-block::fragment:3",
+                ],
+            )
+            self.assertTrue(all(item.parent_block_uid == "irina-block" for item in timeline.segments))
+            self.assertEqual(
+                [item.timecode for item in timeline.segments],
+                ["01:22:29", "01:23:36", "01:24:11"],
+            )
+            self.assertEqual([item.duration_sec for item in timeline.segments], [1.0, 2.0, 3.0])
+            self.assertEqual([item.start_sec for item in timeline.segments], [0.0, 1.0, 3.0])
+
+    def test_multi_fragment_block_does_not_reuse_ambiguous_legacy_ordinal_match(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [{
+                    "uid": "expanded-block",
+                    "order": 1,
+                    "type": "sync",
+                    "normalized_text": "Первая часть Вторая часть",
+                    "sync_fragments": [
+                        {"timecode_start": "00:10", "text": "Первая часть"},
+                        {"timecode_start": "00:20", "text": "Вторая часть"},
+                    ],
+                }],
+            }
+            legacy_matches = {
+                "snh2": {
+                    "source_id": "legacy-source",
+                    "source_in_sec": 20.0,
+                    "source_out_sec": 25.0,
+                    "confidence": 1.0,
+                    "status": "confirmed",
+                }
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=legacy_matches,
+            )
+
+            self.assertEqual([item.match_status for item in timeline.segments], ["", ""])
+            self.assertEqual([item.duration_sec for item in timeline.segments], [10.0, 10.0])
+
 
 if __name__ == "__main__":
     unittest.main()
