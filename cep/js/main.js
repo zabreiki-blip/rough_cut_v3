@@ -7,13 +7,13 @@
   var exportPollTimer = null;
   var whisperPollTimer = null;
   var currentWhisperJobId = "";
+  var CONFORM_VIDEO_TRACK_INDEX = 0;
+  var CONFORM_AUDIO_TRACK_INDEX = 0;
   var hostFunctions = {
     ping: "rcStage2_ping",
     projects: "rcStage2_listProjects",
     inspect: "rcStage2_inspectActiveSequence",
-    layout: "rcStage2_inspectActiveSequenceLayout",
     resolve: "rcStage2_resolveSequence",
-    insert: "rcStage2_insertSequenceRange",
     conform: "rcStage2_conformSequenceRanges",
     exportAudio: "rcStage2_exportActiveSequenceAudio",
     fileInfo: "rcStage2_fileInfo"
@@ -30,6 +30,7 @@
 
   function log(message, data) {
     var target = byId("log");
+    var notice = byId("panelNotice");
     var line = "[" + now() + "] " + message;
     if (data !== undefined) {
       try {
@@ -39,6 +40,15 @@
       }
     }
     target.textContent = target.textContent ? line + "\n\n" + target.textContent : line;
+    if (notice) {
+      notice.className = "panel-notice";
+      if (/(ошиб|недоступ|не удалось|не выполн|не запущ|не загруж|не найден|не разреш|нельзя|отклон|остановлен|проверьте|укажите|введите|отмен)/i.test(message)) {
+        notice.className += " panel-notice-error";
+      } else if (/(готов|заверш|зарегистрирован|сохран|обновл|получен|выбран|поставлен)/i.test(message)) {
+        notice.className += " panel-notice-success";
+      }
+      notice.textContent = message;
+    }
   }
 
   function setHostBadge(state, text) {
@@ -185,13 +195,13 @@
   }
 
   function loadConfig() {
+    var savedProject = window.localStorage.getItem("roughCutStage2.project") || "";
     replaceProjectOptions(
-      [window.localStorage.getItem("roughCutStage2.project") || "BRIK"],
-      window.localStorage.getItem("roughCutStage2.project") || "BRIK"
+      savedProject ? [savedProject] : [],
+      savedProject
     );
     byId("apiBaseUrl").value = window.localStorage.getItem("roughCutStage2.apiBaseUrl") || "http://127.0.0.1:8000";
-    byId("projectsRoot").value = window.localStorage.getItem("roughCutStage2.projectsRoot")
-      || "/Users/mac/Documents/AI/rough_cut_v3/projects";
+    byId("projectsRoot").value = window.localStorage.getItem("roughCutStage2.projectsRoot") || "";
     byId("transcribePath").value =
       window.localStorage.getItem("roughCutStage2.transcribePath") ||
       "/stage2/sync-jobs/start";
@@ -255,7 +265,7 @@
   function whisperMessage(job) {
     var message = String(job.message || "");
     if (message === "Preparing word indexes" || message === "Transcribing audio") {
-      return "Whisper распознаёт аудио";
+      return "Распознавание аудио";
     }
     if (message === "Matching scenario quotes") {
       return "Сопоставление реплик со сценарием";
@@ -267,9 +277,9 @@
       return "Распознавание и сопоставление завершены";
     }
     if (job.status === "failed") {
-      return job.error || "Whisper завершился с ошибкой";
+      return job.error || "Распознавание завершилось с ошибкой";
     }
-    return message || "Ожидание данных Whisper";
+    return message || "Ожидание данных распознавания";
   }
 
   function formatDuration(seconds) {
@@ -404,7 +414,7 @@
       whisperPollTimer = null;
     }
     if (!current.project || !current.apiBaseUrl || !current.token) {
-      renderWhisperIdle("Введите API token, чтобы видеть прогресс.");
+      renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
       return;
     }
     path = currentWhisperJobId
@@ -414,9 +424,9 @@
       var job;
       if (error) {
         if (error.message === "job not found") {
-          renderWhisperIdle("Для проекта пока нет Whisper-задачи.");
+          renderWhisperIdle("Для проекта пока нет задачи распознавания.");
         } else {
-          renderWhisperIdle("Статус Whisper недоступен: " + error.message);
+          renderWhisperIdle("Статус распознавания недоступен: " + error.message);
         }
         scheduleWhisperPoll(10000);
         return;
@@ -454,7 +464,6 @@
       " · V" + sequence.videoTrackCount + "/A" + sequence.audioTrackCount;
     byId("registerSequence").disabled = false;
     byId("resolveSequence").disabled = false;
-    byId("insertRange").disabled = false;
     byId("exportAndTranscribe").disabled = false;
     if (!byId("sourceId").value.trim()) {
       sourceName = String(sequence.name || "");
@@ -797,88 +806,72 @@
     });
   }
 
-  function numericValue(id) {
-    var value = Number(byId(id).value);
-    return isFinite(value) ? value : NaN;
-  }
-
   function pathFilename(value) {
     var parts = String(value || "").split(/[\\/]/);
     return parts.length ? parts[parts.length - 1] : "";
   }
 
-  function insertRange() {
-    var sourceIn = numericValue("sourceIn");
-    var sourceOut = numericValue("sourceOut");
-    var timelineAt = numericValue("timelineAt");
-    var videoTrack = numericValue("videoTrack") - 1;
-    var audioTrack = numericValue("audioTrack") - 1;
+  function setConformStatus(state, message) {
+    var status = byId("conformStatus");
+    status.className = "operation-status operation-status-" + state;
+    status.textContent = message;
+  }
 
-    if (!activeSource) {
-      log("Сначала считайте sync-секвенцию-источник.");
-      return;
-    }
-    if (!isFinite(sourceIn) || !isFinite(sourceOut) || sourceIn < 0 || sourceOut <= sourceIn) {
-      log("Проверьте Source in/out: out должен быть больше in.");
-      return;
-    }
-    if (!isFinite(timelineAt) || timelineAt < 0 || videoTrack < 0 || audioTrack < 0) {
-      log("Проверьте позицию таймлайна и номера дорожек.");
-      return;
-    }
-
-    log("Вставляю диапазон. Активная секвенция будет изменена…");
-    callHost("insert", {
-      sourceSequenceId: activeSource.sequenceId,
-      sourceProjectItemNodeId: activeSource.projectItemNodeId,
-      sourceSequenceName: activeSource.name,
-      sourceInSeconds: sourceIn,
-      sourceOutSeconds: sourceOut,
-      timelineSeconds: timelineAt,
-      videoTrackIndex: Math.floor(videoTrack),
-      audioTrackIndex: Math.floor(audioTrack),
-      mode: byId("insertMode").value,
-      placeholderName: byId("placeholderName").value.trim()
-    }, function (error, response) {
-      if (error) {
-        log("Вставка не завершена: " + error.message, response);
-        return;
-      }
-      log("Диапазон вставлен.", response.result);
-    });
+  function setConformBusy(busy) {
+    byId("conformAll").disabled = busy;
+    byId("conformAll").textContent = busy
+      ? "Применение…"
+      : "Применить подтверждённые СНХ";
   }
 
   function conformAll() {
     var current = config();
-    var videoTrack = numericValue("videoTrack") - 1;
-    var audioTrack = numericValue("audioTrack") - 1;
     if (!current.project) {
       log("Укажите проект.");
+      setConformStatus("error", "Сначала выберите проект в настройках.");
       return;
     }
-    if (videoTrack < 0 || audioTrack < 0) {
-      log("Проверьте номера целевых дорожек.");
+    if (!current.token) {
+      log("Введите ключ доступа.");
+      setConformStatus("error", "Введите ключ доступа в настройках проекта.");
       return;
     }
-    log("Проверяю активную целевую секвенцию перед conform…");
+    setConformBusy(true);
+    setConformStatus("working", "Проверяю активную монтажную секвенцию…");
+    log("Проверяю активную целевую секвенцию…");
     callHost("inspect", undefined, function (inspectError, inspected) {
       var target;
       if (inspectError) {
         log("Целевая секвенция не считана: " + inspectError.message);
+        setConformBusy(false);
+        setConformStatus("error", "Не удалось считать активную секвенцию.");
         return;
       }
       target = inspected.sequence;
       if (activeSource && String(target.sequenceId) === String(activeSource.sequenceId)) {
-        log("Откройте отдельную целевую Rough Cut секвенцию: источник нельзя conform-ить в самого себя.");
+        log("Откройте отдельную монтажную секвенцию: источник нельзя применить к самому себе.");
+        setConformBusy(false);
+        setConformStatus("error", "Откройте целевую монтажную секвенцию, а не секвенцию-источник.");
         return;
       }
-      log("Загружаю подтверждённые ranges для conform…");
+      if (!window.confirm(
+        "Применить подтверждённые СНХ к секвенции «" + target.name + "»?\n\n" +
+        "Перед продолжением рекомендуется создать её копию."
+      )) {
+        setConformBusy(false);
+        setConformStatus("idle", "Операция отменена. Секвенция не изменена.");
+        return;
+      }
+      setConformStatus("working", "Загружаю подтверждённые СНХ…");
+      log("Загружаю подтверждённые диапазоны…");
       request("GET", "/stage2/timeline?project=" + encodeURIComponent(current.project), null, function (error, response) {
       var timeline;
       var segments;
       var items;
       if (error) {
         log("Timeline не загружен: " + error.message, response);
+        setConformBusy(false);
+        setConformStatus("error", "Не удалось загрузить монтажный таймлайн.");
         return;
       }
       timeline = response.result || response;
@@ -915,13 +908,16 @@
       });
       if (!items.length) {
         log("В timeline нет подтверждённых СНХ с валидными sequence/range.");
+        setConformBusy(false);
+        setConformStatus("idle", "Подтверждённые СНХ для применения не найдены.");
         return;
       }
-      log("Начинаю conform " + items.length + " СНХ. Активная секвенция будет изменена…");
+      setConformStatus("working", "Применяю СНХ: " + items.length + "…");
+      log("Начинаю применение " + items.length + " СНХ. Активная секвенция будет изменена…");
       callHost("conform", {
         items: items,
-        videoTrackIndex: Math.floor(videoTrack),
-        audioTrackIndex: Math.floor(audioTrack),
+        videoTrackIndex: CONFORM_VIDEO_TRACK_INDEX,
+        audioTrackIndex: CONFORM_AUDIO_TRACK_INDEX,
         expectedTargetSequenceId: target.sequenceId,
         expectedTargetSequenceName: target.name,
         expectedProjectPath: target.projectPath,
@@ -929,8 +925,19 @@
       }, function (hostError, hostResponse) {
         if (hostError) {
           log("Conform не запущен: " + hostError.message, hostResponse);
+          setConformBusy(false);
+          setConformStatus("error", "Не удалось применить СНХ: " + hostError.message);
           return;
         }
+        setConformBusy(false);
+        setConformStatus(
+          hostResponse.report.stopped ? "error" : "success",
+          hostResponse.report.stopped
+            ? "Операция остановлена: применено " + hostResponse.report.completed.length +
+              " из " + hostResponse.report.requested + "."
+            : "Готово: применено " + hostResponse.report.completed.length +
+              " из " + hostResponse.report.requested + " СНХ."
+        );
         log(
           "Conform: " + hostResponse.report.completed.length + "/" + hostResponse.report.requested +
           (hostResponse.report.stopped ? ", остановлен на ошибке." : ", завершён."),
@@ -938,17 +945,6 @@
         );
       });
     });
-    });
-  }
-
-  function inspectLayout() {
-    log("Считываю позиции клипов на всех дорожках в диапазоне 0–40 с…");
-    callHost("layout", { fromSeconds: 0, toSeconds: 40 }, function (error, response) {
-      if (error) {
-        log("Снимок дорожек не получен: " + error.message, response);
-        return;
-      }
-      log("Снимок дорожек готов.", response.layout);
     });
   }
 
@@ -975,8 +971,6 @@
     byId("registerSequence").addEventListener("click", registerSequence);
     byId("resolveSequence").addEventListener("click", resolveSequence);
     byId("exportAndTranscribe").addEventListener("click", exportAndTranscribe);
-    byId("insertRange").addEventListener("click", insertRange);
-    byId("inspectLayout").addEventListener("click", inspectLayout);
     byId("conformAll").addEventListener("click", conformAll);
     byId("clearLog").addEventListener("click", function () {
       byId("log").textContent = "";
@@ -986,12 +980,12 @@
   function init() {
     loadConfig();
     bind();
-    renderWhisperIdle("Введите API token, чтобы видеть прогресс.");
+    renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
     loadProjects();
     callHost("ping", undefined, function (error, response) {
       if (error) {
-        setHostBadge("error", "host error");
-        log("host.jsx недоступен: " + error.message);
+        setHostBadge("error", "Premiere: ошибка");
+        log("Модуль Premiere недоступен: " + error.message);
         return;
       }
       setHostBadge("ok", response.host || "Premiere");

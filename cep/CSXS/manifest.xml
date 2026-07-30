@@ -33,7 +33,7 @@
         </Lifecycle>
         <UI>
           <Type>Panel</Type>
-          <Menu>Rough Cut v3 — Sync</Menu>
+          <Menu>Rough Cut — Синхронизация</Menu>
           <Geometry>
             <Size>
               <Width>380</Width>

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 HOST = (Path(__file__).parents[1] / "cep" / "host.jsx").read_text(encoding="utf-8")
@@ -113,18 +114,35 @@ def test_ripple_replace_requires_exact_placeholder_then_inserts() -> None:
     assert "if (matches.length === 1)" in HOST
     assert "Math.abs(matches[i].startSeconds - expectedStart) <= 0.08" in HOST
     assert "if (positionMatches.length === 1)" in HOST
-    assert '<option value="ripple_replace">' in (
-        Path(__file__).parents[1] / "cep" / "index.html"
-    ).read_text(encoding="utf-8")
+    assert '<option value="ripple_replace">' not in HTML
 
 
-def test_cross_track_layout_diagnostic_and_conform_kill_switch() -> None:
-    html = (Path(__file__).parents[1] / "cep" / "index.html").read_text(encoding="utf-8")
-    assert "rcStage2_inspectActiveSequenceLayout" in PANEL
+def test_production_panel_hides_manual_diagnostics_and_keeps_conform() -> None:
+    assert "rcStage2_inspectActiveSequenceLayout" not in PANEL
     assert "function sequenceLayout(" in HOST
-    assert 'id="inspectLayout"' in html
-    assert 'id="conformAll" class="button button-primary full-width">' in html
+    assert 'id="inspectLayout"' not in HTML
+    assert 'id="insertRange"' not in HTML
+    assert 'id="sourceIn"' not in HTML
+    assert 'id="sourceOut"' not in HTML
+    assert 'id="timelineAt"' not in HTML
+    assert 'id="insertMode"' not in HTML
+    assert 'id="placeholderName"' not in HTML
+    assert 'id="videoTrack"' not in HTML
+    assert 'id="audioTrack"' not in HTML
+    assert 'id="conformAll"' in HTML
+    assert 'id="conformStatus"' in HTML
     assert "Batch conform is temporarily disabled" in HOST
     assert "function conformOnePass(" in HOST
     assert "moveBatchEntriesOnce(target, entries)" in HOST
     assert "enableExplicitTrackShiftBatch: true" in PANEL
+
+
+def test_panel_literal_dom_references_have_matching_elements() -> None:
+    referenced_ids = set(re.findall(r'byId\("([^"]+)"\)', PANEL))
+    html_ids = set(re.findall(r'id="([^"]+)"', HTML))
+    assert referenced_ids <= html_ids
+
+
+def test_panel_has_no_workstation_specific_defaults() -> None:
+    assert "/Users/mac/" not in PANEL
+    assert '|| "BRIK"' not in PANEL

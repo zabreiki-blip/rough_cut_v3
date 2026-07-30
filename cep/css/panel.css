@@ -22,7 +22,7 @@ body {
 
 body {
   margin: 0;
-  background: var(--bg);
+  background: linear-gradient(180deg, #1b1e22 0, var(--bg) 180px);
   color: var(--text);
   font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -33,6 +33,7 @@ body {
   justify-content: space-between;
   padding: 18px 16px 13px;
   border-bottom: 1px solid #292c31;
+  background: rgba(23, 25, 28, 0.78);
 }
 
 h1,
@@ -86,11 +87,31 @@ main {
   padding: 10px;
 }
 
+.panel-notice {
+  border-left: 3px solid #555b64;
+  border-radius: 4px;
+  background: rgba(34, 37, 42, 0.78);
+  color: var(--muted);
+  padding: 8px 10px;
+  font-size: 11px;
+}
+
+.panel-notice-success {
+  border-left-color: var(--accent-strong);
+  color: #b7ddcf;
+}
+
+.panel-notice-error {
+  border-left-color: var(--danger);
+  color: #efaaa4;
+}
+
 .card {
   overflow: hidden;
   border: 1px solid var(--card-border);
-  border-radius: 7px;
+  border-radius: 8px;
   background: var(--card);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
 }
 
 .card-heading {
@@ -107,20 +128,44 @@ main {
   padding: 12px;
 }
 
-.config-card summary {
+.config-card > summary,
+.log-card > summary {
   cursor: pointer;
   color: var(--muted);
   padding: 10px 12px;
   user-select: none;
 }
 
-.config-card[open] summary {
+.config-card[open] > summary,
+.log-card[open] > summary {
   border-bottom: 1px solid var(--card-border);
+}
+
+.config-card > summary:hover,
+.log-card > summary:hover {
+  color: var(--text);
 }
 
 .grid {
   display: grid;
   gap: 10px;
+}
+
+.advanced-settings {
+  border-top: 1px solid var(--card-border);
+}
+
+.advanced-settings summary {
+  cursor: pointer;
+  color: var(--muted);
+  padding: 10px 0 0;
+  font-size: 11px;
+}
+
+.advanced-settings-body {
+  display: grid;
+  gap: 10px;
+  padding-top: 10px;
 }
 
 .full-width {
@@ -188,10 +233,10 @@ select:focus {
   box-shadow: 0 0 0 1px var(--focus);
 }
 
-.field-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 9px;
+.button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
 .button-row {
@@ -208,11 +253,20 @@ select:focus {
   font: inherit;
   font-weight: 620;
   padding: 5px 10px;
+  transition: background-color 120ms ease, border-color 120ms ease, transform 80ms ease;
 }
 
 .button:disabled {
   cursor: default;
   opacity: 0.42;
+}
+
+.button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .button-primary {
@@ -224,12 +278,6 @@ select:focus {
   border-color: #4a505a;
   background: #30343a;
   color: var(--text);
-}
-
-.button-danger {
-  border-color: #9f5b55;
-  background: #6e3d39;
-  color: #fff;
 }
 
 .button-link {
@@ -267,6 +315,35 @@ select:focus {
 
 .warning {
   color: #e0aaa5;
+}
+
+.section-copy {
+  color: #c9cdd3;
+  font-size: 12px;
+}
+
+.operation-status {
+  border: 1px solid var(--card-border);
+  border-radius: 5px;
+  background: #1b1e21;
+  color: var(--muted);
+  padding: 9px 10px;
+  font-size: 11px;
+}
+
+.operation-status-working {
+  border-color: #4e7368;
+  color: #b7ddcf;
+}
+
+.operation-status-success {
+  border-color: #377b65;
+  color: #9ee8ca;
+}
+
+.operation-status-error {
+  border-color: #884b47;
+  color: #efaaa4;
 }
 
 .whisper-stage {
@@ -324,7 +401,7 @@ select:focus {
 
 .whisper-stats {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
   margin: 12px 0 10px;
 }
@@ -361,8 +438,14 @@ select:focus {
   100% { transform: translateX(270%); }
 }
 
-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  padding: 5px 8px 5px 12px;
+  font-size: 10px;
 }
 
 .log-card pre {
@@ -376,4 +459,10 @@ code {
   white-space: pre-wrap;
   word-break: break-word;
   font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@media (min-width: 520px) {
+  .whisper-stats {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
 }
