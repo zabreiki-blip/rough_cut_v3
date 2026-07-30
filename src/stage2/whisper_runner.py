@@ -24,6 +24,23 @@ _MODEL_CACHE_LOCK = threading.Lock()
 ProgressCallback = Callable[[float, float, int], None]
 
 
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer greater than or equal to {minimum}"
+        ) from exc
+    if value < minimum:
+        raise ValueError(
+            f"{name} must be an integer greater than or equal to {minimum}"
+        )
+    return value
+
+
 def _emit_progress(
     callback: ProgressCallback | None,
     processed_sec: float,
@@ -172,10 +189,16 @@ def _transcribe_faster(
     language: str,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+    from faster_whisper import (  # type: ignore[import-not-found]
+        BatchedInferencePipeline,
+        WhisperModel,
+    )
 
     device = os.getenv("SYNC_WHISPER_DEVICE", "auto").strip() or "auto"
     compute_type = os.getenv("SYNC_WHISPER_COMPUTE_TYPE", "default").strip() or "default"
+    beam_size = _env_int("SYNC_WHISPER_BEAM_SIZE", 5, minimum=1)
+    best_of = _env_int("SYNC_WHISPER_BEST_OF", 5, minimum=1)
+    batch_size = _env_int("SYNC_WHISPER_BATCH_SIZE", 0, minimum=0)
     whisper_model, model_lock = _cached_model(
         ("faster-whisper", model, device, compute_type),
         lambda: WhisperModel(model, device=device, compute_type=compute_type),
@@ -183,11 +206,23 @@ def _transcribe_faster(
     # Backend model instances are not guaranteed to be thread-safe.
     raw_words: list[dict[str, Any]] = []
     with model_lock:
-        segments, info = whisper_model.transcribe(
+        transcriber = (
+            BatchedInferencePipeline(whisper_model)
+            if batch_size > 0
+            else whisper_model
+        )
+        transcribe_kwargs: dict[str, Any] = {
+            "language": language,
+            "word_timestamps": True,
+            "vad_filter": True,
+            "beam_size": beam_size,
+            "best_of": best_of,
+        }
+        if batch_size > 0:
+            transcribe_kwargs["batch_size"] = batch_size
+        segments, info = transcriber.transcribe(
             str(audio_path),
-            language=language,
-            word_timestamps=True,
-            vad_filter=True,
+            **transcribe_kwargs,
         )
         duration_sec = float(getattr(info, "duration", 0.0) or 0.0)
         _emit_progress(progress_callback, 0.0, duration_sec, 0)
@@ -208,6 +243,12 @@ def _transcribe_faster(
         "detected_language": getattr(info, "language", language),
         "language_probability": getattr(info, "language_probability", None),
         "duration_sec": duration_sec,
+        "device": device,
+        "compute_type": compute_type,
+        "beam_size": beam_size,
+        "best_of": best_of,
+        "batch_size": batch_size,
+        "batched": batch_size > 0,
     }
 
 

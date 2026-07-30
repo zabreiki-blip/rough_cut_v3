@@ -36,6 +36,7 @@ def test_whisper_job_progress_is_visible_and_polled_without_restarting_backend()
     assert '"/stage2/sync-jobs/status?project="' in PANEL
     assert "scheduleWhisperPoll(1000)" in PANEL
     assert 'className += " is-indeterminate"' in PANEL
+    assert "force_transcribe: true" not in PANEL
 
 
 def test_sequence_tick_strings_are_converted_to_seconds() -> None:

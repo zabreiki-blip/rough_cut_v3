@@ -105,7 +105,10 @@ class WhisperRunnerTest(unittest.TestCase):
                 )
 
         progress = []
-        fake_module = SimpleNamespace(WhisperModel=FakeModel)
+        fake_module = SimpleNamespace(
+            BatchedInferencePipeline=object,
+            WhisperModel=FakeModel,
+        )
         with patch.dict("sys.modules", {"faster_whisper": fake_module}):
             words, metadata = _transcribe_faster(
                 Path("audio.wav"),
@@ -119,6 +122,161 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertEqual(progress, [(0.0, 10.0, 0), (5.0, 10.0, 1), (10.0, 10.0, 2)])
         self.assertEqual(len(words), 2)
         self.assertEqual(metadata["duration_sec"], 10.0)
+
+    def test_faster_whisper_default_decoding_kwargs_preserve_behavior(self) -> None:
+        calls = {}
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs) -> None:
+                calls["init"] = (args, kwargs)
+
+            def transcribe(self, *args, **kwargs):
+                calls["transcribe"] = (args, kwargs)
+                return iter([
+                    SimpleNamespace(
+                        end=2.0,
+                        words=[SimpleNamespace(word="тест", start=1.0, end=2.0)],
+                    ),
+                ]), SimpleNamespace(
+                    duration=2.0,
+                    language="ru",
+                    language_probability=0.98,
+                )
+
+        class UnexpectedBatchPipeline:
+            def __init__(self, _model) -> None:
+                raise AssertionError("batch pipeline must be disabled by default")
+
+        fake_module = SimpleNamespace(
+            BatchedInferencePipeline=UnexpectedBatchPipeline,
+            WhisperModel=FakeModel,
+        )
+        with (
+            patch.dict("sys.modules", {"faster_whisper": fake_module}),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            _words, metadata = _transcribe_faster(
+                Path("audio.wav"),
+                "default-kwargs-test-model",
+                "ru",
+            )
+
+        self.assertEqual(
+            calls["init"],
+            (
+                ("default-kwargs-test-model",),
+                {"device": "auto", "compute_type": "default"},
+            ),
+        )
+        self.assertEqual(calls["transcribe"][0], ("audio.wav",))
+        self.assertEqual(
+            calls["transcribe"][1],
+            {
+                "language": "ru",
+                "word_timestamps": True,
+                "vad_filter": True,
+                "beam_size": 5,
+                "best_of": 5,
+            },
+        )
+        self.assertEqual(metadata["device"], "auto")
+        self.assertEqual(metadata["compute_type"], "default")
+        self.assertEqual(metadata["beam_size"], 5)
+        self.assertEqual(metadata["best_of"], 5)
+        self.assertEqual(metadata["batch_size"], 0)
+        self.assertFalse(metadata["batched"])
+
+    def test_faster_whisper_uses_configured_batch_pipeline(self) -> None:
+        calls = {}
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs) -> None:
+                calls["model"] = self
+                calls["init"] = (args, kwargs)
+
+            def transcribe(self, *_args, **_kwargs):
+                raise AssertionError("model.transcribe must not be used in batch mode")
+
+        class FakeBatchPipeline:
+            def __init__(self, model) -> None:
+                calls["pipeline_model"] = model
+
+            def transcribe(self, *args, **kwargs):
+                calls["transcribe"] = (args, kwargs)
+                return iter([
+                    SimpleNamespace(
+                        end=3.0,
+                        words=[SimpleNamespace(word="батч", start=2.0, end=3.0)],
+                    ),
+                ]), SimpleNamespace(
+                    duration=3.0,
+                    language="ru",
+                    language_probability=0.97,
+                )
+
+        fake_module = SimpleNamespace(
+            BatchedInferencePipeline=FakeBatchPipeline,
+            WhisperModel=FakeModel,
+        )
+        environment = {
+            "SYNC_WHISPER_DEVICE": "cpu",
+            "SYNC_WHISPER_COMPUTE_TYPE": "int8",
+            "SYNC_WHISPER_BEAM_SIZE": "1",
+            "SYNC_WHISPER_BEST_OF": "2",
+            "SYNC_WHISPER_BATCH_SIZE": "8",
+        }
+        with (
+            patch.dict("sys.modules", {"faster_whisper": fake_module}),
+            patch.dict("os.environ", environment, clear=True),
+        ):
+            _words, metadata = _transcribe_faster(
+                Path("audio.wav"),
+                "batch-kwargs-test-model",
+                "ru",
+            )
+
+        self.assertIs(calls["pipeline_model"], calls["model"])
+        self.assertEqual(
+            calls["transcribe"][1],
+            {
+                "language": "ru",
+                "word_timestamps": True,
+                "vad_filter": True,
+                "beam_size": 1,
+                "best_of": 2,
+                "batch_size": 8,
+            },
+        )
+        self.assertEqual(metadata["device"], "cpu")
+        self.assertEqual(metadata["compute_type"], "int8")
+        self.assertEqual(metadata["beam_size"], 1)
+        self.assertEqual(metadata["best_of"], 2)
+        self.assertEqual(metadata["batch_size"], 8)
+        self.assertTrue(metadata["batched"])
+
+    def test_faster_whisper_rejects_invalid_integer_settings(self) -> None:
+        fake_module = SimpleNamespace(
+            BatchedInferencePipeline=object,
+            WhisperModel=object,
+        )
+        invalid_settings = (
+            ("SYNC_WHISPER_BEAM_SIZE", "0"),
+            ("SYNC_WHISPER_BEST_OF", "-1"),
+            ("SYNC_WHISPER_BATCH_SIZE", "-1"),
+            ("SYNC_WHISPER_BATCH_SIZE", "1.5"),
+        )
+        for name, value in invalid_settings:
+            with self.subTest(name=name, value=value):
+                with (
+                    patch.dict("sys.modules", {"faster_whisper": fake_module}),
+                    patch.dict("os.environ", {name: value}, clear=True),
+                ):
+                    with self.assertRaisesRegex(ValueError, name):
+                        _transcribe_faster(
+                            Path("audio.wav"),
+                            "invalid-env-test-model",
+                            "ru",
+                        )
 
 
 if __name__ == "__main__":

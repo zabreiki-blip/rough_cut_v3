@@ -48,6 +48,9 @@
   - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`
 - для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper`,
   `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
+- параметры faster-whisper: `SYNC_WHISPER_BEAM_SIZE` и
+  `SYNC_WHISPER_BEST_OF` (по умолчанию `5`), `SYNC_WHISPER_BATCH_SIZE`
+  (`0` отключает batching; для CPU начинать с `4` или `8`);
   одна транскрипция выполняется в отдельном процессе с hard timeout
   `SYNC_WHISPER_TIMEOUT_SECONDS` (по умолчанию 14400 секунд)
 - `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV
@@ -254,6 +257,12 @@ projects/<project>/work/full_timeline.json
 Docker устанавливает `faster-whisper` и хранит модели в named volume
 `whisper_cache`. При локальном запуске на Apple Silicon можно установить
 `mlx-whisper`; адаптер выбирается автоматически.
+
+Изолированный Whisper worker переиспользует загруженную модель между
+последовательными заданиями и автоматически пересоздаётся после ошибки или
+таймаута. Word index повторно используется только при совпадении сигнатуры WAV,
+конфигурации, платформы и версий backend; новый индекс атомарно заменяет старый
+только после успешного распознавания.
 
 ## Тесты
 

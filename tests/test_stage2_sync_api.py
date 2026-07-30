@@ -689,8 +689,15 @@ def test_selected_cep_export_still_matches_against_all_ready_indexes(sync_api) -
             ],
         },
     ).status_code == 200
+    # Make the non-selected source stale. A scoped CEP job must still reuse its
+    # last good index instead of unexpectedly transcribing it.
+    other_audio = projects / "demo" / "work" / "sync_audio" / "other_01.wav"
+    other_audio.write_bytes(other_audio.read_bytes() + b"\0\0")
 
-    def fake_transcribe(_path, **_kwargs):
+    transcribed_paths: list[str] = []
+
+    def fake_transcribe(path, **_kwargs):
+        transcribed_paths.append(Path(path).name)
         return {
             "model": "mock",
             "language": "ru",
@@ -715,9 +722,286 @@ def test_selected_cep_export_still_matches_against_all_ready_indexes(sync_api) -
         )
 
     assert response.status_code == 200, response.get_json()
+    assert transcribed_paths == ["vasilieva_01.wav"]
     matches = client.get("/stage2/sync-matches?project=demo").get_json()["result"]
     found = next(
         item for item in matches["matches"]
         if item["block_uid"] == "stable-sync-uid"
     )
     assert found["source_id"] == "other_01"
+
+
+def test_failed_forced_transcription_preserves_previous_word_index(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/words",
+        json={
+            "project": "demo",
+            "words": [
+                {"word": "сохранить", "start": 1.0, "end": 1.4},
+                {"word": "старый", "start": 1.4, "end": 1.8},
+                {"word": "индекс", "start": 1.8, "end": 2.2},
+            ],
+        },
+    ).status_code == 200
+    index_path = (
+        projects / "demo" / "work" / "transcripts" / "vasilieva_01.words.json"
+    )
+    previous = index_path.read_bytes()
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=RuntimeError("backend failed")),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={
+                "project": "demo",
+                "source_ids": ["vasilieva_01"],
+                "force_transcribe": True,
+            },
+        )
+
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["transcribed"] == 0
+    assert job["source_failures"] == [
+        {"source_id": "vasilieva_01", "error": "backend failed"}
+    ]
+    assert index_path.read_bytes() == previous
+
+
+def test_audio_change_during_transcription_preserves_previous_index(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/words",
+        json={
+            "project": "demo",
+            "words": [{"word": "старый", "start": 1.0, "end": 1.5}],
+        },
+    ).status_code == 200
+    index_path = (
+        projects / "demo" / "work" / "transcripts" / "vasilieva_01.words.json"
+    )
+    previous = index_path.read_bytes()
+
+    def mutate_audio(path, **_kwargs):
+        audio_path = Path(path)
+        audio_path.write_bytes(audio_path.read_bytes() + b"\0\0")
+        return {
+            "model": "mock",
+            "language": "ru",
+            "words": [{"word": "новый", "start": 1.0, "end": 1.5}],
+        }
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=mutate_audio),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={
+                "project": "demo",
+                "source_ids": ["vasilieva_01"],
+                "force_transcribe": True,
+            },
+        )
+
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert "changed during transcription" in job["source_failures"][0]["error"]
+    assert index_path.read_bytes() == previous
+
+
+def test_word_index_cache_invalidates_on_config_and_audio_changes(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+    calls: list[Path] = []
+
+    def fake_transcribe(path, **_kwargs):
+        calls.append(Path(path))
+        return {
+            "backend": "faster-whisper",
+            "model": "medium",
+            "language": "ru",
+            "words": [
+                {"word": "маленькая", "start": 10.0, "end": 10.2},
+                {"word": "женщина", "start": 10.2, "end": 10.4},
+                {"word": "покоряла", "start": 10.4, "end": 10.6},
+                {"word": "великих", "start": 10.6, "end": 10.8},
+                {"word": "людей", "start": 10.8, "end": 11.0},
+            ],
+        }
+
+    def start_job() -> dict:
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+        assert response.status_code == 200, response.get_json()
+        return client.get(
+            response.get_json()["result"]["status_url"]
+        ).get_json()["result"]
+
+    environment = {
+        "SYNC_WHISPER_BACKEND": "faster-whisper",
+        "SYNC_WHISPER_MODEL": "medium",
+        "SYNC_WHISPER_LANGUAGE": "ru",
+        "SYNC_WHISPER_BEAM_SIZE": "5",
+        "SYNC_WHISPER_BEST_OF": "5",
+        "SYNC_WHISPER_BATCH_SIZE": "0",
+        "SYNC_WHISPER_DEVICE": "cpu",
+        "SYNC_WHISPER_COMPUTE_TYPE": "int8",
+    }
+    with (
+        patch.dict(api.os.environ, environment),
+        patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        first = start_job()
+        second = start_job()
+        assert first["transcribed"] == 1
+        assert second["transcribed"] == 0
+        assert second["reused_indexes"] == 1
+        assert len(calls) == 1
+
+        api.os.environ["SYNC_WHISPER_BEAM_SIZE"] = "1"
+        changed_config = start_job()
+        assert changed_config["transcribed"] == 1
+        assert len(calls) == 2
+
+        audio_path = calls[-1]
+        audio_path.write_bytes(audio_path.read_bytes() + b"\0\0")
+        changed_audio = start_job()
+        assert changed_audio["transcribed"] == 1
+        assert len(calls) == 3
+
+
+def test_legacy_word_index_is_migrated_without_retranscription(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+    index_path = (
+        projects / "demo" / "work" / "transcripts" / "vasilieva_01.words.json"
+    )
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps(
+            {
+                "source_id": "vasilieva_01",
+                "language": "ru",
+                "model": "legacy-medium",
+                "metadata": {},
+                "words": [
+                    {"word": "ручная", "start": 1.0, "end": 1.4},
+                    {"word": "правка", "start": 1.4, "end": 1.8},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with (
+        patch.object(
+            api,
+            "transcribe_audio",
+            side_effect=AssertionError("legacy index must be reused"),
+        ),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    migrated = json.loads(index_path.read_text(encoding="utf-8"))
+    assert job["transcribed"] == 0
+    assert job["reused_indexes"] == 1
+    assert migrated["words"][0]["word"] == "ручная"
+    assert migrated["metadata"]["transcription_cache"]["origin"] == "legacy"
+
+
+def test_failed_config_refresh_uses_same_audio_index_as_fallback(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes(15.0)), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+
+    transcript = {
+        "backend": "faster-whisper",
+        "model": "medium",
+        "language": "ru",
+        "words": [
+            {"word": "маленькая", "start": 10.0, "end": 10.2},
+            {"word": "женщина", "start": 10.2, "end": 10.4},
+            {"word": "покоряла", "start": 10.4, "end": 10.6},
+            {"word": "великих", "start": 10.6, "end": 10.8},
+            {"word": "людей", "start": 10.8, "end": 11.0},
+        ],
+    }
+    with (
+        patch.object(api, "transcribe_audio", return_value=transcript),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        first = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert first.status_code == 200
+
+    with (
+        patch.dict(api.os.environ, {"SYNC_WHISPER_BEAM_SIZE": "1"}),
+        patch.object(
+            api, "transcribe_audio", side_effect=RuntimeError("temporary failure")
+        ),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        second = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+
+    job = client.get(second.get_json()["result"]["status_url"]).get_json()["result"]
+    matches = client.get("/stage2/sync-matches?project=demo").get_json()["result"]
+    found = next(
+        item for item in matches["matches"]
+        if item["block_uid"] == "stable-sync-uid"
+    )
+    assert job["transcribed"] == 0
+    assert job["reused_indexes"] == 1
+    assert job["source_failures"][0]["error"] == "temporary failure"
+    assert found["source_id"] == "vasilieva_01"

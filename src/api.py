@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hmac
 import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import threading
 from typing import BinaryIO
@@ -45,7 +47,7 @@ from stage2.timeline_parser import (
 )
 from stage2.placeholder import generate_placeholder
 from stage2.sync_matcher import MatcherConfig, SyncMatcher
-from stage2.sync_models import AlignmentRequest, SyncMatch, SyncSource
+from stage2.sync_models import AlignmentRequest, SyncMatch, SyncSource, WordIndex
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
 from stage2.whisper_process import transcribe_audio_in_process as transcribe_audio
@@ -1296,6 +1298,98 @@ def _resolve_sync_audio_path(source: SyncSource, paths: dict[str, Path]) -> Path
     return candidates[0].resolve()
 
 
+_TRANSCRIPTION_CACHE_KEY = "transcription_cache"
+
+
+def _audio_cache_signature(audio_path: Path) -> dict[str, int]:
+    stat = audio_path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _installed_version(distribution: str) -> str:
+    try:
+        return package_version(distribution)
+    except PackageNotFoundError:
+        return "<not-installed>"
+
+
+def _transcription_config(
+    *, backend: str | None, model: str | None, language: str
+) -> dict[str, str]:
+    """Return lightweight cache inputs without importing a Whisper backend."""
+
+    configured_backend = (
+        str(backend).strip() if backend is not None else ""
+    ) or os.getenv("SYNC_WHISPER_BACKEND", "auto").strip() or "auto"
+    configured_model = (
+        str(model).strip() if model is not None else ""
+    ) or os.getenv("SYNC_WHISPER_MODEL", "").strip() or "<backend-default>"
+    return {
+        "backend": configured_backend.lower(),
+        "model": configured_model,
+        "language": str(language).strip().lower(),
+        "beam_size": os.getenv("SYNC_WHISPER_BEAM_SIZE", "5").strip() or "5",
+        "best_of": os.getenv("SYNC_WHISPER_BEST_OF", "5").strip() or "5",
+        "batch_size": os.getenv("SYNC_WHISPER_BATCH_SIZE", "0").strip() or "0",
+        "device": os.getenv("SYNC_WHISPER_DEVICE", "auto").strip().lower() or "auto",
+        "compute_type": (
+            os.getenv("SYNC_WHISPER_COMPUTE_TYPE", "default").strip().lower()
+            or "default"
+        ),
+        "runtime_platform": f"{platform.system()}-{platform.machine()}",
+        "faster_whisper_version": _installed_version("faster-whisper"),
+        "mlx_whisper_version": _installed_version("mlx-whisper"),
+        "openai_whisper_version": _installed_version("openai-whisper"),
+    }
+
+
+def _transcription_config_fingerprint(config: dict[str, str]) -> str:
+    payload = json.dumps(
+        config, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _transcription_cache_metadata(
+    audio_path: Path,
+    config: dict[str, str],
+    *,
+    origin: str = "generated",
+    audio_signature: dict[str, int] | None = None,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "audio": audio_signature or _audio_cache_signature(audio_path),
+        "config_fingerprint": _transcription_config_fingerprint(config),
+        "config": config,
+        "origin": origin,
+    }
+
+
+def _word_index_cache_is_current(
+    index: WordIndex, audio_path: Path, config: dict[str, str]
+) -> bool:
+    cache = index.metadata.get(_TRANSCRIPTION_CACHE_KEY)
+    if not isinstance(cache, dict):
+        return False
+    if not _word_index_audio_matches(index, audio_path):
+        return False
+    if cache.get("origin") == "manual":
+        return True
+    return cache.get("config_fingerprint") == _transcription_config_fingerprint(config)
+
+
+def _word_index_audio_matches(index: WordIndex, audio_path: Path) -> bool:
+    cache = index.metadata.get(_TRANSCRIPTION_CACHE_KEY)
+    if not isinstance(cache, dict) or cache.get("version") != 1:
+        return False
+    try:
+        audio_signature = _audio_cache_signature(audio_path)
+    except OSError:
+        return False
+    return cache.get("audio") == audio_signature
+
+
 def _copy_stream_limited(
     source: BinaryIO,
     destination: Path,
@@ -1518,20 +1612,82 @@ def _run_sync_job(
             _update_sync_job(job_id, current_source_id=source.id)
             index_path = _word_index_path(paths, source.id)
             selected_for_transcription = not source_ids or source.id in source_ids
+            cached_index = None
+            audio_path = None
             try:
-                if index_path.is_file() and not (
-                    force_transcribe and selected_for_transcription
-                ):
-                    index = load_word_index(index_path, source.id)
-                    reused += 1
-                elif source_ids and not selected_for_transcription:
-                    # Another registered sequence has not been exported yet.
-                    # It becomes part of the pool after its own CEP run.
-                    continue
-                else:
-                    if force_transcribe and selected_for_transcription:
-                        index_path.unlink(missing_ok=True)
+                should_force = force_transcribe and selected_for_transcription
+                config = _transcription_config(
+                    backend=backend, model=model, language=language
+                )
+                audio_resolution_error = None
+                try:
                     audio_path = _resolve_sync_audio_path(source, paths)
+                    audio_is_available = audio_path.is_file()
+                except ValueError as exc:
+                    audio_resolution_error = exc
+                    audio_path = None
+                    audio_is_available = False
+
+                cache_load_error = None
+                if index_path.is_file():
+                    try:
+                        cached_index = load_word_index(index_path, source.id)
+                    except (OSError, TypeError, ValueError) as exc:
+                        cache_load_error = exc
+                if cached_index is None and not audio_is_available:
+                    if cache_load_error is not None:
+                        raise cache_load_error
+                    if audio_resolution_error is not None:
+                        raise audio_resolution_error
+
+                # Preserve legacy indexes on their first read. We cannot know
+                # whether an older file was generated or manually corrected,
+                # so migrate its cache metadata without changing its words.
+                if (
+                    cached_index is not None
+                    and audio_is_available
+                    and audio_path is not None
+                    and not isinstance(
+                        cached_index.metadata.get(_TRANSCRIPTION_CACHE_KEY), dict
+                    )
+                ):
+                    cached_index.metadata[_TRANSCRIPTION_CACHE_KEY] = (
+                        _transcription_cache_metadata(
+                            audio_path, config, origin="legacy"
+                        )
+                    )
+                    save_word_index(index_path, cached_index)
+
+                cache_is_current = bool(
+                    cached_index is not None
+                    and audio_is_available
+                    and audio_path is not None
+                    and _word_index_cache_is_current(
+                        cached_index, audio_path, config
+                    )
+                )
+                if source_ids and not selected_for_transcription:
+                    if cached_index is None:
+                        if cache_load_error is not None:
+                            raise cache_load_error
+                        # Another registered sequence has not been indexed yet.
+                        # It joins the matching pool after its own CEP run.
+                        continue
+                    # A scoped CEP job must never unexpectedly transcribe other
+                    # sources. Keep their last good indexes in the matching pool;
+                    # they will be refreshed when selected by a later job.
+                    index = cached_index
+                    reused += 1
+                elif cached_index is not None and not should_force and (
+                    cache_is_current or not audio_is_available
+                ):
+                    index = cached_index
+                    reused += 1
+                else:
+                    if audio_path is None:
+                        raise FileNotFoundError(
+                            f"audio guide not found for sync source {source.id}"
+                        )
                     source_duration = max(0.0, float(source.duration_sec or 0.0))
                     _update_sync_job(
                         job_id,
@@ -1559,6 +1715,7 @@ def _run_sync_job(
                             transcription_words=word_count,
                         )
 
+                    input_audio_signature = _audio_cache_signature(audio_path)
                     result = transcribe_audio(
                         audio_path,
                         backend=backend,
@@ -1570,16 +1727,37 @@ def _run_sync_job(
                             or None
                         ),
                     )
+                    if _audio_cache_signature(audio_path) != input_audio_signature:
+                        raise RuntimeError(
+                            f"audio guide changed during transcription: {audio_path.name}"
+                        )
                     index = ingest_word_index(
                         result,
                         source.id,
                         model=str(result.get("model") or model or ""),
                         language=str(result.get("language") or language),
                     )
+                    index.metadata[_TRANSCRIPTION_CACHE_KEY] = (
+                        _transcription_cache_metadata(
+                            audio_path,
+                            config,
+                            audio_signature=input_audio_signature,
+                        )
+                    )
                     save_word_index(index_path, index)
                     transcribed += 1
                 indexes.append(index)
             except Exception as exc:
+                if (
+                    cached_index is not None
+                    and audio_path is not None
+                    and _word_index_audio_matches(cached_index, audio_path)
+                ):
+                    # A decoding/config refresh may fail temporarily. Keep the
+                    # last transcript for matching when it still describes the
+                    # exact same WAV; never fall back across an audio change.
+                    indexes.append(cached_index)
+                    reused += 1
                 source_failures.append({"source_id": source.id, "error": str(exc)})
             _update_sync_job(
                 job_id,
@@ -1885,9 +2063,9 @@ def stage2_sync_source_audio(source_id: str):
         updated = SyncSource.from_dict(updated_payload)
         with _SYNC_DATA_LOCK:
             source_store.save(updated)
-        # Uploaded audio invalidates only its regenerable transcript; manually
-        # reviewed matches remain available until the next job is started.
-        _word_index_path(paths, source_id).unlink(missing_ok=True)
+        # Keep the previous regenerable transcript until a replacement has
+        # been produced successfully. Its audio signature makes it stale for
+        # the next job, while preserving recovery data if transcription fails.
     except AudioUploadTooLargeError as exc:
         temporary.unlink(missing_ok=True)
         return _json_error(str(exc), 413)
@@ -1923,12 +2101,26 @@ def stage2_sync_source_words(source_id: str):
     paths = _ensure_project(project)
     source_store, _match_store = _sync_stores(paths)
     try:
-        if source_store.get(source_id) is None:
+        source = source_store.get(source_id)
+        if source is None:
             return _json_error("sync source not found", 404)
         transcript_payload = dict(payload) if isinstance(payload, dict) else payload
         if isinstance(transcript_payload, dict):
             transcript_payload.pop("project", None)
         index = ingest_word_index(transcript_payload, source_id)
+        try:
+            audio_path = _resolve_sync_audio_path(source, paths)
+        except ValueError:
+            audio_path = None
+        if audio_path is not None and audio_path.is_file():
+            config = _transcription_config(
+                backend=None,
+                model=index.model or None,
+                language=index.language,
+            )
+            index.metadata[_TRANSCRIPTION_CACHE_KEY] = (
+                _transcription_cache_metadata(audio_path, config, origin="manual")
+            )
         index_path = _word_index_path(paths, source_id)
         save_word_index(index_path, index)
     except (TypeError, ValueError) as exc:

@@ -7,7 +7,13 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from stage2.sync_models import SyncSource, WordIndex
-from stage2.sync_transcript import WordIndexGenerator, ingest_word_index, load_word_index
+from stage2 import sync_transcript
+from stage2.sync_transcript import (
+    WordIndexGenerator,
+    ingest_word_index,
+    load_word_index,
+    save_word_index,
+)
 
 
 def test_ingests_whisperx_nested_word_timestamps() -> None:
@@ -96,6 +102,36 @@ def test_load_word_index_supports_json_file() -> None:
         )
         index = load_word_index(path, "source")
         assert index.words[0].word == "слово"
+
+
+def test_save_word_index_atomically_replaces_existing_file(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "source.words.json"
+    path.write_text("previous index\n", encoding="utf-8")
+    index = ingest_word_index(
+        {"words": [{"word": "новый", "start": 0.0, "end": 0.4}]},
+        "source",
+    )
+    real_replace = sync_transcript.os.replace
+    observed: dict[str, Path] = {}
+
+    def inspect_replace(source, destination) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        assert source_path.parent == path.parent
+        assert destination_path == path
+        assert path.read_text(encoding="utf-8") == "previous index\n"
+        assert (
+            json.loads(source_path.read_text(encoding="utf-8"))["source_id"]
+            == "source"
+        )
+        observed["temporary"] = source_path
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(sync_transcript.os, "replace", inspect_replace)
+    save_word_index(path, index)
+
+    assert observed["temporary"].exists() is False
+    assert load_word_index(path).words[0].word == "новый"
 
 
 def test_generator_protocol_decouples_alignment_from_whisper_invocation() -> None:

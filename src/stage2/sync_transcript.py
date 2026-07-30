@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 from math import isfinite
+import os
 import re
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+import uuid
 
 from .sync_models import SyncSource, WordIndex, WordTimestamp
 
@@ -174,13 +176,17 @@ def load_word_index(
 
 
 def save_word_index(path: Path | str, index: WordIndex) -> None:
-    """Save an already-generated index; transcription remains adapter-owned."""
+    """Atomically save an already-generated index beside its final path."""
 
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    # Word indexes can be regenerated and this helper is intentionally simple;
-    # source/match stores provide stronger atomic update semantics for UI edits.
-    file_path.write_text(
-        json.dumps(index.to_dict(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    temporary = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(index.to_dict(), ensure_ascii=False, indent=2))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, file_path)
+    finally:
+        temporary.unlink(missing_ok=True)

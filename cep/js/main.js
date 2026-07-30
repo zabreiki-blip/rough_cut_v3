@@ -683,8 +683,7 @@
     var path = current.transcribePath || "/stage2/sync-jobs/start";
     request("POST", path, {
       project: current.project,
-      source_ids: [sourceId],
-      force_transcribe: true
+      source_ids: [sourceId]
     }, function (error, response) {
       if (error) {
         log("WAV готов и зарегистрирован, но Whisper job не запущен: " + error.message, response);
