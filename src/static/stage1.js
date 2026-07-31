@@ -20,6 +20,7 @@
     dry_run: el("dry_run"),
     btn_analyze: el("btn_analyze"),
     btn_tts: el("btn_tts"),
+    btn_tts_cancel: el("btn_tts_cancel"),
     btn_phrase_tts: el("btn_phrase_tts"),
     btn_validate: el("btn_validate"),
     btn_run_all: el("btn_run_all"),
@@ -54,6 +55,7 @@
     ts_snh: el("ts_snh"),
     ts_dur: el("ts_dur"),
     btn_sync_align: el("btn_sync_align"),
+    btn_sync_cancel: el("btn_sync_cancel"),
     sync_sources_count: el("sync_sources_count"),
     sync_sources_names: el("sync_sources_names"),
     sync_job_status: el("sync_job_status"),
@@ -112,7 +114,15 @@
   let syncMatches = [];
   let syncMatchesRevision = 0;
   let syncJobRunning = false;
+  let currentSyncJobId = "";
+  let currentSyncJobStatus = "";
   let syncPollTimer = null;
+  let currentTtsJobId = "";
+  let currentTtsJobStatus = "";
+  let ttsPollTimer = null;
+  let ttsPollFailures = 0;
+  let syncPollFailures = 0;
+  const MAX_POLL_BACKOFF_MS = 10000;
   const live = {
     status: "idle",
     event: "\u2014",
@@ -165,6 +175,9 @@
       item_generated: "блок готов",
       item_skipped: "пропущен",
       item_retrying: "повтор",
+      cancelling: "останавливается",
+      cancelled: "прервано",
+      interrupted: "прервано",
       completed: "завершено",
       failed: "ошибка",
     };
@@ -223,9 +236,24 @@
     [ids.btn_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline].forEach((button) => {
       if (button) button.disabled = blocked;
     });
+    if (ids.btn_tts && ["queued", "running", "cancelling"].includes(currentTtsJobStatus)) {
+      ids.btn_tts.disabled = true;
+    }
     if (ids.btn_sync_align) {
       ids.btn_sync_align.disabled = blocked || syncJobRunning
         || syncFeatureAvailable !== true || syncSources.length === 0;
+      ids.btn_sync_align.textContent = ["interrupted", "cancelled", "failed"].includes(currentSyncJobStatus)
+        ? "Продолжить сопоставление"
+        : "Найти СНХ автоматически";
+    }
+    if (ids.btn_sync_cancel) ids.btn_sync_cancel.hidden = !syncJobRunning;
+    if (ids.btn_tts_cancel) {
+      ids.btn_tts_cancel.hidden = !["queued", "running", "cancelling"].includes(currentTtsJobStatus);
+    }
+    if (ids.btn_tts) {
+      ids.btn_tts.textContent = ["interrupted", "cancelled", "failed"].includes(currentTtsJobStatus)
+        ? "Продолжить озвучку"
+        : "TTS";
     }
     document.querySelectorAll("[data-action='confirm-sync-match']").forEach((button) => {
       button.disabled = blocked || syncJobRunning;
@@ -287,7 +315,9 @@
     const response = await fetch(url);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
-      throw new Error(data.error || JSON.stringify(data));
+      const error = new Error(data.error || JSON.stringify(data));
+      error.status = response.status;
+      throw error;
     }
     return data.result || {};
   }
@@ -328,12 +358,24 @@
     }
     if (!response.ok || data.ok === false) {
       const plainText = raw && !raw.trimStart().startsWith("<") ? raw.trim().slice(0, 500) : "";
-      throw new Error(data.message || data.error || plainText || `HTTP ${response.status}`);
+      const error = new Error(data.message || data.error || plainText || `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
     return {
       available: true,
       result: data.result !== undefined ? data.result : data,
     };
+  }
+
+  function isTransientPollingError(error) {
+    const status = Number((error && error.status) || 0);
+    return status === 0 || status === 408 || status === 429 || status >= 500;
+  }
+
+  function pollingBackoffMs(failures, baseDelay) {
+    const exponent = Math.min(4, Math.max(0, Number(failures || 1) - 1));
+    return Math.min(MAX_POLL_BACKOFF_MS, baseDelay * (2 ** exponent));
   }
 
   const blockTypeLabels = {
@@ -824,6 +866,10 @@
     assertRequiredPath(f.prepared_path, "prepared_path");
     assertRequiredPath(f.speaker_dir, "speaker_dir");
     setStepState(ids.step_tts, "active");
+    if (ids.btn_tts_cancel) {
+      ids.btn_tts_cancel.disabled = false;
+      ids.btn_tts_cancel.textContent = "Остановить после текущего блока";
+    }
     setLive({
       status: "queued", event: "queued",
       current: "\u2014", retries: 0, done: 0, total: 0, error: "",
@@ -842,15 +888,34 @@
 
     const jobId = String(start.job_id || "").trim();
     if (!jobId) throw new Error("TTS job start failed: empty job_id");
+    currentTtsJobId = jobId;
+    currentTtsJobStatus = String(start.status || "queued").toLowerCase();
+    if (ids.btn_tts_cancel) ids.btn_tts_cancel.hidden = false;
 
     appendLog(`TTS job queued: ${jobId}`);
     let lastMarker = "";
     let retryCount = 0;
+    let pollFailures = 0;
     while (true) {
-      const state = await getJSON(`/stage1/tts-jobs/${encodeURIComponent(jobId)}`);
+      let state;
+      try {
+        state = await getJSON(`/stage1/tts-jobs/${encodeURIComponent(jobId)}`);
+        pollFailures = 0;
+      } catch (err) {
+        if (!isTransientPollingError(err)) throw err;
+        pollFailures += 1;
+        const delay = pollingBackoffMs(pollFailures, 1200);
+        appendLog(
+          `TTS status временно недоступен; повтор через ${Math.ceil(delay / 1000)} с.`,
+          "warn",
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
       const total = Number(state.total || 0);
       const done = Number(state.done || 0);
       const event = String(state.event || "");
+      currentTtsJobStatus = String(state.status || "running").toLowerCase();
       const currentId = String(state.current_id || "").trim();
       const attempts = Number(state.attempts || 0);
       const marker = `${event}|${done}|${total}|${currentId}|${attempts}`;
@@ -885,6 +950,19 @@
         const skip = result.skipped_count || state.skipped || 0;
         toast(`TTS завершён: ${gen} создано, ${skip} пропущено`, "success");
         appendLog(`TTS done: generated=${gen}, skipped=${skip}, voice=${result.voice || state.voice || ""}`);
+        currentTtsJobId = "";
+        if (ids.btn_tts_cancel) ids.btn_tts_cancel.hidden = true;
+        break;
+      }
+      if (state.status === "cancelled" || state.status === "interrupted") {
+        setStepState(ids.step_tts, "active");
+        setLive({
+          status: state.status, event: state.event || state.status,
+          current: "\u2014", done, total, error: "",
+        });
+        if (ids.btn_tts_cancel) ids.btn_tts_cancel.hidden = true;
+        toast("Озвучка остановлена. Готовые WAV сохранены — можно продолжить позже.", "warn");
+        appendLog("TTS остановлен; повторный запуск пропустит уже готовые WAV.", "warn");
         break;
       }
       if (state.status === "failed") {
@@ -901,6 +979,106 @@
     }
 
     await refreshStatus();
+  }
+
+  async function cancelTTSJob() {
+    if (!currentTtsJobId || !["queued", "running", "cancelling"].includes(currentTtsJobStatus)) return;
+    try {
+      const state = await postJSON(`/stage1/tts-jobs/${encodeURIComponent(currentTtsJobId)}/cancel`, {});
+      currentTtsJobStatus = String(state.status || "cancelling").toLowerCase();
+      setLive({status: currentTtsJobStatus, event: "cancelling"});
+      ids.btn_tts_cancel.disabled = true;
+      ids.btn_tts_cancel.textContent = "Останавливается…";
+      appendLog("Запрошена остановка TTS. Текущий внешний вызов будет завершён безопасно.", "warn");
+    } catch (err) {
+      toast(err.message || String(err), "error");
+      appendLog(`TTS cancel: ${err.message || err}`, "error");
+    }
+  }
+
+  function restoreTtsControls(state) {
+    if (!state || typeof state !== "object") return;
+    if (state.prepared_path) ids.prepared_path.value = String(state.prepared_path);
+    if (state.speaker_dir) ids.speaker_dir.value = String(state.speaker_dir);
+    if (state.provider) ids.provider.value = String(state.provider);
+    if (state.gender) ids.gender.value = String(state.gender);
+    if (Object.prototype.hasOwnProperty.call(state, "voice")) {
+      ids.voice_name.value = String(state.voice || "");
+    }
+    if (Object.prototype.hasOwnProperty.call(state, "dry_run")) {
+      ids.dry_run.checked = Boolean(state.dry_run);
+    }
+    const speed = Number(state.speed);
+    if (Number.isFinite(speed) && speed > 0) {
+      ids.speed.value = String(speed);
+      ids.speed_val.textContent = speed.toFixed(2);
+    }
+  }
+
+  function renderRestoredTtsJob(state) {
+    const total = Number(state.total || 0);
+    const done = Number(state.done || 0);
+    currentTtsJobId = String(state.id || state.job_id || currentTtsJobId || "");
+    currentTtsJobStatus = String(state.status || "").toLowerCase();
+    setLive({
+      status: currentTtsJobStatus || "idle",
+      event: String(state.event || currentTtsJobStatus || "\u2014"),
+      current: String(state.current_id || "\u2014"),
+      retries: Number(state.retry_count || 0),
+      done,
+      total,
+      error: String(state.last_error || state.error || ""),
+    });
+    if (total > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+      ids.progress_bar.style.width = `${pct}%`;
+      ids.m_progress.textContent = `${pct}%`;
+    }
+    const active = ["queued", "running", "cancelling"].includes(currentTtsJobStatus);
+    if (ids.btn_tts_cancel) ids.btn_tts_cancel.hidden = !active;
+    updateActionAvailability();
+    return active;
+  }
+
+  async function pollRestoredTtsJob() {
+    if (!currentTtsJobId) return;
+    try {
+      const state = await getJSON(`/stage1/tts-jobs/${encodeURIComponent(currentTtsJobId)}`);
+      ttsPollFailures = 0;
+      if (renderRestoredTtsJob(state)) {
+        ttsPollTimer = window.setTimeout(pollRestoredTtsJob, 1200);
+      } else {
+        ttsPollTimer = null;
+        if (["cancelled", "interrupted"].includes(currentTtsJobStatus)) {
+          appendLog("TTS остановлен; готовые WAV можно продолжить кнопкой «Продолжить озвучку».", "warn");
+        }
+        await refreshStatus();
+      }
+    } catch (err) {
+      if (!isTransientPollingError(err)) {
+        ttsPollTimer = null;
+        appendLog(`TTS status: ${err.message || err}`, "warn");
+        return;
+      }
+      ttsPollFailures += 1;
+      const delay = pollingBackoffMs(ttsPollFailures, 1200);
+      appendLog(
+        `TTS status временно недоступен; повтор через ${Math.ceil(delay / 1000)} с.`,
+        "warn",
+      );
+      ttsPollTimer = window.setTimeout(pollRestoredTtsJob, delay);
+    }
+  }
+
+  async function restoreTtsJob() {
+    const response = await optionalRequestJSON(
+      `/stage1/tts-jobs/status?project=${encodeURIComponent(project)}`,
+    );
+    if (!response.available || !response.result) return;
+    restoreTtsControls(response.result);
+    if (renderRestoredTtsJob(response.result) && !ttsPollTimer) {
+      ttsPollTimer = window.setTimeout(pollRestoredTtsJob, 500);
+    }
   }
 
   async function doPhraseTTS() {
@@ -1258,11 +1436,22 @@
       const confidenceText = Number.isFinite(confidence)
         ? `${Math.round(confidence * (confidence <= 1 ? 100 : 1))}%`
         : "\u2014";
+      const llmReview = match.metadata?.llm_semantic_review;
+      const llmConfidence = Number(llmReview?.confidence);
+      const llmHint = llmReview
+        ? `<div class="sync-match-llm">LLM выбрал этот вариант по смыслу${
+            Number.isFinite(llmConfidence)
+              ? ` · уверенность ${Math.round(llmConfidence * 100)}%`
+              : ""
+          }. Проверьте аудио перед подтверждением.</div>`
+        : "";
       const sourceIn = Number(candidate.source_in_sec);
       const sourceOut = Number(candidate.source_out_sec);
       const hasCandidate = Boolean(candidate.source_id)
         && Number.isFinite(sourceIn) && Number.isFinite(sourceOut) && sourceOut > sourceIn;
-      const label = status === "unmatched" ? "не найдено" : "нужно проверить";
+      const label = llmReview
+        ? "LLM · проверить"
+        : (status === "unmatched" ? "не найдено" : "нужно проверить");
       const action = hasCandidate && matchId
         ? `<button class="btn btn-sm btn-accent" type="button"
              data-action="confirm-sync-match" data-match-id="${escaped(matchId)}">
@@ -1314,6 +1503,7 @@
           <div class="sync-match-found" data-sync-found>${matchedText
             ? escaped(matchedText)
             : "Whisper-фрагмент не найден"}</div>
+          ${llmHint}
           <div class="sync-match-meta" data-sync-meta>
             ${escaped(source)} · ${formatSourceSecond(sourceIn)}–${formatSourceSecond(sourceOut)}
             · уверенность ${confidenceText}
@@ -1326,9 +1516,10 @@
   }
 
   async function loadSyncWorkspace(quiet) {
-    const [sourcesResponse, matchesResponse] = await Promise.all([
+    const [sourcesResponse, matchesResponse, jobResponse] = await Promise.all([
       optionalRequestJSON(`/stage2/sync-sources?project=${encodeURIComponent(project)}`),
       optionalRequestJSON(`/stage2/sync-matches?project=${encodeURIComponent(project)}`),
+      optionalRequestJSON(`/stage2/sync-jobs/status?project=${encodeURIComponent(project)}`),
     ]);
     syncFeatureAvailable = sourcesResponse.available || matchesResponse.available;
 
@@ -1339,6 +1530,22 @@
     syncMatchesRevision = Number(matchesDocument.revision || 0);
     renderSyncSources();
     renderSyncMatches(matchesDocument);
+    if (jobResponse.available && jobResponse.result) {
+      const job = syncJobPayload(jobResponse.result);
+      renderSyncJob(job);
+      const status = String(job.status || "").toLowerCase();
+      if (["queued", "running", "cancelling"].includes(status)) {
+        syncJobRunning = true;
+        updateActionAvailability();
+        if (!syncPollTimer && currentSyncJobId) {
+          syncPollTimer = window.setTimeout(
+            () => pollSyncJob(`/stage2/sync-jobs/${encodeURIComponent(currentSyncJobId)}`),
+            500,
+          );
+        }
+      }
+      updateActionAvailability();
+    }
     if (!quiet && syncFeatureAvailable === false) {
       appendLog("Stage 2 sync API пока недоступен; обычная сборка продолжает работать.", "warn");
     }
@@ -1352,6 +1559,8 @@
   function renderSyncJob(value) {
     const job = syncJobPayload(value);
     const status = String(job.status || "running").toLowerCase();
+    currentSyncJobId = String(job.id || job.job_id || currentSyncJobId || "");
+    currentSyncJobStatus = status;
     const total = Number(job.total || job.items_total || 0);
     const done = Number(job.done ?? job.completed ?? job.items_done ?? 0);
     const current = job.current_source || job.current_id || "";
@@ -1361,6 +1570,9 @@
     ids.sync_job_status.dataset.state = status;
     ids.sync_job_status.textContent = status === "completed" ? "готово"
       : status === "failed" ? "ошибка"
+      : status === "interrupted" ? "прервано"
+      : status === "cancelled" ? "прервано"
+      : status === "cancelling" ? "останавливается"
       : status === "queued" ? "в очереди"
       : "в работе";
     ids.sync_job_progress.hidden = false;
@@ -1371,6 +1583,7 @@
 
   function finishSyncJob() {
     syncJobRunning = false;
+    syncPollFailures = 0;
     if (syncPollTimer) window.clearTimeout(syncPollTimer);
     syncPollTimer = null;
     updateActionAvailability();
@@ -1379,6 +1592,7 @@
   async function pollSyncJob(statusUrl) {
     try {
       const response = await optionalRequestJSON(statusUrl);
+      syncPollFailures = 0;
       if (!response.available) {
         finishSyncJob();
         appendLog("Статус задачи сопоставления больше недоступен.", "warn");
@@ -1396,21 +1610,47 @@
       }
       if (status === "failed" || status === "cancelled") {
         finishSyncJob();
-        const message = job.error || job.last_error || "Сопоставление завершилось с ошибкой";
-        toast(message, "error");
-        appendLog(`Stage 2 sync: ${message}`, "error");
+        if (status === "cancelled") {
+          toast("Сопоставление остановлено. Индексы и найденные диапазоны сохранены.", "warn");
+          appendLog("Stage 2 sync: остановлено; можно продолжить повторным запуском.", "warn");
+        } else {
+          const message = job.error || job.last_error || "Сопоставление завершилось с ошибкой";
+          toast(message, "error");
+          appendLog(`Stage 2 sync: ${message}`, "error");
+        }
+        return;
+      }
+      if (status === "interrupted") {
+        finishSyncJob();
+        await loadSyncWorkspace(true);
+        toast("Работа была прервана. Подтверждённые СНХ сохранены — запустите сопоставление снова.", "warn");
+        appendLog("Stage 2 sync: задача прервана; сохранённые результаты можно продолжить.", "warn");
         return;
       }
       syncPollTimer = window.setTimeout(() => pollSyncJob(statusUrl), 1500);
     } catch (err) {
-      finishSyncJob();
-      toast(err.message || String(err), "error");
-      appendLog(`Stage 2 sync status: ${err.message || err}`, "error");
+      if (!isTransientPollingError(err)) {
+        finishSyncJob();
+        toast(err.message || String(err), "error");
+        appendLog(`Stage 2 sync status: ${err.message || err}`, "error");
+        return;
+      }
+      syncPollFailures += 1;
+      const delay = pollingBackoffMs(syncPollFailures, 1500);
+      appendLog(
+        `Stage 2 sync status временно недоступен; повтор через ${Math.ceil(delay / 1000)} с.`,
+        "warn",
+      );
+      syncPollTimer = window.setTimeout(() => pollSyncJob(statusUrl), delay);
     }
   }
 
   async function startSyncAlignment() {
     appendLog("Stage 2 sync: запуск распознавания и сопоставления...");
+    if (ids.btn_sync_cancel) {
+      ids.btn_sync_cancel.disabled = false;
+      ids.btn_sync_cancel.textContent = "Остановить после текущего шага";
+    }
     const response = await optionalRequestJSON(
       "/stage2/sync-jobs/start",
       "POST",
@@ -1435,6 +1675,8 @@
     }
     syncFeatureAvailable = true;
     syncJobRunning = true;
+    currentSyncJobId = jobId;
+    currentSyncJobStatus = String(job.status || "queued").toLowerCase();
     renderSyncJob(job);
     updateActionAvailability();
 
@@ -1448,6 +1690,25 @@
       ? suppliedUrl
       : `/stage2/sync-jobs/${encodeURIComponent(jobId)}`;
     syncPollTimer = window.setTimeout(() => pollSyncJob(statusUrl), 500);
+  }
+
+  async function cancelSyncJob() {
+    if (!currentSyncJobId || !syncJobRunning) return;
+    try {
+      const response = await optionalRequestJSON(
+        `/stage2/sync-jobs/${encodeURIComponent(currentSyncJobId)}/cancel`,
+        "POST",
+        {},
+      );
+      if (!response.available) throw new Error("Backend не поддерживает остановку задачи");
+      renderSyncJob(response.result);
+      ids.btn_sync_cancel.disabled = true;
+      ids.btn_sync_cancel.textContent = "Останавливается…";
+      appendLog("Запрошена остановка сопоставления; уже сохранённые результаты останутся.", "warn");
+    } catch (err) {
+      toast(err.message || String(err), "error");
+      appendLog(`Stage 2 sync cancel: ${err.message || err}`, "error");
+    }
   }
 
   async function confirmSyncMatch(matchId, card) {
@@ -1515,6 +1776,7 @@
   }
 
   ids.btn_sync_align.addEventListener("click", () => safely(startSyncAlignment));
+  if (ids.btn_sync_cancel) ids.btn_sync_cancel.addEventListener("click", cancelSyncJob);
   ids.sync_review_list.addEventListener("click", (event) => {
     const button = event.target.closest("[data-action='confirm-sync-match']");
     if (!button) return;
@@ -1574,6 +1836,7 @@
 
   if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
   ids.btn_tts.addEventListener("click", () => safely(doTTS));
+  if (ids.btn_tts_cancel) ids.btn_tts_cancel.addEventListener("click", cancelTTSJob);
   ids.btn_phrase_tts.addEventListener("click", () => safely(doPhraseTTS));
   ids.btn_validate.addEventListener("click", () => safely(doValidate));
   ids.btn_refresh.addEventListener("click", () => safely(async () => {
@@ -1602,5 +1865,6 @@
   renderLive();
   appendLog(`UI ready. project=${project}`);
   Promise.all([loadNormalization(true), loadMemory(true)]).catch((err) => appendLog(`Normalization init: ${err.message}`, "warn"));
+  restoreTtsJob().catch((err) => appendLog(`TTS status init: ${err.message || err}`, "warn"));
   loadSyncWorkspace(true).catch((err) => appendLog(`Stage 2 sync init: ${err.message || err}`, "warn"));
 })();

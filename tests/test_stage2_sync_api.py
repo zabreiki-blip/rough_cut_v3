@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -10,6 +11,8 @@ import wave
 import pytest
 
 import api
+from stage2.sync_llm_review import SemanticDecision
+from stage2.sync_models import SyncAlternative, SyncMatch, SyncSource, WordIndex, WordTimestamp
 
 
 class _ImmediateThread:
@@ -19,6 +22,44 @@ class _ImmediateThread:
 
     def start(self) -> None:
         self.target(**self.kwargs)
+
+
+def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
+    source = SyncSource(id="source", speaker="A", premiere_sequence="Sequence")
+    units = [{
+        "segment_id": "block-1",
+        "parent_block_uid": "block-1",
+        "text": "точная цитата",
+        "speaker": "A",
+        "timecode_start": "00:10",
+    }]
+    index = WordIndex(
+        source_id="source",
+        words=[WordTimestamp("цитата", 10.0, 10.5)],
+        generated_at="stable",
+    )
+    arguments = {
+        "units": units,
+        "sources": [source],
+        "indexes": [index],
+        "normalization_revision": 3,
+        "timecode_mode": "relative",
+        "search_window_sec": 180.0,
+        "llm_enabled": True,
+        "llm_model": "model",
+        "llm_threshold": 0.8,
+        "llm_limit": 30,
+    }
+    first = api._sync_matching_fingerprint(**arguments)
+    assert first == api._sync_matching_fingerprint(**arguments)
+
+    changed = dict(arguments)
+    changed["indexes"] = [WordIndex(
+        source_id="source",
+        words=[WordTimestamp("другая", 10.0, 10.5)],
+        generated_at="stable",
+    )]
+    assert api._sync_matching_fingerprint(**changed) != first
 
 
 def _wav_bytes(duration_sec: float = 1.0, sample_rate: int = 8000) -> bytes:
@@ -46,6 +87,7 @@ def sync_api():
             with api._SYNC_JOBS_LOCK:
                 api._SYNC_JOBS.clear()
                 api._SYNC_ACTIVE_PROJECTS.clear()
+                api._SYNC_CANCEL_EVENTS.clear()
             yield api.app.test_client(), projects
 
 
@@ -286,6 +328,282 @@ def test_source_reregistration_preserves_guide_and_rejects_id_rebinding(sync_api
         },
     )
     assert rebound.status_code == 409
+
+
+def test_latest_sync_job_status_survives_in_memory_registry_reset(sync_api) -> None:
+    client, projects = sync_api
+    created = api._create_sync_job("demo")
+    completed = api._update_sync_job(
+        created["id"],
+        status="completed",
+        message="Completed",
+        done=12,
+        total=12,
+        finished_at="2026-07-30T20:00:00+00:00",
+    )
+    assert completed is not None
+
+    status_path = projects / "demo" / "work" / "sync_job_status.json"
+    persisted = json.loads(status_path.read_text(encoding="utf-8"))
+    assert persisted["id"] == created["id"]
+    assert persisted["status"] == "completed"
+    assert persisted["done"] == 12
+
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_JOBS.clear()
+
+    response = client.get("/stage2/sync-jobs/status?project=demo")
+    assert response.status_code == 200
+    restored = response.get_json()["result"]
+    assert restored["id"] == created["id"]
+    assert restored["status"] == "completed"
+    assert restored["done"] == 12
+    assert client.get(f"/stage2/sync-jobs/{created['id']}").status_code == 404
+
+
+def test_corrupt_persisted_sync_job_status_is_ignored(sync_api) -> None:
+    client, projects = sync_api
+    status_path = projects / "demo" / "work" / "sync_job_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text("{not valid json", encoding="utf-8")
+
+    response = client.get("/stage2/sync-jobs/status?project=demo")
+    assert response.status_code == 404
+    assert response.get_json()["error"] == "job not found"
+
+
+def test_semantic_review_selects_only_a_real_candidate_and_stays_manual():
+    original = SyncMatch(
+        segment_id="block-1",
+        query_text="длинная цитата сценария для смысловой проверки",
+        speaker="Спикер",
+        source_id="source-a",
+        source_in_sec=10.0,
+        source_out_sec=15.0,
+        confidence=0.62,
+        status="needs_review",
+        matched_text="первый вариант",
+        strategy="full_transcript",
+        alternatives=[
+            SyncAlternative("source-a", 30.0, 37.0, 0.57, "второй вариант"),
+        ],
+    )
+    candidates = api._semantic_review_candidates(original)
+    reviewed = api._apply_semantic_review(
+        original,
+        candidates,
+        1,
+        llm_confidence=0.93,
+        reason="совпадает смысл",
+        model="test/model",
+    )
+    assert reviewed.status == "needs_review"
+    assert reviewed.strategy == "llm_semantic_review"
+    assert reviewed.source_in_sec == 30.0
+    assert reviewed.source_out_sec == 37.0
+    assert reviewed.confidence == 0.57
+    assert reviewed.metadata["llm_semantic_review"] == {
+        "selected_candidate": 1,
+        "confidence": 0.93,
+        "reason": "совпадает смысл",
+        "model": "test/model",
+        "original_strategy": "full_transcript",
+        "original_confidence": 0.62,
+    }
+
+
+def test_background_job_uses_llm_for_low_confidence_blocks_without_auto_confirming(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/words",
+        json={
+            "project": "demo",
+            "words": [
+                {"word": "тестовая", "start": 10.0, "end": 10.4},
+                {"word": "расшифровка", "start": 10.4, "end": 10.8},
+            ],
+        },
+    ).status_code == 200
+
+    settings = api.get_settings()
+    settings.openrouter_api_key = "test-key"
+
+    def low_match(_matcher, request):
+        return SyncMatch(
+            segment_id=request.segment_id,
+            query_text=request.text,
+            speaker=request.speaker,
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=15.0,
+            confidence=0.63,
+            status="needs_review",
+            matched_text="первый буквальный кандидат",
+            strategy="full_transcript",
+            alternatives=[
+                SyncAlternative(
+                    "vasilieva_01", 20.0, 26.0, 0.55,
+                    "второй смысловой кандидат",
+                ),
+            ],
+        )
+
+    with (
+        patch.object(api, "get_settings", return_value=settings),
+        patch.object(api.SyncMatcher, "match", low_match),
+        patch.object(
+            api,
+            "review_candidates_with_llm",
+            return_value=SemanticDecision(1, 0.92, "тот же смысл", "test/model"),
+        ) as llm_review,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["llm_reviewed"] == 1
+    assert job["needs_review"] == 2
+    assert job["auto_matched"] == 0
+    assert llm_review.call_count == 1
+
+    matches = client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    assert len(matches) == 2
+    assert all(item["status"] == "needs_review" for item in matches)
+    reviewed = next(item for item in matches if item["strategy"] == "llm_semantic_review")
+    assert reviewed["source_in_sec"] == 20.0
+    assert reviewed["source_out_sec"] == 26.0
+
+
+def test_persisted_running_sync_job_is_reported_as_interrupted_checkpoint(sync_api) -> None:
+    client, projects = sync_api
+    created = api._create_sync_job("demo")
+    running = api._update_sync_job(
+        created["id"],
+        status="running",
+        message="Matching scenario quotes",
+        done=7,
+        total=12,
+        current_segment_id="stable-sync-uid",
+    )
+    assert running is not None
+
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_JOBS.clear()
+
+    response = client.get("/stage2/sync-jobs/status?project=demo")
+    assert response.status_code == 200
+    restored = response.get_json()["result"]
+    assert restored["id"] == created["id"]
+    assert restored["status"] == "interrupted"
+    assert restored["done"] == 7
+    assert restored["total"] == 12
+    assert restored["current_segment_id"] == ""
+    assert "saved progress" in restored["message"]
+
+    build = client.post("/stage2/build", json={"project": "demo"})
+    assert build.status_code == 409
+    assert build.get_json()["error"].startswith("sync_job_interrupted:")
+
+
+def test_persisted_cancelling_sync_job_is_reported_as_interrupted_checkpoint(
+    sync_api,
+) -> None:
+    client, _projects = sync_api
+    created = api._create_sync_job("demo")
+    updated = api._update_sync_job(
+        created["id"],
+        status="cancelling",
+        message="Cancellation requested; saving completed work",
+        done=3,
+        total=8,
+    )
+    assert updated is not None
+
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_JOBS.clear()
+        api._SYNC_ACTIVE_PROJECTS.clear()
+        api._SYNC_CANCEL_EVENTS.clear()
+
+    response = client.get("/stage2/sync-jobs/status?project=demo")
+    assert response.status_code == 200
+    restored = response.get_json()["result"]
+    assert restored["id"] == created["id"]
+    assert restored["status"] == "interrupted"
+    assert restored["done"] == 3
+    assert restored["total"] == 8
+
+
+def test_sync_cancel_endpoint_sets_durable_cancelling_checkpoint(sync_api) -> None:
+    client, projects = sync_api
+    created = api._create_sync_job("demo")
+
+    response = client.post(f"/stage2/sync-jobs/{created['id']}/cancel")
+
+    assert response.status_code == 202
+    result = response.get_json()["result"]
+    assert result["status"] == "cancelling"
+    with api._SYNC_JOBS_LOCK:
+        assert api._SYNC_CANCEL_EVENTS[created["id"]].is_set()
+
+    persisted = json.loads(
+        (projects / "demo" / "work" / "sync_job_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted["id"] == created["id"]
+    assert persisted["status"] == "cancelling"
+
+
+def test_cancelled_sync_checkpoint_blocks_partial_timeline_build(sync_api) -> None:
+    client, _projects = sync_api
+    created = api._create_sync_job("demo")
+    updated = api._update_sync_job(
+        created["id"],
+        status="cancelled",
+        message="Cancelled; saved indexes and matches can be resumed",
+        finished_at=api._utc_now_iso(),
+    )
+    assert updated is not None
+
+    response = client.post("/stage2/build", json={"project": "demo"})
+    assert response.status_code == 409
+    assert response.get_json()["error"].startswith("sync_job_interrupted:")
+
+
+def test_cancelled_queued_sync_worker_releases_project_without_loading_inputs(
+    sync_api,
+) -> None:
+    _client, _projects = sync_api
+    assert api._reserve_sync_project("demo")
+    created = api._create_sync_job("demo")
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_CANCEL_EVENTS[created["id"]].set()
+
+    api._run_sync_job(
+        job_id=created["id"],
+        project="demo",
+        backend=None,
+        model=None,
+        language="ru",
+        timecode_mode="relative",
+        rematch_confirmed=False,
+        source_ids=(),
+        force_transcribe=False,
+        search_window_sec=180.0,
+    )
+
+    state = api._get_sync_job(created["id"])
+    assert state is not None
+    assert state["status"] == "cancelled"
+    with api._SYNC_JOBS_LOCK:
+        assert "demo" not in api._SYNC_ACTIVE_PROJECTS
+        assert created["id"] not in api._SYNC_CANCEL_EVENTS
 
 
 def test_words_ingestion_match_patch_build_and_timeline(sync_api) -> None:
@@ -846,6 +1164,8 @@ def test_word_index_cache_invalidates_on_config_and_audio_changes(sync_api) -> N
         content_type="multipart/form-data",
     ).status_code == 200
     calls: list[Path] = []
+    match_calls: list[str] = []
+    original_match = api.SyncMatcher.match
 
     def fake_transcribe(path, **_kwargs):
         calls.append(Path(path))
@@ -861,6 +1181,10 @@ def test_word_index_cache_invalidates_on_config_and_audio_changes(sync_api) -> N
                 {"word": "людей", "start": 10.8, "end": 11.0},
             ],
         }
+
+    def tracked_match(matcher, alignment):
+        match_calls.append(alignment.segment_id)
+        return original_match(matcher, alignment)
 
     def start_job() -> dict:
         response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
@@ -882,25 +1206,43 @@ def test_word_index_cache_invalidates_on_config_and_audio_changes(sync_api) -> N
     with (
         patch.dict(api.os.environ, environment),
         patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.SyncMatcher, "match", new=tracked_match),
         patch.object(api.threading, "Thread", _ImmediateThread),
     ):
         first = start_job()
+        first_match_count = len(match_calls)
         second = start_job()
         assert first["transcribed"] == 1
         assert second["transcribed"] == 0
         assert second["reused_indexes"] == 1
         assert len(calls) == 1
+        assert first_match_count > 0
+        assert len(match_calls) == first_match_count
+
+        audio_path = calls[-1]
+        stat = audio_path.stat()
+        os.utime(
+            audio_path,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+        )
+        same_content_new_mtime = start_job()
+        assert same_content_new_mtime["transcribed"] == 0
+        assert same_content_new_mtime["reused_indexes"] == 1
+        assert len(calls) == 1
+        assert len(match_calls) == first_match_count
 
         api.os.environ["SYNC_WHISPER_BEAM_SIZE"] = "1"
         changed_config = start_job()
         assert changed_config["transcribed"] == 1
         assert len(calls) == 2
+        assert len(match_calls) == first_match_count * 2
 
         audio_path = calls[-1]
         audio_path.write_bytes(audio_path.read_bytes() + b"\0\0")
         changed_audio = start_job()
         assert changed_audio["transcribed"] == 1
         assert len(calls) == 3
+        assert len(match_calls) == first_match_count * 3
 
 
 def test_legacy_word_index_is_migrated_without_retranscription(sync_api) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import re
 from urllib.request import pathname2url
 import wave
 from xml.etree import ElementTree as ET
@@ -39,6 +40,26 @@ def _frames(seconds: float, fps: int) -> int:
     return math.ceil(seconds * fps)
 
 
+def _placeholder_identity(seg: TimelineSegment) -> str:
+    return f"RC_BLOCK {seg.block_uid} | {seg.speaker} [{seg.timecode}]"
+
+
+def _validate_placeholder_identities(timeline: FullTimeline) -> None:
+    seen: set[str] = set()
+    for seg in timeline.segments:
+        if seg.type not in {"snh", "host"} or not seg.placeholder_path:
+            continue
+        if not seg.block_uid or not re.fullmatch(r"[A-Za-z0-9._:-]+", seg.block_uid):
+            raise ValueError(
+                f"{seg.id} has no valid canonical block_uid for XML export"
+            )
+        if seg.block_uid in seen:
+            raise ValueError(
+                f"duplicate placeholder block_uid in XML export: {seg.block_uid}"
+            )
+        seen.add(seg.block_uid)
+
+
 def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
     file_el = ET.SubElement(parent, "file")
     file_el.set("id", f"file-{seg.id}")
@@ -73,6 +94,7 @@ def _video_file_el(parent: ET.Element, seg: TimelineSegment, fps: int,
 
 
 def build_xml(timeline: FullTimeline) -> str:
+    _validate_placeholder_identities(timeline)
     fps = timeline.fps
     total_frames = _frames(timeline.total_duration_sec, fps)
 
@@ -148,7 +170,7 @@ def build_xml(timeline: FullTimeline) -> str:
         elif seg.type in {"snh", "host"} and seg.placeholder_path:
             ci = ET.SubElement(vtrack, "clipitem")
             ci.set("id", f"clipitem-{clip_idx}")
-            label = f"{seg.speaker} [{seg.timecode}]"
+            label = _placeholder_identity(seg)
             _sub(ci, "name", label)
             _sub(ci, "duration", str(dur_f))
             _rate_el(ci, fps)

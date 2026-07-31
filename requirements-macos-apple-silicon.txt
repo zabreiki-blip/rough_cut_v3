@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Native Metal backend for M1/M2/M3/M4 Macs. MLX is intentionally not put in
+# the Linux Docker image because Docker Desktop cannot expose Apple Metal.
+mlx-whisper==0.4.3

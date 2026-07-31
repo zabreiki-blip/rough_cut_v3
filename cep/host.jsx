@@ -539,7 +539,8 @@
             projectName = projectItem ? asString(projectItem.name) : "";
             clipName = asString(clip.name);
             for (j = 0; j < expectedNames.length; j++) {
-                if (projectName === expectedNames[j] || clipName === expectedNames[j]) {
+                if (placeholderLabelMatches(projectName, expectedNames[j]) ||
+                        placeholderLabelMatches(clipName, expectedNames[j])) {
                     break;
                 }
             }
@@ -840,6 +841,7 @@
     }
 
     function placeholderCandidates(params) {
+        var stableIdentity = asString(params.placeholderIdentity);
         var names = params.placeholderNames instanceof Array ?
             params.placeholderNames.slice(0) : [];
         var single = asString(params.placeholderName);
@@ -847,10 +849,20 @@
         var name;
         var seen = {};
         var i;
+        if (params.placeholderIdentityRequired && !stableIdentity) {
+            throw new Error(
+                "Segment " + asString(params.segmentId) +
+                " has no canonical placeholder identity. Rebuild the " +
+                "normalized timeline and XML. Conform cancelled before " +
+                "timeline changes."
+            );
+        }
+        if (stableIdentity) {
+            return [stableIdentity];
+        }
         if (single) {
-            // The generated filename is the stable identity. Human-readable
-            // clip labels are legacy fallbacks and may legitimately repeat
-            // when one speaker has two quotes with the same source timecode.
+            // Legacy panels did not provide canonical block identity. Keep
+            // their filename/display-name lookup isolated from the safe path.
             names.unshift(single);
         }
         for (i = 0; i < names.length; i++) {
@@ -861,6 +873,16 @@
             }
         }
         return result;
+    }
+
+    function placeholderLabelMatches(actualName, expectedIdentity) {
+        var actual = asString(actualName);
+        var expected = asString(expectedIdentity);
+        if (expected.indexOf("RC_BLOCK ") === 0) {
+            return actual === expected ||
+                actual.indexOf(expected + " | ") === 0;
+        }
+        return actual === expected;
     }
 
     function placeholderAnywhere(target, params) {
@@ -877,16 +899,16 @@
         if (!names.length) {
             throw new Error("No exact placeholder names were supplied.");
         }
-        // Resolve aliases in priority order instead of merging their matches.
-        // A stable generated filename can be unique while a legacy display
-        // label such as "SPEAKER [00:12:43]" matches several valid clips.
+        // Canonical RC_BLOCK identity is the only candidate for current
+        // panels. Multiple aliases below are legacy-panel compatibility.
         for (j = 0; j < names.length; j++) {
             matches = [];
             for (i = 0; i < track.clips.numItems; i++) {
                 clip = track.clips[i];
                 projectName = clip.projectItem ? asString(clip.projectItem.name) : "";
                 clipName = asString(clip.name);
-                if (projectName === names[j] || clipName === names[j]) {
+                if (placeholderLabelMatches(projectName, names[j]) ||
+                        placeholderLabelMatches(clipName, names[j])) {
                     matches.push({
                         clip: clip,
                         nodeId: asString(clip.nodeId),
@@ -905,6 +927,16 @@
                 return matches[0];
             }
             if (matches.length > 1) {
+                if (asString(params.placeholderIdentity)) {
+                    throw new Error(
+                        "Target sequence is ambiguous: expected one placeholder " +
+                        "identity [" + asString(params.placeholderIdentity) +
+                        "] for " + asString(params.segmentId) + " on V" +
+                        (params.videoTrackIndex + 1) + "; found " +
+                        matches.length + ". Remove the duplicate or re-import " +
+                        "the latest XML. Conform cancelled before timeline changes."
+                    );
+                }
                 positionMatches = [];
                 if (isFinite(expectedStart)) {
                     for (i = 0; i < matches.length; i++) {
@@ -926,9 +958,91 @@
             }
         }
         throw new Error(
-            "Expected one globally unique placeholder [" + names.join(" | ") +
-            "] on V" + (params.videoTrackIndex + 1) + "; found 0."
+            (asString(params.placeholderIdentity) ?
+                "Target sequence is stale or legacy: placeholder identity [" +
+                asString(params.placeholderIdentity) + "] for " +
+                asString(params.segmentId) + " was not found on V" +
+                (params.videoTrackIndex + 1) + ". Re-import the latest XML " +
+                "into a new sequence. Conform cancelled before timeline changes." :
+                "Expected one globally unique placeholder [" + names.join(" | ") +
+                "] on V" + (params.videoTrackIndex + 1) + "; found 0.")
         );
+    }
+
+    function preparedGapForInsertion(target, item, actualDuration, params) {
+        var expectedTimelineDuration = Number(params.expectedTimelineDuration);
+        var currentDuration = sequenceDurationSeconds(target);
+        var start = Number(item.timelineSeconds);
+        var end = start + Number(actualDuration);
+        var videoTrack;
+        var endsAtStart = [];
+        var startsAtEnd = [];
+        var clip;
+        var clipStart;
+        var clipEnd;
+        var count;
+        var i;
+        if (!item.placeholderIdentityRequired ||
+                asString(item.placeholderIdentity).indexOf("RC_BLOCK ") !== 0) {
+            throw new Error(
+                "prepared-gap recovery requires a canonical placeholder identity"
+            );
+        }
+        if (!isFinite(expectedTimelineDuration) ||
+                expectedTimelineDuration <= 0 ||
+                Math.abs(currentDuration - expectedTimelineDuration) > 0.1) {
+            throw new Error(
+                "sequence duration does not match the expected prepared timeline"
+            );
+        }
+        if (item.videoTrackIndex !== 0 || item.audioTrackIndex !== 0) {
+            throw new Error("prepared-gap recovery is limited to V1/A1");
+        }
+        if (!isFinite(start) || start < 0 ||
+                !isFinite(actualDuration) || actualDuration <= 0) {
+            throw new Error("prepared-gap recovery received an invalid range");
+        }
+        if (!trackRangeIsClear(target.videoTracks[0], start, end) ||
+                !trackRangeIsClear(target.audioTracks[0], start, end)) {
+            throw new Error("the expected V1/A1 gap is not clear");
+        }
+        videoTrack = target.videoTracks[0];
+        count = Number(videoTrack.clips.numItems);
+        if (count > 10000) {
+            throw new Error("prepared-gap boundary scan exceeded 10000 clips");
+        }
+        for (i = 0; i < count; i++) {
+            clip = videoTrack.clips[i];
+            clipStart = secondsOf(clip.start);
+            clipEnd = secondsOf(clip.end);
+            if (Math.abs(clipEnd - start) <= 0.05) {
+                endsAtStart.push(clip);
+            }
+            if (Math.abs(clipStart - end) <= 0.05) {
+                startsAtEnd.push(clip);
+            }
+        }
+        if (endsAtStart.length !== 1 || startsAtEnd.length !== 1 ||
+                asString(endsAtStart[0].nodeId) ===
+                    asString(startsAtEnd[0].nodeId)) {
+            throw new Error(
+                "V1 does not have unique clips bracketing the prepared gap"
+            );
+        }
+        return {
+            preparedGap: true,
+            placeholder: {
+                clip: null,
+                nodeId: "",
+                clipName: asString(item.placeholderIdentity),
+                projectItemName: asString(item.placeholderIdentity),
+                startSeconds: start,
+                endSeconds: end,
+                durationSeconds: Number(actualDuration)
+            },
+            currentDuration: currentDuration,
+            expectedTimelineDuration: expectedTimelineDuration
+        };
     }
 
     function captureAllTrackItems(target, excludedNodeIds) {
@@ -1084,12 +1198,16 @@
         var clip;
         var before;
         var after;
+        var removed = 0;
         var i;
         plans.sort(function (left, right) {
             return right.placeholder.startSeconds - left.placeholder.startSeconds;
         });
         for (i = 0; i < plans.length; i++) {
             plan = plans[i];
+            if (plan.preparedGap) {
+                continue;
+            }
             track = target.videoTracks[plan.item.videoTrackIndex];
             clip = findTrackItemByNodeId(track, plan.placeholder.nodeId);
             if (!clip) {
@@ -1107,16 +1225,19 @@
                     plan.placeholder.clipName + "."
                 );
             }
+            removed++;
         }
         plans.sort(function (left, right) {
             return left.placeholder.startSeconds - right.placeholder.startSeconds;
         });
+        return removed;
     }
 
     function conformOnePass(target, items, params) {
         var sequenceDurationBefore = sequenceDurationSeconds(target);
         var plans = [];
         var skipped = [];
+        var skippedPlans = [];
         var excludedNodeIds = {};
         var entries;
         var cumulativeDelta = 0;
@@ -1128,6 +1249,8 @@
         var existingAudio;
         var existingVerification;
         var placeholder;
+        var placeholderError;
+        var preparedGap;
         var originalRange;
         var rangeSupport;
         var actualDuration;
@@ -1136,8 +1259,13 @@
         var overwriteParams;
         var placement;
         var verification;
+        var markerState;
         var markerResult;
+        var skippedPlan;
+        var skippedPosition;
+        var removedPlaceholderCount;
         var inserted = [];
+        var warnings = [];
         var finalDuration;
         var expectedFinalDuration;
         var i;
@@ -1163,6 +1291,33 @@
             if (!sourceItem) {
                 throw new Error("Batch source sequence has no project item.");
             }
+            item.sourceSequenceName = asString(source.name);
+            markerState = conformMarkerState(target, item);
+            if (markerState.status === "valid") {
+                existingVerification = verifyConformMarkerInsertion(
+                    target,
+                    item,
+                    sourceItem,
+                    markerState
+                );
+                skippedPlans.push({
+                    item: item,
+                    source: source,
+                    sourceItem: sourceItem,
+                    markerState: markerState,
+                    verification: existingVerification,
+                    videoNodeId: asString(existingVerification.videoClip.nodeId),
+                    audioNodeId: asString(existingVerification.audioClip.nodeId)
+                });
+                if (!skippedPlans[skippedPlans.length - 1].videoNodeId ||
+                        !skippedPlans[skippedPlans.length - 1].audioNodeId) {
+                    throw new Error(
+                        "Marker [" + markerState.name +
+                        "] source clips have no stable node IDs; conform cancelled."
+                    );
+                }
+                continue;
+            }
             existingVideo = trackSourceAt(
                 target.videoTracks[item.videoTrackIndex],
                 sourceItem,
@@ -1175,18 +1330,69 @@
             );
             if (existingVideo || existingAudio) {
                 if (!existingVideo || !existingAudio) {
-                    throw new Error("Batch found a partial existing V/A insertion.");
+                    throw new Error(
+                        "Batch found a partial source insertion without a valid " +
+                        "RC_SYNC marker; both verified video and audio are required."
+                    );
                 }
-                existingVerification = verifyInsertedRange(target, sourceItem, item);
-                skipped.push({
-                    segmentId: asString(item.segmentId),
-                    sourceSequenceName: asString(source.name),
-                    verification: existingVerification.report
+                try {
+                    existingVerification = verifyInsertedRange(
+                        target,
+                        sourceItem,
+                        item
+                    );
+                } catch (orphanVerificationError) {
+                    throw new Error(
+                        "Batch found an existing source insertion without a valid " +
+                        "RC_SYNC marker, but its source range is not exact: " +
+                        orphanVerificationError.message
+                    );
+                }
+                markerResult = upsertConformMarker(target, item);
+                if (!markerResult.ok) {
+                    throw new Error(
+                        "Verified V/A content exists, but its RC_SYNC marker could not " +
+                        "be recovered: " + asString(markerResult.error)
+                    );
+                }
+                markerState = conformMarkerState(target, item);
+                skippedPlans.push({
+                    item: item,
+                    source: source,
+                    sourceItem: sourceItem,
+                    markerState: markerState,
+                    verification: existingVerification,
+                    videoNodeId: asString(existingVerification.videoClip.nodeId),
+                    audioNodeId: asString(existingVerification.audioClip.nodeId),
+                    recoveredMissingMarker: true
                 });
+                if (!skippedPlans[skippedPlans.length - 1].videoNodeId ||
+                        !skippedPlans[skippedPlans.length - 1].audioNodeId) {
+                    throw new Error(
+                        "Recovered source clips have no stable node IDs; conform cancelled."
+                    );
+                }
                 continue;
             }
-            placeholder = placeholderAnywhere(target, item);
-            captureDownstreamItems(target, placeholder.endSeconds);
+            placeholder = null;
+            placeholderError = null;
+            preparedGap = null;
+            try {
+                placeholder = placeholderAnywhere(target, item);
+            } catch (placeholderLookupError) {
+                if (item.placeholderIdentityRequired &&
+                        asString(item.placeholderIdentity) &&
+                        placeholderLookupError.message.indexOf(
+                            "was not found on V"
+                        ) >= 0) {
+                    placeholderError = placeholderLookupError;
+                } else {
+                    throw placeholderLookupError;
+                }
+            }
+            if (placeholder) {
+                captureDownstreamItems(target, placeholder.endSeconds);
+            }
             originalRange = saveRange(sourceItem);
             try {
                 rangeSupport = setRange(
@@ -1205,17 +1411,38 @@
                 ) > 0.05) {
                 throw new Error("Batch source V/A durations differ.");
             }
+            if (!placeholder) {
+                try {
+                    preparedGap = preparedGapForInsertion(
+                        target,
+                        item,
+                        actualDuration,
+                        params
+                    );
+                    placeholder = preparedGap.placeholder;
+                } catch (preparedGapError) {
+                    throw new Error(
+                        placeholderError.message +
+                        " Prepared-gap recovery rejected: " +
+                        preparedGapError.message + "."
+                    );
+                }
+            }
             plan = {
                 item: item,
                 source: source,
                 sourceItem: sourceItem,
                 placeholder: placeholder,
                 actualDurationSeconds: actualDuration,
-                deltaSeconds: actualDuration - placeholder.durationSeconds,
+                deltaSeconds: preparedGap ?
+                    0 : actualDuration - placeholder.durationSeconds,
                 rangeSupport: rangeSupport,
+                preparedGap: !!preparedGap,
                 finalStartSeconds: 0
             };
-            excludedNodeIds[placeholder.nodeId] = true;
+            if (placeholder.nodeId) {
+                excludedNodeIds[placeholder.nodeId] = true;
+            }
             plans.push(plan);
         }
         plans.sort(function (left, right) {
@@ -1230,7 +1457,7 @@
         }
         entries = captureAllTrackItems(target, excludedNodeIds);
         assignFinalBatchPositions(entries, plans);
-        removeBatchPlaceholders(target, plans);
+        removedPlaceholderCount = removeBatchPlaceholders(target, plans);
         moveReport = moveBatchEntriesOnce(target, entries);
         verifyBatchEntryPositions(target, entries);
 
@@ -1276,6 +1503,13 @@
             }
             plan.item.timelineSeconds = plan.finalStartSeconds;
             markerResult = upsertConformMarker(target, plan.item);
+            if (!markerResult.ok) {
+                throw new Error(
+                    "Inserted " + asString(plan.item.segmentId) +
+                    " but could not create its completion marker: " +
+                    asString(markerResult.error)
+                );
+            }
             inserted.push({
                 segmentId: asString(plan.item.segmentId),
                 sourceSequenceId: asString(plan.source.sequenceID),
@@ -1288,6 +1522,44 @@
             });
         }
         verifyBatchEntryPositions(target, entries);
+        for (i = 0; i < skippedPlans.length; i++) {
+            skippedPlan = skippedPlans[i];
+            skippedPosition = verifySkippedInsertionAfterMove(
+                target,
+                skippedPlan
+            );
+            skippedPlan.item.timelineSeconds = skippedPosition.timelineSeconds;
+            try {
+                markerResult = reanchorConformMarker(
+                    target,
+                    skippedPlan.markerState.marker,
+                    skippedPlan.item,
+                    skippedPosition.timelineSeconds
+                );
+                skippedPlan.markerState.marker = markerResult.marker;
+                markerResult = markerResult.report;
+            } catch (markerRepairError) {
+                markerResult = {
+                    ok: false,
+                    name: markerNameForItem(skippedPlan.item),
+                    error: markerRepairError.message
+                };
+                warnings.push({
+                    segmentId: asString(skippedPlan.item.segmentId),
+                    warning: markerRepairError.message
+                });
+            }
+            skipped.push({
+                segmentId: asString(skippedPlan.item.segmentId),
+                sourceSequenceId: asString(skippedPlan.source.sequenceID),
+                sourceSequenceName: asString(skippedPlan.source.name),
+                timelineSeconds: skippedPosition.timelineSeconds,
+                alreadyConformed: true,
+                recoveredMissingMarker: !!skippedPlan.recoveredMissingMarker,
+                verification: skippedPosition.verification.report,
+                marker: markerResult
+            });
+        }
         finalDuration = sequenceDurationSeconds(target);
         expectedFinalDuration = sequenceDurationBefore + totalDelta;
         if (Math.abs(finalDuration - expectedFinalDuration) > 0.1) {
@@ -1297,6 +1569,14 @@
                 finalDuration.toFixed(3) + "s."
             );
         }
+        if (isFinite(Number(params.expectedTimelineDuration)) &&
+                Math.abs(finalDuration - Number(params.expectedTimelineDuration)) > 0.1) {
+            throw new Error(
+                "Final sequence duration does not match the authoritative timeline. " +
+                "Expected " + Number(params.expectedTimelineDuration).toFixed(3) +
+                "s, got " + finalDuration.toFixed(3) + "s."
+            );
+        }
         return {
             target: sequenceMetadata(target),
             requested: items.length,
@@ -1304,7 +1584,7 @@
             completedCount: skipped.length + inserted.length,
             alreadyConformed: skipped,
             inserted: inserted,
-            removedPlaceholders: plans.length,
+            removedPlaceholders: removedPlaceholderCount,
             moveReport: moveReport,
             existingClipsVerified: entries.length,
             sequenceDurationBefore: sequenceDurationBefore,
@@ -1313,7 +1593,8 @@
             sequenceDurationAfter: finalDuration,
             durationMatchesExpected: true,
             stopped: false,
-            errors: []
+            errors: [],
+            warnings: warnings
         };
     }
 
@@ -1421,6 +1702,8 @@
         return {
             timelineSeconds: timelineSeconds,
             videoTrackIndex: params.videoTrackIndex,
+            placeholderIdentity: params.placeholderIdentity,
+            placeholderIdentityRequired: params.placeholderIdentityRequired,
             placeholderName: params.placeholderName,
             placeholderNames: params.placeholderNames
         };
@@ -1493,51 +1776,575 @@
         };
     }
 
-    function upsertConformMarker(target, item) {
-        var markerName = "RC_SYNC " + asString(item.segmentId);
+    function normalizeMarkerText(value) {
+        return asString(value)
+            .replace(/\r\n?/g, "\n")
+            .replace(/[ \t]+/g, " ")
+            .replace(/ *\n */g, "\n")
+            .replace(/\n+/g, "\n")
+            .replace(/^\s+|\s+$/g, "");
+    }
+
+    function markerNameForItem(item) {
+        var markerName = "RC_SYNC " +
+            asString(item.blockUid || item.segmentId);
+        return markerName;
+    }
+
+    function markerSourceLine(item) {
+        return "Source: " + asString(item.sourceSequenceName) +
+            " [" + Number(item.sourceInSeconds).toFixed(3) +
+            "–" + Number(item.sourceOutSeconds).toFixed(3) + "]";
+    }
+
+    function markerCommentForItem(item) {
+        var comments = asString(item.speaker);
+        if (comments && item.text) {
+            comments += "\n";
+        }
+        comments += asString(item.text);
+        comments += "\n" + markerSourceLine(item);
+        if (isFinite(Number(item.confidence))) {
+            comments += "\nConfidence: " +
+                Math.round(Number(item.confidence) * 100) + "%";
+        }
+        return comments;
+    }
+
+    function markerPositionKey(marker) {
+        var start = "";
+        var end = "";
+        try { start = ticksOf(marker.start); } catch (ignoreMarkerStart) {}
+        try { end = ticksOf(marker.end); } catch (ignoreMarkerEnd) {}
+        if (!start) {
+            try { start = Number(secondsOf(marker.start)).toFixed(6); }
+            catch (ignoreMarkerStartSeconds) {}
+        }
+        if (!end) {
+            try { end = Number(secondsOf(marker.end)).toFixed(6); }
+            catch (ignoreMarkerEndSeconds) {}
+        }
+        return asString(marker.name) + "\n" + start + "\n" + end + "\n" +
+            asString(marker.comments);
+    }
+
+    function exactMarkersNamed(target, markerName) {
         var markers;
-        var marker = null;
+        var matches = [];
         var current;
+        var next;
+        var currentKey;
+        var nextKey;
+        var visited = 0;
+        var maxMarkers = 10000;
+        try {
+            markers = target.markers;
+        } catch (markerAccessError) {
+            markers = null;
+        }
+        if (!markers ||
+                typeof markers.getFirstMarker !== "function" ||
+                typeof markers.getNextMarker !== "function") {
+            throw new Error(
+                "Sequence markers API is unavailable; conform cannot safely resume."
+            );
+        }
+        current = markers.getFirstMarker();
+        while (current) {
+            visited += 1;
+            if (visited > maxMarkers) {
+                throw new Error(
+                    "Sequence marker scan exceeded " + maxMarkers +
+                    " entries; conform cancelled."
+                );
+            }
+            if (asString(current.name) === markerName) {
+                matches.push(current);
+            }
+            currentKey = markerPositionKey(current);
+            next = markers.getNextMarker(current);
+            if (next) {
+                nextKey = markerPositionKey(next);
+                if (next === current || nextKey === currentKey) {
+                    throw new Error(
+                        "Sequence marker scan did not advance at [" +
+                        asString(current.name) + "]; conform cancelled."
+                    );
+                }
+            }
+            current = next;
+        }
+        return matches;
+    }
+
+    function conformMarkerState(target, item) {
+        var markerName = markerNameForItem(item);
+        var matches = exactMarkersNamed(target, markerName);
+        var marker;
         var comments;
+        var lines;
+        var sourceLineIndex = -1;
+        var actualText;
+        var actualTextWithoutLabel;
+        var expectedText;
+        var expectedSource;
+        var markerStart;
+        var i;
+        if (!matches.length) {
+            return { status: "absent", name: markerName };
+        }
+        if (matches.length !== 1) {
+            throw new Error(
+                "Expected exactly one marker [" + markerName +
+                "]; found " + matches.length + ". Conform cancelled."
+            );
+        }
+        marker = matches[0];
+        comments = asString(marker.comments).replace(/\r\n?/g, "\n");
+        lines = comments.split("\n");
+        expectedSource = normalizeMarkerText(markerSourceLine(item));
+        for (i = 0; i < lines.length; i++) {
+            if (normalizeMarkerText(lines[i]).indexOf("Source:") === 0) {
+                if (sourceLineIndex !== -1) {
+                    throw new Error(
+                        "Marker [" + markerName +
+                        "] has ambiguous Source metadata; conform cancelled."
+                    );
+                }
+                sourceLineIndex = i;
+            }
+        }
+        if (sourceLineIndex === -1 ||
+                normalizeMarkerText(lines[sourceLineIndex]) !== expectedSource) {
+            throw new Error(
+                "Marker [" + markerName +
+                "] Source sequence/range does not match; conform cancelled."
+            );
+        }
+        actualText = normalizeMarkerText(
+            lines.slice(0, sourceLineIndex).join("\n")
+        );
+        actualTextWithoutLabel = normalizeMarkerText(
+            lines.slice(1, sourceLineIndex).join("\n")
+        );
+        expectedText = normalizeMarkerText(item.text);
+        if (actualText !== expectedText &&
+                actualTextWithoutLabel !== expectedText) {
+            throw new Error(
+                "Marker [" + markerName +
+                "] item text does not match; conform cancelled."
+            );
+        }
+        try {
+            if (marker.start === null || marker.start === undefined) {
+                throw new Error("missing marker start");
+            }
+            markerStart = secondsOf(marker.start);
+        } catch (markerStartError) {
+            throw new Error(
+                "Marker [" + markerName +
+                "] has no readable start position; conform cancelled."
+            );
+        }
+        if (!isFinite(markerStart) || markerStart < 0) {
+            throw new Error(
+                "Marker [" + markerName +
+                "] has an invalid start position; conform cancelled."
+            );
+        }
+        return {
+            status: "valid",
+            name: markerName,
+            source: expectedSource,
+            timelineSeconds: markerStart,
+            marker: marker
+        };
+    }
+
+    function markerVerificationParams(item, timelineSeconds) {
+        return {
+            sourceInSeconds: Number(item.sourceInSeconds),
+            sourceOutSeconds: Number(item.sourceOutSeconds),
+            timelineSeconds: Number(timelineSeconds),
+            videoTrackIndex: Number(item.videoTrackIndex),
+            audioTrackIndex: Number(item.audioTrackIndex)
+        };
+    }
+
+    function verifyConformMarkerInsertion(target, item, sourceItem, markerState) {
+        var directError;
+        var recovered;
+        try {
+            return verifyInsertedRange(
+                target,
+                sourceItem,
+                markerVerificationParams(item, markerState.timelineSeconds)
+            );
+        } catch (verificationError) {
+            directError = verificationError;
+        }
+        try {
+            recovered = uniqueSourcePairAnywhere(target, item, sourceItem);
+            if (recovered) {
+                return recovered;
+            }
+        } catch (recoveryError) {
+            throw new Error(
+                "Marker [" + markerState.name +
+                "] is stale or partial: " + recoveryError.message
+            );
+        }
+        throw new Error(
+            "Marker [" + markerState.name +
+            "] is stale or partial: " + directError.message
+        );
+    }
+
+    function clipMatchesSourceRange(clip, sourceItem, item) {
+        var clipItem;
+        var expectedNodeId = asString(sourceItem.nodeId);
+        var metadata;
+        var expectedDuration = Number(item.sourceOutSeconds) -
+            Number(item.sourceInSeconds);
+        try {
+            clipItem = clip.projectItem;
+        } catch (ignoreClipItem) {
+            return false;
+        }
+        if (clipItem !== sourceItem &&
+                (!expectedNodeId || !clipItem ||
+                    asString(clipItem.nodeId) !== expectedNodeId)) {
+            return false;
+        }
+        metadata = trackItemMetadata(clip);
+        return !!metadata &&
+            Math.abs(metadata.durationSeconds - expectedDuration) <= 0.08 &&
+            Math.abs(metadata.sourceInSeconds -
+                Number(item.sourceInSeconds)) <= 0.08 &&
+            Math.abs(metadata.sourceOutSeconds -
+                Number(item.sourceOutSeconds)) <= 0.08;
+    }
+
+    function matchingSourceClips(track, sourceItem, item) {
+        var matches = [];
+        var count;
+        var i;
+        try {
+            count = Number(track.clips.numItems);
+        } catch (countError) {
+            count = 0;
+        }
+        if (count > 10000) {
+            throw new Error(
+                "Source-pair recovery scan exceeded 10000 clips."
+            );
+        }
+        for (i = 0; i < count; i++) {
+            if (clipMatchesSourceRange(track.clips[i], sourceItem, item)) {
+                matches.push(track.clips[i]);
+            }
+        }
+        return matches;
+    }
+
+    function uniqueSourcePairAnywhere(target, item, sourceItem) {
+        var videos = matchingSourceClips(
+            target.videoTracks[item.videoTrackIndex],
+            sourceItem,
+            item
+        );
+        var audios = matchingSourceClips(
+            target.audioTracks[item.audioTrackIndex],
+            sourceItem,
+            item
+        );
+        var pairs = [];
+        var videoStart;
+        var audioStart;
+        var verification;
+        var i;
+        var j;
+        for (i = 0; i < videos.length; i++) {
+            videoStart = secondsOf(videos[i].start);
+            for (j = 0; j < audios.length; j++) {
+                audioStart = secondsOf(audios[j].start);
+                if (Math.abs(videoStart - audioStart) <= 0.05) {
+                    pairs.push({
+                        video: videos[i],
+                        audio: audios[j],
+                        timelineSeconds: videoStart
+                    });
+                    if (pairs.length > 1) {
+                        throw new Error(
+                            "More than one matching V/A source pair exists."
+                        );
+                    }
+                }
+            }
+        }
+        if (!pairs.length) {
+            return null;
+        }
+        verification = verifyInsertedRange(
+            target,
+            sourceItem,
+            markerVerificationParams(item, pairs[0].timelineSeconds)
+        );
+        if (asString(verification.videoClip.nodeId) !==
+                    asString(pairs[0].video.nodeId) ||
+                asString(verification.audioClip.nodeId) !==
+                    asString(pairs[0].audio.nodeId)) {
+            throw new Error(
+                "Recovered V/A source pair identity is ambiguous."
+            );
+        }
+        return verification;
+    }
+
+    function verifySkippedInsertionAfterMove(target, skippedPlan) {
+        var item = skippedPlan.item;
+        var videoTrack = target.videoTracks[item.videoTrackIndex];
+        var audioTrack = target.audioTracks[item.audioTrackIndex];
+        var videoClip = findTrackItemByNodeId(
+            videoTrack,
+            skippedPlan.videoNodeId
+        );
+        var audioClip = findTrackItemByNodeId(
+            audioTrack,
+            skippedPlan.audioNodeId
+        );
+        var videoStart;
+        var audioStart;
+        var verification;
+        if (!videoClip || !audioClip) {
+            throw new Error(
+                "Previously conformed source pair [" +
+                markerNameForItem(item) +
+                "] disappeared during batch movement; conform cancelled."
+            );
+        }
+        videoStart = secondsOf(videoClip.start);
+        audioStart = secondsOf(audioClip.start);
+        if (Math.abs(videoStart - audioStart) > 0.05) {
+            throw new Error(
+                "Previously conformed source pair [" +
+                markerNameForItem(item) +
+                "] lost V/A alignment; conform cancelled."
+            );
+        }
+        try {
+            verification = verifyInsertedRange(
+                target,
+                skippedPlan.sourceItem,
+                markerVerificationParams(item, videoStart)
+            );
+        } catch (verificationError) {
+            throw new Error(
+                "Previously conformed source pair [" +
+                markerNameForItem(item) +
+                "] failed after batch movement: " +
+                verificationError.message
+            );
+        }
+        if ((skippedPlan.videoNodeId &&
+                    asString(verification.videoClip.nodeId) !==
+                    skippedPlan.videoNodeId) ||
+                (skippedPlan.audioNodeId &&
+                    asString(verification.audioClip.nodeId) !==
+                    skippedPlan.audioNodeId)) {
+            throw new Error(
+                "Previously conformed source pair [" +
+                markerNameForItem(item) +
+                "] changed identity during batch movement; conform cancelled."
+            );
+        }
+        return {
+            timelineSeconds: videoStart,
+            verification: verification
+        };
+    }
+
+    function markerTimingMatches(marker, startSeconds, endSeconds) {
+        var actualStart;
+        var actualEnd;
+        try {
+            actualStart = secondsOf(marker.start);
+            actualEnd = secondsOf(marker.end);
+        } catch (readError) {
+            return false;
+        }
+        return Math.abs(actualStart - Number(startSeconds)) <= 0.05 &&
+            Math.abs(actualEnd - Number(endSeconds)) <= 0.05;
+    }
+
+    function reanchorConformMarker(target, marker, item, timelineSeconds) {
+        var markerName = markerNameForItem(item);
+        var expectedStart = Number(timelineSeconds);
+        var expectedEnd = Number(timelineSeconds) +
+            Number(item.sourceOutSeconds) -
+            Number(item.sourceInSeconds);
+        var preservedName = asString(marker.name);
+        var preservedComments = asString(marker.comments);
+        var markers;
+        var temporary = null;
+        var deleteResult;
+        var exactMatches;
+        var currentStart;
+        var currentEnd;
+        var actualStart;
+        var actualEnd;
+        try {
+            currentStart = secondsOf(marker.start);
+            currentEnd = secondsOf(marker.end);
+            if (!isFinite(currentStart) || !isFinite(currentEnd) ||
+                    currentEnd < currentStart) {
+                throw new Error("marker has an invalid current range");
+            }
+            // Premiere can reject start > current end. When moving a marker
+            // to the right beyond its old range, extend the end first.
+            if (expectedStart > currentEnd) {
+                marker.end = expectedEnd;
+                marker.start = expectedStart;
+            } else {
+                marker.start = expectedStart;
+                marker.end = expectedEnd;
+            }
+        } catch (ignoreDirectMarkerWrite) {}
+        if (!markerTimingMatches(marker, expectedStart, expectedEnd)) {
+            try {
+                markers = target.markers;
+                if (!markers ||
+                        typeof markers.createMarker !== "function" ||
+                        typeof markers.deleteMarker !== "function") {
+                    throw new Error(
+                        "marker delete/create API is unavailable"
+                    );
+                }
+                temporary = markers.createMarker(expectedStart);
+                if (!temporary) {
+                    throw new Error("createMarker returned no marker");
+                }
+                temporary.name = "RC_SYNC_REANCHOR_TMP " +
+                    asString(item.segmentId);
+                temporary.comments = preservedComments;
+                temporary.end = expectedEnd;
+                if (!markerTimingMatches(
+                        temporary,
+                        expectedStart,
+                        expectedEnd
+                    )) {
+                    try { markers.deleteMarker(temporary); }
+                    catch (ignoreTemporaryDelete) {}
+                    temporary = null;
+                    throw new Error(
+                        "temporary marker timing did not verify"
+                    );
+                }
+                try {
+                    deleteResult = markers.deleteMarker(marker);
+                    if (deleteResult === false) {
+                        throw new Error("deleteMarker returned false");
+                    }
+                } catch (oldMarkerDeleteError) {
+                    try { markers.deleteMarker(temporary); }
+                    catch (ignoreTemporaryCleanup) {}
+                    temporary = null;
+                    throw oldMarkerDeleteError;
+                }
+                temporary.name = preservedName;
+                temporary.comments = preservedComments;
+                marker = temporary;
+                exactMatches = exactMarkersNamed(target, preservedName);
+                if (exactMatches.length !== 1 ||
+                        !markerTimingMatches(
+                            exactMatches[0],
+                            expectedStart,
+                            expectedEnd
+                        )) {
+                    throw new Error(
+                        "replacement marker did not become globally unique"
+                    );
+                }
+                marker = exactMatches[0];
+            } catch (recreateError) {
+                throw new Error(
+                    "Could not recreate marker [" + markerName +
+                    "] at the verified source pair: " +
+                    recreateError.message
+                );
+            }
+        }
+        if (asString(marker.name) !== preservedName ||
+                asString(marker.comments) !== preservedComments ||
+                !markerTimingMatches(marker, expectedStart, expectedEnd)) {
+            throw new Error(
+                "Premiere did not re-anchor marker [" + markerName +
+                "] to the verified source pair."
+            );
+        }
+        actualStart = secondsOf(marker.start);
+        actualEnd = secondsOf(marker.end);
+        return {
+            marker: marker,
+            report: {
+                ok: true,
+                name: markerName,
+                startSeconds: actualStart,
+                endSeconds: actualEnd,
+                recreated: marker === temporary
+            }
+        };
+    }
+
+    function upsertConformMarker(target, item) {
+        var markerName = markerNameForItem(item);
+        var markerComments = markerCommentForItem(item);
+        var markerStart = Number(item.timelineSeconds);
+        var markerEnd = markerStart + Number(item.sourceOutSeconds) -
+            Number(item.sourceInSeconds);
+        var markers;
+        var matches;
+        var marker = null;
+        var persistedMarker = null;
         try {
             markers = target.markers;
             if (!markers || typeof markers.createMarker !== "function") {
                 return { ok: false, error: "Sequence markers API is unavailable." };
             }
-            try {
-                current = markers.getFirstMarker();
-                while (current) {
-                    if (asString(current.name) === markerName) {
-                        marker = current;
-                        break;
-                    }
-                    current = markers.getNextMarker(current);
-                }
-            } catch (ignoreMarkerScan) {}
-            if (!marker) {
-                marker = markers.createMarker(Number(item.timelineSeconds));
+            matches = exactMarkersNamed(target, markerName);
+            if (matches.length > 1) {
+                return {
+                    ok: false,
+                    error: "Expected at most one marker [" + markerName +
+                        "]; found " + matches.length + "."
+                };
+            }
+            if (matches.length === 1) {
+                marker = matches[0];
+            } else {
+                marker = markers.createMarker(markerStart);
             }
             marker.name = markerName;
-            comments = asString(item.speaker);
-            if (comments && item.text) {
-                comments += "\n";
-            }
-            comments += asString(item.text);
-            comments += "\nSource: " + asString(item.sourceSequenceName);
-            comments += " [" + Number(item.sourceInSeconds).toFixed(3) +
-                "–" + Number(item.sourceOutSeconds).toFixed(3) + "]";
-            if (isFinite(Number(item.confidence))) {
-                comments += "\nConfidence: " + Math.round(Number(item.confidence) * 100) + "%";
-            }
-            marker.comments = comments;
+            marker.comments = markerComments;
             try {
-                marker.end = (
-                    Number(item.timelineSeconds) +
-                    Number(item.sourceOutSeconds) -
-                    Number(item.sourceInSeconds)
-                );
+                marker.end = markerEnd;
             } catch (ignoreMarkerEnd) {}
-            return { ok: true, name: markerName };
+            matches = exactMarkersNamed(target, markerName);
+            persistedMarker = matches.length === 1 ? matches[0] : null;
+            // Premiere may return a fresh host proxy when the marker
+            // collection is read again.  Object identity is therefore not a
+            // persistence signal; verify the unique re-read marker's content.
+            if (!persistedMarker ||
+                    asString(persistedMarker.name) !== markerName ||
+                    asString(persistedMarker.comments) !== markerComments ||
+                    !markerTimingMatches(persistedMarker, markerStart, markerEnd)) {
+                return {
+                    ok: false,
+                    error: "Premiere did not persist the exact completion marker [" +
+                        markerName + "]."
+                };
+            }
+            return { ok: true, name: markerName, marker: persistedMarker };
         } catch (error) {
             return { ok: false, error: error.message };
         }
@@ -2080,7 +2887,12 @@
 
     if ($._roughCutTestMode) {
         $._roughCutStage2Test = {
-            placeholderAnywhere: placeholderAnywhere
+            placeholderAnywhere: placeholderAnywhere,
+            preparedGapForInsertion: preparedGapForInsertion,
+            conformMarkerState: conformMarkerState,
+            verifyConformMarkerInsertion: verifyConformMarkerInsertion,
+            reanchorConformMarker: reanchorConformMarker,
+            upsertConformMarker: upsertConformMarker
         };
     }
 })();

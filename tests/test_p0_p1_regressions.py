@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from stage1.gemini_tts import (
+    TtsCancelledError,
     _atomic_write_bytes,
     _meta_path,
     _read_meta_fingerprint,
@@ -158,6 +159,43 @@ class DryRunPreservesExistingWavTest(unittest.TestCase):
 
             self.assertEqual(result["files_count"], 1)
             self.assertTrue((speaker_dir / "zk1.wav").exists())
+
+
+class TtsCancellationTest(unittest.TestCase):
+    def test_cancellation_after_provider_call_is_never_retried(self) -> None:
+        with TemporaryDirectory() as tmp:
+            speaker_dir = Path(tmp)
+            prepared = speaker_dir / "prepared.json"
+            _make_prepared_json(prepared)
+            cancelled = False
+            progress_events: list[str] = []
+
+            def synthesize_once(*_args, **_kwargs):
+                nonlocal cancelled
+                cancelled = True
+                return _make_wav_bytes(1000)
+
+            with unittest.mock.patch(
+                "stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"
+            ), unittest.mock.patch(
+                "stage1.gemini_tts._synthesize_wav_bytes", side_effect=synthesize_once
+            ) as synthesize, unittest.mock.patch(
+                "stage1.gemini_tts.time.sleep"
+            ) as sleep:
+                with self.assertRaises(TtsCancelledError):
+                    synthesize_tts(
+                        prepared,
+                        speaker_dir,
+                        provider="macos",
+                        voice_name="Yuri",
+                        gender="male",
+                        cancel_check=lambda: cancelled,
+                        progress_callback=lambda item: progress_events.append(item["event"]),
+                    )
+
+            synthesize.assert_called_once()
+            sleep.assert_not_called()
+            self.assertNotIn("item_retrying", progress_events)
 
 
 class CorruptedWavFailsValidationTest(unittest.TestCase):

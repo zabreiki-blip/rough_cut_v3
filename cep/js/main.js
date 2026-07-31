@@ -7,6 +7,8 @@
   var exportPollTimer = null;
   var whisperPollTimer = null;
   var currentWhisperJobId = "";
+  var currentWhisperReviewCount = 0;
+  var currentWhisperJobStatus = "";
   var CONFORM_VIDEO_TRACK_INDEX = 0;
   var CONFORM_AUDIO_TRACK_INDEX = 0;
   var hostFunctions = {
@@ -257,6 +259,9 @@
       queued: "в очереди",
       running: "в работе",
       completed: "готово",
+      interrupted: "прервано",
+      cancelled: "прервано",
+      cancelling: "останавливается",
       failed: "ошибка"
     };
     return labels[status] || status || "ожидание";
@@ -278,6 +283,9 @@
     }
     if (job.status === "failed") {
       return job.error || "Распознавание завершилось с ошибкой";
+    }
+    if (job.status === "interrupted" || job.status === "cancelled") {
+      return "Работа была прервана. Сохранённые подтверждения не потеряны; запустите распознавание снова, чтобы продолжить.";
     }
     return message || "Ожидание данных распознавания";
   }
@@ -309,6 +317,10 @@
 
   function renderWhisperIdle(message) {
     var fill = byId("whisperProgressFill");
+    currentWhisperReviewCount = 0;
+    currentWhisperJobStatus = "";
+    byId("resumeWhisper").hidden = true;
+    byId("cancelWhisper").hidden = true;
     byId("whisperStatus").className = "badge badge-muted";
     byId("whisperStatus").textContent = "ожидание";
     byId("whisperMessage").textContent = message || "Задача ещё не запущена.";
@@ -318,6 +330,14 @@
     fill.className = "whisper-progress-fill";
     fill.style.width = "0";
     byId("whisperProgress").removeAttribute("aria-valuenow");
+    byId("whisperReviewNotice").hidden = true;
+    byId("whisperReviewNoticeCount").textContent = "0";
+  }
+
+  function whisperJobIsActive() {
+    return currentWhisperJobStatus === "queued" ||
+      currentWhisperJobStatus === "running" ||
+      currentWhisperJobStatus === "cancelling";
   }
 
   function renderWhisperJob(job) {
@@ -338,6 +358,10 @@
     var etaSeconds = 0;
     var fill = byId("whisperProgressFill");
     var badge = byId("whisperStatus");
+    var reviewCount = Number(
+      job.needs_review !== undefined ? job.needs_review : (job.review || 0)
+    );
+    var reviewNotice = byId("whisperReviewNotice");
     var current = job.current_source_id
       ? "Источник: " + job.current_source_id
       : (job.current_segment_id ? "Реплика: " + job.current_segment_id : "Источник: —");
@@ -350,8 +374,19 @@
     byId("whisperSources").textContent = sourcesDone + " / " + totalSources;
     byId("whisperSegments").textContent = done + " / " + Number(job.total_segments || total || 0);
     byId("whisperMatched").textContent = Number(job.matched || 0);
-    byId("whisperReview").textContent = Number(job.review || 0);
+    currentWhisperJobStatus = status;
+    byId("resumeWhisper").hidden = !(
+      status === "interrupted" || status === "cancelled" || status === "failed"
+    );
+    byId("cancelWhisper").hidden = !(
+      status === "queued" || status === "running" || status === "cancelling"
+    );
+    byId("exportAndTranscribe").disabled = whisperJobIsActive();
+    currentWhisperReviewCount = reviewCount;
+    byId("whisperReview").textContent = String(reviewCount);
     byId("whisperUnmatched").textContent = Number(job.unmatched || 0);
+    byId("whisperReviewNoticeCount").textContent = String(reviewCount);
+    reviewNotice.hidden = reviewCount <= 0;
     fill.className = "whisper-progress-fill";
 
     if (status === "failed") {
@@ -406,27 +441,45 @@
     whisperPollTimer = window.setTimeout(refreshWhisperStatus, delay);
   }
 
-  function refreshWhisperStatus() {
+  function refreshWhisperStatus(options) {
+    options = options || {};
     var current = config();
     var path;
+    var requestedJobId = currentWhisperJobId;
+    var manual = Boolean(options.manual);
+    var allowProjectFallback = options.allowProjectFallback !== false;
     if (whisperPollTimer) {
       window.clearTimeout(whisperPollTimer);
       whisperPollTimer = null;
     }
     if (!current.project || !current.apiBaseUrl || !current.token) {
       renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
+      if (manual) {
+        log("Статус распознавания не обновлён: проверьте проект, адрес сервера и ключ доступа.");
+      }
       return;
     }
-    path = currentWhisperJobId
-      ? "/stage2/sync-jobs/" + encodeURIComponent(currentWhisperJobId)
+    path = requestedJobId
+      ? "/stage2/sync-jobs/" + encodeURIComponent(requestedJobId)
       : "/stage2/sync-jobs/status?project=" + encodeURIComponent(current.project);
     request("GET", path, null, function (error, response) {
       var job;
       if (error) {
+        if (requestedJobId && error.message === "job not found" && allowProjectFallback) {
+          currentWhisperJobId = "";
+          refreshWhisperStatus({
+            manual: manual,
+            allowProjectFallback: false
+          });
+          return;
+        }
         if (error.message === "job not found") {
           renderWhisperIdle("Для проекта пока нет задачи распознавания.");
         } else {
           renderWhisperIdle("Статус распознавания недоступен: " + error.message);
+        }
+        if (manual) {
+          log("Статус распознавания не обновлён: " + error.message);
         }
         scheduleWhisperPoll(10000);
         return;
@@ -434,9 +487,21 @@
       job = response.result || response;
       currentWhisperJobId = job.id || currentWhisperJobId;
       renderWhisperJob(job);
+      if (manual) {
+        log("Статус распознавания обновлён.", job);
+      }
       scheduleWhisperPoll(
-        job.status === "queued" || job.status === "running" ? 2500 : 10000
+        job.status === "queued" || job.status === "running" || job.status === "cancelling" ? 2500 : 10000
       );
+    });
+  }
+
+  function refreshWhisperStatusManually() {
+    currentWhisperJobId = "";
+    log("Обновляю статус распознавания…");
+    refreshWhisperStatus({
+      manual: true,
+      allowProjectFallback: false
     });
   }
 
@@ -464,7 +529,7 @@
       " · V" + sequence.videoTrackCount + "/A" + sequence.audioTrackCount;
     byId("registerSequence").disabled = false;
     byId("resolveSequence").disabled = false;
-    byId("exportAndTranscribe").disabled = false;
+    byId("exportAndTranscribe").disabled = whisperJobIsActive();
     if (!byId("sourceId").value.trim()) {
       sourceName = String(sequence.name || "");
       generatedId = /[^\x00-\x7F]/.test(sourceName) ? "" : sourceName
@@ -484,7 +549,7 @@
   function setSourceActionsDisabled(disabled) {
     byId("registerSequence").disabled = disabled;
     byId("resolveSequence").disabled = disabled;
-    byId("exportAndTranscribe").disabled = disabled;
+    byId("exportAndTranscribe").disabled = disabled || whisperJobIsActive();
   }
 
   function absoluteGuidePath(source, current) {
@@ -703,6 +768,41 @@
     });
   }
 
+  function resumeTranscriptionJob() {
+    if (!byId("sourceId").value.trim()) {
+      log("Продолжение не запущено: сначала выберите или считайте sync-источник.");
+      return;
+    }
+    log("Продолжаю распознавание без повторного экспорта WAV…");
+    startTranscriptionJob();
+  }
+
+  function cancelTranscriptionJob() {
+    if (!currentWhisperJobId || !(
+      currentWhisperJobStatus === "queued" ||
+      currentWhisperJobStatus === "running" ||
+      currentWhisperJobStatus === "cancelling"
+    )) {
+      return;
+    }
+    byId("cancelWhisper").disabled = true;
+    request(
+      "POST",
+      "/stage2/sync-jobs/" + encodeURIComponent(currentWhisperJobId) + "/cancel",
+      {},
+      function (error, response) {
+        byId("cancelWhisper").disabled = false;
+        if (error) {
+          log("Остановка не выполнена: " + error.message, response);
+          return;
+        }
+        log("Остановка запрошена. Индексы и найденные диапазоны сохраняются.", response);
+        renderWhisperJob(response.result || response);
+        scheduleWhisperPoll(500);
+      }
+    );
+  }
+
   function pollExport(outputPath, jobId) {
     var previousSize = -1;
     var previousModified = -1;
@@ -820,7 +920,25 @@
     byId("conformAll").disabled = busy;
     byId("conformAll").textContent = busy
       ? "Применение…"
-      : "Применить подтверждённые СНХ";
+      : "Применить найденные СНХ";
+  }
+
+  function loadFreshTimeline(project, callback) {
+    request("POST", "/stage2/build", {
+      project: project,
+      fps: 25
+    }, function (buildError, buildResponse) {
+      if (buildError) {
+        callback(buildError, buildResponse);
+        return;
+      }
+      request(
+        "GET",
+        "/stage2/timeline?project=" + encodeURIComponent(project),
+        null,
+        callback
+      );
+    });
   }
 
   function conformAll() {
@@ -833,6 +951,17 @@
     if (!current.token) {
       log("Введите ключ доступа.");
       setConformStatus("error", "Введите ключ доступа в настройках проекта.");
+      return;
+    }
+    if (currentWhisperJobStatus === "queued" || currentWhisperJobStatus === "running" ||
+        currentWhisperJobStatus === "cancelling") {
+      log("Conform не запущен: дождитесь завершения сопоставления СНХ.");
+      setConformStatus("error", "Сопоставление ещё выполняется. После завершения обновите статус.");
+      return;
+    }
+    if (currentWhisperJobStatus === "interrupted" || currentWhisperJobStatus === "cancelled") {
+      log("Conform не запущен: сопоставление было прервано. Запустите его снова — сохранённые подтверждения останутся.");
+      setConformStatus("error", "Сначала возобновите сопоставление СНХ в браузере.");
       return;
     }
     setConformBusy(true);
@@ -854,16 +983,21 @@
         return;
       }
       if (!window.confirm(
-        "Применить подтверждённые СНХ к секвенции «" + target.name + "»?\n\n" +
+        "Применить найденные СНХ к секвенции «" + target.name + "»?\n\n" +
+        (currentWhisperReviewCount > 0
+          ? currentWhisperReviewCount + " СНХ требуют подтверждения в браузере: " +
+            "проект → «Сборка» → Sync → «Требуют проверки». " +
+            "Сейчас они будут пропущены.\n\n"
+          : "") +
         "Перед продолжением рекомендуется создать её копию."
       )) {
         setConformBusy(false);
         setConformStatus("idle", "Операция отменена. Секвенция не изменена.");
         return;
       }
-      setConformStatus("working", "Загружаю подтверждённые СНХ…");
-      log("Загружаю подтверждённые диапазоны…");
-      request("GET", "/stage2/timeline?project=" + encodeURIComponent(current.project), null, function (error, response) {
+      setConformStatus("working", "Собираю актуальный timeline…");
+      log("Пересобираю timeline и загружаю найденные диапазоны…");
+      loadFreshTimeline(current.project, function (error, response) {
       var timeline;
       var segments;
       var items;
@@ -875,6 +1009,16 @@
       }
       timeline = response.result || response;
       segments = timeline.segments || [];
+      var reviewCount = segments.filter(function (segment) {
+        return segment.match_status === "needs_review";
+      }).length;
+      if (reviewCount > 0) {
+        log(
+          reviewCount + " СНХ требуют подтверждения в браузере: " +
+          "проект → «Сборка» → Sync → «Требуют проверки». " +
+          "До подтверждения они не будут применены в Premiere."
+        );
+      }
       items = segments.filter(function (segment) {
         var typeOk = segment.type === "snh" || segment.type === "host";
         var statusOk = segment.match_status === "auto_matched" || segment.match_status === "confirmed";
@@ -882,13 +1026,19 @@
         var rangeOk = Number(segment.source_out_sec) > Number(segment.source_in_sec);
         return typeOk && statusOk && sourceOk && rangeOk && isFinite(Number(segment.start_sec));
       }).map(function (segment) {
+        var placeholderIdentity = segment.block_uid
+          ? "RC_BLOCK " + String(segment.block_uid)
+          : "";
         return {
           segmentId: segment.id || segment.block_uid,
+          blockUid: segment.block_uid || "",
           sourceSequenceId: segment.sequence_id || "",
           sourceSequenceName: segment.sequence_name || "",
           sourceInSeconds: Number(segment.source_in_sec),
           sourceOutSeconds: Number(segment.source_out_sec),
           timelineSeconds: Number(segment.start_sec),
+          placeholderIdentity: placeholderIdentity,
+          placeholderIdentityRequired: true,
           placeholderName: pathFilename(segment.placeholder_path)
             || String(segment.id || "") + "_placeholder.png",
           placeholderNames: [
@@ -906,9 +1056,9 @@
         return left.timelineSeconds - right.timelineSeconds;
       });
       if (!items.length) {
-        log("В timeline нет подтверждённых СНХ с валидными sequence/range.");
+        log("В timeline нет найденных СНХ с валидными sequence/range.");
         setConformBusy(false);
-        setConformStatus("idle", "Подтверждённые СНХ для применения не найдены.");
+        setConformStatus("idle", "Найденные СНХ для применения отсутствуют.");
         return;
       }
       setConformStatus("working", "Применяю СНХ: " + items.length + "…");
@@ -920,27 +1070,47 @@
         expectedTargetSequenceId: target.sequenceId,
         expectedTargetSequenceName: target.name,
         expectedProjectPath: target.projectPath,
+        expectedTimelineDuration: Number(timeline.total_duration_sec),
         enableExplicitTrackShiftBatch: true
       }, function (hostError, hostResponse) {
+        var report;
+        var insertedCount;
+        var existingCount;
         if (hostError) {
-          log("Conform не запущен: " + hostError.message, hostResponse);
+          var changedTimeline = /^Inserted\s+/i.test(hostError.message);
+          log(
+            (changedTimeline
+              ? "Conform прерван после частичного изменения: "
+              : "Conform не запущен: ") + hostError.message,
+            hostResponse
+          );
           setConformBusy(false);
-          setConformStatus("error", "Не удалось применить СНХ: " + hostError.message);
+          setConformStatus(
+            "error",
+            changedTimeline
+              ? "Клип уже вставлен, но операция прервалась. Не удаляйте его: повторный запуск проверит V/A и восстановит маркер."
+              : "Не удалось применить СНХ: " + hostError.message
+          );
           return;
         }
+        report = hostResponse.report;
+        insertedCount = (report.inserted || []).length;
+        existingCount = (report.alreadyConformed || []).length;
         setConformBusy(false);
         setConformStatus(
-          hostResponse.report.stopped ? "error" : "success",
-          hostResponse.report.stopped
-            ? "Операция остановлена: применено " + hostResponse.report.completed.length +
-              " из " + hostResponse.report.requested + "."
-            : "Готово: применено " + hostResponse.report.completed.length +
-              " из " + hostResponse.report.requested + " СНХ."
+          report.stopped ? "error" : "success",
+          report.stopped
+            ? "Операция остановлена: добавлено " + insertedCount +
+              ", уже было " + existingCount + " из " + report.requested + "."
+            : "Готово: добавлено " + insertedCount +
+              "; уже было " + existingCount + "."
         );
         log(
-          "Conform: " + hostResponse.report.completed.length + "/" + hostResponse.report.requested +
-          (hostResponse.report.stopped ? ", остановлен на ошибке." : ", завершён."),
-          hostResponse.report
+          "Conform: добавлено " + insertedCount +
+          ", уже было " + existingCount +
+          " из " + report.requested +
+          (report.stopped ? ", остановлен на ошибке." : ", завершён."),
+          report
         );
       });
     });
@@ -950,7 +1120,9 @@
   function bind() {
     byId("saveConfig").addEventListener("click", saveConfig);
     byId("refreshProjects").addEventListener("click", loadProjects);
-    byId("refreshWhisper").addEventListener("click", refreshWhisperStatus);
+    byId("refreshWhisper").addEventListener("click", refreshWhisperStatusManually);
+    byId("resumeWhisper").addEventListener("click", resumeTranscriptionJob);
+    byId("cancelWhisper").addEventListener("click", cancelTranscriptionJob);
     byId("apiToken").addEventListener("change", function () {
       loadProjects();
       refreshWhisperStatus();
@@ -998,6 +1170,8 @@
       etaFromProgress: etaFromProgress,
       formatDuration: formatDuration,
       refreshWhisperStatus: refreshWhisperStatus,
+      refreshWhisperStatusManually: refreshWhisperStatusManually,
+      loadFreshTimeline: loadFreshTimeline,
       renderWhisperJob: renderWhisperJob
     };
   }

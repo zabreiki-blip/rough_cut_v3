@@ -432,6 +432,27 @@ summary:focus-visible {
   font-size: 12px;
 }
 
+.sync-review-notice {
+  display: grid;
+  gap: 3px;
+  margin: 0 0 10px;
+  border: 1px solid #8b6738;
+  border-left-width: 3px;
+  border-radius: 5px;
+  background: #2b2419;
+  color: #efd5a7;
+  padding: 9px 10px;
+  font-size: 11px;
+}
+
+.sync-review-notice[hidden] {
+  display: none;
+}
+
+.sync-review-notice strong {
+  color: #ffd995;
+}
+
 @keyframes whisper-moving {
   0% { transform: translateX(-105%); }
   50% { transform: translateX(85%); }

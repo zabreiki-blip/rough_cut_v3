@@ -243,7 +243,11 @@
           <button id="btn_tts" class="btn btn-accent">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
             TTS
-          </button>          <button id="btn_validate" class="btn">
+          </button>
+          <button id="btn_tts_cancel" class="btn btn-ghost" type="button" hidden>
+            Остановить после текущего блока
+          </button>
+          <button id="btn_validate" class="btn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
             Validate
           </button>
@@ -371,8 +375,12 @@
               <button id="btn_sync_align" class="btn btn-accent" type="button" disabled>
                 Найти СНХ автоматически
               </button>
+              <button id="btn_sync_cancel" class="btn btn-ghost" type="button" hidden>
+                Остановить после текущего шага
+              </button>
             </div>
           </div>
+          <p class="section-copy">Готовые WAV, индексы Whisper и уже найденные диапазоны сохраняются. После остановки нажмите «Продолжить».</p>
 
           <div id="sync_job_progress" class="sync-job-progress" hidden aria-live="polite">
             <div class="sync-progress-copy">
@@ -407,7 +415,7 @@
             <div class="sync-review-heading">
               <div>
                 <h3>Требуют проверки</h3>
-                <p class="section-copy">Прослушайте диапазон, выберите альтернативу или поправьте in/out перед подтверждением.</p>
+                <p class="section-copy">Прослушайте диапазон, выберите альтернативу или поправьте in/out перед подтверждением. Каждое подтверждение сохраняется сразу — страницу можно закрыть и продолжить позже.</p>
               </div>
               <span id="sync_review_count" class="speaker-count">0 фрагментов</span>
             </div>

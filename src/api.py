@@ -24,7 +24,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_from_dir
 
 from stage1.analyzer import analyze_script
 from stage1.config import get_settings
-from stage1.gemini_tts import synthesize_phrase, synthesize_tts
+from stage1.gemini_tts import TtsCancelledError, synthesize_phrase, synthesize_tts
 from stage1.normalizer import (
     NormalizationMemory,
     NormalizationError,
@@ -46,11 +46,21 @@ from stage2.timeline_parser import (
     sync_fragment_id,
 )
 from stage2.placeholder import generate_placeholder
-from stage2.sync_matcher import MatcherConfig, SyncMatcher
-from stage2.sync_models import AlignmentRequest, SyncMatch, SyncSource, WordIndex
+from stage2.sync_llm_review import SemanticCandidate, review_candidates_with_llm
+from stage2.sync_matcher import MatcherConfig, SyncMatcher, normalize_text
+from stage2.sync_models import (
+    AlignmentRequest,
+    SyncAlternative,
+    SyncMatch,
+    SyncSource,
+    WordIndex,
+)
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
-from stage2.whisper_process import transcribe_audio_in_process as transcribe_audio
+from stage2.whisper_process import (
+    WhisperCancelledError,
+    transcribe_audio_in_process as transcribe_audio,
+)
 from stage2.xml_export import build_xml
 
 
@@ -67,16 +77,22 @@ _TTS_JOBS_TTL_SECONDS = 24 * 60 * 60
 _TTS_CONCURRENT_MAX = 3
 _TTS_SEMAPHORE = threading.Semaphore(_TTS_CONCURRENT_MAX)
 _TTS_ACTIVE_PROJECTS: set[str] = set()
+_TTS_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _SOURCE_HASH_CACHE: dict[str, tuple[int, int, str]] = {}
 _SOURCE_HASH_CACHE_LOCK = threading.Lock()
 _SYNC_JOBS: dict[str, dict] = {}
 _SYNC_JOBS_LOCK = threading.Lock()
 _SYNC_ACTIVE_PROJECTS: set[str] = set()
+_SYNC_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _SYNC_DATA_LOCK = threading.Lock()
 
 
 class AudioUploadTooLargeError(ValueError):
     """Raised after the actual uploaded stream exceeds its byte limit."""
+
+
+class _JobCancelled(RuntimeError):
+    """Internal control-flow signal for cooperative background-job stops."""
 
 
 def _api_token() -> str:
@@ -183,6 +199,8 @@ def _project_paths(project: str) -> dict[str, Path]:
         "raw": root / "work" / "scenario_raw.txt",
         "sync_sources": root / "work" / "sync_sources.json",
         "sync_matches": root / "work" / "sync_matches.json",
+        "sync_job_status": root / "work" / "sync_job_status.json",
+        "tts_job_status": root / "work" / "tts_job_status.json",
         "sync_audio": root / "work" / "sync_audio",
         "sync_transcripts": root / "work" / "transcripts",
         "timeline": root / "work" / "full_timeline.json",
@@ -386,11 +404,48 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _persist_tts_job(job: dict) -> None:
+    """Best-effort atomic snapshot of the latest TTS job for one project."""
+    try:
+        project = _normalize_project_name(str(job.get("project") or ""))
+        path = _project_paths(project)["tts_job_status"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(job, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except (OSError, TypeError, ValueError):
+        app.logger.exception("Could not persist TTS job status")
+
+
+def _load_persisted_tts_job(project: str) -> dict | None:
+    payload = _read_json_safe(_project_paths(project)["tts_job_status"])
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("project") != project or not str(payload.get("id") or "").strip():
+        return None
+    restored = dict(payload)
+    if str(restored.get("status") or "").lower() in {
+        "queued", "running", "cancelling",
+    }:
+        restored["status"] = "interrupted"
+        restored["event"] = "interrupted"
+        restored["message"] = "Interrupted; generated WAV files can be resumed"
+        restored["current_id"] = ""
+    return restored
+
+
 def _trim_tts_jobs_locked() -> None:
     now = datetime.now(UTC)
     terminal_ids = [
         job_id for job_id, job in _TTS_JOBS.items()
-        if job.get("status") in {"completed", "failed"}
+        if job.get("status") in {"completed", "failed", "cancelled"}
     ]
     for job_id in terminal_ids:
         stamp = _TTS_JOBS[job_id].get("finished_at") or ""
@@ -402,7 +457,7 @@ def _trim_tts_jobs_locked() -> None:
             _TTS_JOBS.pop(job_id, None)
     terminal_ids = [
         job_id for job_id, job in _TTS_JOBS.items()
-        if job.get("status") in {"completed", "failed"}
+        if job.get("status") in {"completed", "failed", "cancelled"}
     ]
     ordered_ids = sorted(
         terminal_ids,
@@ -429,7 +484,17 @@ def _release_tts_project(project: str) -> None:
         _TTS_ACTIVE_PROJECTS.discard(project)
 
 
-def _create_tts_job(project: str) -> dict:
+def _create_tts_job(
+    project: str,
+    *,
+    prepared_path: Path | None = None,
+    speaker_dir: Path | None = None,
+    provider: str | None = None,
+    voice: str | None = None,
+    gender: str | None = None,
+    dry_run: bool = False,
+    speed: float = 1.0,
+) -> dict:
     job_id = uuid.uuid4().hex
     now = _utc_now_iso()
     job = {
@@ -446,10 +511,17 @@ def _create_tts_job(project: str) -> dict:
         "retry_count": 0,
         "current_id": "",
         "last_error": "",
-        "provider": "",
-        "voice": "",
-        "gender": "",
-        "dry_run": False,
+        # Keep the complete launch configuration in every durable checkpoint.
+        # The browser uses it to resume with exactly the same controls after a
+        # backend or page restart.
+        "prepared_path": str(prepared_path) if prepared_path is not None else "",
+        "speaker_dir": str(speaker_dir) if speaker_dir is not None else "",
+        "provider": (provider or "").strip().lower(),
+        "voice": (voice or "").strip(),
+        "gender": (gender or "").strip().lower(),
+        "dry_run": bool(dry_run),
+        "speed": float(speed),
+        "resolved_voice": "",
         "error": "",
         "created_at": now,
         "started_at": "",
@@ -458,8 +530,11 @@ def _create_tts_job(project: str) -> dict:
     }
     with _TTS_JOBS_LOCK:
         _TTS_JOBS[job_id] = job
+        _TTS_CANCEL_EVENTS[job_id] = threading.Event()
         _trim_tts_jobs_locked()
-    return dict(job)
+        snapshot = dict(job)
+    _persist_tts_job(snapshot)
+    return snapshot
 
 
 def _update_tts_job(job_id: str, **updates) -> dict | None:
@@ -468,7 +543,9 @@ def _update_tts_job(job_id: str, **updates) -> dict | None:
         if not job:
             return None
         job.update(updates)
-        return dict(job)
+        snapshot = dict(job)
+    _persist_tts_job(snapshot)
+    return snapshot
 
 
 def _get_tts_job(job_id: str) -> dict | None:
@@ -477,6 +554,11 @@ def _get_tts_job(job_id: str) -> dict | None:
         if not job:
             return None
         return dict(job)
+
+
+def _tts_cancel_event(job_id: str) -> threading.Event | None:
+    with _TTS_JOBS_LOCK:
+        return _TTS_CANCEL_EVENTS.get(job_id)
 
 
 def _run_tts_job(
@@ -491,7 +573,23 @@ def _run_tts_job(
     dry_run: bool,
     speed: float = 1.0,
 ) -> None:
-    _TTS_SEMAPHORE.acquire()
+    cancel_event = _tts_cancel_event(job_id)
+    acquired = False
+    while not acquired:
+        if cancel_event is not None and cancel_event.is_set():
+            _update_tts_job(
+                job_id,
+                status="cancelled",
+                event="cancelled",
+                message="Cancelled before synthesis started",
+                current_id="",
+                finished_at=_utc_now_iso(),
+            )
+            _release_tts_project(project)
+            with _TTS_JOBS_LOCK:
+                _TTS_CANCEL_EVENTS.pop(job_id, None)
+            return
+        acquired = _TTS_SEMAPHORE.acquire(timeout=0.25)
     _update_tts_job(
         job_id,
         status="running",
@@ -506,6 +604,8 @@ def _run_tts_job(
     )
 
     def progress_callback(progress: dict) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         event = str(progress.get("event", "")).strip() or "progress"
         total = int(progress.get("total") or 0)
         done = int(progress.get("completed") or 0)
@@ -549,8 +649,42 @@ def _run_tts_job(
             gender=gender,
             dry_run=dry_run,
             progress_callback=progress_callback,
+            cancel_check=(cancel_event.is_set if cancel_event is not None else None),
             speed=speed,
         )
+        total = int(result.get("items_total") or 0)
+        generated = int(result.get("files_count") or 0)
+        skipped = int(result.get("skipped_count") or 0)
+        _update_tts_job(
+            job_id,
+            status="completed",
+            event="completed",
+            message=f"Completed: {generated} generated, {skipped} skipped",
+            total=total,
+            done=total,
+            generated=generated,
+            skipped=skipped,
+            attempts=0,
+            current_id="",
+            error="",
+            last_error="",
+            finished_at=_utc_now_iso(),
+            provider=str(result.get("provider", "")),
+            resolved_voice=str(result.get("voice", "")),
+            gender=str(result.get("gender", "")),
+            dry_run=bool(result.get("dry_run", False)),
+            result=result,
+        )
+    except TtsCancelledError:
+        _update_tts_job(
+            job_id,
+            status="cancelled",
+            event="cancelled",
+            message="Cancelled; generated WAV files were kept",
+            current_id="",
+            finished_at=_utc_now_iso(),
+        )
+        return
     except Exception as exc:
         _update_tts_job(
             job_id,
@@ -561,35 +695,13 @@ def _run_tts_job(
             last_error=str(exc),
             finished_at=_utc_now_iso(),
         )
-        _release_tts_project(project)
         return
     finally:
-        _TTS_SEMAPHORE.release()
-
-    total = int(result.get("items_total") or 0)
-    generated = int(result.get("files_count") or 0)
-    skipped = int(result.get("skipped_count") or 0)
-    _update_tts_job(
-        job_id,
-        status="completed",
-        event="completed",
-        message=f"Completed: {generated} generated, {skipped} skipped",
-        total=total,
-        done=total,
-        generated=generated,
-        skipped=skipped,
-        attempts=0,
-        current_id="",
-        error="",
-        last_error="",
-        finished_at=_utc_now_iso(),
-        provider=str(result.get("provider", "")),
-        voice=str(result.get("voice", "")),
-        gender=str(result.get("gender", "")),
-        dry_run=bool(result.get("dry_run", False)),
-        result=result,
-    )
-    _release_tts_project(project)
+        if acquired:
+            _TTS_SEMAPHORE.release()
+        _release_tts_project(project)
+        with _TTS_JOBS_LOCK:
+            _TTS_CANCEL_EVENTS.pop(job_id, None)
 
 
 @app.get("/")
@@ -1099,7 +1211,16 @@ def stage1_tts_job_start():
         return _json_error(f"TTS already active for project {project}", 409)
 
     try:
-        job = _create_tts_job(project=project)
+        job = _create_tts_job(
+            project=project,
+            prepared_path=prepared_path,
+            speaker_dir=speaker_dir,
+            provider=provider,
+            voice=voice_name,
+            gender=gender,
+            dry_run=dry_run,
+            speed=speed,
+        )
         worker = threading.Thread(
             target=_run_tts_job,
             kwargs={
@@ -1139,6 +1260,48 @@ def stage1_tts_job_status(job_id: str):
     if not job:
         return _json_error("job not found", 404)
     return jsonify({"ok": True, "result": job})
+
+
+@app.get("/stage1/tts-jobs/status")
+def stage1_tts_job_status_alias():
+    try:
+        project = _resolve_project_name(request.args.get("project"))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    with _TTS_JOBS_LOCK:
+        candidates = [
+            dict(item) for item in _TTS_JOBS.values()
+            if item.get("project") == project
+        ]
+    if candidates:
+        latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
+        return jsonify({"ok": True, "result": latest})
+    persisted = _load_persisted_tts_job(project)
+    if persisted is None:
+        return _json_error("job not found", 404)
+    return jsonify({"ok": True, "result": persisted})
+
+
+@app.post("/stage1/tts-jobs/<job_id>/cancel")
+def stage1_tts_job_cancel(job_id: str):
+    with _TTS_JOBS_LOCK:
+        job = _TTS_JOBS.get(job_id)
+        if job is None:
+            return _json_error("job not found", 404)
+        if job.get("status") not in {"queued", "running", "cancelling"}:
+            return _json_error("job is not active", 409)
+        event = _TTS_CANCEL_EVENTS.get(job_id)
+        if event is None:
+            return _json_error("job worker is not active", 409)
+        event.set()
+        job.update({
+            "status": "cancelling",
+            "event": "cancelling",
+            "message": "Cancellation requested; finishing current TTS call",
+        })
+        snapshot = dict(job)
+    _persist_tts_job(snapshot)
+    return jsonify({"ok": True, "result": snapshot}), 202
 
 
 @app.post("/stage1/tts-phrase")
@@ -1301,9 +1464,32 @@ def _resolve_sync_audio_path(source: SyncSource, paths: dict[str, Path]) -> Path
 _TRANSCRIPTION_CACHE_KEY = "transcription_cache"
 
 
-def _audio_cache_signature(audio_path: Path) -> dict[str, int]:
+def _audio_stat_signature(audio_path: Path) -> dict[str, int]:
     stat = audio_path.stat()
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _audio_cache_signature(audio_path: Path) -> dict[str, int | str]:
+    """Cheap content-aware identity for large guide WAV files.
+
+    Hashing the first and last MiB avoids re-reading multi-gigabyte guides on
+    every status run while detecting copies whose mtime changed and ordinary
+    in-place replacements whose size did not.
+    """
+    stat_signature = _audio_stat_signature(audio_path)
+    size = stat_signature["size"]
+    sample_size = 1024 * 1024
+    digest = hashlib.sha256()
+    digest.update(str(size).encode("ascii"))
+    with audio_path.open("rb") as stream:
+        digest.update(stream.read(sample_size))
+        if size > sample_size:
+            stream.seek(max(0, size - sample_size))
+            digest.update(stream.read(sample_size))
+    return {
+        **stat_signature,
+        "sample_sha256": digest.hexdigest(),
+    }
 
 
 def _installed_version(distribution: str) -> str:
@@ -1355,7 +1541,7 @@ def _transcription_cache_metadata(
     config: dict[str, str],
     *,
     origin: str = "generated",
-    audio_signature: dict[str, int] | None = None,
+    audio_signature: dict[str, int | str] | None = None,
 ) -> dict[str, object]:
     return {
         "version": 1,
@@ -1387,7 +1573,17 @@ def _word_index_audio_matches(index: WordIndex, audio_path: Path) -> bool:
         audio_signature = _audio_cache_signature(audio_path)
     except OSError:
         return False
-    return cache.get("audio") == audio_signature
+    stored = cache.get("audio")
+    if not isinstance(stored, dict):
+        return False
+    if stored.get("sample_sha256"):
+        return (
+            stored.get("size") == audio_signature.get("size")
+            and stored.get("sample_sha256") == audio_signature.get("sample_sha256")
+        )
+    # Backward-compatible first read. The caller upgrades this metadata after
+    # a successful size/mtime comparison without retranscribing the source.
+    return stored == _audio_stat_signature(audio_path)
 
 
 def _copy_stream_limited(
@@ -1511,6 +1707,171 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
     }
 
 
+def _sync_matching_fingerprint(
+    *,
+    units: list[dict[str, object]],
+    sources: list[SyncSource],
+    indexes: list[WordIndex],
+    normalization_revision: object,
+    timecode_mode: str,
+    search_window_sec: float,
+    llm_enabled: bool,
+    llm_model: str,
+    llm_threshold: float,
+    llm_limit: int,
+) -> str:
+    """Identify every durable input that can change a matching decision."""
+    payload = {
+        "version": 1,
+        "normalization_revision": normalization_revision,
+        "timecode_mode": timecode_mode,
+        "search_window_sec": round(float(search_window_sec), 6),
+        "llm": {
+            "enabled": bool(llm_enabled),
+            "model": llm_model if llm_enabled else "",
+            "threshold": round(float(llm_threshold), 6),
+            "limit": int(llm_limit),
+        },
+        "units": [
+            {
+                "segment_id": str(item.get("segment_id") or ""),
+                "parent_block_uid": str(item.get("parent_block_uid") or ""),
+                "text": str(item.get("text") or ""),
+                "speaker": str(item.get("speaker") or ""),
+                "timecode_start": str(item.get("timecode_start") or ""),
+            }
+            for item in units
+        ],
+        "sources": [item.to_dict() for item in sources],
+        # Hash the actual words, not only their count/duration. A manual word
+        # correction or regenerated transcript must invalidate old decisions.
+        "indexes": [item.to_dict() for item in indexes],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _semantic_review_candidates(match: SyncMatch) -> list[SemanticCandidate]:
+    candidates: list[SemanticCandidate] = []
+    if (
+        match.source_id
+        and match.source_in_sec is not None
+        and match.source_out_sec is not None
+        and match.source_out_sec > match.source_in_sec
+    ):
+        candidates.append(SemanticCandidate(
+            source_id=match.source_id,
+            source_in_sec=match.source_in_sec,
+            source_out_sec=match.source_out_sec,
+            confidence=match.confidence,
+            matched_text=match.matched_text,
+        ))
+    for alternative in match.alternatives:
+        if alternative.source_id and alternative.source_out_sec > alternative.source_in_sec:
+            candidates.append(SemanticCandidate(
+                source_id=alternative.source_id,
+                source_in_sec=alternative.source_in_sec,
+                source_out_sec=alternative.source_out_sec,
+                confidence=alternative.confidence,
+                matched_text=alternative.matched_text,
+            ))
+    return candidates
+
+
+def _apply_semantic_review(
+    match: SyncMatch,
+    candidates: list[SemanticCandidate],
+    selected_index: int,
+    *,
+    llm_confidence: float,
+    reason: str,
+    model: str,
+) -> SyncMatch:
+    selected = candidates[selected_index]
+    alternatives = [
+        SyncAlternative(
+            source_id=item.source_id,
+            source_in_sec=item.source_in_sec,
+            source_out_sec=item.source_out_sec,
+            confidence=item.confidence,
+            matched_text=item.matched_text,
+        )
+        for index, item in enumerate(candidates)
+        if index != selected_index
+    ]
+    metadata = dict(match.metadata)
+    metadata["llm_semantic_review"] = {
+        "selected_candidate": selected_index,
+        "confidence": round(llm_confidence, 4),
+        "reason": reason,
+        "model": model,
+        "original_strategy": match.strategy,
+        "original_confidence": match.confidence,
+    }
+    return SyncMatch(
+        segment_id=match.segment_id,
+        query_text=match.query_text,
+        speaker=match.speaker,
+        approximate_timecode=match.approximate_timecode,
+        source_id=selected.source_id,
+        source_in_sec=selected.source_in_sec,
+        source_out_sec=selected.source_out_sec,
+        confidence=selected.confidence,
+        # An LLM decision is a review aid, never automatic editorial approval.
+        status="needs_review",
+        matched_text=selected.matched_text,
+        strategy="llm_semantic_review",
+        alternatives=alternatives,
+        metadata=metadata,
+    )
+
+
+def _persist_sync_job(job: dict) -> None:
+    """Best-effort atomic snapshot of the latest job for one project."""
+    try:
+        project = _normalize_project_name(str(job.get("project") or ""))
+        path = _project_paths(project)["sync_job_status"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(job, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except (OSError, TypeError, ValueError):
+        app.logger.exception("Could not persist sync job status")
+
+
+def _load_persisted_sync_job(project: str) -> dict | None:
+    payload = _read_json_safe(_project_paths(project)["sync_job_status"])
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("project") != project or not str(payload.get("id") or "").strip():
+        return None
+    restored = dict(payload)
+    if str(restored.get("status") or "").lower() in {
+        "queued", "running", "cancelling",
+    }:
+        # There is no live worker for a job loaded only from disk. Present it
+        # as an interrupted checkpoint instead of leaving every client polling
+        # a task that can never advance. Match decisions are stored separately
+        # after each segment, so a new job can safely continue from them.
+        restored["status"] = "interrupted"
+        restored["message"] = "Interrupted; saved progress can be resumed"
+        restored["current_source_id"] = ""
+        restored["current_segment_id"] = ""
+    return restored
+
+
 def _create_sync_job(project: str) -> dict:
     now = _utc_now_iso()
     job = {
@@ -1529,6 +1890,8 @@ def _create_sync_job(project: str) -> dict:
         "review": 0,
         "unmatched": 0,
         "segment_failures": [],
+        "llm_reviewed": 0,
+        "llm_review_failures": [],
         "current_source_id": "",
         "current_segment_id": "",
         "transcription_processed_sec": 0.0,
@@ -1536,6 +1899,7 @@ def _create_sync_job(project: str) -> dict:
         "transcription_words": 0,
         "transcription_source_started_at": "",
         "matching_started_at": "",
+        "matching_fingerprint": "",
         "transcription_timeout_seconds": 0.0,
         "created_at": now,
         "started_at": "",
@@ -1544,7 +1908,10 @@ def _create_sync_job(project: str) -> dict:
     }
     with _SYNC_JOBS_LOCK:
         _SYNC_JOBS[job["id"]] = job
-    return dict(job)
+        _SYNC_CANCEL_EVENTS[job["id"]] = threading.Event()
+        snapshot = dict(job)
+    _persist_sync_job(snapshot)
+    return snapshot
 
 
 def _update_sync_job(job_id: str, **updates) -> dict | None:
@@ -1553,13 +1920,20 @@ def _update_sync_job(job_id: str, **updates) -> dict | None:
         if job is None:
             return None
         job.update(updates)
-        return dict(job)
+        snapshot = dict(job)
+    _persist_sync_job(snapshot)
+    return snapshot
 
 
 def _get_sync_job(job_id: str) -> dict | None:
     with _SYNC_JOBS_LOCK:
         job = _SYNC_JOBS.get(job_id)
         return dict(job) if job else None
+
+
+def _sync_cancel_event(job_id: str) -> threading.Event | None:
+    with _SYNC_JOBS_LOCK:
+        return _SYNC_CANCEL_EVENTS.get(job_id)
 
 
 def _reserve_sync_project(project: str) -> bool:
@@ -1590,13 +1964,20 @@ def _run_sync_job(
 ) -> None:
     paths = _project_paths(project)
     source_store, match_store = _sync_stores(paths)
-    _update_sync_job(
-        job_id,
-        status="running",
-        message="Preparing word indexes",
-        started_at=_utc_now_iso(),
-    )
+    cancel_event = _sync_cancel_event(job_id)
+
+    def ensure_not_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise _JobCancelled("Sync job cancelled")
+
     try:
+        ensure_not_cancelled()
+        _update_sync_job(
+            job_id,
+            status="running",
+            message="Preparing word indexes",
+            started_at=_utc_now_iso(),
+        )
         all_sources = source_store.list()
         # ``source_ids`` scopes forced transcription, not the matching pool.
         # This lets the CEP panel export one guide at a time while every
@@ -1609,6 +1990,7 @@ def _run_sync_job(
         _update_sync_job(job_id, total_sources=len(sources))
 
         for source in sources:
+            ensure_not_cancelled()
             _update_sync_job(job_id, current_source_id=source.id)
             index_path = _word_index_path(paths, source.id)
             selected_for_transcription = not source_ids or source.id in source_ids
@@ -1657,6 +2039,26 @@ def _run_sync_job(
                         )
                     )
                     save_word_index(index_path, cached_index)
+
+                if (
+                    cached_index is not None
+                    and audio_is_available
+                    and audio_path is not None
+                ):
+                    cache_metadata = cached_index.metadata.get(
+                        _TRANSCRIPTION_CACHE_KEY
+                    )
+                    stored_audio = (
+                        cache_metadata.get("audio")
+                        if isinstance(cache_metadata, dict) else None
+                    )
+                    if (
+                        isinstance(stored_audio, dict)
+                        and not stored_audio.get("sample_sha256")
+                        and stored_audio == _audio_stat_signature(audio_path)
+                    ):
+                        cache_metadata["audio"] = _audio_cache_signature(audio_path)
+                        save_word_index(index_path, cached_index)
 
                 cache_is_current = bool(
                     cached_index is not None
@@ -1708,6 +2110,8 @@ def _run_sync_job(
                         duration_sec: float,
                         word_count: int,
                     ) -> None:
+                        if cancel_event is not None and cancel_event.is_set():
+                            return
                         _update_sync_job(
                             job_id,
                             transcription_processed_sec=processed_sec,
@@ -1722,6 +2126,7 @@ def _run_sync_job(
                         model=model,
                         language=language,
                         progress_callback=report_progress,
+                        cancel_event=cancel_event,
                         timeout_seconds=(
                             app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS")
                             or None
@@ -1748,6 +2153,10 @@ def _run_sync_job(
                     transcribed += 1
                 indexes.append(index)
             except Exception as exc:
+                if isinstance(exc, WhisperCancelledError) or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    raise _JobCancelled("Sync job cancelled") from exc
                 if (
                     cached_index is not None
                     and audio_path is not None
@@ -1786,12 +2195,45 @@ def _run_sync_job(
             indexes,
             MatcherConfig(search_window_sec=search_window_sec),
         )
+        settings = get_settings()
+        llm_review_enabled = (
+            bool(settings.openrouter_api_key)
+            and str(os.getenv("SYNC_LLM_REVIEW_ENABLED", "1")).strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+        try:
+            llm_review_threshold = float(
+                os.getenv("SYNC_LLM_REVIEW_THRESHOLD", "0.80")
+            )
+        except ValueError:
+            llm_review_threshold = 0.80
+        llm_review_threshold = max(0.0, min(1.0, llm_review_threshold))
+        try:
+            llm_review_limit = max(
+                0, int(os.getenv("SYNC_LLM_REVIEW_MAX_BLOCKS", "30"))
+            )
+        except ValueError:
+            llm_review_limit = 30
+        llm_reviewed = 0
+        llm_review_failures: list[dict[str, str]] = []
         existing = {item.segment_id: item for item in match_store.list()}
         current_ids = {
             str(unit.get("segment_id") or "").strip()
             for unit in units
             if str(unit.get("segment_id") or "").strip()
         }
+        matching_fingerprint = _sync_matching_fingerprint(
+            units=units,
+            sources=matching_sources,
+            indexes=indexes,
+            normalization_revision=normalization_revision,
+            timecode_mode=timecode_mode,
+            search_window_sec=search_window_sec,
+            llm_enabled=llm_review_enabled,
+            llm_model=settings.openrouter_model,
+            llm_threshold=llm_review_threshold,
+            llm_limit=llm_review_limit,
+        )
         total_segments = len(current_ids)
         _update_sync_job(
             job_id,
@@ -1800,11 +2242,13 @@ def _run_sync_job(
             total=total_segments,
             current_source_id="",
             matching_started_at=_utc_now_iso(),
+            matching_fingerprint=matching_fingerprint,
         )
 
         segment_failures: list[dict[str, str]] = []
         processed = 0
         for unit in units:
+            ensure_not_cancelled()
             segment_id = str(unit.get("segment_id") or "").strip()
             if not segment_id:
                 segment_failures.append({
@@ -1820,11 +2264,23 @@ def _run_sync_job(
             prior_is_current = (
                 prior_revision in (None, "", normalization_revision)
             )
+            prior_matching_fingerprint = (
+                str(prior.metadata.get("matching_fingerprint") or "")
+                if prior else ""
+            )
             if (
                 prior
-                and prior.status == "confirmed"
                 and prior_is_current
-                and not rematch_confirmed
+                and (
+                    (
+                        prior.status == "confirmed"
+                        and not rematch_confirmed
+                    )
+                    or (
+                        prior.status != "confirmed"
+                        and prior_matching_fingerprint == matching_fingerprint
+                    )
+                )
             ):
                 processed += 1
                 current = [
@@ -1848,7 +2304,40 @@ def _run_sync_job(
                         timecode_mode=timecode_mode,  # type: ignore[arg-type]
                     )
                 )
+                semantic_candidates = _semantic_review_candidates(match)
+                if (
+                    llm_review_enabled
+                    and llm_reviewed < llm_review_limit
+                    and match.status != "auto_matched"
+                    and match.confidence < llm_review_threshold
+                    and len(normalize_text(match.query_text)) >= 5
+                    and semantic_candidates
+                ):
+                    try:
+                        decision = review_candidates_with_llm(
+                            query_text=match.query_text,
+                            speaker=match.speaker,
+                            candidates=semantic_candidates,
+                            settings=settings,
+                        )
+                        llm_reviewed += 1
+                        if decision is not None:
+                            match = _apply_semantic_review(
+                                match,
+                                semantic_candidates,
+                                decision.candidate_index,
+                                llm_confidence=decision.confidence,
+                                reason=decision.reason,
+                                model=decision.model,
+                            )
+                    except Exception as exc:
+                        llm_reviewed += 1
+                        llm_review_failures.append({
+                            "segment_id": segment_id,
+                            "error": str(exc),
+                        })
                 match.metadata["normalization_revision"] = normalization_revision
+                match.metadata["matching_fingerprint"] = matching_fingerprint
                 match.metadata["parent_block_uid"] = str(
                     unit.get("parent_block_uid") or segment_id
                 )
@@ -1877,11 +2366,14 @@ def _run_sync_job(
                 done=processed,
                 **_sync_summary(current),
                 segment_failures=list(segment_failures),
+                llm_reviewed=llm_reviewed,
+                llm_review_failures=list(llm_review_failures),
             )
 
         all_matches = [
             item for item in match_store.list() if item.segment_id in current_ids
         ]
+        ensure_not_cancelled()
         summary = _sync_summary(all_matches)
         _update_sync_job(
             job_id,
@@ -1891,7 +2383,18 @@ def _run_sync_job(
             current_segment_id="",
             source_failures=source_failures,
             segment_failures=segment_failures,
+            llm_reviewed=llm_reviewed,
+            llm_review_failures=llm_review_failures,
             **summary,
+        )
+    except _JobCancelled:
+        _update_sync_job(
+            job_id,
+            status="cancelled",
+            message="Cancelled; saved indexes and matches can be resumed",
+            current_source_id="",
+            current_segment_id="",
+            finished_at=_utc_now_iso(),
         )
     except Exception as exc:
         _update_sync_job(
@@ -1903,6 +2406,8 @@ def _run_sync_job(
         )
     finally:
         _release_sync_project(project)
+        with _SYNC_JOBS_LOCK:
+            _SYNC_CANCEL_EVENTS.pop(job_id, None)
 
 
 @app.route("/stage2/sync-sources", methods=["GET", "POST", "DELETE"])
@@ -2233,6 +2738,27 @@ def stage2_sync_job_status(job_id: str):
     return jsonify({"ok": True, "result": job})
 
 
+@app.post("/stage2/sync-jobs/<job_id>/cancel")
+def stage2_sync_job_cancel(job_id: str):
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        if job is None:
+            return _json_error("job not found", 404)
+        if job.get("status") not in {"queued", "running", "cancelling"}:
+            return _json_error("job is not active", 409)
+        event = _SYNC_CANCEL_EVENTS.get(job_id)
+        if event is None:
+            return _json_error("job worker is not active", 409)
+        event.set()
+        job.update({
+            "status": "cancelling",
+            "message": "Cancellation requested; saving completed work",
+        })
+        snapshot = dict(job)
+    _persist_sync_job(snapshot)
+    return jsonify({"ok": True, "result": snapshot}), 202
+
+
 @app.get("/stage2/sync-jobs/status")
 def stage2_sync_job_status_alias():
     job_id = str(request.args.get("job_id") or "").strip()
@@ -2247,7 +2773,10 @@ def stage2_sync_job_status_alias():
             dict(item) for item in _SYNC_JOBS.values() if item.get("project") == project
         ]
     if not candidates:
-        return _json_error("job not found", 404)
+        persisted = _load_persisted_sync_job(project)
+        if persisted is None:
+            return _json_error("job not found", 404)
+        return jsonify({"ok": True, "result": persisted})
     latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
     return jsonify({"ok": True, "result": latest})
 
@@ -2423,6 +2952,20 @@ def stage2_build():
         project = _resolve_project_name(payload.get("project"))
     except ValueError as exc:
         return _json_error(str(exc), 400)
+
+    with _SYNC_JOBS_LOCK:
+        sync_job_active = project in _SYNC_ACTIVE_PROJECTS
+    if sync_job_active:
+        return _json_error(
+            "sync_job_in_progress: дождитесь завершения сопоставления СНХ",
+            409,
+        )
+    persisted_job = _load_persisted_sync_job(project)
+    if persisted_job and persisted_job.get("status") in {"interrupted", "cancelled"}:
+        return _json_error(
+            "sync_job_interrupted: перезапустите сопоставление СНХ, чтобы продолжить с сохранённой контрольной точки",
+            409,
+        )
 
     paths = _ensure_project(project)
     gate = _normalization_required(project)

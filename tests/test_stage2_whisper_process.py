@@ -10,6 +10,7 @@ import pytest
 
 from stage2.whisper_process import (
     _shutdown_worker,
+    WhisperCancelledError,
     WhisperProcessError,
     WhisperTimeoutError,
     transcribe_audio_in_process,
@@ -148,6 +149,30 @@ def test_timeout_terminates_worker_promptly() -> None:
             _start_method="fork",
         )
 
+    assert time.monotonic() - started < 2.0
+
+
+def test_cancel_event_terminates_worker_promptly() -> None:
+    def hang(_path, *, progress_callback, **_kwargs):
+        progress_callback(0.0, 1.0, 0)
+        time.sleep(5.0)
+        return {"words": []}
+
+    cancel_event = threading.Event()
+    started = time.monotonic()
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=hang),
+        pytest.raises(WhisperCancelledError, match="cancelled"),
+    ):
+        transcribe_audio_in_process(
+            "unused.wav",
+            cancel_event=cancel_event,
+            timeout_seconds=10.0,
+            _start_method="fork",
+            progress_callback=lambda *_args: cancel_event.set(),
+        )
+
+    assert cancel_event.is_set()
     assert time.monotonic() - started < 2.0
 
 

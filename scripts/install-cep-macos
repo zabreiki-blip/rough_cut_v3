@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET_DIR="${HOME}/Library/Application Support/Adobe/CEP/extensions"
+TARGET="${TARGET_DIR}/rough-cut-v3-sync"
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "This helper is for macOS. See cep/README.md for Windows installation." >&2
+  exit 2
+fi
+
+mkdir -p "${TARGET_DIR}"
+if [[ -L "${TARGET}" && "$(readlink "${TARGET}")" == "${ROOT_DIR}/cep" ]]; then
+  echo "CEP panel is already linked: ${TARGET}"
+elif [[ -e "${TARGET}" || -L "${TARGET}" ]]; then
+  echo "Target already exists and was not changed: ${TARGET}" >&2
+  echo "Move it aside manually, then run this command again." >&2
+  exit 2
+else
+  ln -s "${ROOT_DIR}/cep" "${TARGET}"
+  echo "Linked CEP panel: ${TARGET} -> ${ROOT_DIR}/cep"
+fi
+
+defaults write com.adobe.CSXS.11 PlayerDebugMode 1
+defaults write com.adobe.CSXS.12 PlayerDebugMode 1
+echo "Restart Premiere Pro, then open Window -> Extensions -> Rough Cut — Синхронизация."

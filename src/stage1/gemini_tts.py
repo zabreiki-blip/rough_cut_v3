@@ -555,6 +555,15 @@ def _emit_progress(
         return
 
 
+class TtsCancelledError(RuntimeError):
+    """Raised between synthesis items after a cooperative cancellation."""
+
+
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise TtsCancelledError("TTS synthesis cancelled")
+
+
 def synthesize_tts(
     prepared_path: Path,
     speaker_dir: Path,
@@ -563,6 +572,7 @@ def synthesize_tts(
     gender: str | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
     speed: float = 1.0,
 ) -> dict:
     payload = read_json(prepared_path)
@@ -630,6 +640,7 @@ def synthesize_tts(
     )
 
     for index, (block_id, text) in enumerate(prepared_items, start=1):
+        _raise_if_cancelled(cancel_check)
         out_file = speaker_dir / f"{block_id}.wav"
         fp = _synthesis_fingerprint(text, provider, voice, resolved_gender, speed, _fp_model, _fp_sample_rate, _fp_extra_rate)
         _emit_progress(
@@ -696,9 +707,11 @@ def synthesize_tts(
 
         attempts = 0
         while True:
+            _raise_if_cancelled(cancel_check)
             attempts += 1
             try:
                 wav_bytes = _synthesize_wav_bytes(provider, text, settings, voice, client, types)
+                _raise_if_cancelled(cancel_check)
                 wav_bytes = _apply_tempo(wav_bytes, speed)
                 _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
                 _write_meta_fingerprint(out_file, fp)
@@ -717,6 +730,11 @@ def synthesize_tts(
                     },
                 )
                 break
+            except TtsCancelledError:
+                # Cancellation is control flow, not a transient provider
+                # failure. Propagate it immediately without retry events or
+                # an additional backoff sleep.
+                raise
             except Exception as exc:
                 retryable = attempts < 4 and _is_retryable_tts_error(provider, exc)
                 _emit_progress(

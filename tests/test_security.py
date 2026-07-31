@@ -242,7 +242,10 @@ class ContainerSecurityConfigurationTest(unittest.TestCase):
     def test_compose_exposes_only_localhost_without_reload(self) -> None:
         compose = (ROOT_DIR / "docker-compose.yml").read_text(encoding="utf-8")
 
-        self.assertIn('"127.0.0.1:8000:8000"', compose)
+        self.assertIn(
+            '"${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}:8000"',
+            compose,
+        )
         self.assertNotIn("--reload", compose)
         self.assertRegex(compose, r"(?:^|\s)--workers\s+1\b")
 

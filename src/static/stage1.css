@@ -589,6 +589,11 @@ select { cursor: pointer; }
   color: var(--red);
 }
 
+.live-pill[data-state="interrupted"] {
+  background: var(--orange-dim);
+  color: var(--orange);
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
@@ -1032,6 +1037,15 @@ select { cursor: pointer; }
 .sync-match-meta {
   color: var(--muted);
   font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+}
+
+.sync-match-llm {
+  border-left: 3px solid var(--orange);
+  border-radius: 4px;
+  background: var(--orange-dim);
+  color: var(--orange);
+  padding: 7px 9px;
   font-size: 10px;
 }
 

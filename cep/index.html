@@ -133,7 +133,16 @@
             <div><span>Проверить</span><strong id="whisperReview">0</strong></div>
             <div><span>Не найдено</span><strong id="whisperUnmatched">0</strong></div>
           </div>
-          <button id="refreshWhisper" class="button button-secondary full-width" type="button">Обновить статус</button>
+          <div id="whisperReviewNotice" class="sync-review-notice" role="alert" hidden>
+            <strong><span id="whisperReviewNoticeCount">0</span> СНХ требуют подтверждения</strong>
+            <span>Откройте проект в браузере → «Сборка» → Sync → «Требуют проверки». Неподтверждённые СНХ не применяются в Premiere.</span>
+          </div>
+          <div class="button-row">
+            <button id="refreshWhisper" class="button button-secondary" type="button">Обновить статус</button>
+            <button id="resumeWhisper" class="button button-primary" type="button" hidden>Продолжить без экспорта</button>
+            <button id="cancelWhisper" class="button button-secondary" type="button" hidden>Остановить</button>
+          </div>
+          <p class="hint">Готовый WAV, индекс Whisper и найденные диапазоны используются повторно.</p>
         </div>
       </section>
 
@@ -145,9 +154,10 @@
           </div>
         </div>
         <div class="card-body grid">
-          <p class="section-copy">Откройте целевую монтажную секвенцию. Панель заменит плейсхолдеры только у подтверждённых СНХ.</p>
+          <p class="section-copy">Откройте целевую монтажную секвенцию. Панель пересоберёт timeline и заменит плейсхолдеры у найденных СНХ.</p>
           <div id="conformStatus" class="operation-status" aria-live="polite">Откройте целевую секвенцию. СНХ будут добавлены на дорожки V1 и A1.</div>
-          <button id="conformAll" class="button button-primary full-width">Применить подтверждённые СНХ</button>
+          <button id="conformAll" class="button button-primary full-width">Применить найденные СНХ</button>
+          <p class="hint">Можно продолжить позже: повторный запуск проверит маркеры RC_SYNC, пропустит уже применённые СНХ и продолжит с оставшихся.</p>
           <p class="warning">Перед применением создайте копию монтажной секвенции: Premiere не предоставляет общего Undo для всей операции.</p>
         </div>
       </section>

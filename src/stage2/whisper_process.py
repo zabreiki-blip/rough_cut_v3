@@ -26,6 +26,10 @@ class WhisperTimeoutError(TimeoutError):
     """Raised after the isolated Whisper worker exceeds its deadline."""
 
 
+class WhisperCancelledError(RuntimeError):
+    """Raised after a caller cooperatively cancels active inference."""
+
+
 @dataclass
 class _Worker:
     process: Any
@@ -239,6 +243,7 @@ def transcribe_audio_in_process(
     model: str | None = None,
     language: str = "ru",
     progress_callback: ProgressCallback | None = None,
+    cancel_event: Any | None = None,
     timeout_seconds: float | None = None,
     _start_method: str = "spawn",
 ) -> dict[str, Any]:
@@ -277,6 +282,9 @@ def transcribe_audio_in_process(
             raise WhisperProcessError("Whisper worker IPC connection failed") from exc
 
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                _discard_worker_locked(worker)
+                raise WhisperCancelledError("Whisper transcription cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _discard_worker_locked(worker)

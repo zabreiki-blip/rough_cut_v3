@@ -39,6 +39,30 @@ def test_whisper_job_progress_is_visible_and_polled_without_restarting_backend()
     assert "force_transcribe: true" not in PANEL
 
 
+def test_premiere_panel_explains_that_review_matches_need_browser_confirmation() -> None:
+    assert 'id="whisperReviewNotice"' in HTML
+    assert 'id="whisperReviewNoticeCount"' in HTML
+    assert "Неподтверждённые СНХ не применяются в Premiere" in HTML
+    assert 'segment.match_status === "needs_review"' in PANEL
+    assert "СНХ требуют подтверждения в браузере" in PANEL
+    assert "До подтверждения они не будут применены в Premiere" in PANEL
+
+
+def test_premiere_panel_explains_safe_resume_after_an_interruption() -> None:
+    assert "повторный запуск проверит маркеры RC_SYNC" in HTML
+    assert 'interrupted: "прервано"' in PANEL
+    assert "Сохранённые подтверждения не потеряны" in PANEL
+    assert 'currentWhisperJobStatus === "queued"' in PANEL
+    assert 'currentWhisperJobStatus === "interrupted"' in PANEL
+    assert "Сначала возобновите сопоставление СНХ в браузере" in PANEL
+    assert 'var changedTimeline = /^Inserted\\s+/i.test(hostError.message);' in PANEL
+    assert "повторный запуск проверит V/A и восстановит маркер" in PANEL
+    assert 'id="resumeWhisper"' in HTML
+    assert 'id="cancelWhisper"' in HTML
+    assert '"/cancel"' in PANEL
+    assert "Продолжаю распознавание без повторного экспорта WAV" in PANEL
+
+
 def test_sequence_tick_strings_are_converted_to_seconds() -> None:
     assert 'typeof timeValue === "string" || typeof timeValue === "number"' in HOST
     assert 'if (typeof timeValue === "string")' in HOST
@@ -86,12 +110,51 @@ def test_batch_conform_preserves_editorial_context_as_sequence_markers() -> None
     assert "confidence: Number(segment.match_confidence" in PANEL
 
 
+def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> None:
+    assert "function conformMarkerState(target, item)" in HOST
+    assert "Expected exactly one marker [" in HOST
+    assert "Source sequence/range does not match" in HOST
+    assert "item text does not match" in HOST
+    assert "Sequence marker scan did not advance" in HOST
+    assert "Sequence marker scan exceeded " in HOST
+    assert "verifyConformMarkerInsertion(" in HOST
+    assert "verifySkippedInsertionAfterMove(" in HOST
+    assert "findTrackItemByNodeId(" in HOST
+    assert "reanchorConformMarker(" in HOST
+    assert "without a valid \" +" in HOST
+    assert "source clips have no stable node IDs" in HOST
+    marker_check = HOST.index("markerState = conformMarkerState(target, item);")
+    placeholder_lookup = HOST.index(
+        "placeholder = placeholderAnywhere(target, item);",
+        marker_check,
+    )
+    assert marker_check < placeholder_lookup
+    assert "recoveredMissingMarker: true" in HOST
+    assert "both verified video and audio are required" in HOST
+    assert "its source range is not exact" in HOST
+    assert "Premiere did not persist the exact completion marker" in HOST
+    assert "Object identity is therefore not a" in HOST
+    assert "asString(persistedMarker.name)" in HOST
+    assert "Final sequence duration does not match the authoritative timeline" in HOST
+
+
+def test_batch_conform_uses_stable_block_identity_for_fresh_placeholders() -> None:
+    assert '"RC_BLOCK " + String(segment.block_uid)' in PANEL
+    assert "placeholderIdentity: placeholderIdentity" in PANEL
+    assert "var stableIdentity = asString(params.placeholderIdentity);" in HOST
+    assert "return [stableIdentity];" in HOST
+    assert "Target sequence is stale or legacy" in HOST
+    assert "Re-import the latest XML" in HOST
+    assert "item.blockUid || item.segmentId" in HOST
+
+
 def test_ripple_replace_requires_exact_placeholder_then_inserts() -> None:
     assert "placeholderForRipple(target, params)" in HOST
     assert "found.clip.remove(1, 1)" in HOST
     assert "function sequenceDurationSeconds(sequence)" in HOST
     assert "track.clips[track.clips.numItems - 1].end" in HOST
-    assert "projectName === expectedNames[j] || clipName === expectedNames[j]" in HOST
+    assert "placeholderLabelMatches(projectName, expectedNames[j])" in HOST
+    assert "placeholderLabelMatches(clipName, expectedNames[j])" in HOST
     assert "projectItem.setInPoint(secondsToTicks(inSeconds), 4)" in HOST
     assert "projectItem.getOutPoint(2)" in HOST
     assert "function verifyInsertedRange(" in HOST
@@ -111,7 +174,7 @@ def test_ripple_replace_requires_exact_placeholder_then_inserts() -> None:
     assert "placeholderName: pathFilename(segment.placeholder_path)" in PANEL
     assert "placeholderNames: [" in PANEL
     assert "names.unshift(single)" in HOST
-    assert "Resolve aliases in priority order instead of merging their matches" in HOST
+    assert "Canonical RC_BLOCK identity is the only candidate" in HOST
     assert "if (matches.length === 1)" in HOST
     assert "Math.abs(matches[i].startSeconds - expectedStart) <= 0.08" in HOST
     assert "if (positionMatches.length === 1)" in HOST

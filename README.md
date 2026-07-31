@@ -55,6 +55,11 @@
   `SYNC_WHISPER_TIMEOUT_SECONDS` (по умолчанию 14400 секунд)
 - `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV
   (по умолчанию 4 ГБ), работающий и без `Content-Length`
+- `SYNC_LLM_REVIEW_ENABLED=1` включает смысловую проверку блоков с низким
+  совпадением; `SYNC_LLM_REVIEW_THRESHOLD` задаёт порог (по умолчанию `0.80`),
+  а `SYNC_LLM_REVIEW_MAX_BLOCKS` ограничивает число LLM-проверок за запуск.
+  Модель выбирает только из реальных диапазонов Whisper, и результат всегда
+  требует ручного подтверждения в браузере
 - `ROUGH_CUT_CEP_CORS=1` — разрешить аутентифицированные запросы только из
   локального Premiere CEP file origin
 
@@ -202,6 +207,8 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `POST /stage1/tts`
 - `POST /stage1/tts-jobs/start` (асинхронный запуск TTS с live-прогрессом)
 - `GET /stage1/tts-jobs/<job_id>` (получение статуса job)
+- `GET /stage1/tts-jobs/status?project=<project>` (последняя задача, включая checkpoint после рестарта)
+- `POST /stage1/tts-jobs/<job_id>/cancel` (остановка после текущего внешнего вызова)
 - `POST /stage1/tts-phrase` (озвучка одной фразы)
 - `POST /stage1/validate`
 - `POST /stage2/build`
@@ -211,13 +218,28 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `PUT /stage2/sync-sources/<source_id>/words`
 - `POST /stage2/sync-jobs/start`
 - `GET /stage2/sync-jobs/<job_id>`
+- `GET /stage2/sync-jobs/status?project=<project>`
+- `POST /stage2/sync-jobs/<job_id>/cancel` (сохраняет готовые индексы и совпадения)
 - `GET|PATCH /stage2/sync-matches`
 - `PATCH /stage2/sync-matches/<block_uid>`
 - `GET /stage2/timeline?project=<project>`
 
-Примечание: статусы `tts-jobs` хранятся в памяти одного процесса API; Docker
-явно запускает один worker. Завершённые статусы удаляются через 24 часа.
-После рестарта backend активные/исторические job-статусы сбрасываются.
+Последний статус TTS и sync атомарно сохраняется в каталоге `work` проекта.
+После рестарта незавершённая задача показывается как `interrupted`: повторный
+запуск TTS пропускает WAV с тем же fingerprint, а sync повторно использует
+готовые Whisper-индексы и сохранённые совпадения, если fingerprint всех входов
+не изменился. Завершённые in-memory статусы удаляются через 24 часа.
+
+Ограничение: публичный API `faster-whisper` не экспортирует состояние decoder/VAD,
+необходимое для точного продолжения внутри одного WAV. При остановке сохраняются
+полностью готовые источники; текущий незавершённый аудиофайл распознаётся заново.
+Резюм через `clip_timestamps` намеренно не используется, поскольку он меняет VAD
+и контекст декодирования и может дать пропуски либо дубли на границе.
+
+LLM-нормализация сохраняет успешные batch-решения в
+`work/normalization_llm_cache.json`. Повторный запуск после сбоя запрашивает
+только недостающие batch; изменение текста, правил, модели или prompt инвалидирует
+соответствующий кеш.
 
 ## Stage 2.1: автоматическое подключение синхронов
 
@@ -272,6 +294,61 @@ PYTHONPATH=src pytest -q
 ```
 
 ## Docker
+
+### Быстрое развёртывание на другой машине
+
+Linux, Windows/WSL2, Intel Mac и универсальный CPU-вариант для Apple Silicon:
+
+```bash
+git clone git@github.com:zabreiki-blip/rough_cut_v3.git
+cd rough_cut_v3
+scripts/bootstrap-docker
+```
+
+Скрипт проверяет Docker Compose v2, создаёт `.env` с новым локальным API token,
+создаёт каталоги данных, собирает образ и ждёт успешный `/health`. Затем заполните
+в `.env` ключи используемых LLM/TTS-провайдеров. Каталоги `projects/` и `data/`
+примонтированы с хоста и переживают пересборку контейнера; кеш Whisper хранится
+в named volume. Образ собирается под нативную архитектуру Docker host без
+жёсткой привязки к `amd64` или `arm64`.
+
+```bash
+docker compose ps
+docker compose logs --tail=100 stage1-api
+```
+
+Для установки панели на другом Mac:
+
+```bash
+scripts/install-cep-macos
+```
+
+После этого в CEP-настройках укажите каталог `projects` этой машины, URL backend
+и новый `ROUGH_CUT_API_TOKEN` из её `.env`.
+
+### Apple Silicon M1–M4: Metal/MLX
+
+Docker Desktop работает внутри Linux VM и не передаёт Apple Metal контейнеру.
+Для ускорения на процессорах M‑серии запускайте API нативно:
+
+```bash
+brew install python@3.12 ffmpeg catdoc
+scripts/setup-macos-apple-silicon
+# заполнить .env
+scripts/run-native-macos
+```
+
+Установщик требует нативный `arm64` Python (не Rosetta), создаёт отдельное
+окружение `.venv-macos-arm64`, ставит `mlx-whisper==0.4.3` и проверяет, что
+`SYNC_WHISPER_BACKEND=auto` выбрал `mlx-whisper`. Модель `medium` автоматически
+преобразуется адаптером в `mlx-community/whisper-medium-mlx` и загружается при
+первом распознавании. Официальный MLX Whisper требует `ffmpeg`, поддерживает
+word timestamps и установку через `pip install mlx-whisper`.
+
+Обычный Docker-режим на M‑серии тоже поддерживается, но использует CPU
+`faster-whisper`; он переносимее, однако медленнее нативного MLX.
+
+### Ручной Docker-запуск
 
 ```bash
 docker compose build

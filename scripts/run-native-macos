@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv-macos-arm64}"
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "Native MLX mode requires Apple Silicon. Use scripts/bootstrap-docker here." >&2
+  exit 2
+fi
+if [[ ! -x "${VENV_DIR}/bin/gunicorn" ]]; then
+  echo "Native environment is missing. Run scripts/setup-macos-apple-silicon first." >&2
+  exit 2
+fi
+
+export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export HF_HOME="${HF_HOME:-${ROOT_DIR}/.cache/huggingface}"
+mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data" "${HF_HOME}"
+
+cd "${ROOT_DIR}"
+exec "${VENV_DIR}/bin/gunicorn" \
+  -b "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}" \
+  --workers 1 \
+  --timeout 600 \
+  api:app

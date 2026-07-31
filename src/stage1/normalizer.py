@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
 import json
 import os
@@ -67,30 +67,52 @@ _TECH_MARKERS = {
     "видео", "лайф", "титр", "плашка", "графика", "карта", "фото",
     "архив", "отбивка", "шапка", "склейка", "ремарка", "техническое",
 }
-_TIMECODE = re.compile(r"\[?(\d{1,2}[:.]\d{2}(?:[:.]\d{2})?)\]?")
+_TIMECODE_TOKEN = (
+    r"(?:\[?\d{1,2}[:.]\d{2}(?:[:.]\d{2})?\]?|\[?\d{1,2}-\d{2}\]?)"
+)
+_TIMECODE = re.compile(rf"({_TIMECODE_TOKEN})")
 _SYNC_METADATA = re.compile(
     r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*"
-    r"([^,]{2,80}),\s*(\d{1,2}[:.]\d{2}(?:[:.]\d{2})?)"
+    rf"(.{{2,160}}?)(?:,\s*|:\s*|\s+)({_TIMECODE_TOKEN})"
     r"[.\s–\-]*(.*)$",
     re.DOTALL,
 )
 _SYNC_LABEL_METADATA = re.compile(
-    r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*([^,]{2,160})$"
+    r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*(.{2,160})$"
 )
 _SYNC_NAME_ONLY_LABEL = re.compile(
-    r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)+$"
+    r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*$"
 )
 _SYNC_CONTINUATION_NOTE = re.compile(
     r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE
 )
-_TIMECODE_TOKEN = r"\[?\d{1,2}[:.]\d{2}(?:[:.]\d{2})?\]?"
 _SYNC_FRAGMENT = re.compile(
     rf"(?P<start>{_TIMECODE_TOKEN})"
     rf"(?:\s*[-–—]\s*(?P<end>{_TIMECODE_TOKEN}))?"
     rf"[.\s]*(?P<text>.*?)(?=(?:{_TIMECODE_TOKEN})|$)",
     re.DOTALL,
 )
+_EDITORIAL_TIMECODE_PREFIX = re.compile(
+    rf"^\s*\((?:[^)\n]{{1,240}}\)\s*:?\s*|[^:\n]{{1,240}}:\s*)"
+    rf"{_TIMECODE_TOKEN}",
+    re.DOTALL,
+)
 _LLM_CONFIDENCE_THRESHOLD = 0.65
+_LLM_CACHE_VERSION = 1
+_LLM_CACHE_MAX_ENTRIES = 2000
+_OPENROUTER_SYSTEM_PROMPT = "You normalize TV production scripts."
+_OPENROUTER_INSTRUCTIONS = (
+    "Classify every scenario paragraph without deleting or merging any item. "
+    "Allowed types: voiceover, sync, host, technical, other, unknown. "
+    "Return JSON {\"items\":[{\"uid\":...,\"type\":...,\"confidence\":0..1,"
+    "\"label_is_marker\":true|false,"
+    "\"text_for_tts\":...,\"speaker\":...,\"role\":...,"
+    "\"timecode_start\":...,\"timecode_end\":...,\"notes\":...}]}. "
+    "Use unknown when unsure. Do not rewrite original content. "
+    "An item with continuation_of_type=voiceover is an unlabelled paragraph "
+    "continuing the preceding voiceover unless its text clearly starts a new "
+    "speaker or technical cue. "
+)
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
 
@@ -159,28 +181,68 @@ def _generate_normalization_unlocked(
             llm = classifier or _openrouter_classifier
             batches = _llm_batches(unresolved)
             payloads = [[_llm_input(block) for block in batch] for batch in batches]
+            cache_path = _llm_cache_path(Path(output_path))
+            cache = _load_llm_cache(cache_path)
+            rules_signature = _llm_rules_signature(memory)
+            cache_keys = [
+                _llm_cache_fingerprint(
+                    payload,
+                    hint=hint,
+                    classifier=classifier,
+                    rules_signature=rules_signature,
+                )
+                for payload in payloads
+            ]
+            batch_results: list[
+                tuple[list[dict[str, Any]] | None, Exception | None]
+            ] = [(None, None) for _ in batches]
+            pending: list[int] = []
+            for index, (payload, cache_key) in enumerate(zip(payloads, cache_keys)):
+                cached = _llm_cached_results(cache, cache_key, payload)
+                if cached is None:
+                    pending.append(index)
+                else:
+                    batch_results[index] = (cached, None)
 
             # A large documentary script can contain hundreds of unresolved
             # paragraphs. OpenRouter calls are independent, so bounded
             # concurrency keeps the HTTP request practical without flooding the
             # provider. Injected classifiers remain sequential for deterministic
             # tests and custom integrations.
-            if classifier is None and len(batches) > 1:
-                with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
-                    futures = [pool.submit(llm, payload, hint) for payload in payloads]
-                    batch_results = []
-                    for future in futures:
+            if classifier is None and len(pending) > 1:
+                with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+                    futures = {
+                        pool.submit(llm, payloads[index], hint): index
+                        for index in pending
+                    }
+                    for future in as_completed(futures):
+                        index = futures[future]
                         try:
-                            batch_results.append((future.result(), None))
+                            results = future.result()
+                            batch_results[index] = (results, None)
+                            _cache_llm_results(
+                                cache_path,
+                                cache,
+                                cache_keys[index],
+                                payloads[index],
+                                results,
+                            )
                         except Exception as exc:
-                            batch_results.append((None, exc))
+                            batch_results[index] = (None, exc)
             else:
-                batch_results = []
-                for payload in payloads:
+                for index in pending:
                     try:
-                        batch_results.append((llm(payload, hint), None))
+                        results = llm(payloads[index], hint)
+                        batch_results[index] = (results, None)
+                        _cache_llm_results(
+                            cache_path,
+                            cache,
+                            cache_keys[index],
+                            payloads[index],
+                            results,
+                        )
                     except Exception as exc:
-                        batch_results.append((None, exc))
+                        batch_results[index] = (None, exc)
 
             for batch, (results, error) in zip(batches, batch_results):
                 if error is None:
@@ -540,18 +602,35 @@ def _snapshot_proposals(blocks: list[NormalizedBlock]) -> None:
 
 
 def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
-    continuation_type = ""
+    previous: NormalizedBlock | None = None
     for block in blocks:
-        if block.type == BlockType.VOICEOVER.value:
-            continuation_type = BlockType.VOICEOVER.value
-            continue
-        if block.type != BlockType.UNKNOWN.value or block.original_label:
-            continuation_type = ""
-            continue
-        if continuation_type:
-            block.continuation_of_type = continuation_type
+        if (
+            previous is not None
+            and block.type == BlockType.UNKNOWN.value
+            and not block.original_label
+            and previous.type == BlockType.SYNC.value
+            and _looks_like_sync_continuation(block.original_text)
+        ):
+            block.continuation_of_type = BlockType.SYNC.value
             if not block.suggested_type:
-                block.suggested_type = continuation_type
+                block.suggested_type = BlockType.SYNC.value
+            _apply_type(
+                block,
+                BlockType.SYNC.value,
+                DecisionSource.BUILTIN_RULE.value,
+                0.9,
+            )
+            block.speaker = previous.speaker
+            block.role = previous.role
+        elif (
+            previous is not None
+            and block.type == BlockType.UNKNOWN.value
+            and not block.original_label
+            and previous.type == BlockType.VOICEOVER.value
+        ):
+            block.continuation_of_type = BlockType.VOICEOVER.value
+            if not block.suggested_type:
+                block.suggested_type = BlockType.VOICEOVER.value
             # A plain paragraph after an explicitly recognized voiceover marker
             # is part of the same voiceover section. Classify this locally so a
             # paragraph boundary does not make the result depend on the LLM.
@@ -561,6 +640,11 @@ def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
                 DecisionSource.BUILTIN_RULE.value,
                 0.9,
             )
+        previous = block
+
+
+def _looks_like_sync_continuation(text: str) -> bool:
+    return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё]|И(?:\s|$))", text.lstrip()))
 
 
 def _split_label(text: str) -> tuple[str, str]:
@@ -568,6 +652,19 @@ def _split_label(text: str) -> tuple[str, str]:
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
         return "", text.strip()
+    # Built-in structural markers take precedence over generic dash-separated
+    # labels. Documentary headings such as "ЗК Стратегия Лили — ..." otherwise
+    # look like one long, unknown label instead of a known voiceover marker.
+    known = sorted(set(_BUILTIN_MARKERS) | _TECH_MARKERS, key=len, reverse=True)
+    for marker in known:
+        match = re.match(
+            rf"^\s*({re.escape(marker)})(?:\s*[-.]?\s*\d+[A-Za-zА-Яа-я]?)?"
+            rf"(?:\s*[.:\-–—]\s*|\s+|$)(.*)$",
+            text,
+            flags=re.I | re.DOTALL,
+        )
+        if match and normalize_marker(match.group(1)) == marker:
+            return match.group(1).strip(), match.group(2).strip()
     # A formal speaker credit can be much longer than an ordinary marker. It
     # is safe to accept only when its content starts with a structural timecode
     # (optionally after a "Продолжение синхрона" note).
@@ -581,21 +678,25 @@ def _split_label(text: str) -> tuple[str, str]:
             or _SYNC_NAME_ONLY_LABEL.match(candidate)
         ) and _TIMECODE.match(sync_content):
             return candidate, content
-    generic = re.match(r"^\s*([^:–—\n]{1,60}?)\s*[:–—]\s*(.+)$", text, flags=re.DOTALL)
+    # Some scripts put a timecode directly after the speaker credit, without a
+    # colon: "Бартон 00:37 — 01:07 ...". Validate the prefix as a name or a
+    # name-and-role credit before treating it as a label.
+    timecoded_speaker = re.match(
+        rf"^\s*(.{{2,240}}?)\s+({_TIMECODE_TOKEN}.*)$", text, flags=re.DOTALL
+    )
+    if timecoded_speaker:
+        candidate = timecoded_speaker.group(1).strip()
+        if (
+            _SYNC_LABEL_METADATA.match(candidate)
+            or _SYNC_NAME_ONLY_LABEL.match(candidate)
+        ):
+            return candidate, timecoded_speaker.group(2).strip()
+    generic = re.match(r"^\s*([^:\n]{1,60}?)\s*:\s*(.+)$", text, flags=re.DOTALL)
     if generic:
         candidate = generic.group(1).strip()
-        if len(candidate.split()) <= 6:
+        if not candidate.startswith("(") and len(candidate.split()) <= 3:
             return candidate, generic.group(2).strip()
     normalized_text = normalize_marker(text)
-    known = sorted(set(_BUILTIN_MARKERS) | _TECH_MARKERS, key=len, reverse=True)
-    for marker in known:
-        match = re.match(
-            rf"^\s*({re.escape(marker)})(?:\s*[-.]?\s*\d+[A-Za-zА-Яа-я]?)?\s*[.:\-–—]?\s*(.*)$",
-            text,
-            flags=re.I | re.DOTALL,
-        )
-        if match and normalize_marker(match.group(1)) == marker:
-            return match.group(1).strip(), match.group(2).strip()
     if normalized_text in set(_BUILTIN_MARKERS) | _TECH_MARKERS:
         return text.strip(), ""
     return "", text.strip()
@@ -643,7 +744,9 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
         and _TIMECODE.match(sync_content)
     ):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif re.match(r"^(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\(…\)|\(\.\.\.\))", stripped):
+    elif _TIMECODE.match(stripped) or re.match(r"^\s*\((?:…|\.\.\.)\)", stripped):
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+    elif _EDITORIAL_TIMECODE_PREFIX.match(stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
@@ -659,9 +762,9 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
         block.text_for_tts = block.normalized_text
     timecodes = _TIMECODE.findall(block.original_text)
     if timecodes:
-        block.timecode_start = timecodes[0]
+        block.timecode_start = _canonicalize_timecode(timecodes[0])
         if len(timecodes) > 1 and block.type != BlockType.SYNC.value:
-            block.timecode_end = timecodes[1]
+            block.timecode_end = _canonicalize_timecode(timecodes[1])
 
 
 def _extract_block_metadata(block: NormalizedBlock) -> None:
@@ -712,10 +815,17 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
             continue
         fragments.append(SyncFragment(
             text=fragment_text,
-            timecode_start=match.group("start").strip("[]"),
-            timecode_end=(match.group("end") or "").strip("[]"),
+            timecode_start=_canonicalize_timecode(match.group("start")),
+            timecode_end=_canonicalize_timecode(match.group("end") or ""),
         ))
     return fragments
+
+
+def _canonicalize_timecode(value: str) -> str:
+    value = value.strip().strip("[]")
+    if re.fullmatch(r"\d{1,2}-\d{2}", value):
+        return value.replace("-", ":")
+    return value
 
 
 def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, Any]]) -> None:
@@ -751,6 +861,238 @@ def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, An
         if block.type == BlockType.VOICEOVER.value:
             block.text_for_tts = str(item.get("text_for_tts", "")).strip() or block.normalized_text
         _extract_block_metadata(block)
+
+
+def _llm_cache_path(output_path: Path) -> Path:
+    parent = Path(output_path).parent
+    work_dir = parent if parent.name == "work" else parent / "work"
+    return work_dir / "normalization_llm_cache.json"
+
+
+def _load_llm_cache(path: Path) -> dict[str, Any]:
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"version": _LLM_CACHE_VERSION, "entries": {}}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _LLM_CACHE_VERSION
+        or not isinstance(payload.get("entries"), dict)
+    ):
+        return {"version": _LLM_CACHE_VERSION, "entries": {}}
+    return payload
+
+
+def _classifier_identity(classifier: LLMClassifier | None) -> dict[str, Any]:
+    if classifier is None:
+        settings = get_settings()
+        return {
+            "kind": "openrouter",
+            "model": settings.openrouter_model,
+            "base_url": settings.openrouter_base_url,
+            "temperature": 0.1,
+            "response_format": "json_object",
+            "system_prompt": _OPENROUTER_SYSTEM_PROMPT,
+            "instructions": _OPENROUTER_INSTRUCTIONS,
+        }
+    target = classifier
+    code = getattr(target, "__code__", None)
+    if code is None:
+        target = getattr(classifier, "__call__", classifier)
+        code = getattr(target, "__code__", None)
+    code_hash = ""
+    if code is not None:
+        code_hash = sha256(
+            json.dumps(
+                _stable_code_identity(code),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    return {
+        "kind": "custom",
+        "module": getattr(classifier, "__module__", type(classifier).__module__),
+        "qualname": getattr(
+            classifier, "__qualname__", type(classifier).__qualname__
+        ),
+        "code_hash": code_hash,
+    }
+
+
+def _stable_code_identity(code: Any) -> dict[str, Any]:
+    def stable_constant(value: Any) -> Any:
+        if hasattr(value, "co_code") and hasattr(value, "co_consts"):
+            return _stable_code_identity(value)
+        if isinstance(value, tuple):
+            return [stable_constant(item) for item in value]
+        if isinstance(value, frozenset):
+            items = [stable_constant(item) for item in value]
+            return {
+                "frozenset": sorted(
+                    items,
+                    key=lambda item: json.dumps(
+                        item, ensure_ascii=False, sort_keys=True
+                    ),
+                )
+            }
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, bytes):
+            return {"bytes": value.hex()}
+        return {"type": type(value).__qualname__, "value": str(value)}
+
+    return {
+        "code": bytes(code.co_code).hex(),
+        "constants": [stable_constant(value) for value in code.co_consts],
+        "names": list(code.co_names),
+        "varnames": list(code.co_varnames),
+        "freevars": list(code.co_freevars),
+        "cellvars": list(code.co_cellvars),
+        "argcount": code.co_argcount,
+        "kwonlyargcount": code.co_kwonlyargcount,
+    }
+
+
+def _llm_rules_signature(memory: NormalizationMemory) -> str:
+    memory_rules = [
+        {
+            "normalized_marker": str(rule.get("normalized_marker") or ""),
+            "target_type": str(rule.get("target_type") or ""),
+            "status": str(rule.get("status") or ""),
+            "source": str(rule.get("source") or ""),
+        }
+        for rule in memory.list_rules()
+    ]
+    memory_rules.sort(
+        key=lambda item: (
+            item["normalized_marker"],
+            item["target_type"],
+            item["status"],
+            item["source"],
+        )
+    )
+    rules = {
+        "builtin_markers": sorted(_BUILTIN_MARKERS.items()),
+        "technical_markers": sorted(_TECH_MARKERS),
+        "sync_metadata": _SYNC_METADATA.pattern,
+        "sync_label_metadata": _SYNC_LABEL_METADATA.pattern,
+        "sync_name_only": _SYNC_NAME_ONLY_LABEL.pattern,
+        "editorial_timecode_prefix": _EDITORIAL_TIMECODE_PREFIX.pattern,
+        "confidence_threshold": _LLM_CONFIDENCE_THRESHOLD,
+        "memory_rules": memory_rules,
+    }
+    return sha256(
+        json.dumps(rules, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _stable_llm_input(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in item.items() if key != "uid"}
+        for item in payload
+    ]
+
+
+def _llm_cache_fingerprint(
+    payload: list[dict[str, Any]],
+    *,
+    hint: str,
+    classifier: LLMClassifier | None,
+    rules_signature: str,
+) -> str:
+    material = {
+        "version": _LLM_CACHE_VERSION,
+        "input": _stable_llm_input(payload),
+        "hint": hint.strip(),
+        "classifier": _classifier_identity(classifier),
+        "rules_signature": rules_signature,
+    }
+    return sha256(
+        json.dumps(
+            material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _cacheable_llm_results(
+    payload: list[dict[str, Any]], results: Any
+) -> list[dict[str, Any]] | None:
+    if not isinstance(results, list):
+        return None
+    requested_uids = [str(item.get("uid") or "") for item in payload]
+    by_uid: dict[str, dict[str, Any]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            return None
+        uid = str(result.get("uid") or "")
+        if not uid or uid in by_uid:
+            return None
+        by_uid[uid] = result
+    if set(by_uid) != set(requested_uids):
+        return None
+    decisions: list[dict[str, Any]] = []
+    for uid in requested_uids:
+        decision = dict(by_uid[uid])
+        decision.pop("uid", None)
+        if str(decision.get("type") or "") not in VALID_BLOCK_TYPES:
+            return None
+        try:
+            float(decision.get("confidence", 0.6))
+            json.dumps(decision, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return None
+        decisions.append(decision)
+    return decisions
+
+
+def _llm_cached_results(
+    cache: dict[str, Any], cache_key: str, payload: list[dict[str, Any]]
+) -> list[dict[str, Any]] | None:
+    entry = cache.get("entries", {}).get(cache_key)
+    if not isinstance(entry, dict) or not isinstance(entry.get("results"), list):
+        return None
+    decisions = entry["results"]
+    if len(decisions) != len(payload) or not all(
+        isinstance(item, dict) for item in decisions
+    ):
+        return None
+    restored: list[dict[str, Any]] = []
+    for request, decision in zip(payload, decisions):
+        item = dict(decision)
+        item["uid"] = str(request.get("uid") or "")
+        restored.append(item)
+    if _cacheable_llm_results(payload, restored) is None:
+        return None
+    return restored
+
+
+def _cache_llm_results(
+    path: Path,
+    cache: dict[str, Any],
+    cache_key: str,
+    payload: list[dict[str, Any]],
+    results: Any,
+) -> bool:
+    decisions = _cacheable_llm_results(payload, results)
+    if decisions is None:
+        return False
+    entries = cache.setdefault("entries", {})
+    entries[cache_key] = {"created_at": _utcnow(), "results": decisions}
+    if len(entries) > _LLM_CACHE_MAX_ENTRIES:
+        oldest = sorted(
+            entries,
+            key=lambda key: str(entries[key].get("created_at") or ""),
+        )[: len(entries) - _LLM_CACHE_MAX_ENTRIES]
+        for key in oldest:
+            entries.pop(key, None)
+    cache["version"] = _LLM_CACHE_VERSION
+    try:
+        _atomic_write_json(path, cache)
+    except (OSError, TypeError, ValueError):
+        entries.pop(cache_key, None)
+        return False
+    return True
 
 
 def _llm_batches(
@@ -792,23 +1134,15 @@ def _openrouter_classifier(blocks: list[dict[str, Any]], hint: str) -> list[dict
         import requests
     except ImportError as exc:
         raise RuntimeError("requests is not installed") from exc
-    prompt = (
-        "Classify every scenario paragraph without deleting or merging any item. "
-        "Allowed types: voiceover, sync, host, technical, other, unknown. "
-        "Return JSON {\"items\":[{\"uid\":...,\"type\":...,\"confidence\":0..1,"
-        "\"label_is_marker\":true|false,"
-        "\"text_for_tts\":...,\"speaker\":...,\"role\":...,"
-        "\"timecode_start\":...,\"timecode_end\":...,\"notes\":...}]}. "
-        "Use unknown when unsure. Do not rewrite original content. "
-        "An item with continuation_of_type=voiceover is an unlabelled paragraph "
-        "continuing the preceding voiceover unless its text clearly starts a new speaker or technical cue. "
-        f"Author hint: {hint or '(none)'}. Items: {json.dumps(blocks, ensure_ascii=False)}"
+    prompt = _OPENROUTER_INSTRUCTIONS + (
+        f"Author hint: {hint or '(none)'}. "
+        f"Items: {json.dumps(blocks, ensure_ascii=False)}"
     )
     request_kwargs = {
         "headers": {"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
         "json": {
             "model": settings.openrouter_model,
-            "messages": [{"role": "system", "content": "You normalize TV production scripts."},
+            "messages": [{"role": "system", "content": _OPENROUTER_SYSTEM_PROMPT},
                          {"role": "user", "content": prompt}],
             "temperature": 0.1,
             "response_format": {"type": "json_object"},

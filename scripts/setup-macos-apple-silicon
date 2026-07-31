@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv-macos-arm64}"
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "This installer requires a native Apple Silicon macOS shell (arm64)." >&2
+  echo "On an Intel/Windows/Linux machine use: scripts/bootstrap-docker" >&2
+  exit 2
+fi
+
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  echo "Python 3 is required. Install an arm64 build of Python 3.11 or 3.12." >&2
+  exit 2
+fi
+
+PYTHON_ARCH="$(${PYTHON_BIN} -c 'import platform; print(platform.machine())')"
+PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [[ "${PYTHON_ARCH}" != "arm64" ]]; then
+  echo "Python is ${PYTHON_ARCH}; MLX requires a native arm64 Python (Rosetta is not supported)." >&2
+  exit 2
+fi
+if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)'; then
+  echo "Python ${PYTHON_VERSION} is unsupported; use Python 3.10–3.13." >&2
+  exit 2
+fi
+
+for dependency in ffmpeg catdoc; do
+  if ! command -v "${dependency}" >/dev/null 2>&1; then
+    echo "Missing ${dependency}. Install it first: brew install ffmpeg catdoc" >&2
+    exit 2
+  fi
+done
+
+"${PYTHON_BIN}" -m venv "${VENV_DIR}"
+"${VENV_DIR}/bin/python" -m pip install --upgrade pip
+"${VENV_DIR}/bin/pip" install -r "${ROOT_DIR}/requirements-macos-apple-silicon.txt"
+
+if [[ ! -f "${ROOT_DIR}/.env" ]]; then
+  cp "${ROOT_DIR}/.env.example" "${ROOT_DIR}/.env"
+  echo "Created .env from .env.example. Fill ROUGH_CUT_API_TOKEN and provider keys."
+fi
+mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data"
+
+PYTHONPATH="${ROOT_DIR}/src" "${VENV_DIR}/bin/python" - <<'PY'
+import platform
+import mlx_whisper
+from stage2.whisper_runner import resolve_backend
+
+assert platform.machine() == "arm64"
+assert resolve_backend("auto") == "mlx-whisper"
+print("Apple Silicon backend ready: mlx-whisper")
+PY
+
+echo "Setup complete. Start with: scripts/run-native-macos"
