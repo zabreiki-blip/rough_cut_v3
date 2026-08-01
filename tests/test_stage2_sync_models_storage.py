@@ -203,6 +203,36 @@ def test_match_store_is_separate_and_preserves_scenario_file() -> None:
         assert confirmed.metadata["confirmed_by"] == "editor"
 
 
+def test_match_store_keeps_distinct_blocks_with_overlapping_ranges() -> None:
+    with TemporaryDirectory() as temporary:
+        store = SyncMatchStore(Path(temporary) / "sync_matches.json")
+        store.replace_all([
+            SyncMatch(
+                segment_id="teaser-block",
+                query_text="Короткий анонс",
+                source_id="interview-1",
+                source_in_sec=120.0,
+                source_out_sec=124.0,
+                confidence=0.98,
+                status="confirmed",
+            ),
+            SyncMatch(
+                segment_id="full-block",
+                query_text="Полный ответ героя",
+                source_id="interview-1",
+                source_in_sec=120.0,
+                source_out_sec=132.0,
+                confidence=0.98,
+                status="confirmed",
+            ),
+        ])
+
+        restored = store.list()
+        assert [item.segment_id for item in restored] == ["teaser-block", "full-block"]
+        assert [item.source_in_sec for item in restored] == [120.0, 120.0]
+        assert [item.source_out_sec for item in restored] == [124.0, 132.0]
+
+
 def test_store_reports_malformed_json_instead_of_overwriting_it() -> None:
     with TemporaryDirectory() as temporary:
         path = Path(temporary) / "sync_sources.json"

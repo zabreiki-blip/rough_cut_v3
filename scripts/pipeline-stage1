@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv}"
+PROJECT=""
+INPUT=""
+CONFIRM=0
+DRY_RUN=0
+PROVIDER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project) PROJECT="${2:-}"; shift 2 ;;
+    --input) INPUT="${2:-}"; shift 2 ;;
+    --yes-confirm) CONFIRM=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --provider) PROVIDER="${2:-}"; shift 2 ;;
+    *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "${PROJECT}" || -z "${INPUT}" ]]; then
+  echo "Использование: scripts/pipeline-stage1 --project ИМЯ --input ФАЙЛ [--yes-confirm] [--dry-run] [--provider PROVIDER]" >&2
+  exit 2
+fi
+if [[ ! -f "${INPUT}" ]]; then
+  echo "Исходный файл не найден: ${INPUT}" >&2
+  exit 2
+fi
+INPUT="$(cd "$(dirname "${INPUT}")" && pwd)/$(basename "${INPUT}")"
+if [[ ! "${PROJECT}" =~ ^[A-Za-zА-Яа-яЁё0-9_-]{1,64}$ ]]; then
+  echo "Недопустимое имя проекта." >&2
+  exit 2
+fi
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+  echo "Нет локального окружения; запустите scripts/setup-local." >&2
+  exit 2
+fi
+
+PROJECT_ROOT="${ROOT_DIR}/projects/${PROJECT}"
+NORMALIZED="${PROJECT_ROOT}/work/scenario_normalized.json"
+PREPARED="${PROJECT_ROOT}/work/scenario_prepared.json"
+RAW="${PROJECT_ROOT}/work/scenario_raw.txt"
+SPEAKER="${PROJECT_ROOT}/speaker"
+MANIFEST="${SPEAKER}/manifest.json"
+mkdir -p "${PROJECT_ROOT}/input" "${PROJECT_ROOT}/work" "${SPEAKER}"
+export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${ROOT_DIR}/.env"
+  set +a
+fi
+
+if [[ "${CONFIRM}" -eq 1 && -f "${NORMALIZED}" ]]; then
+  NORMALIZED_SOURCE="$("${VENV_DIR}/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("source", ""))' "${NORMALIZED}")"
+  if [[ "${NORMALIZED_SOURCE}" != "${INPUT}" ]]; then
+    echo "Существующий черновик относится к другому исходнику. Сначала запустите команду без --yes-confirm." >&2
+    exit 2
+  fi
+  echo "Использую проверенный черновик: ${NORMALIZED}"
+else
+  "${VENV_DIR}/bin/python" -m stage1.cli normalize --in "${INPUT}" --out "${NORMALIZED}"
+fi
+if [[ "${CONFIRM}" -ne 1 ]]; then
+  echo "Черновик создан: ${NORMALIZED}"
+  echo "Проверьте его и повторите команду с --yes-confirm, чтобы подтвердить и продолжить."
+  exit 3
+fi
+"${VENV_DIR}/bin/python" -m stage1.cli confirm --in "${NORMALIZED}" --prepared "${PREPARED}" --raw "${RAW}"
+
+RUN_ARGS=(run --normalized "${NORMALIZED}" --prepared "${PREPARED}" --speaker "${SPEAKER}" --manifest "${MANIFEST}")
+[[ "${DRY_RUN}" -eq 1 ]] && RUN_ARGS+=(--dry-run)
+[[ -n "${PROVIDER}" ]] && RUN_ARGS+=(--provider "${PROVIDER}")
+"${VENV_DIR}/bin/python" -m stage1.cli "${RUN_ARGS[@]}"

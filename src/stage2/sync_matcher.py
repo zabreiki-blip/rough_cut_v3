@@ -266,8 +266,9 @@ def _search_one(
     approx: float | None,
     window: float | None,
     strategy: str,
+    timed_tokens: list[_Token] | None = None,
 ) -> list[_Candidate]:
-    all_tokens = _timed_tokens(index)
+    all_tokens = timed_tokens if timed_tokens is not None else _timed_tokens(index)
     if approx is not None and window is not None:
         guide_approx = approx - source.guide_offset_sec
         lower, upper = guide_approx - window, guide_approx + window
@@ -383,6 +384,18 @@ class SyncMatcher:
     ):
         self.sources = {item.id: item for item in sources}
         self.indexes = {item.source_id: item for item in indexes}
+        self.timed_tokens = {
+            source_id: _timed_tokens(index)
+            for source_id, index in self.indexes.items()
+        }
+        self.speaker_tokens = {
+            source_id: [
+                tokens
+                for name in source.speaker_names
+                if (tokens := normalize_text(name))
+            ]
+            for source_id, source in self.sources.items()
+        }
         self.config = config or MatcherConfig()
 
     def _eligible_sources(self, request: AlignmentRequest) -> list[SyncSource]:
@@ -401,7 +414,7 @@ class SyncMatcher:
         universal = [source for source in available if source.all_speakers]
 
         def source_speaker_tokens(source: SyncSource) -> list[list[str]]:
-            return [normalize_text(name) for name in source.speaker_names if normalize_text(name)]
+            return self.speaker_tokens.get(source.id, [])
 
         def with_universal(values: list[SyncSource]) -> list[SyncSource]:
             by_id = {source.id: source for source in [*values, *universal]}
@@ -459,6 +472,7 @@ class SyncMatcher:
                     approx,
                     self.config.search_window_sec if approx is not None else None,
                     "near_timecode" if approx is not None else "full_transcript",
+                    self.timed_tokens[source.id],
                 )
             )
         candidates = [
@@ -477,6 +491,7 @@ class SyncMatcher:
                         None,
                         None,
                         "fallback_full",
+                        self.timed_tokens[source.id],
                     )
                 )
             candidates = [

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
 SegmentType = Literal["zk", "snh", "host", "tech"]
+TIMELINE_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -44,6 +45,29 @@ class TimelineSegment:
         d["end_sec"] = self.end_sec
         return d
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "TimelineSegment":
+        if not isinstance(value, dict):
+            raise TypeError("timeline segment must be an object")
+        init_fields = {item.name for item in fields(cls) if item.init}
+        required = {"id", "type", "text", "duration_sec"}
+        missing = sorted(key for key in required if key not in value)
+        if missing:
+            raise ValueError(f"timeline segment is missing: {', '.join(missing)}")
+        kwargs = {key: value[key] for key in init_fields if key in value}
+        if kwargs["type"] not in {"zk", "snh", "host", "tech"}:
+            raise ValueError(f"invalid timeline segment type: {kwargs['type']!r}")
+        for key in (
+            "duration_sec", "start_sec", "source_in_sec", "source_out_sec",
+            "match_confidence",
+        ):
+            if key in kwargs:
+                try:
+                    kwargs[key] = float(kwargs[key])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"timeline segment {key} must be numeric") from exc
+        return cls(**kwargs)
+
 
 @dataclass
 class FullTimeline:
@@ -52,6 +76,7 @@ class FullTimeline:
     fps: int = 25
     width: int = 1920
     height: int = 1080
+    schema_version: int = TIMELINE_SCHEMA_VERSION
 
     @property
     def total_duration_sec(self) -> float:
@@ -62,6 +87,7 @@ class FullTimeline:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "project": self.project,
             "fps": self.fps,
             "width": self.width,
@@ -69,3 +95,33 @@ class FullTimeline:
             "total_duration_sec": self.total_duration_sec,
             "segments": [s.to_dict() for s in self.segments],
         }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "FullTimeline":
+        if not isinstance(value, dict):
+            raise TypeError("timeline must be an object")
+        version = int(value.get("schema_version", TIMELINE_SCHEMA_VERSION))
+        if version < 1 or version > TIMELINE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported timeline schema_version: {version}")
+        raw_segments = value.get("segments")
+        if not isinstance(raw_segments, list):
+            raise ValueError("timeline segments must be a list")
+        project = str(value.get("project") or "").strip()
+        if not project:
+            raise ValueError("timeline project is required")
+        try:
+            fps = int(value.get("fps", 25))
+            width = int(value.get("width", 1920))
+            height = int(value.get("height", 1080))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeline fps/width/height must be integers") from exc
+        if fps < 1 or width < 1 or height < 1:
+            raise ValueError("timeline fps/width/height must be positive")
+        return cls(
+            project=project,
+            segments=[TimelineSegment.from_dict(item) for item in raw_segments],
+            fps=fps,
+            width=width,
+            height=height,
+            schema_version=version,
+        )

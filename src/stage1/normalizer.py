@@ -4,14 +4,16 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
 import json
-import os
+import logging
 from pathlib import Path
 import re
-import tempfile
 import threading
 import time
 from typing import Any, Callable
 from uuid import uuid4
+
+from atomic_io import atomic_write_json as _atomic_write_json
+from atomic_io import atomic_write_text as _atomic_write_text
 
 from .config import get_settings
 from .io_utils import extract_paragraphs, extract_text, read_json
@@ -25,6 +27,8 @@ from .normalization_models import (
     SyncFragment,
     VALID_BLOCK_TYPES,
 )
+
+logger = logging.getLogger(__name__)
 
 
 LLMClassifier = Callable[[list[dict[str, Any]], str], list[dict[str, Any]]]
@@ -150,6 +154,7 @@ def _generate_normalization_unlocked(
     input_path = Path(input_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
+    logger.info("Normalization started source=%s llm=%s", input_path, use_llm)
     source_hash = _file_hash(input_path)
     paragraphs = _extract_paragraphs(input_path)
     now = _utcnow()
@@ -263,6 +268,7 @@ def _generate_normalization_unlocked(
     )
     payload = scenario.to_dict()
     _atomic_write_json(Path(output_path), payload)
+    logger.info("Normalization draft written source=%s blocks=%d", input_path, len(blocks))
     return payload
 
 
@@ -431,6 +437,12 @@ def _confirm_normalization_unlocked(
     _atomic_write_text(Path(raw_path), raw_text)
     result = scenario.to_dict()
     _atomic_write_json(normalized_path, result)
+    logger.info(
+        "Normalization confirmed source=%s revision=%s blocks=%d",
+        scenario.source,
+        scenario.revision,
+        len(scenario.blocks),
+    )
     try:
         _learn_from_confirmation(
             scenario, resolved_memory_path, learning_candidates, decisions
@@ -1244,26 +1256,6 @@ def _file_hash(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    finally:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
 
 
 def _path_lock(path: Path) -> threading.RLock:

@@ -587,11 +587,25 @@
     const inputPath = ids.normalization_input_path.value.trim();
     assertRequiredPath(inputPath, "input_path");
     appendLog(`Нормализация: ${inputPath}`);
-    const result = await requestJSON("/stage1/normalization/generate", "POST", {
+    const started = await requestJSON("/stage1/normalization-jobs/start", "POST", {
       project, input_path: inputPath, hint: ids.normalization_hint.value.trim(),
       use_llm: ids.normalization_use_llm.checked,
     });
-    normalization = canonicalDocument(result);
+    const jobId = String(started.id || "").trim();
+    if (!jobId) throw new Error("Сервер не вернул ID задачи нормализации");
+    appendLog(`Нормализация поставлена в очередь: ${jobId}`);
+    let state = started;
+    while (["queued", "running"].includes(String(state.status || "").toLowerCase())) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      state = await requestJSON(
+        `/stage1/normalization-jobs/${encodeURIComponent(jobId)}`,
+        "GET",
+      );
+    }
+    if (state.status !== "completed") {
+      throw new Error(state.error || state.message || "Нормализация завершилась с ошибкой");
+    }
+    normalization = canonicalDocument(state.result);
     normalizationEligible = false;
     normalizationDirty = false;
     renderNormalization();

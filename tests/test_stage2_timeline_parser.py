@@ -163,6 +163,59 @@ class NormalizedTimelineTest(unittest.TestCase):
             self.assertEqual(second.duration_sec, 10.0)
             self.assertEqual(second.start_sec, 7.75)
 
+    def test_teaser_and_full_sync_reuse_overlapping_source_range(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "teaser-block",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Короткий анонс ответа героя",
+                    },
+                    {
+                        "uid": "full-block",
+                        "order": 2,
+                        "type": "sync",
+                        "normalized_text": "Полный развёрнутый ответ героя",
+                    },
+                ],
+            }
+            matches = {
+                "teaser-block": {
+                    "source_id": "interview-1",
+                    "source_in_sec": 120.0,
+                    "source_out_sec": 124.0,
+                    "confidence": 0.98,
+                    "status": "confirmed",
+                },
+                "full-block": {
+                    "source_id": "interview-1",
+                    "source_in_sec": 120.0,
+                    "source_out_sec": 132.0,
+                    "confidence": 0.98,
+                    "status": "confirmed",
+                },
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches,
+            )
+
+            self.assertEqual([item.block_uid for item in timeline.segments], [
+                "teaser-block", "full-block",
+            ])
+            self.assertEqual([item.source_in_sec for item in timeline.segments], [
+                120.0, 120.0,
+            ])
+            self.assertEqual([item.source_out_sec for item in timeline.segments], [
+                124.0, 132.0,
+            ])
+            self.assertEqual([item.start_sec for item in timeline.segments], [0.0, 4.0])
+            self.assertEqual([item.duration_sec for item in timeline.segments], [4.0, 12.0])
+
     def test_one_sync_block_expands_to_independently_matched_fragments(self) -> None:
         with TemporaryDirectory() as tmp:
             base = Path(tmp)

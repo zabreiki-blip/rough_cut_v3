@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+from collections.abc import Mapping
 
 
 @dataclass
@@ -27,8 +28,54 @@ class Settings:
     macos_connector_url: str
     macos_connector_token: str
     macos_connector_timeout: int
+    macos_command_timeout: int
     project_name: str
     max_zk_blocks: int
+
+
+def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
+    """Return actionable configuration warnings without exposing secret values."""
+    env = os.environ if environ is None else environ
+    warnings: list[str] = []
+
+    def integer(name: str, minimum: int, maximum: int | None = None) -> None:
+        raw = str(env.get(name, "")).strip()
+        if not raw:
+            return
+        try:
+            value = int(raw)
+        except ValueError:
+            warnings.append(f"{name}={raw!r} is not an integer; the default will be used")
+            return
+        if value < minimum or (maximum is not None and value > maximum):
+            range_text = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
+            warnings.append(f"{name} must be {range_text}; the value will be adjusted")
+
+    provider = str(env.get("TTS_PROVIDER", "gemini")).strip().lower()
+    if provider not in {"gemini", "openrouter", "macos"}:
+        warnings.append("TTS_PROVIDER must be gemini, openrouter or macos")
+    gender = str(env.get("TTS_GENDER", "female")).strip().lower()
+    if gender not in {"female", "male"}:
+        warnings.append("TTS_GENDER must be female or male")
+    if provider == "gemini" and not str(env.get("GEMINI_API_KEY", "")).strip():
+        warnings.append("GEMINI_API_KEY is empty; real Gemini TTS is unavailable")
+    if provider == "openrouter" and not str(env.get("OPENROUTER_API_KEY", "")).strip():
+        warnings.append("OPENROUTER_API_KEY is empty; OpenRouter analysis/TTS is unavailable")
+    if not str(env.get("ROUGH_CUT_API_TOKEN", "")).strip():
+        warnings.append("ROUGH_CUT_API_TOKEN is empty; authenticated API routes will return 503")
+    connector_url = str(env.get("MACOS_CONNECTOR_URL", "")).strip()
+    if connector_url and not connector_url.startswith(("http://", "https://")):
+        warnings.append("MACOS_CONNECTOR_URL must start with http:// or https://")
+
+    integer("MAX_ZK_BLOCKS", 1)
+    integer("OPENROUTER_TTS_SAMPLE_RATE", 8000, 192000)
+    integer("MACOS_TTS_RATE", 80, 420)
+    integer("MACOS_TTS_SAMPLE_RATE", 8000, 192000)
+    integer("MACOS_CONNECTOR_TIMEOUT", 5)
+    integer("MACOS_COMMAND_TIMEOUT", 30, 7200)
+    integer("SYNC_WHISPER_TIMEOUT_SECONDS", 1)
+    integer("SYNC_AUDIO_MAX_BYTES", 1)
+    return warnings
 
 
 def get_settings() -> Settings:
@@ -74,6 +121,14 @@ def get_settings() -> Settings:
     if macos_connector_timeout < 5:
         macos_connector_timeout = 5
 
+    macos_command_timeout_raw = os.getenv("MACOS_COMMAND_TIMEOUT", "900").strip()
+    try:
+        macos_command_timeout = int(macos_command_timeout_raw)
+    except ValueError:
+        macos_command_timeout = 900
+    if macos_command_timeout < 30:
+        macos_command_timeout = 30
+
     return Settings(
         tts_provider=os.getenv("TTS_PROVIDER", "gemini").strip().lower(),
         tts_gender=os.getenv("TTS_GENDER", "female").strip().lower(),
@@ -113,6 +168,7 @@ def get_settings() -> Settings:
         macos_connector_url=os.getenv("MACOS_CONNECTOR_URL", "").strip(),
         macos_connector_token=os.getenv("MACOS_CONNECTOR_TOKEN", "").strip(),
         macos_connector_timeout=macos_connector_timeout,
+        macos_command_timeout=macos_command_timeout,
         project_name=os.getenv("PROJECT_NAME", "rough_cut_v3").strip(),
         max_zk_blocks=max_blocks,
     )

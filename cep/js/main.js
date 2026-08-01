@@ -5,6 +5,7 @@
   var activeSource = null;
   var guideAudioPath = "";
   var exportPollTimer = null;
+  var exportInProgress = false;
   var whisperPollTimer = null;
   var currentWhisperJobId = "";
   var currentWhisperReviewCount = 0;
@@ -211,17 +212,26 @@
 
   function request(method, path, body, callback) {
     var current = config();
+    var finished = false;
+    function finish(error, payload) {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      callback(error, payload);
+    }
     if (!current.apiBaseUrl) {
-      callback(new Error("Укажите Backend URL."));
+      finish(new Error("Укажите Backend URL."));
       return;
     }
     if (!current.token) {
-      callback(new Error("Введите API token."));
+      finish(new Error("Введите API token."));
       return;
     }
 
     var xhr = new XMLHttpRequest();
     xhr.open(method, current.apiBaseUrl + path, true);
+    xhr.timeout = 30000;
     xhr.setRequestHeader("Accept", "application/json");
     xhr.setRequestHeader("Authorization", "Bearer " + current.token);
     if (body !== null) {
@@ -235,21 +245,24 @@
       try {
         parsed = xhr.responseText ? JSON.parse(xhr.responseText) : {};
       } catch (error) {
-        callback(new Error("Backend вернул не JSON (HTTP " + xhr.status + ")."));
+        finish(new Error("Backend вернул не JSON (HTTP " + xhr.status + ")."));
         return;
       }
       if (xhr.status < 200 || xhr.status >= 300) {
-        callback(new Error(parsed.error || parsed.message || ("HTTP " + xhr.status)), parsed);
+        finish(new Error(parsed.error || parsed.message || ("HTTP " + xhr.status)), parsed);
         return;
       }
       if (parsed.ok === false) {
-        callback(new Error(parsed.error || parsed.message || "Backend отклонил запрос."), parsed);
+        finish(new Error(parsed.error || parsed.message || "Backend отклонил запрос."), parsed);
         return;
       }
-      callback(null, parsed);
+      finish(null, parsed);
     };
     xhr.onerror = function () {
-      callback(new Error("Backend недоступен или запрос заблокирован CORS."));
+      finish(new Error("Backend недоступен или соединение было прервано."));
+    };
+    xhr.ontimeout = function () {
+      finish(new Error("Backend не ответил за 30 секунд."));
     };
     xhr.send(body === null ? null : JSON.stringify(body));
   }
@@ -381,7 +394,7 @@
     byId("cancelWhisper").hidden = !(
       status === "queued" || status === "running" || status === "cancelling"
     );
-    byId("exportAndTranscribe").disabled = whisperJobIsActive();
+    byId("exportAndTranscribe").disabled = exportInProgress || whisperJobIsActive();
     currentWhisperReviewCount = reviewCount;
     byId("whisperReview").textContent = String(reviewCount);
     byId("whisperUnmatched").textContent = Number(job.unmatched || 0);
@@ -549,7 +562,7 @@
   function setSourceActionsDisabled(disabled) {
     byId("registerSequence").disabled = disabled;
     byId("resolveSequence").disabled = disabled;
-    byId("exportAndTranscribe").disabled = disabled || whisperJobIsActive();
+    byId("exportAndTranscribe").disabled = disabled || exportInProgress || whisperJobIsActive();
   }
 
   function absoluteGuidePath(source, current) {
@@ -820,6 +833,8 @@
             exportPollTimer = window.setTimeout(check, 2000);
           } else {
             exportPollTimer = null;
+            exportInProgress = false;
+            byId("exportAndTranscribe").disabled = whisperJobIsActive();
           }
           return;
         }
@@ -835,6 +850,7 @@
 
         if (stableChecks >= 3) {
           exportPollTimer = null;
+          exportInProgress = false;
           guideAudioPath = file.path || outputPath;
           log("Guide WAV готов: " + file.size + " байт.", file);
           registerSequenceWithCallback(function (registerError) {
@@ -846,6 +862,8 @@
         }
         if (attempts >= maxAttempts) {
           exportPollTimer = null;
+          exportInProgress = false;
+          byId("exportAndTranscribe").disabled = whisperJobIsActive();
           log("Ожидание экспорта остановлено через 30 минут. Job ID: " + jobId);
           return;
         }
@@ -870,6 +888,12 @@
       log("Укажите Guide WAV или настройте общий каталог projects, проект и Source ID.");
       return;
     }
+    if (exportInProgress) {
+      log("Экспорт уже выполняется.");
+      return;
+    }
+    exportInProgress = true;
+    byId("exportAndTranscribe").disabled = true;
     byId("guideOutputPath").value = outputPath;
     log("Передаю экспорт звука в Adobe Media Encoder…");
     callHost("exportAudio", {
@@ -879,6 +903,8 @@
       overwrite: byId("overwriteGuide").checked
     }, function (error, response) {
       if (error) {
+        exportInProgress = false;
+        byId("exportAndTranscribe").disabled = whisperJobIsActive();
         log("Экспорт не запущен: " + error.message);
         return;
       }

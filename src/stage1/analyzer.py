@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 import re
 from typing import Iterable
 
@@ -13,6 +14,8 @@ from .io_utils import (
 )
 from .models import NarrationBlock
 from .openrouter_client import analyze_with_openrouter
+
+logger = logging.getLogger(__name__)
 
 # --- Regex patterns ---
 
@@ -242,26 +245,28 @@ def _from_marked_docx(input_path: Path) -> list[NarrationBlock]:
 
 def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
     """Extract blocks wrapped in [[VO]]...[[/VO]] or prefixed with ЗК: etc."""
-    found: list[tuple[int, str, str]] = []
+    found: list[tuple[int, int, str, str]] = []
 
     for match in NARRATOR_TAG_RE.finditer(scenario_text):
         text = match.group(1).strip()
         if text:
-            found.append((match.start(), text, "manual_tag"))
+            found.append((match.start(), match.end(), text, "manual_tag"))
 
     current_start: int | None = None
+    current_end: int | None = None
     current_note = "manual_prefix"
     current_lines: list[str] = []
     offset = 0
 
     def flush_current() -> None:
-        nonlocal current_start, current_note, current_lines
+        nonlocal current_start, current_end, current_note, current_lines
         if current_start is None:
             return
         text = "\n".join(line for line in current_lines if line).strip()
         if text:
-            found.append((current_start, text, current_note))
+            found.append((current_start, current_end or current_start, text, current_note))
         current_start = None
+        current_end = None
         current_note = "manual_prefix"
         current_lines = []
 
@@ -273,6 +278,7 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
         if marker_rest is not None:
             flush_current()
             current_start = offset
+            current_end = offset + len(raw_line)
             current_note = "manual_numbered" if re.search(r"\d", stripped) else "manual_prefix"
             current_lines = [marker_rest] if marker_rest else []
         elif current_start is not None:
@@ -282,6 +288,7 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
                 flush_current()
             else:
                 current_lines.append(stripped)
+                current_end = offset + len(raw_line)
 
         offset += len(raw_line)
 
@@ -290,8 +297,14 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
     found.sort(key=lambda x: x[0])
 
     return [
-        NarrationBlock(id="", text_original=text, text_for_tts=text, notes=note)
-        for _, text, note in found
+        NarrationBlock(
+            id="",
+            text_original=text,
+            text_for_tts=text,
+            notes=note,
+            source_spans=[(start, end)],
+        )
+        for start, end, text, note in found
     ]
 
 
@@ -379,6 +392,7 @@ def _cleanup_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
             text_for_tts=text_for_tts,
             pause_ms=block.pause_ms,
             notes=block.notes,
+            source_spans=list(block.source_spans),
         ))
     return cleaned_blocks
 
@@ -493,7 +507,70 @@ def _merge_adjacent_pair(
         text_for_tts=_join_block_text(left.text_for_tts, right.text_for_tts, separator=separator),
         pause_ms=max(left.pause_ms, right.pause_ms),
         notes=_merge_block_notes(left.notes, right.notes),
+        source_spans=sorted([*left.source_spans, *right.source_spans]),
     )
+
+
+def _attach_source_spans(
+    blocks: list[NarrationBlock],
+    scenario_text: str,
+) -> None:
+    """Best-effort location of extracted blocks, preserving duplicate order."""
+    cursor = 0
+    for block in blocks:
+        if block.source_spans:
+            cursor = max(cursor, max(end for _start, end in block.source_spans))
+            continue
+        candidates = (block.text_original.strip(), block.text_for_tts.strip())
+        for candidate in candidates:
+            if not candidate:
+                continue
+            start = scenario_text.find(candidate, cursor)
+            if start < 0:
+                start = scenario_text.find(candidate)
+            if start >= 0:
+                end = start + len(candidate)
+                block.source_spans = [(start, end)]
+                cursor = end
+                break
+
+
+def _canonical_raw_projection(
+    scenario_text: str,
+    blocks: list[NarrationBlock],
+) -> tuple[str, list[str]]:
+    """Render legacy raw text without relying on ambiguous string replacement."""
+    edits: list[tuple[int, int, str]] = []
+    missing: list[str] = []
+    occupied: list[tuple[int, int]] = []
+
+    for block in blocks:
+        num = block.id[2:]
+        rendered_text = block.text_original.strip() or block.text_for_tts.strip()
+        spans = sorted(
+            (start, end)
+            for start, end in block.source_spans
+            if 0 <= start < end <= len(scenario_text)
+        )
+        usable: list[tuple[int, int]] = []
+        for start, end in spans:
+            if any(start < prior_end and end > prior_start for prior_start, prior_end in occupied):
+                continue
+            usable.append((start, end))
+            occupied.append((start, end))
+        if not usable:
+            missing.append(f"ЗК{num}: {rendered_text}")
+            continue
+        first_start, first_end = usable[0]
+        edits.append((first_start, first_end, f"ЗК{num}: {rendered_text}"))
+        edits.extend((start, end, "") for start, end in usable[1:])
+
+    raw_text = scenario_text
+    for start, end, replacement in sorted(edits, reverse=True):
+        raw_text = raw_text[:start] + replacement + raw_text[end:]
+    if missing:
+        raw_text = raw_text.rstrip() + "\n\n" + "\n".join(missing)
+    return raw_text, missing
 
 
 def _merge_candidate_score(left: NarrationBlock, right: NarrationBlock) -> int:
@@ -573,6 +650,8 @@ def analyze_script(
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
+    logger.info("Legacy analysis started source=%s", input_path)
+
     scenario_text = extract_text(input_path)
     raw_output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -630,40 +709,14 @@ def analyze_script(
                 blocks = _fallback_blocks(scenario_text)
                 extraction_method = "fallback"
 
+    _attach_source_spans(blocks, scenario_text)
     blocks = _cleanup_blocks(blocks)
     blocks = _merge_short_blocks(blocks)
     before_merge_count = len(blocks)
     blocks = _merge_blocks_to_limit(blocks, settings.max_zk_blocks)
     blocks = _renumber_blocks(blocks)
 
-    # Inject canonical ЗКN: markers so Stage 2 finds voiceover segments.
-    # For manual_markers: original text may contain [[VO]], VO:, NARRATOR:, ЗК:, etc.
-    # We replace those original markers with canonical ЗКN: so Stage 2 counter aligns with
-    # renumbered IDs.  Fall back to plain inject if the pattern isn't found verbatim.
-    # For other strategies: raw text has no markers yet — just inject before source text.
-    # Merged blocks whose joined text is absent in raw_text are silently skipped (known limitation).
-    _MARKER_PREFIX = (
-        r"(?:\[\[\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\]\s*"
-        r"|(?:VO|NARRATOR|ЗК\w*|ЗАКАДР\b\w*)\s*[:\-–]?\s*\n?)"
-    )
-    raw_text = scenario_text
-    for block in blocks:
-        num = block.id[2:]
-        text_original = block.text_original.strip()
-        text_for_tts = block.text_for_tts.strip()
-        source_text = text_original if text_original in raw_text else text_for_tts
-        if not source_text or source_text not in raw_text:
-            continue
-        if extraction_method == "manual_markers":
-            escaped = re.escape(source_text)
-            pattern = _MARKER_PREFIX + escaped + r"(?:\s*\[\[\s*/\s*(?:VO|NARRATOR|ЗК|ЗАКАДР)\s*\]\])?"
-            new_raw, count = re.subn(
-                pattern, f"ЗК{num}: {source_text}", raw_text, count=1, flags=re.IGNORECASE | re.DOTALL
-            )
-            if count:
-                raw_text = new_raw
-                continue
-        raw_text = raw_text.replace(source_text, f"ЗК{num}: {source_text}", 1)
+    raw_text, raw_projection_fallbacks = _canonical_raw_projection(scenario_text, blocks)
     raw_output_path.write_text(raw_text + "\n", encoding="utf-8")
 
     payload = {
@@ -672,11 +725,18 @@ def analyze_script(
         "manual_markers_used": manual_markers_used,
         "extraction_method": extraction_method,
         "llm_errors": llm_errors,
+        "raw_projection_fallbacks": raw_projection_fallbacks,
         "max_zk_blocks": settings.max_zk_blocks,
         "blocks_count_before_merge": before_merge_count,
         "items": [b.to_dict() for b in blocks],
     }
     write_json(output_path, payload)
+    logger.info(
+        "Legacy analysis completed source=%s method=%s blocks=%d",
+        input_path,
+        extraction_method,
+        len(blocks),
+    )
 
     return {
         "source": str(input_path),

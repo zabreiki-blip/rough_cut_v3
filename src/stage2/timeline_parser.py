@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import logging
 import wave
 from pathlib import Path
 
 from .models import FullTimeline, TimelineSegment
+
+logger = logging.getLogger(__name__)
 
 # ЗАКАДР: text  or  ЗК: text  or  ЗК1 text  or  ЗК1: text  or  ЗК4.1 text  or  ЗК38А text
 # \b after ЗАКАДР prevents false match on ЗАКАДРОВЫЙ.
@@ -79,7 +82,8 @@ def _wav_duration(path: Path) -> float:
     try:
         with wave.open(str(path), "rb") as f:
             return f.getnframes() / f.getframerate()
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not read WAV duration path=%s error=%s", path, exc)
         return 0.0
 
 

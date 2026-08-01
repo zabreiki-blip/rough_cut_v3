@@ -87,6 +87,10 @@
         return value === null || value === undefined ? "" : String(value);
     }
 
+    function validProjectName(value) {
+        return /^[A-Za-zА-Яа-яЁё0-9_-]{1,64}$/.test(asString(value));
+    }
+
     function ticksOf(timeValue) {
         if (timeValue === null || timeValue === undefined) {
             return "";
@@ -2435,7 +2439,7 @@
                         continue;
                     }
                     name = asString(entries[i].name);
-                    if (/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+                    if (validProjectName(name)) {
                         projects.push(name);
                     }
                 }
@@ -2595,22 +2599,6 @@
             var params;
             var items;
             var target;
-            var report;
-            var item;
-            var source;
-            var sourceItem;
-            var originalRange;
-            var rangeSupport;
-            var placement;
-            var replacement;
-            var rippleResult;
-            var existingVideo;
-            var existingAudio;
-            var existingVerification;
-            var resumeParams;
-            var resumedReplacement;
-            var markerResult;
-            var i;
             try {
                 params = parsePayload(encodedPayload);
                 if (!params.enableExplicitTrackShiftBatch) {
@@ -2638,147 +2626,6 @@
                 return success({
                     report: conformOnePass(target, items, params)
                 });
-                items.sort(function (left, right) {
-                    return Number(left.timelineSeconds) - Number(right.timelineSeconds);
-                });
-                report = {
-                    target: sequenceMetadata(target),
-                    requested: items.length,
-                    completed: [],
-                    errors: [],
-                    stopped: false
-                };
-
-                for (i = 0; i < items.length; i++) {
-                    item = items[i];
-                    rangeSupport = null;
-                    placement = null;
-                    replacement = null;
-                    rippleResult = null;
-                    existingVerification = null;
-                    resumedReplacement = null;
-                    item.sourceInSeconds = Number(item.sourceInSeconds);
-                    item.sourceOutSeconds = Number(item.sourceOutSeconds);
-                    item.timelineSeconds = Number(item.timelineSeconds);
-                    item.videoTrackIndex = Math.floor(Number(
-                        item.videoTrackIndex === undefined ? params.videoTrackIndex : item.videoTrackIndex
-                    ));
-                    item.audioTrackIndex = Math.floor(Number(
-                        item.audioTrackIndex === undefined ? params.audioTrackIndex : item.audioTrackIndex
-                    ));
-                    item.mode = "ripple_replace";
-                    try {
-                        if (!isFinite(item.sourceInSeconds) || item.sourceInSeconds < 0 ||
-                                !isFinite(item.sourceOutSeconds) || item.sourceOutSeconds <= item.sourceInSeconds ||
-                                !isFinite(item.timelineSeconds) || item.timelineSeconds < 0) {
-                            throw new Error("Invalid source/timeline range.");
-                        }
-                        if (item.videoTrackIndex < 0 || item.audioTrackIndex < 0 ||
-                                item.videoTrackIndex >= target.videoTracks.numTracks ||
-                                item.audioTrackIndex >= target.audioTracks.numTracks) {
-                            throw new Error("Requested target track does not exist.");
-                        }
-                        source = resolveSequence(item);
-                        if (asString(source.sequenceID) === asString(target.sequenceID)) {
-                            throw new Error("Source sequence is the active target sequence.");
-                        }
-                        if (item.sourceOutSeconds > sequenceDurationSeconds(source) + 0.001) {
-                            throw new Error(
-                                "Source out " + item.sourceOutSeconds.toFixed(3) +
-                                "s exceeds sequence duration " +
-                                sequenceDurationSeconds(source).toFixed(3) + "s."
-                            );
-                        }
-                        sourceItem = source.projectItem;
-                        if (!sourceItem) {
-                            throw new Error("Source sequence has no project item.");
-                        }
-                        existingVideo = trackSourceAt(
-                            target.videoTracks[item.videoTrackIndex],
-                            sourceItem,
-                            item.timelineSeconds
-                        );
-                        existingAudio = trackSourceAt(
-                            target.audioTracks[item.audioTrackIndex],
-                            sourceItem,
-                            item.timelineSeconds
-                        );
-                        if (existingVideo || existingAudio) {
-                            if (!existingVideo || !existingAudio) {
-                                throw new Error(
-                                    "A partial source insertion already exists at the target position. " +
-                                    "Restore or inspect this segment before continuing."
-                                );
-                            }
-                            existingVerification = verifyInsertedRange(target, sourceItem, item);
-                            resumeParams = placeholderParamsAt(
-                                item,
-                                item.timelineSeconds +
-                                    existingVerification.report.video.durationSeconds
-                            );
-                            try {
-                                placeholderForRipple(target, resumeParams);
-                                resumedReplacement = removePlaceholderWithRipple(target, resumeParams);
-                            } catch (resumeError) {
-                                if (resumeError.message.indexOf("; found 0.") < 0) {
-                                    throw resumeError;
-                                }
-                            }
-                            markerResult = upsertConformMarker(target, item);
-                            report.completed.push({
-                                segmentId: asString(item.segmentId),
-                                sourceSequenceId: asString(source.sequenceID),
-                                sourceSequenceName: asString(source.name),
-                                timelineSeconds: item.timelineSeconds,
-                                alreadyConformed: !resumedReplacement,
-                                resumedPartialReplacement: !!resumedReplacement,
-                                replacement: resumedReplacement,
-                                verification: existingVerification.report,
-                                marker: markerResult
-                            });
-                            continue;
-                        }
-                        originalRange = saveRange(sourceItem);
-                        try {
-                            rangeSupport = setRange(sourceItem, item.sourceInSeconds, item.sourceOutSeconds);
-                            rippleResult = insertThenRippleReplace(target, sourceItem, item);
-                            replacement = rippleResult.replacement;
-                            placement = rippleResult.placement;
-                        } finally {
-                            restoreRange(sourceItem, originalRange);
-                        }
-                        if (!placement.videoObserved || !placement.audioObserved) {
-                            report.errors.push({
-                                segmentId: asString(item.segmentId),
-                                error: "Premiere did not expose both video and audio after placement.",
-                                placement: placement
-                            });
-                            report.stopped = true;
-                            break;
-                        }
-                        markerResult = upsertConformMarker(target, item);
-                        report.completed.push({
-                            segmentId: asString(item.segmentId),
-                            sourceSequenceId: asString(source.sequenceID),
-                            sourceSequenceName: asString(source.name),
-                            timelineSeconds: item.timelineSeconds,
-                            rangeSupport: rangeSupport,
-                            replacement: replacement,
-                            placement: placement,
-                            verification: rippleResult.verification,
-                            rippleResult: rippleResult,
-                            marker: markerResult
-                        });
-                    } catch (itemError) {
-                        report.errors.push({
-                            segmentId: asString(item.segmentId),
-                            error: itemError.message
-                        });
-                        report.stopped = true;
-                        break;
-                    }
-                }
-                return success({ report: report });
             } catch (error) {
                 return fail(error.message);
             }
@@ -2892,7 +2739,8 @@
             conformMarkerState: conformMarkerState,
             verifyConformMarkerInsertion: verifyConformMarkerInsertion,
             reanchorConformMarker: reanchorConformMarker,
-            upsertConformMarker: upsertConformMarker
+            upsertConformMarker: upsertConformMarker,
+            validProjectName: validProjectName
         };
     }
 })();

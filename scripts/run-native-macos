@@ -21,5 +21,6 @@ cd "${ROOT_DIR}"
 exec "${VENV_DIR}/bin/gunicorn" \
   -b "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}" \
   --workers 1 \
-  --timeout 600 \
+  --threads 4 \
+  --timeout 3600 \
   api:app

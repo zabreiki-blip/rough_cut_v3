@@ -83,6 +83,31 @@ class ManualMarkersRawTextTest(unittest.TestCase):
         self.assertNotIn("ЗК: ЗК", raw, f"Double marker found in raw: {raw!r}")
         self.assertRegex(raw, r"ЗК\d+: Без дублирования маркера\.")
 
+    def test_merged_manual_blocks_keep_one_canonical_timeline_segment(self) -> None:
+        blocks, raw = self._analyze(
+            "VO: Короткий первый блок.\n\nVO: Короткий второй блок.\n"
+        )
+
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("ЗК1: Короткий первый блок. Короткий второй блок.", raw)
+        self.assertNotIn("VO:", raw)
+        with TemporaryDirectory() as tmp:
+            timeline = parse_timeline(raw, Path(tmp), Path(tmp), "TEST")
+        self.assertEqual([segment.type for segment in timeline.segments], ["zk"])
+        self.assertEqual(
+            timeline.segments[0].text,
+            "Короткий первый блок. Короткий второй блок.",
+        )
+
+    def test_duplicate_manual_blocks_use_distinct_source_ranges(self) -> None:
+        blocks, raw = self._analyze(
+            "VO: Одинаковый короткий текст.\n\nVO: Одинаковый короткий текст.\n"
+        )
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(raw.count("ЗК1:"), 1)
+        self.assertNotIn("VO:", raw)
+
 
 class DotTimecodeSnhTest(unittest.TestCase):
     """Dot-separated timecodes (00.42.51) must be excluded from ZK blocks in fallback mode."""

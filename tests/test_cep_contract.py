@@ -91,6 +91,10 @@ def test_source_switch_clears_identity_and_export_poll_retries() -> None:
     assert 'byId("speakerName").value = "";' in PANEL
     assert "hydrateSourceForm(sequence)" in PANEL
     assert "exportPollTimer = window.setTimeout(check, 2000);" in PANEL
+    assert "xhr.timeout = 30000;" in PANEL
+    assert "xhr.ontimeout" in PANEL
+    assert "exportInProgress = true;" in PANEL
+    assert 'byId("exportAndTranscribe").disabled = true;' in PANEL
 
 
 def test_source_registration_supports_shared_and_all_speaker_sequences() -> None:
@@ -167,9 +171,9 @@ def test_ripple_replace_requires_exact_placeholder_then_inserts() -> None:
     assert "mode: \"overwrite\"" in HOST
     assert "target.setPlayerPosition(secondsToTicks(params.timelineSeconds))" in HOST
     assert "playerPositionForced: playerPositionForced" in HOST
-    assert "alreadyConformed: !resumedReplacement" in HOST
-    assert "resumedPartialReplacement: !!resumedReplacement" in HOST
-    assert 'item.mode = "ripple_replace"' in HOST
+    assert "alreadyConformed: true" in HOST
+    assert "recoveredMissingMarker: !!skippedPlan.recoveredMissingMarker" in HOST
+    assert 'mode: "overwrite"' in HOST
     assert 'requestedMode === "ripple_replace"' in HOST
     assert "placeholderName: pathFilename(segment.placeholder_path)" in PANEL
     assert "placeholderNames: [" in PANEL

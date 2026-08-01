@@ -115,6 +115,26 @@ function testPlaceholderSelection() {
   );
 }
 
+function testCyrillicProjectNames() {
+  const context = {
+    $: {_roughCutTestMode: true}, app: {}, console, Date, JSON, Math,
+    decodeURIComponent, encodeURIComponent, isFinite,
+    File: function File() {}, Folder: function Folder() {},
+    Time: function Time() { this.ticks = "0"; },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    fs.readFileSync(path.join(root, "cep", "host.jsx"), "utf8"),
+    context,
+    {filename: "host.jsx"},
+  );
+  const valid = context.$._roughCutStage2Test.validProjectName;
+  assert.strictEqual(valid("Русский_проект-01"), true);
+  assert.strictEqual(valid("demo_01"), true);
+  assert.strictEqual(valid("имя проекта"), false);
+  assert.strictEqual(valid("../demo"), false);
+}
+
 function testMarkerAwareConformResume() {
   const context = {
     $: {_roughCutTestMode: true},
@@ -747,5 +767,6 @@ function testWhisperPollingAndEta() {
 }
 
 testPlaceholderSelection();
+testCyrillicProjectNames();
 testMarkerAwareConformResume();
 testWhisperPollingAndEta();

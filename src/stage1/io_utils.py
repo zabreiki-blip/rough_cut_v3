@@ -7,6 +7,8 @@ import re
 import subprocess
 from typing import Any
 
+from atomic_io import atomic_write_json
+
 
 def normalize_whitespace(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -223,13 +225,22 @@ def extract_text_from_doc(path: Path) -> str:
         ["textutil", "-convert", "txt", "-stdout", str(path)],
     ):
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60,
+            )
             return normalize_whitespace(proc.stdout)
         except FileNotFoundError:
             continue
         except subprocess.CalledProcessError as exc:
             last_error = (exc.stderr or exc.stdout or "").strip() or "unknown error"
             continue  # try next tool
+        except subprocess.TimeoutExpired:
+            last_error = f"{cmd[0]} timed out after 60 seconds"
+            continue
     if last_error:
         raise RuntimeError(f"Failed to parse .doc: {last_error}")
     raise RuntimeError("Neither catdoc nor textutil found. Convert .doc to .docx first.")
@@ -247,11 +258,7 @@ def extract_text(input_path: Path) -> str:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(path, payload)
 
 
 def read_json(path: Path) -> dict[str, Any]:

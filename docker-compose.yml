@@ -23,7 +23,7 @@ services:
       - ./projects:/app/projects
       - ./data:/app/data
       - whisper_cache:/app/.cache/huggingface
-    command: gunicorn -b 0.0.0.0:8000 --workers 1 --timeout 600 api:app
+    command: gunicorn -b 0.0.0.0:8000 --workers 1 --threads 4 --timeout 3600 api:app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

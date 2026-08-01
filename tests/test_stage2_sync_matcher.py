@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import patch
+
+import stage2.sync_matcher as sync_matcher_module
 
 from stage2.sync_matcher import (
     MatcherConfig,
@@ -43,6 +46,51 @@ def test_russian_normalization_handles_case_yo_punctuation_and_inflections() -> 
     assert normalize_text("энергетический вампир") == normalize_text(
         "энергетическим вампиром"
     )
+
+
+def test_transcript_tokens_are_built_once_per_matcher() -> None:
+    index = _index("s1", "одна и та же точная цитата героя", 10.0)
+    with patch.object(
+        sync_matcher_module,
+        "_timed_tokens",
+        wraps=sync_matcher_module._timed_tokens,
+    ) as tokenize:
+        matcher = SyncMatcher([_source("s1")], [index])
+        for segment_id in ("one", "two"):
+            matcher.match(AlignmentRequest(
+                segment_id=segment_id,
+                text="точная цитата героя",
+                source_ids=("s1",),
+            ))
+
+    assert tokenize.call_count == 1
+
+
+def test_teaser_and_full_quote_can_reuse_overlapping_source_range() -> None:
+    transcript = (
+        "это важное решение изменит жизнь всего города "
+        "потому что жители давно просили новый общественный транспорт"
+    )
+    matcher = SyncMatcher([_source("s1")], [_index("s1", transcript, 120.0)])
+
+    teaser = matcher.match(AlignmentRequest(
+        segment_id="teaser-block",
+        text="это важное решение изменит жизнь всего города",
+        source_ids=("s1",),
+    ))
+    full = matcher.match(AlignmentRequest(
+        segment_id="full-block",
+        text=transcript,
+        source_ids=("s1",),
+    ))
+
+    assert teaser.segment_id == "teaser-block"
+    assert full.segment_id == "full-block"
+    assert teaser.source_id == full.source_id == "s1"
+    assert teaser.source_in_sec == pytest.approx(full.source_in_sec)
+    assert teaser.source_out_sec is not None
+    assert full.source_out_sec is not None
+    assert teaser.source_out_sec < full.source_out_sec
 
 
 @pytest.mark.parametrize(

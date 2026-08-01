@@ -10,6 +10,7 @@ from pathlib import Path
 import platform
 import re
 import threading
+import time
 from typing import BinaryIO
 import uuid
 import wave
@@ -22,8 +23,11 @@ except ImportError:
 
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
+from atomic_io import atomic_write_json
+from job_runtime import get_job, release_project, reserve_project, update_job
+
 from stage1.analyzer import analyze_script
-from stage1.config import get_settings
+from stage1.config import get_settings, validate_env
 from stage1.gemini_tts import TtsCancelledError, synthesize_phrase, synthesize_tts
 from stage1.normalizer import (
     NormalizationMemory,
@@ -65,10 +69,13 @@ from stage2.xml_export import build_xml
 
 
 app = Flask(__name__)
+_CONFIG_WARNINGS = validate_env()
+for _warning in _CONFIG_WARNINGS:
+    app.logger.warning("Configuration: %s", _warning)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = ROOT_DIR / "projects"
 NORMALIZATION_MEMORY_PATH = ROOT_DIR / "data" / "normalization_memory.sqlite3"
-PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+PROJECT_NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9_-]{1,64}$")
 SYNC_SOURCE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,96}$")
 _TTS_JOBS: dict[str, dict] = {}
 _TTS_JOBS_LOCK = threading.Lock()
@@ -85,6 +92,10 @@ _SYNC_JOBS_LOCK = threading.Lock()
 _SYNC_ACTIVE_PROJECTS: set[str] = set()
 _SYNC_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _SYNC_DATA_LOCK = threading.Lock()
+_NORMALIZATION_JOBS: dict[str, dict] = {}
+_NORMALIZATION_JOBS_LOCK = threading.Lock()
+_NORMALIZATION_ACTIVE_PROJECTS: set[str] = set()
+_NORMALIZATION_JOBS_MAX = 50
 
 
 class AudioUploadTooLargeError(ValueError):
@@ -148,7 +159,14 @@ def require_api_authentication():
         return None
     response = jsonify({"ok": False, "error": "unauthorized"})
     response.status_code = 401
-    response.headers["WWW-Authenticate"] = 'Basic realm="Rough Cut", charset="UTF-8"'
+    # A Basic challenge makes Chromium-based CEP panels display a native
+    # username/password dialog even though the panel authenticates with Bearer.
+    # Keep the challenge for direct browser navigation only.
+    header = request.headers.get("Authorization", "").strip()
+    if not _cep_cors_origin() and not header.lower().startswith("bearer "):
+        response.headers["WWW-Authenticate"] = (
+            'Basic realm="Rough Cut", charset="UTF-8"'
+        )
     return response
 
 
@@ -180,9 +198,9 @@ def _internal_error(exc: Exception):
 
 def _normalize_project_name(name: str) -> str:
     project = (name or "").strip()
-    if not PROJECT_NAME_RE.match(project):
+    if not PROJECT_NAME_RE.fullmatch(project):
         raise ValueError(
-            "project must match ^[a-zA-Z0-9_-]{1,64}$"
+            "project may contain 1-64 Latin/Cyrillic letters, digits, '_' or '-'"
         )
     return project
 
@@ -200,6 +218,7 @@ def _project_paths(project: str) -> dict[str, Path]:
         "sync_sources": root / "work" / "sync_sources.json",
         "sync_matches": root / "work" / "sync_matches.json",
         "sync_job_status": root / "work" / "sync_job_status.json",
+        "normalization_job_status": root / "work" / "normalization_job_status.json",
         "tts_job_status": root / "work" / "tts_job_status.json",
         "sync_audio": root / "work" / "sync_audio",
         "sync_transcripts": root / "work" / "transcripts",
@@ -220,7 +239,11 @@ def _ensure_project(project: str) -> dict[str, Path]:
 def _list_projects() -> list[str]:
     if not PROJECTS_DIR.exists():
         return []
-    items = [p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and PROJECT_NAME_RE.match(p.name)]
+    items = [
+        p.name
+        for p in PROJECTS_DIR.iterdir()
+        if p.is_dir() and PROJECT_NAME_RE.fullmatch(p.name)
+    ]
     return sorted(items)
 
 
@@ -229,8 +252,13 @@ def _read_json_safe(path: Path) -> dict:
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("Ignoring unreadable JSON %s: %s", path, exc)
         return {}
+
+
+def _atomic_write_json_file(path: Path, payload: dict) -> None:
+    atomic_write_json(path, payload)
 
 
 def _normalization_source_is_current(document: dict, project_root: Path) -> bool:
@@ -409,17 +437,7 @@ def _persist_tts_job(job: dict) -> None:
     try:
         project = _normalize_project_name(str(job.get("project") or ""))
         path = _project_paths(project)["tts_job_status"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(job, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _atomic_write_json_file(path, job)
     except (OSError, TypeError, ValueError):
         app.logger.exception("Could not persist TTS job status")
 
@@ -472,16 +490,11 @@ def _trim_tts_jobs_locked() -> None:
 
 
 def _reserve_tts_project(project: str) -> bool:
-    with _TTS_JOBS_LOCK:
-        if project in _TTS_ACTIVE_PROJECTS:
-            return False
-        _TTS_ACTIVE_PROJECTS.add(project)
-        return True
+    return reserve_project(_TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS, project)
 
 
 def _release_tts_project(project: str) -> None:
-    with _TTS_JOBS_LOCK:
-        _TTS_ACTIVE_PROJECTS.discard(project)
+    release_project(_TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS, project)
 
 
 def _create_tts_job(
@@ -538,22 +551,15 @@ def _create_tts_job(
 
 
 def _update_tts_job(job_id: str, **updates) -> dict | None:
-    with _TTS_JOBS_LOCK:
-        job = _TTS_JOBS.get(job_id)
-        if not job:
-            return None
-        job.update(updates)
-        snapshot = dict(job)
+    snapshot = update_job(_TTS_JOBS_LOCK, _TTS_JOBS, job_id, updates)
+    if snapshot is None:
+        return None
     _persist_tts_job(snapshot)
     return snapshot
 
 
 def _get_tts_job(job_id: str) -> dict | None:
-    with _TTS_JOBS_LOCK:
-        job = _TTS_JOBS.get(job_id)
-        if not job:
-            return None
-        return dict(job)
+    return get_job(_TTS_JOBS_LOCK, _TTS_JOBS, job_id)
 
 
 def _tts_cancel_event(job_id: str) -> threading.Event | None:
@@ -776,7 +782,11 @@ def project_dashboard(project: str):
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "status": "healthy"})
+    return jsonify({
+        "ok": True,
+        "status": "healthy",
+        "configuration_warnings": list(_CONFIG_WARNINGS),
+    })
 
 
 @app.get("/stage1/status")
@@ -880,6 +890,218 @@ def _normalization_payload_for_save(payload: dict, normalized_path: Path) -> dic
     # loss of source hashes and other server-owned document fields.
     current.update(editable)
     return current
+
+
+def _persist_normalization_job(job: dict) -> None:
+    try:
+        project = _normalize_project_name(str(job.get("project") or ""))
+        _atomic_write_json_file(
+            _project_paths(project)["normalization_job_status"],
+            job,
+        )
+    except (OSError, TypeError, ValueError):
+        app.logger.exception("Could not persist normalization job status")
+
+
+def _create_normalization_job(
+    project: str,
+    *,
+    input_path: Path,
+    use_llm: bool,
+    hint: str,
+) -> dict:
+    now = _utc_now_iso()
+    job = {
+        "id": uuid.uuid4().hex,
+        "project": project,
+        "status": "queued",
+        "message": "Queued",
+        "input_path": str(input_path),
+        "use_llm": bool(use_llm),
+        "hint": hint,
+        "created_at": now,
+        "started_at": "",
+        "finished_at": "",
+        "error": "",
+        "result": None,
+    }
+    with _NORMALIZATION_JOBS_LOCK:
+        _NORMALIZATION_JOBS[job["id"]] = job
+        terminal = sorted(
+            (
+                (job_id, item)
+                for job_id, item in _NORMALIZATION_JOBS.items()
+                if item.get("status") in {"completed", "failed", "cancelled"}
+            ),
+            key=lambda pair: (pair[1].get("finished_at") or pair[1].get("created_at") or ""),
+        )
+        for old_id, _old_job in terminal[:max(0, len(_NORMALIZATION_JOBS) - _NORMALIZATION_JOBS_MAX)]:
+            _NORMALIZATION_JOBS.pop(old_id, None)
+        snapshot = dict(job)
+    _persist_normalization_job(snapshot)
+    return snapshot
+
+
+def _update_normalization_job(job_id: str, **updates) -> dict | None:
+    snapshot = update_job(
+        _NORMALIZATION_JOBS_LOCK,
+        _NORMALIZATION_JOBS,
+        job_id,
+        updates,
+    )
+    if snapshot is None:
+        return None
+    _persist_normalization_job(snapshot)
+    return snapshot
+
+
+def _get_normalization_job(job_id: str) -> dict | None:
+    return get_job(_NORMALIZATION_JOBS_LOCK, _NORMALIZATION_JOBS, job_id)
+
+
+def _load_persisted_normalization_job(project: str) -> dict | None:
+    payload = _read_json_safe(_project_paths(project)["normalization_job_status"])
+    if not isinstance(payload, dict) or payload.get("project") != project:
+        return None
+    restored = dict(payload)
+    if restored.get("status") in {"queued", "running"}:
+        restored.update({
+            "status": "interrupted",
+            "message": "Interrupted; normalization can be restarted",
+            "finished_at": _utc_now_iso(),
+        })
+    return restored
+
+
+def _run_normalization_job(
+    *,
+    job_id: str,
+    project: str,
+    input_path: Path,
+    output_path: Path,
+    use_llm: bool,
+    hint: str,
+) -> None:
+    _update_normalization_job(
+        job_id,
+        status="running",
+        message="Normalizing scenario",
+        started_at=_utc_now_iso(),
+    )
+    try:
+        result = generate_normalization(
+            input_path,
+            output_path,
+            memory_path=NORMALIZATION_MEMORY_PATH,
+            use_llm=use_llm,
+            hint=hint,
+        )
+        _update_normalization_job(
+            job_id,
+            status="completed",
+            message="Completed",
+            finished_at=_utc_now_iso(),
+            result=result,
+        )
+    except Exception as exc:
+        app.logger.exception("Normalization job failed project=%s job=%s", project, job_id)
+        _update_normalization_job(
+            job_id,
+            status="failed",
+            message="Failed",
+            error=str(exc),
+            finished_at=_utc_now_iso(),
+        )
+    finally:
+        release_project(
+            _NORMALIZATION_JOBS_LOCK,
+            _NORMALIZATION_ACTIVE_PROJECTS,
+            project,
+        )
+
+
+@app.post("/stage1/normalization-jobs/start")
+def stage1_normalization_job_start():
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = _resolve_project_name(payload.get("project"))
+        paths = _ensure_project(project)
+        input_files = _discover_input_files(paths["input"], project)
+        default_input = ROOT_DIR / input_files[0] if input_files else paths["input"] / "scenario.docx"
+        input_path = _abs_path(
+            str(payload.get("input_path") or ""),
+            default_input,
+            paths["root"],
+        )
+        if not input_path.is_file():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FileNotFoundError as exc:
+        return _json_error(str(exc), 404)
+
+    if not reserve_project(
+        _NORMALIZATION_JOBS_LOCK,
+        _NORMALIZATION_ACTIVE_PROJECTS,
+        project,
+    ):
+        return _json_error(f"normalization already active for project {project}", 409)
+    job = _create_normalization_job(
+        project,
+        input_path=input_path,
+        use_llm=bool(payload.get("use_llm", True)),
+        hint=str(payload.get("hint") or payload.get("author_hint") or ""),
+    )
+    worker = threading.Thread(
+        target=_run_normalization_job,
+        kwargs={
+            "job_id": job["id"],
+            "project": project,
+            "input_path": input_path,
+            "output_path": paths["normalized"],
+            "use_llm": job["use_llm"],
+            "hint": job["hint"],
+        },
+        daemon=True,
+        name=f"normalization-{project}-{job['id'][:8]}",
+    )
+    try:
+        worker.start()
+    except Exception:
+        release_project(
+            _NORMALIZATION_JOBS_LOCK,
+            _NORMALIZATION_ACTIVE_PROJECTS,
+            project,
+        )
+        raise
+    return jsonify({"ok": True, "result": job}), 202
+
+
+@app.get("/stage1/normalization-jobs/<job_id>")
+def stage1_normalization_job_get(job_id: str):
+    job = _get_normalization_job(job_id)
+    if job is None:
+        return _json_error("normalization job not found", 404)
+    return jsonify({"ok": True, "result": job})
+
+
+@app.get("/stage1/normalization-jobs/status")
+def stage1_normalization_job_status():
+    try:
+        project = _resolve_project_name(request.args.get("project"))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    with _NORMALIZATION_JOBS_LOCK:
+        candidates = [
+            dict(job)
+            for job in _NORMALIZATION_JOBS.values()
+            if job.get("project") == project
+        ]
+    if candidates:
+        latest = max(candidates, key=lambda item: item.get("created_at") or "")
+    else:
+        latest = _load_persisted_normalization_job(project)
+    return jsonify({"ok": True, "result": latest or {}})
 
 
 @app.post("/stage1/normalization/generate")
@@ -1614,6 +1836,24 @@ def _copy_stream_limited(
     return written
 
 
+def _cleanup_stale_uploads(directory: Path, *, max_age_seconds: int = 24 * 60 * 60) -> int:
+    """Remove abandoned hidden upload parts after a conservative grace period."""
+    if not directory.is_dir():
+        return 0
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for path in directory.glob(".*.upload"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            app.logger.warning("Could not remove stale upload %s: %s", path, exc)
+    return removed
+
+
 def _sync_quote(block: dict) -> str:
     """Remove a scenario speaker/role/timecode prefix before fuzzy matching."""
     text = str(
@@ -1705,6 +1945,25 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
         "review": needs_review,
         "unmatched": not_found,
     }
+
+
+def _sync_job_with_live_summary(job: dict) -> dict:
+    """Refresh terminal job counters after matches are reviewed in the browser."""
+    snapshot = dict(job)
+    if str(snapshot.get("status") or "") in {"queued", "running", "cancelling"}:
+        return snapshot
+    project = str(snapshot.get("project") or "").strip()
+    if not project:
+        return snapshot
+    try:
+        matches = SyncMatchStore(_project_paths(project)["sync_matches"]).list()
+    except ValueError as exc:
+        app.logger.warning(
+            "Could not refresh sync summary project=%s error=%s", project, exc
+        )
+        return snapshot
+    snapshot.update(_sync_summary(matches))
+    return snapshot
 
 
 def _sync_matching_fingerprint(
@@ -1836,17 +2095,7 @@ def _persist_sync_job(job: dict) -> None:
     try:
         project = _normalize_project_name(str(job.get("project") or ""))
         path = _project_paths(project)["sync_job_status"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(job, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _atomic_write_json_file(path, job)
     except (OSError, TypeError, ValueError):
         app.logger.exception("Could not persist sync job status")
 
@@ -1915,20 +2164,15 @@ def _create_sync_job(project: str) -> dict:
 
 
 def _update_sync_job(job_id: str, **updates) -> dict | None:
-    with _SYNC_JOBS_LOCK:
-        job = _SYNC_JOBS.get(job_id)
-        if job is None:
-            return None
-        job.update(updates)
-        snapshot = dict(job)
+    snapshot = update_job(_SYNC_JOBS_LOCK, _SYNC_JOBS, job_id, updates)
+    if snapshot is None:
+        return None
     _persist_sync_job(snapshot)
     return snapshot
 
 
 def _get_sync_job(job_id: str) -> dict | None:
-    with _SYNC_JOBS_LOCK:
-        job = _SYNC_JOBS.get(job_id)
-        return dict(job) if job else None
+    return get_job(_SYNC_JOBS_LOCK, _SYNC_JOBS, job_id)
 
 
 def _sync_cancel_event(job_id: str) -> threading.Event | None:
@@ -1937,16 +2181,11 @@ def _sync_cancel_event(job_id: str) -> threading.Event | None:
 
 
 def _reserve_sync_project(project: str) -> bool:
-    with _SYNC_JOBS_LOCK:
-        if project in _SYNC_ACTIVE_PROJECTS:
-            return False
-        _SYNC_ACTIVE_PROJECTS.add(project)
-        return True
+    return reserve_project(_SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS, project)
 
 
 def _release_sync_project(project: str) -> None:
-    with _SYNC_JOBS_LOCK:
-        _SYNC_ACTIVE_PROJECTS.discard(project)
+    release_project(_SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS, project)
 
 
 def _run_sync_job(
@@ -1965,6 +2204,9 @@ def _run_sync_job(
     paths = _project_paths(project)
     source_store, match_store = _sync_stores(paths)
     cancel_event = _sync_cancel_event(job_id)
+
+    def checkpoint_matches() -> None:
+        return None
 
     def ensure_not_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -2217,6 +2459,25 @@ def _run_sync_job(
         llm_reviewed = 0
         llm_review_failures: list[dict[str, str]] = []
         existing = {item.segment_id: item for item in match_store.list()}
+        checkpoint_state = {"dirty": False}
+
+        def checkpoint_matches() -> None:
+            if not checkpoint_state["dirty"]:
+                return
+            with _SYNC_DATA_LOCK:
+                persisted = {
+                    item.segment_id: item for item in match_store.list()
+                }
+                # Manual edits made while matching was running are authoritative.
+                for persisted_id, persisted_match in persisted.items():
+                    if persisted_match.status == "confirmed" or persisted_match.metadata.get(
+                        "manual_updated_at"
+                    ):
+                        existing[persisted_id] = persisted_match
+                    elif persisted_id not in existing:
+                        existing[persisted_id] = persisted_match
+                match_store.replace_all(list(existing.values()))
+                checkpoint_state["dirty"] = False
         current_ids = {
             str(unit.get("segment_id") or "").strip()
             for unit in units
@@ -2343,21 +2604,16 @@ def _run_sync_job(
                 )
                 match.metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 match.metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
-                with _SYNC_DATA_LOCK:
-                    latest = match_store.get(segment_id)
-                    if latest and latest.status == "confirmed":
-                        # Manual editor decisions always win, including when
-                        # they arrive while this background match was running.
-                        existing[segment_id] = latest
-                    else:
-                        match_store.save(match)
-                        existing[segment_id] = match
+                existing[segment_id] = match
+                checkpoint_state["dirty"] = True
             except Exception as exc:
                 segment_failures.append({
                     "segment_id": segment_id,
                     "error": str(exc),
                 })
             processed += 1
+            if processed % 10 == 0:
+                checkpoint_matches()
             current = [
                 item for key, item in existing.items() if key in current_ids
             ]
@@ -2370,8 +2626,9 @@ def _run_sync_job(
                 llm_review_failures=list(llm_review_failures),
             )
 
+        checkpoint_matches()
         all_matches = [
-            item for item in match_store.list() if item.segment_id in current_ids
+            item for key, item in existing.items() if key in current_ids
         ]
         ensure_not_cancelled()
         summary = _sync_summary(all_matches)
@@ -2388,6 +2645,10 @@ def _run_sync_job(
             **summary,
         )
     except _JobCancelled:
+        try:
+            checkpoint_matches()
+        except Exception:
+            app.logger.exception("Could not checkpoint cancelled sync job=%s", job_id)
         _update_sync_job(
             job_id,
             status="cancelled",
@@ -2397,6 +2658,10 @@ def _run_sync_job(
             finished_at=_utc_now_iso(),
         )
     except Exception as exc:
+        try:
+            checkpoint_matches()
+        except Exception:
+            app.logger.exception("Could not checkpoint failed sync job=%s", job_id)
         _update_sync_job(
             job_id,
             status="failed",
@@ -2550,6 +2815,7 @@ def stage2_sync_source_audio(source_id: str):
         return _json_error("audio must be a WAV file", 415)
 
     destination = _canonical_audio_path(paths, source_id)
+    _cleanup_stale_uploads(destination.parent)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.upload")
     duration = 0.0
     try:
@@ -2735,7 +3001,7 @@ def stage2_sync_job_status(job_id: str):
     job = _get_sync_job(job_id)
     if not job:
         return _json_error("job not found", 404)
-    return jsonify({"ok": True, "result": job})
+    return jsonify({"ok": True, "result": _sync_job_with_live_summary(job)})
 
 
 @app.post("/stage2/sync-jobs/<job_id>/cancel")
@@ -2776,9 +3042,12 @@ def stage2_sync_job_status_alias():
         persisted = _load_persisted_sync_job(project)
         if persisted is None:
             return _json_error("job not found", 404)
-        return jsonify({"ok": True, "result": persisted})
+        return jsonify({
+            "ok": True,
+            "result": _sync_job_with_live_summary(persisted),
+        })
     latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
-    return jsonify({"ok": True, "result": latest})
+    return jsonify({"ok": True, "result": _sync_job_with_live_summary(latest)})
 
 
 @app.route("/stage2/sync-matches", methods=["GET", "PATCH"])
@@ -2853,6 +3122,9 @@ def stage2_sync_matches(block_uid: str | None = None):
         revision = confirmed.get("revision")
         saved: list[SyncMatch] = []
         with _SYNC_DATA_LOCK:
+            stored_by_id = {
+                item.segment_id: item for item in match_store.list()
+            }
             for update in updates:
                 values = dict(update)
                 values.pop("project", None)
@@ -2873,7 +3145,7 @@ def stage2_sync_matches(block_uid: str | None = None):
                     raise ValueError("segment_id must match block_uid path")
                 values.pop("block_uid", None)
                 values["segment_id"] = segment_id
-                current = match_store.get(segment_id)
+                current = stored_by_id.get(segment_id)
                 merged = current.to_dict() if current else {
                     "segment_id": segment_id,
                     "query_text": "",
@@ -2887,6 +3159,7 @@ def stage2_sync_matches(block_uid: str | None = None):
                 )
                 metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
+                metadata["manual_updated_at"] = _utc_now_iso()
                 merged["metadata"] = metadata
                 source_id = str(merged.get("source_id") or "")
                 if source_id and source_id not in source_ids:
@@ -2902,8 +3175,9 @@ def stage2_sync_matches(block_uid: str | None = None):
                     raise ValueError(
                         f"source_out_sec exceeds source duration ({source.duration_sec})"
                     )
-                match_store.save(match)
+                stored_by_id[match.segment_id] = match
                 saved.append(match)
+            match_store.replace_all(list(stored_by_id.values()))
         return jsonify({
             "ok": True,
             "result": {
@@ -2980,6 +3254,8 @@ def stage2_build():
         fps = int(payload.get("fps", 25))
     except (TypeError, ValueError):
         return _json_error("fps must be an integer", 400)
+    if fps < 1:
+        return _json_error("fps must be at least 1", 400)
 
     try:
         normalization = load_normalization(paths["normalized"])
@@ -3112,16 +3388,11 @@ def stage2_export_xml():
             409,
         )
 
-    from stage2.models import FullTimeline, TimelineSegment
-    segs = [TimelineSegment(**{k: v for k, v in s.items() if k != "end_sec"})
-            for s in data["segments"]]
-    tl = FullTimeline(
-        project=data["project"],
-        segments=segs,
-        fps=data.get("fps", 25),
-        width=data.get("width", 1920),
-        height=data.get("height", 1080),
-    )
+    from stage2.models import FullTimeline
+    try:
+        tl = FullTimeline.from_dict(data)
+    except (TypeError, ValueError) as exc:
+        return _json_error(f"invalid full_timeline.json: {exc}", 500)
 
     try:
         xml_str = build_xml(tl)

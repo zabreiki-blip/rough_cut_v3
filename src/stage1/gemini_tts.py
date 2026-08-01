@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 from datetime import datetime, UTC
 import hashlib
+from functools import lru_cache
+import logging
 from pathlib import Path
 import re
 import io
@@ -17,6 +19,8 @@ from typing import Callable
 
 from .config import get_settings
 from .io_utils import read_json
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_tempo(wav_bytes: bytes, speed: float) -> bytes:
@@ -40,6 +44,7 @@ def _apply_tempo(wav_bytes: bytes, speed: float) -> bytes:
         result = subprocess.run(
             ["ffmpeg", "-y", "-i", str(src), "-filter:a", atempo, str(dst)],
             capture_output=True,
+            timeout=max(30, int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "180"))),
         )
         if result.returncode != 0 or not dst.exists():
             return wav_bytes  # fallback to original on error
@@ -296,18 +301,21 @@ def _synthesize_gemini_wav(text: str, settings, voice: str, client, types) -> by
     return _ensure_wav_bytes(audio_bytes, mime_type)
 
 
-def _list_macos_voices() -> list[str]:
+@lru_cache(maxsize=4)
+def _list_macos_voices(timeout: int = 15) -> tuple[str, ...]:
     if shutil.which("say") is None:
-        return []
+        return ()
     try:
         proc = subprocess.run(
             ["say", "-v", "?"],
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        logger.warning("Could not enumerate macOS voices: %s", exc)
+        return ()
     voices: list[str] = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -316,11 +324,11 @@ def _list_macos_voices() -> list[str]:
         name = line.split(maxsplit=1)[0]
         if name:
             voices.append(name)
-    return voices
+    return tuple(voices)
 
 
-def _resolve_macos_voice(voice: str) -> str:
-    voices = _list_macos_voices()
+def _resolve_macos_voice(voice: str, timeout: int = 15) -> str:
+    voices = _list_macos_voices(timeout=timeout)
     if not voices:
         return voice or "Alex"
     if voice in voices:
@@ -337,7 +345,8 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
     if shutil.which("afconvert") is None:
         raise RuntimeError("macOS command 'afconvert' is not found.")
 
-    voice = _resolve_macos_voice(voice)
+    command_timeout = int(getattr(settings, "macos_command_timeout", 900))
+    voice = _resolve_macos_voice(voice, timeout=min(30, command_timeout))
     with tempfile.TemporaryDirectory() as td:
         src_text = Path(td) / "tts.txt"
         src_aiff = Path(td) / "tts.aiff"
@@ -356,7 +365,13 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
             str(src_text),
         ]
         try:
-            subprocess.run(say_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                say_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
         except subprocess.CalledProcessError as exc:
             # Fallback to system default voice when the selected one is unavailable.
             fallback_cmd = [
@@ -369,7 +384,13 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
                 str(src_text),
             ]
             try:
-                subprocess.run(fallback_cmd, check=True, capture_output=True, text=True)
+                subprocess.run(
+                    fallback_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=command_timeout,
+                )
             except subprocess.CalledProcessError as fallback_exc:
                 details = (fallback_exc.stderr or fallback_exc.stdout or "").strip()
                 if not details:
@@ -388,7 +409,13 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
             str(out_wav),
         ]
         try:
-            subprocess.run(af_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                af_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
         except subprocess.CalledProcessError as exc:
             details = (exc.stderr or exc.stdout or "").strip() or "unknown afconvert error"
             raise RuntimeError(f"macOS 'afconvert' failed: {details}") from exc

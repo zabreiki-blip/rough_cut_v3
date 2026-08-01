@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import hmac
+from functools import lru_cache
 from pathlib import Path
 import subprocess
 import tempfile
@@ -52,20 +53,33 @@ def _auth_ok() -> bool:
     return bool(supplied) and hmac.compare_digest(supplied, token)
 
 
-def _voice_exists(voice: str) -> bool:
-    if not voice:
-        return False
+@lru_cache(maxsize=1)
+def _available_voices() -> frozenset[str]:
     try:
-        proc = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, check=True)
-    except Exception:
-        return False
+        proc = subprocess.run(
+            ["say", "-v", "?"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+        )
+    except Exception as exc:
+        app.logger.warning("Could not enumerate macOS voices: %s", exc)
+        return frozenset()
+    voices: set[str] = set()
     for line in proc.stdout.splitlines():
-        if line.strip().startswith(f"{voice} "):
-            return True
-    return False
+        name = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+        if name:
+            voices.add(name)
+    return frozenset(voices)
+
+
+def _voice_exists(voice: str) -> bool:
+    return bool(voice) and voice in _available_voices()
 
 
 def _run_say_and_convert(text: str, voice: str, rate: int, sample_rate: int) -> bytes:
+    command_timeout = _env_int("MACOS_COMMAND_TIMEOUT", 900, 30, 7200)
     with tempfile.TemporaryDirectory() as td:
         src_text = Path(td) / "tts.txt"
         src_aiff = Path(td) / "tts.aiff"
@@ -81,7 +95,17 @@ def _run_say_and_convert(text: str, voice: str, rate: int, sample_rate: int) -> 
         if voice:
             say_cmd[1:1] = ["-v", voice]
         try:
-            subprocess.run(say_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                say_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"say timed out after {command_timeout} seconds"
+            ) from exc
         except subprocess.CalledProcessError as exc:
             details = (exc.stderr or exc.stdout or "").strip() or "unknown say error"
             raise RuntimeError(f"say failed: {details}") from exc
@@ -96,7 +120,17 @@ def _run_say_and_convert(text: str, voice: str, rate: int, sample_rate: int) -> 
             str(out_wav),
         ]
         try:
-            subprocess.run(af_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                af_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"afconvert timed out after {command_timeout} seconds"
+            ) from exc
         except subprocess.CalledProcessError as exc:
             details = (exc.stderr or exc.stdout or "").strip() or "unknown afconvert error"
             raise RuntimeError(f"afconvert failed: {details}") from exc

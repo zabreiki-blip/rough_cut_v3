@@ -85,7 +85,7 @@ scenario.docx → analyze → scenario_prepared.json → synthesize → speaker/
 ## 3. Объединение и нумерация блоков
 
 1. **Короткие блоки** (<40 символов) объединяются со следующим.
-2. **Глобальный лимит** `MAX_ZK_BLOCKS` (env, default=200, min=40) — если блоков больше, они группируются.
+2. **Глобальный лимит** `MAX_ZK_BLOCKS` (env, default=40, min=1) — если блоков больше, они группируются.
 3. **Перенумерация** — всем блокам присваиваются ID `zk1`, `zk2`, ..., `zkN`.
 
 ---
@@ -155,15 +155,15 @@ scripts/validate-stage1 \
 - `--voice Sharon` — конкретный голос
 - `--gender female|male` — выбор по полу
 
-**Retry:** до 3 попыток с exponential backoff (8с, 16с, 24с).
+**Retry:** до 4 попыток; задержки перед повторами — 8с, 16с и 24с.
 
 ---
 
 ## 6. API (Flask)
 
 ```bash
-export PYTHONPATH=src
-flask --app api run --host 0.0.0.0 --port 8000
+scripts/setup-local
+scripts/run-local
 ```
 
 | Метод | Endpoint | Описание |
@@ -171,13 +171,17 @@ flask --app api run --host 0.0.0.0 --port 8000
 | GET | `/project/<project>` | UI Stage 1 |
 | GET | `/stage1/status?project=<p>` | Статус обработки |
 | POST | `/stage1/analyze` | Анализ сценария |
+| POST | `/stage1/normalization-jobs/start` | Фоновая нормализация |
+| GET | `/stage1/normalization-jobs/<job_id>` | Статус нормализации |
 | POST | `/stage1/tts` | Синхронный синтез |
 | POST | `/stage1/tts-jobs/start` | Асинхронный TTS с live-прогрессом |
 | GET | `/stage1/tts-jobs/<job_id>` | Статус job |
 | POST | `/stage1/tts-phrase` | Озвучка одной фразы |
 | POST | `/stage1/validate` | Валидация + манифест |
 
-Статусы `tts-jobs` хранятся в памяти процесса.
+Последний статус normalization/TTS/sync job атомарно сохраняется в `work/`.
+После рестарта незавершённая задача показывается как прерванная и может быть
+безопасно перезапущена с сохранённых артефактов.
 
 ---
 
@@ -204,23 +208,21 @@ projects/<project>/
 
 ### Docker (рекомендуется)
 ```bash
-cd /Users/mac/Documents/AI/rough_cut_v3
-docker compose up --build   # первый раз или после изменений Dockerfile/requirements
-docker compose up            # обычный запуск (код монтируется через volume)
+scripts/bootstrap-docker
 ```
-Gunicorn работает с `--reload` — подхватывает изменения в коде автоматически.
+Gunicorn запускается без `--reload`, с четырьмя потоками и часовым timeout.
+После изменения кода Docker-образ нужно пересобрать.
 
 ### Без Docker
 ```bash
-cd /Users/mac/Documents/AI/rough_cut_v3
-export PYTHONPATH=src
-flask --app api run --host 0.0.0.0 --port 8000 --reload
+scripts/setup-local
+scripts/run-local
 ```
 
 ### macOS Connector (TTS через `say`)
 Запускается **на хосте** (не в Docker), т.к. `say` — системная команда macOS:
 ```bash
-python3 src/macos_connector.py
+scripts/run-macos-connector
 ```
 Слушает порт **8001**. В `.env` должно быть:
 ```
@@ -253,11 +255,10 @@ MACOS_CONNECTOR_URL=http://host.docker.internal:8001/synthesize
 - Пропуски в исходной нумерации не вызывают ошибок.
 
 ### macOS TTS не работает в Docker
-- Нужен коннектор: `src/macos_connector.py` (запускается на хосте).
+- Нужен macOS-коннектор, запускаемый на хосте.
 - Установи `MACOS_CONNECTOR_URL=http://host.docker.internal:8001/synthesize`.
 ```bash
-cd /Users/mac/Documents/AI/rough_cut_v3
-python3 src/macos_connector.py
+scripts/run-macos-connector
 ```
 
 ### После правки кода Flask показывает старые данные
@@ -273,7 +274,8 @@ python3 src/macos_connector.py
 | `GEMINI_API_KEY` | — | Ключ для Gemini TTS |
 | `TTS_PROVIDER` | `gemini` | Провайдер TTS |
 | `TTS_GENDER` | `female` | Пол голоса |
-| `MAX_ZK_BLOCKS` | `200` | Максимум блоков. В `.env` сейчас стоит `70` |
+| `MAX_ZK_BLOCKS` | `40` | Максимум legacy-блоков после объединения |
+| `MACOS_COMMAND_TIMEOUT` | `900` | Таймаут `say`/`afconvert`, секунд |
 | `GEMINI_TTS_VOICE_FEMALE` | `Sharon` | Женский голос Gemini |
 | `GEMINI_TTS_VOICE_MALE` | `Kore` | Мужской голос Gemini |
 | `MACOS_TTS_RATE` | `175` | Скорость macOS TTS (wpm) |

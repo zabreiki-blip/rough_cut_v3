@@ -61,6 +61,18 @@ class ApiAuthenticationTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.get_json()["error"], "unauthorized")
+        self.assertNotIn("WWW-Authenticate", response.headers)
+
+    def test_direct_browser_request_keeps_basic_challenge(self) -> None:
+        api.app.config["API_TOKEN"] = "correct-token"
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.headers["WWW-Authenticate"],
+            'Basic realm="Rough Cut", charset="UTF-8"',
+        )
 
     def test_bearer_token_is_accepted(self) -> None:
         api.app.config["API_TOKEN"] = "correct-token"
@@ -106,6 +118,7 @@ class ApiAuthenticationTest(unittest.TestCase):
             headers={"Origin": "null"},
         )
         self.assertEqual(unauthenticated.status_code, 401)
+        self.assertNotIn("WWW-Authenticate", unauthenticated.headers)
         self.assertEqual(
             unauthenticated.headers["Access-Control-Allow-Origin"],
             "null",
@@ -178,6 +191,22 @@ class MacosConnectorAuthenticationTest(unittest.TestCase):
         self.assertEqual(response.data, fake_wav)
         synthesize.assert_called_once()
 
+    def test_voice_inventory_is_cached_between_blocks(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["say", "-v", "?"],
+            0,
+            "Milena ru_RU # Russian\nYuri ru_RU # Russian\n",
+            "",
+        )
+        macos_connector._available_voices.cache_clear()
+        try:
+            with patch.object(macos_connector.subprocess, "run", return_value=result) as run:
+                self.assertTrue(macos_connector._voice_exists("Milena"))
+                self.assertTrue(macos_connector._voice_exists("Yuri"))
+            run.assert_called_once()
+        finally:
+            macos_connector._available_voices.cache_clear()
+
     def test_multiline_dash_text_is_read_from_file_not_argv(self) -> None:
         commands = []
         file_contents = []
@@ -202,6 +231,15 @@ class MacosConnectorAuthenticationTest(unittest.TestCase):
         input_path = Path(say_command[say_command.index("-f") + 1])
         self.assertEqual(input_path.name, "tts.txt")
         self.assertEqual(file_contents, [text])
+
+    def test_macos_command_timeout_becomes_actionable_error(self) -> None:
+        with patch.object(
+            macos_connector.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["say"], 900),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "say timed out"):
+                macos_connector._run_say_and_convert("Текст", "Milena", 175, 24000)
 
     def test_local_macos_fallback_also_reads_multiline_dash_text_from_file(self) -> None:
         commands = []

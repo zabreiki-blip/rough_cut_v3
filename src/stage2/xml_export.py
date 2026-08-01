@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from pathlib import Path
 import re
 from urllib.request import pathname2url
@@ -9,13 +10,16 @@ from xml.etree import ElementTree as ET
 
 from .models import FullTimeline, TimelineSegment
 
+logger = logging.getLogger(__name__)
+
 
 def _wav_audio_params(path: str) -> tuple[int, int, int]:
     """Return (sample_rate, bit_depth, channels) from WAV file, or TTS defaults on error."""
     try:
         with wave.open(path, "rb") as wf:
             return wf.getframerate(), wf.getsampwidth() * 8, wf.getnchannels()
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not read WAV parameters path=%s error=%s", path, exc)
         return 24000, 16, 1
 
 

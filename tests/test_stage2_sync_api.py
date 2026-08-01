@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 from unittest.mock import patch
 import wave
 
@@ -231,6 +232,21 @@ def test_actual_stream_bytes_are_limited_without_trusting_content_length(tmp_pat
     assert destination.stat().st_size <= 4
 
 
+def test_stale_upload_cleanup_preserves_recent_parts(tmp_path: Path) -> None:
+    stale = tmp_path / ".stale.wav.dead.upload"
+    recent = tmp_path / ".recent.wav.live.upload"
+    stale.write_bytes(b"old")
+    recent.write_bytes(b"new")
+    old = time.time() - 48 * 60 * 60
+    os.utime(stale, (old, old))
+
+    removed = api._cleanup_stale_uploads(tmp_path)
+
+    assert removed == 1
+    assert not stale.exists()
+    assert recent.exists()
+
+
 def test_source_crud_and_server_named_validated_audio(sync_api) -> None:
     client, projects = sync_api
     created = _post_source(client)
@@ -359,6 +375,46 @@ def test_latest_sync_job_status_survives_in_memory_registry_reset(sync_api) -> N
     assert restored["status"] == "completed"
     assert restored["done"] == 12
     assert client.get(f"/stage2/sync-jobs/{created['id']}").status_code == 404
+
+
+def test_terminal_job_status_uses_live_match_summary_after_browser_review(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    match_path = projects / "demo" / "work" / "sync_matches.json"
+    store = api.SyncMatchStore(match_path)
+    pending = api.SyncMatch(
+        segment_id="stable-sync-uid",
+        query_text="Реплика для проверки",
+        source_id="source-1",
+        source_in_sec=10.0,
+        source_out_sec=14.0,
+        confidence=0.7,
+        status="needs_review",
+    )
+    store.save(pending)
+    created = api._create_sync_job("demo")
+    api._update_sync_job(
+        created["id"],
+        status="completed",
+        needs_review=1,
+        confirmed=0,
+    )
+
+    before = client.get(f"/stage2/sync-jobs/{created['id']}").get_json()["result"]
+    assert before["needs_review"] == 1
+
+    pending.status = "confirmed"
+    store.save(pending)
+
+    by_id = client.get(f"/stage2/sync-jobs/{created['id']}").get_json()["result"]
+    by_project = client.get(
+        "/stage2/sync-jobs/status?project=demo"
+    ).get_json()["result"]
+    assert by_id["needs_review"] == 0
+    assert by_id["confirmed"] == 1
+    assert by_project["needs_review"] == 0
+    assert by_project["confirmed"] == 1
 
 
 def test_corrupt_persisted_sync_job_status_is_ignored(sync_api) -> None:

@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import json
 from math import isfinite
-import os
 import re
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
-import uuid
+
+from atomic_io import atomic_write_json
 
 from .sync_models import SyncSource, WordIndex, WordTimestamp
 
@@ -177,16 +177,4 @@ def load_word_index(
 
 def save_word_index(path: Path | str, index: WordIndex) -> None:
     """Atomically save an already-generated index beside its final path."""
-
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps(index.to_dict(), ensure_ascii=False, indent=2))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, file_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(path, index.to_dict())

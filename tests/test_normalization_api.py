@@ -42,7 +42,7 @@ class NormalizationApiTest(unittest.TestCase):
         return source
 
     def test_list_projects_returns_only_valid_directories_sorted(self) -> None:
-        for name in ("zeta", "alpha_02", "invalid project"):
+        for name in ("zeta", "alpha_02", "Русский_проект-01", "invalid project"):
             (self.projects / name).mkdir()
         (self.projects / "plain-file").write_text("not a project", encoding="utf-8")
 
@@ -51,8 +51,31 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.get_json(),
-            {"ok": True, "projects": ["alpha_02", "zeta"]},
+            {
+                "ok": True,
+                "projects": ["alpha_02", "zeta", "Русский_проект-01"],
+            },
         )
+
+    def test_cyrillic_project_name_is_accepted_end_to_end(self) -> None:
+        source = self._source("Монтаж_01")
+
+        response = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "Монтаж_01", "input_path": str(source), "use_llm": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["project"], "Монтаж_01")
+
+    def test_project_name_rejects_path_syntax(self) -> None:
+        for project in ("../demo", "demo/test", "demo.test", "имя проекта"):
+            with self.subTest(project=project):
+                response = self.client.post(
+                    "/stage1/normalization/generate",
+                    json={"project": project},
+                )
+                self.assertEqual(response.status_code, 400)
 
     def test_generate_save_confirm_and_get(self) -> None:
         source = self._source()
@@ -107,6 +130,15 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(timeline_result["zk"], 1)
         self.assertEqual(timeline_result["snh"], 1)
         self.assertEqual(self.client.get("/stage2/export/xml?project=demo").status_code, 200)
+        timeline_path = self.projects / "demo" / "work" / "full_timeline.json"
+        timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+        self.assertEqual(timeline_payload["schema_version"], 1)
+        timeline_payload["segments"][0]["future_field"] = "ignored"
+        timeline_path.write_text(
+            json.dumps(timeline_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.client.get("/stage2/export/xml?project=demo").status_code, 200)
 
         confirmed["blocks"][0]["normalized_text"] = "Ещё одна редакция."
         saved_again = self.client.put(
@@ -126,6 +158,35 @@ class NormalizationApiTest(unittest.TestCase):
             self.client.get("/stage2/export/xml?project=demo").status_code,
             409,
         )
+
+    def test_async_normalization_job_returns_pollable_result(self) -> None:
+        source = self._source()
+
+        class ImmediateThread:
+            def __init__(self, *, target, kwargs, **_unused):
+                self.target = target
+                self.kwargs = kwargs
+
+            def start(self):
+                self.target(**self.kwargs)
+
+        with patch.object(api.threading, "Thread", ImmediateThread):
+            response = self.client.post(
+                "/stage1/normalization-jobs/start",
+                json={"project": "demo", "input_path": str(source), "use_llm": False},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        job_id = response.get_json()["result"]["id"]
+        status = self.client.get(f"/stage1/normalization-jobs/{job_id}")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.get_json()["result"]["status"], "completed")
+        self.assertTrue(status.get_json()["result"]["result"]["blocks"])
+        with api._NORMALIZATION_JOBS_LOCK:
+            api._NORMALIZATION_JOBS.clear()
+        restored = self.client.get("/stage1/normalization-jobs/status?project=demo")
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.get_json()["result"]["status"], "completed")
 
     def test_revision_conflict_is_409(self) -> None:
         source = self._source()

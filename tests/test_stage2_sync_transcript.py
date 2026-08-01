@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
+import atomic_io
 
 from stage2.sync_models import SyncSource, WordIndex
 from stage2 import sync_transcript
@@ -111,7 +112,7 @@ def test_save_word_index_atomically_replaces_existing_file(tmp_path, monkeypatch
         {"words": [{"word": "новый", "start": 0.0, "end": 0.4}]},
         "source",
     )
-    real_replace = sync_transcript.os.replace
+    real_replace = atomic_io.os.replace
     observed: dict[str, Path] = {}
 
     def inspect_replace(source, destination) -> None:
@@ -127,7 +128,7 @@ def test_save_word_index_atomically_replaces_existing_file(tmp_path, monkeypatch
         observed["temporary"] = source_path
         real_replace(source_path, destination_path)
 
-    monkeypatch.setattr(sync_transcript.os, "replace", inspect_replace)
+    monkeypatch.setattr(atomic_io.os, "replace", inspect_replace)
     save_word_index(path, index)
 
     assert observed["temporary"].exists() is False

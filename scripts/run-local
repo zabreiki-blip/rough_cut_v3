@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv}"
+if [[ ! -x "${VENV_DIR}/bin/gunicorn" ]]; then
+  echo "Локальное окружение не найдено. Выполните scripts/setup-local." >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/.env"
+set +a
+export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${ROOT_DIR}"
+exec "${VENV_DIR}/bin/gunicorn" \
+  -b "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}" \
+  --workers 1 --threads 4 --timeout 3600 api:app

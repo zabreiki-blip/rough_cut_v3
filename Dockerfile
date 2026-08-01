@@ -29,4 +29,4 @@ EXPOSE 8000
 
 USER roughcut
 
-CMD ["gunicorn", "-b", "0.0.0.0:8000", "--timeout", "600", "api:app"]
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "3600", "api:app"]

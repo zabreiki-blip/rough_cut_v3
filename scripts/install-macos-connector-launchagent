@@ -7,7 +7,8 @@ PLIST_NAME="com.roughcut.macos-connector"
 PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
 LOG_DIR="${HOME}/Library/Logs/RoughCut"
 CONNECTOR_ENV="${HOME}/Library/Application Support/RoughCut/macos-connector.env"
-PYTHON_BIN="${ROOT_DIR}/.venv/bin/python3"
+VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv}"
+PYTHON_BIN="${VENV_DIR}/bin/python3"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3)"

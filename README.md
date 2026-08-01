@@ -276,6 +276,11 @@ projects/<project>/work/full_timeline.json
 нескольких секвенций не перетирает предыдущие результаты: поиск выполняется по
 общему пулу готовых word indexes.
 
+Один и тот же участок исходного синхрона можно использовать в нескольких местах
+монтажа — например, короткую часть ответа в анонсе, а полный ответ позднее.
+Совпадения различаются по `block_uid`/`segment_id`, поэтому одинаковые и
+пересекающиеся диапазоны `source in/out` намеренно не дедуплицируются.
+
 Docker устанавливает `faster-whisper` и хранит модели в named volume
 `whisper_cache`. При локальном запуске на Apple Silicon можно установить
 `mlx-whisper`; адаптер выбирается автоматически.
@@ -290,8 +295,29 @@ Docker устанавливает `faster-whisper` и хранит модели 
 
 ```bash
 pip install -r requirements-dev.txt
-PYTHONPATH=src pytest -q
+pytest -q
+node tests/cep_behavior_test.cjs
+python -m compileall -q src tests
+docker compose config --quiet
 ```
+
+Те же проверки автоматически выполняются в GitHub Actions. Корректностные
+правила Ruff запускаются командой `ruff check src tests`; форматтер доступен
+как `ruff format src tests` и может вводиться постепенно без массового diff.
+
+## Локальная автоматизация
+
+```bash
+scripts/setup-local                         # venv, зависимости, .env, диагностика
+scripts/run-local                           # локальный API
+scripts/doctor                              # зависимости, ключи, порты и connector
+scripts/bootstrap-macos                     # setup + LaunchAgent + CEP на macOS
+scripts/pipeline-stage1 --project Демо --input scenario.docx
+```
+
+`pipeline-stage1` сначала создаёт черновик нормализации и останавливается для
+проверки. После проверки повторите команду с `--yes-confirm`; затем выполняются
+confirm → TTS → validate. Для проверки без платного TTS добавьте `--dry-run`.
 
 ## Docker
 
@@ -366,4 +392,6 @@ curl -X POST http://localhost:8000/stage1/analyze \
 ```
 
 `/stage1/analyze` оставлен только для legacy CLI/API и помечен deprecated.
-Новый workflow начинается с `/stage1/normalization/generate`.
+Новый веб-workflow запускает фоновую задачу через
+`/stage1/normalization-jobs/start`; синхронный `/stage1/normalization/generate`
+сохранён для совместимости и тестовых интеграций.
