@@ -284,6 +284,15 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error(
                 f"unknown sync sources: {', '.join(unknown_source_ids)}", 400
             )
+        source_scope = str(payload.get("source_scope") or "all").strip().lower()
+        if source_scope not in {"all", "review_media"}:
+            return services._json_error(
+                "source_scope must be 'all' or 'review_media'", 400
+            )
+        if source_scope == "review_media" and not any(
+            source.source_kind == "review_media" for source in sources
+        ):
+            return services._json_error("no review media sources configured", 409)
         try:
             search_window_sec = float(payload.get("search_window_sec", 180.0))
         except (TypeError, ValueError):
@@ -314,6 +323,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
                     "timecode_mode": timecode_mode,
                     "rematch_confirmed": bool(payload.get("rematch_confirmed", False)),
                     "source_ids": source_ids,
+                    "source_scope": source_scope,
                     "force_transcribe": bool(payload.get("force_transcribe", False)),
                     "search_window_sec": search_window_sec,
                 },

@@ -12,6 +12,7 @@ def run_sync_job(
     timecode_mode: str,
     rematch_confirmed: bool,
     source_ids: tuple[str, ...],
+    source_scope: str,
     force_transcribe: bool,
     search_window_sec: float,
 ) -> None:
@@ -32,7 +33,6 @@ def run_sync_job(
     save_word_index = services.save_word_index
     _audio_stat_signature = services._audio_stat_signature
     _audio_cache_signature = services._audio_cache_signature
-    _word_index_cache_is_current = services._word_index_cache_is_current
     app = services.app
     os = services.os
     transcribe_audio = services.transcribe_audio
@@ -84,12 +84,18 @@ def run_sync_job(
             status="running",
             message="Preparing word indexes",
             started_at=_utc_now_iso(),
+            whisper_model=str(model or os.getenv("SYNC_WHISPER_MODEL") or ""),
+            source_scope=source_scope,
         )
         all_sources = source_store.list()
         # ``source_ids`` scopes forced transcription, not the matching pool.
         # This lets the CEP panel export one guide at a time while every
         # already-indexed source remains eligible for scenario matching.
-        sources = all_sources
+        sources = (
+            [source for source in all_sources if source.source_kind == "review_media"]
+            if source_scope == "review_media"
+            else all_sources
+        )
         indexes = []
         source_failures: list[dict[str, str]] = []
         transcribed = 0
@@ -167,13 +173,11 @@ def run_sync_job(
                         cache_metadata["audio"] = _audio_cache_signature(audio_path)
                         save_word_index(index_path, cached_index)
 
-                cache_is_current = bool(
+                cache_matches_audio = bool(
                     cached_index is not None
                     and audio_is_available
                     and audio_path is not None
-                    and _word_index_cache_is_current(
-                        cached_index, audio_path, config
-                    )
+                    and _word_index_audio_matches(cached_index, audio_path)
                 )
                 if source_ids and not selected_for_transcription:
                     if cached_index is None:
@@ -188,8 +192,11 @@ def run_sync_job(
                     index = cached_index
                     reused += 1
                 elif cached_index is not None and not should_force and (
-                    cache_is_current or not audio_is_available
+                    cache_matches_audio or not audio_is_available
                 ):
+                    # A completed transcript is an expensive durable artifact.
+                    # Switching Small/Medium changes only future files; it must
+                    # not invalidate a transcript for unchanged media.
                     index = cached_index
                     reused += 1
                 else:

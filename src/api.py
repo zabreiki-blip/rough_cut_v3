@@ -1240,6 +1240,8 @@ def _create_sync_job(project: str) -> dict:
         "matching_started_at": "",
         "matching_fingerprint": "",
         "transcription_timeout_seconds": 0.0,
+        "whisper_model": "",
+        "source_scope": "all",
         "created_at": now,
         "started_at": "",
         "finished_at": "",
@@ -1295,6 +1297,7 @@ def _run_sync_job(
     timecode_mode: str,
     rematch_confirmed: bool,
     source_ids: tuple[str, ...],
+    source_scope: str,
     force_transcribe: bool,
     search_window_sec: float,
 ) -> None:
@@ -1308,6 +1311,7 @@ def _run_sync_job(
         timecode_mode=timecode_mode,
         rematch_confirmed=rematch_confirmed,
         source_ids=source_ids,
+        source_scope=source_scope,
         force_transcribe=force_transcribe,
         search_window_sec=search_window_sec,
     )

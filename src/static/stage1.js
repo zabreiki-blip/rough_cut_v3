@@ -74,6 +74,7 @@
     sync_review_count: el("sync_review_count"),
     sync_review_list: el("sync_review_list"),
     sync_timecode_mode: el("sync_timecode_mode"),
+    sync_whisper_model: el("sync_whisper_model"),
     normalization_input_path: el("normalization_input_path"),
     normalization_hint: el("normalization_hint"),
     normalization_use_llm: el("normalization_use_llm"),
@@ -263,6 +264,7 @@
         : "Найти СНХ автоматически";
     }
     if (ids.btn_sync_cancel) ids.btn_sync_cancel.hidden = !syncJobRunning;
+    if (ids.sync_whisper_model) ids.sync_whisper_model.disabled = syncJobRunning;
     if (ids.btn_tts_cancel) {
       ids.btn_tts_cancel.hidden = !["queued", "running", "cancelling"].includes(currentTtsJobStatus);
     }
@@ -1929,6 +1931,8 @@
       {
         project,
         timecode_mode: ids.sync_timecode_mode?.value || "relative",
+        model: ids.sync_whisper_model?.value || "small",
+        source_scope: stage3MediaCount > 0 ? "review_media" : "all",
       },
     );
     if (!response.available) {

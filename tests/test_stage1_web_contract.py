@@ -60,3 +60,11 @@ def test_whisper_progress_shows_current_viewing_elapsed_and_eta() -> None:
     assert "job.transcription_source_started_at" in STAGE1_JS
     assert "overallEtaSec" in STAGE1_JS
     assert "stage3SourceMapping.find" in STAGE1_JS
+
+
+def test_headless_whisper_model_and_source_scope_controls() -> None:
+    assert 'id="sync_whisper_model"' in PROJECT_HTML
+    assert '<option value="small" selected>Small — быстро</option>' in PROJECT_HTML
+    assert '<option value="medium">Medium — точнее</option>' in PROJECT_HTML
+    assert 'model: ids.sync_whisper_model?.value || "small"' in STAGE1_JS
+    assert 'source_scope: stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS

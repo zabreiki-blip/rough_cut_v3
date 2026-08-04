@@ -414,6 +414,13 @@
             </div>
             <div class="sync-source-actions">
               <label class="sync-timecode-mode">
+                <span>Модель Whisper</span>
+                <select id="sync_whisper_model">
+                  <option value="small" selected>Small — быстро</option>
+                  <option value="medium">Medium — точнее</option>
+                </select>
+              </label>
+              <label class="sync-timecode-mode">
                 <span>Таймкоды</span>
                 <select id="sync_timecode_mode">
                   <option value="relative">От начала секвенции</option>
@@ -428,7 +435,7 @@
               </button>
             </div>
           </div>
-          <p class="section-copy">Готовые WAV, индексы Whisper и уже найденные диапазоны сохраняются. После остановки нажмите «Продолжить».</p>
+          <p class="section-copy">Small рекомендуется для первого прохода. Medium точнее, но примерно вдвое медленнее. Готовые индексы Whisper и найденные диапазоны сохраняются.</p>
 
           <div id="sync_job_progress" class="sync-job-progress" hidden aria-live="polite">
             <div class="sync-progress-copy">

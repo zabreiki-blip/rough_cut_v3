@@ -754,6 +754,7 @@ def test_cancelled_queued_sync_worker_releases_project_without_loading_inputs(
         timecode_mode="relative",
         rematch_confirmed=False,
         source_ids=(),
+        source_scope="all",
         force_transcribe=False,
         search_window_sec=180.0,
     )
@@ -764,6 +765,65 @@ def test_cancelled_queued_sync_worker_releases_project_without_loading_inputs(
     with api._SYNC_JOBS_LOCK:
         assert "demo" not in api._SYNC_ACTIVE_PROJECTS
         assert created["id"] not in api._SYNC_CANCEL_EVENTS
+
+
+def test_review_media_scope_excludes_legacy_sources_and_records_model(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client, "legacy", "Татьяна Васильева").status_code == 201
+    created = client.post("/stage2/sync-sources", json={
+        "project": "demo",
+        "id": "review",
+        "source_kind": "review_media",
+        "media_path": "media/reviews/Васильева.mp4",
+        "guide_audio": "media/reviews/Васильева.mp4",
+        "premiere_sequence": "Васильева",
+        "speaker": "Татьяна Васильева",
+        "duration_sec": 100.0,
+    })
+    assert created.status_code == 201, created.get_json()
+    assert client.put(
+        "/stage2/sync-sources/review/words",
+        json={
+            "project": "demo",
+            "words": [
+                {"word": "маленькая", "start": 10.0, "end": 10.5},
+                {"word": "женщина", "start": 10.5, "end": 11.0},
+                {"word": "покоряла", "start": 11.0, "end": 11.5},
+                {"word": "великих", "start": 11.5, "end": 12.0},
+                {"word": "людей", "start": 12.0, "end": 12.5},
+            ],
+        },
+    ).status_code == 200
+
+    with patch.object(api.threading, "Thread", _ImmediateThread):
+        response = client.post("/stage2/sync-jobs/start", json={
+            "project": "demo",
+            "model": "small",
+            "source_scope": "review_media",
+        })
+
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["total_sources"] == 1
+    assert job["reused_indexes"] == 1
+    assert job["whisper_model"] == "small"
+    assert job["source_scope"] == "review_media"
+
+
+def test_sync_job_rejects_unknown_source_scope(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+
+    response = client.post("/stage2/sync-jobs/start", json={
+        "project": "demo",
+        "source_scope": "everything",
+    })
+
+    assert response.status_code == 400
+    assert "source_scope" in response.get_json()["error"]
 
 
 def test_words_ingestion_match_patch_build_and_timeline(sync_api) -> None:
@@ -1339,7 +1399,7 @@ def test_audio_change_during_transcription_preserves_previous_index(sync_api) ->
     assert index_path.read_bytes() == previous
 
 
-def test_word_index_cache_invalidates_on_config_and_audio_changes(sync_api) -> None:
+def test_word_index_cache_survives_config_change_but_invalidates_on_audio_change(sync_api) -> None:
     client, projects = sync_api
     _write_confirmed_normalization(projects)
     assert _post_source(client).status_code == 201
@@ -1421,16 +1481,17 @@ def test_word_index_cache_invalidates_on_config_and_audio_changes(sync_api) -> N
 
         api.os.environ["SYNC_WHISPER_BEAM_SIZE"] = "1"
         changed_config = start_job()
-        assert changed_config["transcribed"] == 1
-        assert len(calls) == 2
-        assert len(match_calls) == first_match_count * 2
+        assert changed_config["transcribed"] == 0
+        assert changed_config["reused_indexes"] == 1
+        assert len(calls) == 1
+        assert len(match_calls) == first_match_count
 
         audio_path = calls[-1]
         audio_path.write_bytes(audio_path.read_bytes() + b"\0\0")
         changed_audio = start_job()
         assert changed_audio["transcribed"] == 1
-        assert len(calls) == 3
-        assert len(match_calls) == first_match_count * 3
+        assert len(calls) == 2
+        assert len(match_calls) == first_match_count * 2
 
 
 def test_legacy_word_index_is_migrated_without_retranscription(sync_api) -> None:
@@ -1484,7 +1545,7 @@ def test_legacy_word_index_is_migrated_without_retranscription(sync_api) -> None
     assert migrated["metadata"]["transcription_cache"]["origin"] == "legacy"
 
 
-def test_failed_config_refresh_uses_same_audio_index_as_fallback(sync_api) -> None:
+def test_model_config_change_reuses_completed_same_audio_index(sync_api) -> None:
     client, projects = sync_api
     _write_confirmed_normalization(projects)
     assert _post_source(client).status_code == 201
@@ -1519,7 +1580,9 @@ def test_failed_config_refresh_uses_same_audio_index_as_fallback(sync_api) -> No
     with (
         patch.dict(api.os.environ, {"SYNC_WHISPER_BEAM_SIZE": "2"}),
         patch.object(
-            api, "transcribe_audio", side_effect=RuntimeError("temporary failure")
+            api,
+            "transcribe_audio",
+            side_effect=AssertionError("completed transcript must be reused"),
         ),
         patch.object(api.threading, "Thread", _ImmediateThread),
     ):
@@ -1533,5 +1596,5 @@ def test_failed_config_refresh_uses_same_audio_index_as_fallback(sync_api) -> No
     )
     assert job["transcribed"] == 0
     assert job["reused_indexes"] == 1
-    assert job["source_failures"][0]["error"] == "temporary failure"
+    assert job["source_failures"] == []
     assert found["source_id"] == "vasilieva_01"
