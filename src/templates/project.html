@@ -349,6 +349,54 @@
         <p class="section-copy">Соберите подтверждённый сценарий и готовые WAV-файлы в монтажный таймлайн.</p>
         <div id="assembly_gate_message" class="gate-message">Подтвердите нормализацию сценария, чтобы открыть сборку.</div>
 
+        <section class="stage3-media-workspace" aria-labelledby="stage3_media_title">
+          <div class="stage3-media-heading">
+            <div>
+              <h3 id="stage3_media_title">Просмотровки</h3>
+              <p class="section-copy">Отрендеренные таймлайны берутся из папки проекта автоматически. Сканирование и подготовка выполняются в Docker — Premiere на этом этапе не нужен.</p>
+            </div>
+            <span id="stage3_media_status" class="live-pill" data-state="idle" aria-live="polite">не сканировалось</span>
+          </div>
+
+          <div class="stage3-media-controls">
+            <div class="stage3-media-directory">
+              <span>Папка просмотровок</span>
+              <code id="stage3_media_directory">Определяется настройками проекта…</code>
+            </div>
+            <button id="btn_stage3_media_scan" class="btn btn-accent" type="button">Обновить просмотровки</button>
+          </div>
+          <p class="stage3-media-hint">Папка определяется автоматически. Найденные видео сразу регистрируются как источники Whisper; отдельный экспорт звука из Premiere не нужен.</p>
+
+          <div class="stage3-media-summary">
+            <span>Найдено файлов: <strong id="stage3_media_count">0</strong></span>
+            <span id="stage3_media_message">Откройте вкладку — сканирование начнётся автоматически.</span>
+          </div>
+          <div id="stage3_media_list" class="stage3-media-list" aria-live="polite">
+            <div class="empty-state compact">Просмотровки ещё не найдены.</div>
+          </div>
+
+          <div class="stage3-flow" aria-label="Как просмотровки превращаются в таймлайн">
+            <span>Просмотровка</span><b>→</b>
+            <span>Звук ffmpeg</span><b>→</b>
+            <span>Whisper</span><b>→</b>
+            <span>In / Out</span><b>→</b>
+            <span>RC_SRC_*</span><b>→</b>
+            <span>ROUGH_CUT_*</span>
+          </div>
+          <div class="stage3-mapping-heading">
+            <h4>Какая просмотровка используется</h4>
+            <span>Сопоставление обновляется после сканирования.</span>
+          </div>
+          <div id="stage3_source_mapping" class="stage3-source-mapping" aria-live="polite">
+            <div class="empty-state compact">Соответствия ещё не рассчитаны.</div>
+          </div>
+
+          <div class="stage3-media-next">
+            <button id="btn_stage3_prepare" class="btn btn-primary" type="button" disabled>Подготовить таймлайн</button>
+            <span>Создаёт XML с `RC_VIEWINGS`, заменяемыми `RC_SRC_*` и готовой `ROUGH_CUT_*` sequence.</span>
+          </div>
+        </section>
+
         <section class="sync-workspace" aria-labelledby="sync_workspace_title">
           <div class="sync-heading">
             <div>
@@ -389,6 +437,12 @@
             </div>
             <div class="progress-wrap sync-progress-wrap">
               <div id="sync_progress_bar" class="progress-bar"></div>
+            </div>
+            <div class="sync-progress-meta">
+              <span>Просмотровка: <strong id="sync_job_current">—</strong></span>
+              <span>Обработано видео: <strong id="sync_job_video_progress">—</strong></span>
+              <span>Прошло: <strong id="sync_job_elapsed">—</strong></span>
+              <span>Осталось примерно: <strong id="sync_job_eta">рассчитывается</strong></span>
             </div>
           </div>
 

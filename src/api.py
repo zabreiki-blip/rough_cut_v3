@@ -27,6 +27,7 @@ from api_core_routes import register_core_routes
 import api_stage1_jobs as stage1_jobs
 from api_stage1_routes import register_stage1_routes
 from api_stage2_routes import register_stage2_routes
+from api_stage3_routes import register_stage3_routes
 from api_sync_worker import run_sync_job
 from atomic_io import atomic_write_json
 from job_runtime import JobRegistry, get_job, release_project, reserve_project, update_job
@@ -1325,4 +1326,11 @@ _expose_registered_views(
     "stage2_timeline",
     "stage2_build",
     "stage2_export_xml",
+)
+
+register_stage3_routes(app, sys.modules[__name__])
+_expose_registered_views(
+    "stage3_media_scan",
+    "stage3_timeline_prepare",
+    "stage3_export_xml",
 )

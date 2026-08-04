@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 MatchStatus = Literal["auto_matched", "confirmed", "needs_review", "not_found"]
 TimecodeMode = Literal["relative", "display"]
+SyncSourceKind = Literal["premiere_sequence", "review_media"]
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -30,7 +31,13 @@ def _boolean(value: Any) -> bool:
 
 @dataclass(frozen=True)
 class SyncSource:
-    """A Premiere sequence and its exported, sample-aligned guide audio."""
+    """A source timeline used for transcript matching and final assembly.
+
+    ``premiere_sequence`` is the original Stage 2 source.  ``review_media`` is
+    an additive schema-v1 variant: Premiere imports the supplied media path and
+    records the proxy subsequence it creates around that item.  The backend
+    stores those values as opaque metadata and never opens ``media_path``.
+    """
 
     id: str
     speaker: str
@@ -48,12 +55,23 @@ class SyncSource:
     duration_sec: float = 0.0
     project_path: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Additive fields intentionally follow every legacy field so positional
+    # construction by older integrations keeps its original meaning.
+    source_kind: SyncSourceKind = "premiere_sequence"
+    media_path: str = ""
+    media_fingerprint: str = ""
+    proxy_sequence_id: str = ""
+    proxy_sequence_name: str = ""
 
     def __post_init__(self) -> None:
         if not self.id.strip():
             raise ValueError("sync source id must not be empty")
+        if self.source_kind not in {"premiere_sequence", "review_media"}:
+            raise ValueError(f"invalid sync source kind: {self.source_kind}")
         if not self.premiere_sequence.strip():
             raise ValueError("premiere_sequence must not be empty")
+        if self.source_kind == "review_media" and not self.media_path.strip():
+            raise ValueError("media_path must not be empty for review_media")
         if self.fps <= 0 or not isfinite(self.fps):
             raise ValueError("fps must be a positive finite number")
         if self.guide_offset_sec < 0 or not isfinite(self.guide_offset_sec):
@@ -96,12 +114,19 @@ class SyncSource:
         else:
             speakers = ()
         scope = str(value.get("speaker_scope") or "").strip().lower()
+        source_kind = str(value.get("source_kind") or "premiere_sequence").strip()
+        proxy_sequence_name = str(value.get("proxy_sequence_name") or "").strip()
+        premiere_sequence = str(
+            value.get("premiere_sequence")
+            or value.get("sequence_name")
+            or value.get("name")
+            or (proxy_sequence_name if source_kind == "review_media" else "")
+        ).strip()
         return cls(
             id=str(value.get("id") or value.get("source_id") or "").strip(),
             speaker=str(value.get("speaker") or "").strip(),
-            premiere_sequence=str(
-                value.get("premiere_sequence") or value.get("sequence_name") or value.get("name") or ""
-            ).strip(),
+            premiere_sequence=premiere_sequence,
+            source_kind=source_kind,  # type: ignore[arg-type]
             speakers=speakers,
             all_speakers=_boolean(value.get("all_speakers", False)) or scope == "all",
             sequence_id=str(value.get("sequence_id") or ""),
@@ -111,6 +136,10 @@ class SyncSource:
             guide_offset_sec=_number(value.get("guide_offset_sec"), 0.0),
             duration_sec=_number(value.get("duration_sec"), 0.0),
             project_path=str(value.get("project_path") or ""),
+            media_path=str(value.get("media_path") or ""),
+            media_fingerprint=str(value.get("media_fingerprint") or ""),
+            proxy_sequence_id=str(value.get("proxy_sequence_id") or ""),
+            proxy_sequence_name=proxy_sequence_name,
             metadata=dict(value.get("metadata") or {}),
         )
 

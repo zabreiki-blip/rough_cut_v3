@@ -307,6 +307,72 @@ def test_source_crud_and_server_named_validated_audio(sync_api) -> None:
     assert not fixed.exists()
 
 
+def test_review_media_registration_stores_opaque_path_without_reading_it(sync_api) -> None:
+    client, projects = sync_api
+    media_path = "/Volumes/L_BRICK/DOP/Брик_просмотровки/missing-review.mp4"
+
+    created = client.post(
+        "/stage2/sync-sources",
+        json={
+            "project": "demo",
+            "id": "brick_review_01",
+            "source_kind": "review_media",
+            "media_path": media_path,
+            "media_fingerprint": "size:1234:mtime:5678",
+            "proxy_sequence_name": "RC_SRC_BRICK_REVIEW_01",
+        },
+    )
+
+    assert created.status_code == 201, created.get_json()
+    source = created.get_json()["result"]["source"]
+    assert source["source_kind"] == "review_media"
+    assert source["media_path"] == media_path
+    assert source["sequence_name"] == "RC_SRC_BRICK_REVIEW_01"
+    # Registration only persists client metadata.  In particular, it neither
+    # requires the path to exist nor copies it into the project workspace.
+    assert not (projects / "demo" / "work" / "missing-review.mp4").exists()
+
+    updated = client.post(
+        "/stage2/sync-sources",
+        json={
+            "project": "demo",
+            "id": "brick_review_01",
+            "proxy_sequence_id": "premiere-proxy-01",
+        },
+    )
+    assert updated.status_code == 201, updated.get_json()
+    updated_source = updated.get_json()["result"]["source"]
+    assert updated_source["proxy_sequence_id"] == "premiere-proxy-01"
+    assert updated_source["media_path"] == media_path
+
+
+def test_review_media_registration_validates_kind_and_required_path(sync_api) -> None:
+    client, _projects = sync_api
+    missing_path = client.post(
+        "/stage2/sync-sources",
+        json={
+            "project": "demo",
+            "id": "review_missing_path",
+            "source_kind": "review_media",
+            "proxy_sequence_name": "RC_SRC_MISSING",
+        },
+    )
+    assert missing_path.status_code == 400
+    assert "media_path" in missing_path.get_json()["error"]
+
+    unknown_kind = client.post(
+        "/stage2/sync-sources",
+        json={
+            "project": "demo",
+            "id": "unknown_kind",
+            "source_kind": "external_url",
+            "premiere_sequence": "SYNC_UNKNOWN",
+        },
+    )
+    assert unknown_kind.status_code == 400
+    assert "source kind" in unknown_kind.get_json()["error"]
+
+
 def test_source_reregistration_preserves_guide_and_rejects_id_rebinding(sync_api) -> None:
     client, _projects = sync_api
     assert _post_source(client).status_code == 201

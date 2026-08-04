@@ -4,6 +4,9 @@ from pathlib import Path
 STAGE1_JS = (
     Path(__file__).parents[1] / "src" / "static" / "stage1.js"
 ).read_text(encoding="utf-8")
+PROJECT_HTML = (
+    Path(__file__).parents[1] / "src" / "templates" / "project.html"
+).read_text(encoding="utf-8")
 
 
 def test_restored_tts_job_rehydrates_every_resume_control() -> None:
@@ -26,3 +29,34 @@ def test_tts_and_sync_polling_retry_transient_errors_with_bounded_backoff() -> N
     assert STAGE1_JS.count("if (!isTransientPollingError(err))") >= 3
     assert "ttsPollTimer = window.setTimeout(pollRestoredTtsJob, delay);" in STAGE1_JS
     assert "syncPollTimer = window.setTimeout(() => pollSyncJob(statusUrl), delay);" in STAGE1_JS
+
+
+def test_stage3_headless_media_scan_contract() -> None:
+    assert 'id="stage3_media_directory"' in PROJECT_HTML
+    assert 'id="btn_stage3_media_scan"' in PROJECT_HTML
+    assert 'id="stage3_media_list"' in PROJECT_HTML
+    assert 'id="btn_stage3_prepare"' in PROJECT_HTML
+    assert "Premiere на этом этапе не нужен" in PROJECT_HTML
+    assert 'postJSON("/stage3/media/scan", { project })' in STAGE1_JS
+    assert "stage3MediaScanAttempted" in STAGE1_JS
+    assert "scanStage3MediaOnce();" in STAGE1_JS
+    assert "localStorage" not in STAGE1_JS
+    assert "/Volumes/L_BRICK" not in PROJECT_HTML
+    assert '["sources", "items", "files", "media"]' in STAGE1_JS
+    assert "item.duration_sec" in STAGE1_JS
+    assert "item.container_path" in STAGE1_JS
+
+
+def test_whisper_progress_shows_current_viewing_elapsed_and_eta() -> None:
+    for element_id in (
+        "sync_job_current",
+        "sync_job_video_progress",
+        "sync_job_elapsed",
+        "sync_job_eta",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+    assert "job.transcription_processed_sec" in STAGE1_JS
+    assert "job.transcription_duration_sec" in STAGE1_JS
+    assert "job.transcription_source_started_at" in STAGE1_JS
+    assert "overallEtaSec" in STAGE1_JS
+    assert "stage3SourceMapping.find" in STAGE1_JS

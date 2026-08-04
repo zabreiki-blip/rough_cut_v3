@@ -63,6 +63,10 @@
     sync_job_message: el("sync_job_message"),
     sync_job_numbers: el("sync_job_numbers"),
     sync_progress_bar: el("sync_progress_bar"),
+    sync_job_current: el("sync_job_current"),
+    sync_job_video_progress: el("sync_job_video_progress"),
+    sync_job_elapsed: el("sync_job_elapsed"),
+    sync_job_eta: el("sync_job_eta"),
     sync_count_auto: el("sync_count_auto"),
     sync_count_confirmed: el("sync_count_confirmed"),
     sync_count_review: el("sync_count_review"),
@@ -100,6 +104,14 @@
     voiceover_lock: el("voiceover_lock"),
     assembly_lock: el("assembly_lock"),
     assembly_gate_message: el("assembly_gate_message"),
+    stage3_media_directory: el("stage3_media_directory"),
+    btn_stage3_media_scan: el("btn_stage3_media_scan"),
+    btn_stage3_prepare: el("btn_stage3_prepare"),
+    stage3_media_status: el("stage3_media_status"),
+    stage3_media_count: el("stage3_media_count"),
+    stage3_media_message: el("stage3_media_message"),
+    stage3_media_list: el("stage3_media_list"),
+    stage3_source_mapping: el("stage3_source_mapping"),
   };
 
   const toastContainer = document.getElementById("toast-container");
@@ -122,6 +134,10 @@
   let ttsPollTimer = null;
   let ttsPollFailures = 0;
   let syncPollFailures = 0;
+  let stage3MediaScanAttempted = false;
+  let stage3MediaScanning = false;
+  let stage3MediaCount = 0;
+  let stage3SourceMapping = [];
   const MAX_POLL_BACKOFF_MS = 10000;
   const live = {
     status: "idle",
@@ -207,7 +223,7 @@
       ids.btn_sync_align,
       ids.btn_normalize, ids.btn_save_normalization, ids.btn_confirm_normalization, ids.btn_add_normalization_block,
       ids.btn_reset_normalization,
-      ids.btn_add_memory].forEach((b) => {
+      ids.btn_add_memory, ids.btn_stage3_media_scan].forEach((b) => {
       if (b) b.disabled = state;
     });
     document.querySelectorAll("[data-action='confirm-sync-match']").forEach((button) => {
@@ -1187,10 +1203,196 @@
     });
   }
 
+  // ── Stage 3: headless media scan ─────────────────────────────────────────
+  function stage3MediaItems(result) {
+    if (Array.isArray(result)) return result;
+    if (!result || typeof result !== "object") return [];
+    for (const key of ["sources", "items", "files", "media"]) {
+      if (Array.isArray(result[key])) return result[key];
+    }
+    return [];
+  }
+
+  function formatMediaDuration(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return "—";
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const rest = Math.floor(seconds % 60);
+    return hours > 0
+      ? `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`
+      : `${minutes}:${String(rest).padStart(2, "0")}`;
+  }
+
+  function formatMediaSize(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return "—";
+    if (bytes < 1024) return `${bytes} Б`;
+    const units = ["КБ", "МБ", "ГБ", "ТБ"];
+    let size = bytes / 1024;
+    let unit = units[0];
+    for (let index = 1; index < units.length && size >= 1024; index += 1) {
+      size /= 1024;
+      unit = units[index];
+    }
+    return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${unit}`;
+  }
+
+  function mediaItemMetadata(item) {
+    const probe = item.probe && typeof item.probe === "object" ? item.probe : {};
+    const video = item.video && typeof item.video === "object" ? item.video : {};
+    const duration = item.duration_sec ?? item.duration_seconds ?? item.duration
+      ?? probe.duration_sec ?? probe.duration_seconds ?? probe.duration;
+    const size = item.size_bytes ?? item.size ?? probe.size_bytes ?? probe.size;
+    const width = item.width ?? video.width ?? probe.width;
+    const height = item.height ?? video.height ?? probe.height;
+    const fps = item.fps ?? video.fps ?? probe.fps;
+    const resolution = width && height ? `${width}×${height}` : "—";
+    const fpsText = Number.isFinite(Number(fps)) ? `${Number(fps).toFixed(2)} fps` : "—";
+    return { duration, size, resolution, fpsText };
+  }
+
+  function renderStage3Media(result) {
+    if (!ids.stage3_media_list) return;
+    const items = stage3MediaItems(result);
+    stage3MediaCount = items.length;
+    if (ids.stage3_media_directory) {
+      ids.stage3_media_directory.textContent = result.directory || "Папка проекта не настроена";
+    }
+    ids.stage3_media_count.textContent = String(items.length);
+    if (ids.btn_stage3_prepare) {
+      ids.btn_stage3_prepare.disabled = busy || items.length === 0;
+    }
+    ids.stage3_media_message.textContent = items.length > 0
+      ? `Папка просканирована. ${items.length} файл(ов) готовы как временные источники.`
+      : "В указанной папке поддерживаемые видеофайлы не найдены.";
+    ids.stage3_media_list.innerHTML = items.length === 0
+      ? '<div class="empty-state compact">Проверьте путь и наличие видеофайлов.</div>'
+      : items.map((item) => {
+        const path = String(item.container_path || item.relative_path || item.path || item.file || item.name || "Без имени");
+        const name = String(item.name || path.split(/[\\/]/).pop() || path);
+        const metadata = mediaItemMetadata(item);
+        return `<article class="stage3-media-item">
+          <div class="stage3-media-file">
+            <strong title="${escaped(path)}">${escaped(name)}</strong>
+            <span title="${escaped(path)}">${escaped(path)}</span>
+          </div>
+          <dl class="stage3-media-meta">
+            <div><dt>Длительность</dt><dd>${formatMediaDuration(metadata.duration)}</dd></div>
+            <div><dt>Размер</dt><dd>${formatMediaSize(metadata.size)}</dd></div>
+            <div><dt>Кадр</dt><dd>${escaped(metadata.resolution)}</dd></div>
+            <div><dt>Частота</dt><dd>${escaped(metadata.fpsText)}</dd></div>
+          </dl>
+        </article>`;
+      }).join("");
+    renderStage3SourceMapping(result.mapping || []);
+  }
+
+  function stage3MappingLabel(item) {
+    const aliases = (item.sequence_aliases || []).concat(item.speaker_aliases || []);
+    return aliases[0] || item.source_id || "Источник";
+  }
+
+  function renderStage3SourceMapping(mapping) {
+    if (!ids.stage3_source_mapping) return;
+    const items = Array.isArray(mapping) ? mapping : [];
+    stage3SourceMapping = items;
+    if (items.length === 0) {
+      ids.stage3_source_mapping.innerHTML =
+        '<div class="empty-state compact">Сначала соберите Stage 2 timeline.</div>';
+      return;
+    }
+    ids.stage3_source_mapping.innerHTML = items.map((item) => {
+      const mapped = item.status === "mapped";
+      const reason = mapped
+        ? `до ${formatMediaDuration(item.max_source_out_sec)} на исходнике`
+        : (item.reason === "ambiguous_name_match" ? "неоднозначное имя" :
+          (item.reason === "media_too_short" ? "просмотровка короче нужного диапазона" :
+            "просмотровка не найдена"));
+      return `<article class="stage3-map-row" data-state="${mapped ? "mapped" : "unmapped"}">
+        <div><strong>${escaped(stage3MappingLabel(item))}</strong><small>${escaped(item.source_id || "")}</small></div>
+        <span class="stage3-map-arrow">→</span>
+        <div><strong>${escaped(item.media_name || "Нет файла")}</strong><small>${escaped(reason)}</small></div>
+      </article>`;
+    }).join("");
+  }
+
+  async function scanStage3Media() {
+    if (stage3MediaScanning) return;
+    stage3MediaScanAttempted = true;
+    stage3MediaScanning = true;
+    ids.btn_stage3_media_scan.disabled = true;
+    ids.stage3_media_status.dataset.state = "running";
+    ids.stage3_media_status.textContent = "сканирование…";
+    ids.stage3_media_message.textContent = "Читаем файлы и метаданные…";
+    try {
+      const result = await postJSON("/stage3/media/scan", { project });
+      renderStage3Media(result);
+      await loadSyncWorkspace(true);
+      ids.stage3_media_status.dataset.state = "completed";
+      ids.stage3_media_status.textContent = "готово";
+      toast(`Просмотровки найдены: ${stage3MediaItems(result).length}`, "success");
+      appendLog(
+        `Stage 3 media: найдено ${stage3MediaItems(result).length}; `
+        + `Whisper-источников=${Number(result.registered_sources || 0)}; `
+        + `directory=${result.directory || "—"}`
+      );
+    } catch (err) {
+      ids.stage3_media_status.dataset.state = "failed";
+      ids.stage3_media_status.textContent = "ошибка";
+      ids.stage3_media_message.textContent = err.message || String(err);
+      throw err;
+    } finally {
+      stage3MediaScanning = false;
+      ids.btn_stage3_media_scan.disabled = busy;
+    }
+  }
+
+  function scanStage3MediaOnce() {
+    if (stage3MediaScanAttempted) return;
+    scanStage3Media().catch((err) => {
+      appendLog(`Stage 3 media init: ${err.message || err}`, "warn");
+    });
+  }
+
+  async function prepareStage3Timeline() {
+    if (stage3MediaCount <= 0) {
+      throw new Error("Сначала добавьте просмотровки в папку проекта.");
+    }
+    ids.btn_stage3_prepare.disabled = true;
+    ids.btn_stage3_prepare.textContent = "Подготовка XML…";
+    ids.stage3_media_status.dataset.state = "running";
+    ids.stage3_media_status.textContent = "сборка…";
+    try {
+      const result = await postJSON("/stage3/timeline/prepare", { project });
+      renderStage3SourceMapping(result.source_mapping || []);
+      ids.stage3_media_status.dataset.state = "completed";
+      ids.stage3_media_status.textContent = "XML готов";
+      ids.stage3_media_message.textContent =
+        `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
+        + `плейсхолдеров: ${Number(result.placeholder_segments || 0)}.`;
+      appendLog(
+        `Stage 3 XML: mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
+        + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
+      );
+      toast("Nested XML готов. Начинаю загрузку.", "success");
+      window.location.href = result.download_url;
+    } catch (err) {
+      ids.stage3_media_status.dataset.state = "failed";
+      ids.stage3_media_status.textContent = "ошибка";
+      ids.stage3_media_message.textContent = err.message || String(err);
+      throw err;
+    } finally {
+      ids.btn_stage3_prepare.textContent = "Подготовить таймлайн";
+      ids.btn_stage3_prepare.disabled = busy || stage3MediaCount <= 0;
+    }
+  }
+
   document.querySelectorAll(".workspace-tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       openTab(tab.dataset.tab);
       if (tab.dataset.tab === "assembly") {
+        scanStage3MediaOnce();
         loadSyncWorkspace(true).catch((err) => {
           appendLog(`Stage 2 sync: ${err.message || err}`, "warn");
         });
@@ -1577,9 +1779,44 @@
     currentSyncJobStatus = status;
     const total = Number(job.total || job.items_total || 0);
     const done = Number(job.done ?? job.completed ?? job.items_done ?? 0);
-    const current = job.current_source || job.current_id || "";
+    const current = job.current_source_id || job.current_source || job.current_id || "";
     const message = job.message || job.event || (current ? `Обрабатывается ${current}` : "Сопоставление СНХ");
-    const pct = total > 0 ? Math.round((done / total) * 100) : (status === "completed" ? 100 : 0);
+    const totalSources = Number(job.total_sources || 0);
+    const completedSources = Math.min(
+      totalSources || Number.POSITIVE_INFINITY,
+      Number(job.transcribed || 0)
+        + Number(job.reused_indexes || 0)
+        + (Array.isArray(job.source_failures) ? job.source_failures.length : 0),
+    );
+    const processedVideo = Number(job.transcription_processed_sec || 0);
+    const currentVideoDuration = Number(job.transcription_duration_sec || 0);
+    const currentFraction = currentVideoDuration > 0
+      ? Math.max(0, Math.min(1, processedVideo / currentVideoDuration))
+      : 0;
+    const sourcePct = totalSources > 0
+      ? Math.round(((completedSources + currentFraction) / totalSources) * 100)
+      : 0;
+    const pct = status === "completed" ? 100
+      : (currentVideoDuration > 0 || totalSources > 0 ? sourcePct
+        : (total > 0 ? Math.round((done / total) * 100) : 0));
+    const mapping = stage3SourceMapping.find((item) => item.source_id === current) || {};
+    const jobStartedAt = Date.parse(job.started_at || "");
+    const sourceStartedAt = Date.parse(job.transcription_source_started_at || "");
+    const elapsedSec = Number.isFinite(jobStartedAt)
+      ? Math.max(0, (Date.now() - jobStartedAt) / 1000)
+      : 0;
+    const sourceElapsedSec = Number.isFinite(sourceStartedAt)
+      ? Math.max(0, (Date.now() - sourceStartedAt) / 1000)
+      : 0;
+    const currentEtaSec = sourceElapsedSec > 0
+      && processedVideo > 0
+      && currentVideoDuration > processedVideo
+      ? sourceElapsedSec * (currentVideoDuration - processedVideo) / processedVideo
+      : 0;
+    const overallFraction = Math.max(0, Math.min(1, pct / 100));
+    const overallEtaSec = elapsedSec > 0 && overallFraction > 0 && overallFraction < 1
+      ? elapsedSec * (1 - overallFraction) / overallFraction
+      : 0;
 
     ids.sync_job_status.dataset.state = status;
     ids.sync_job_status.textContent = status === "completed" ? "готово"
@@ -1591,8 +1828,29 @@
       : "в работе";
     ids.sync_job_progress.hidden = false;
     ids.sync_job_message.textContent = message;
-    ids.sync_job_numbers.textContent = total > 0 ? `${done}/${total}` : `${pct}%`;
+    ids.sync_job_numbers.textContent = totalSources > 0
+      ? `${completedSources}/${totalSources} файлов · ${pct}%`
+      : (total > 0 ? `${done}/${total}` : `${pct}%`);
     ids.sync_progress_bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    if (ids.sync_job_current) {
+      ids.sync_job_current.textContent = mapping.media_name || current || "—";
+    }
+    if (ids.sync_job_video_progress) {
+      ids.sync_job_video_progress.textContent = currentVideoDuration > 0
+        ? `${formatMediaDuration(processedVideo)} / ${formatMediaDuration(currentVideoDuration)}`
+        : "—";
+    }
+    if (ids.sync_job_elapsed) {
+      ids.sync_job_elapsed.textContent = elapsedSec > 0 ? formatMediaDuration(elapsedSec) : "—";
+    }
+    if (ids.sync_job_eta) {
+      ids.sync_job_eta.textContent = status === "completed" ? "готово"
+        : (overallEtaSec > 0
+          ? `≈ ${formatMediaDuration(overallEtaSec)} всего`
+          : (currentEtaSec > 0
+            ? `≈ ${formatMediaDuration(currentEtaSec)} текущая`
+            : "рассчитывается"));
+    }
   }
 
   function finishSyncJob() {
@@ -1847,6 +2105,8 @@
     if (Number.isFinite(end) && audio.currentTime >= end) audio.pause();
   }, true);
   ids.btn_build_timeline.addEventListener("click", () => safely(doBuildTimeline));
+  if (ids.btn_stage3_media_scan) ids.btn_stage3_media_scan.addEventListener("click", () => safely(scanStage3Media));
+  if (ids.btn_stage3_prepare) ids.btn_stage3_prepare.addEventListener("click", () => safely(prepareStage3Timeline));
 
   if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
   ids.btn_tts.addEventListener("click", () => safely(doTTS));

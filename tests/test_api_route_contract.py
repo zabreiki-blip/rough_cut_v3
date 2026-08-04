@@ -64,6 +64,9 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage2/sync-sources/<source_id>/audio": {"GET", "PUT"},
         "/stage2/sync-sources/<source_id>/words": {"PUT"},
         "/stage2/timeline": {"GET"},
+        "/stage3/media/scan": {"POST"},
+        "/stage3/timeline/prepare": {"POST"},
+        "/stage3/export/xml": {"GET"},
     }
     actual: dict[str, set[str]] = defaultdict(set)
     for rule in api.app.url_map.iter_rules():

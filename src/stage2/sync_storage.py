@@ -9,6 +9,10 @@ from atomic_io import atomic_write_json as _atomic_write_json
 
 from .sync_models import SyncMatch, SyncSource
 
+# Review-media support is an additive extension of the existing schema.  Keep
+# writing version 1 so older clients that ignore unknown source fields continue
+# to accept the document; ``SyncSource.from_dict`` supplies defaults for older
+# records that do not contain them.
 SCHEMA_VERSION = 1
 
 

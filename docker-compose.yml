@@ -16,6 +16,9 @@ services:
       - SYNC_AUDIO_MAX_BYTES=${SYNC_AUDIO_MAX_BYTES:-4294967296}
       - HF_HOME=/app/.cache/huggingface
       - ROUGH_CUT_CEP_CORS=1
+      # XMEML is imported by Premiere on the macOS host, so exported file URLs
+      # must use the host checkout path rather than /app inside the container.
+      - ROUGH_CUT_HOST_PROJECTS_ROOT=${PWD}/projects
     ports:
       - "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}:8000"
     extra_hosts:
