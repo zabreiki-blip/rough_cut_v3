@@ -258,6 +258,33 @@ def test_speaker_filter_selects_only_matching_registered_sequences() -> None:
     assert result.status == "not_found"
 
 
+def test_rendered_viewing_wins_over_duplicate_legacy_premiere_source() -> None:
+    phrase = "эта переставленная цитата найдена в другом месте интервью"
+    sources = [
+        _source("legacy", "Марк Бартон"),
+        _source(
+            "viewing",
+            "Бартон",
+            source_kind="review_media",
+            media_path="media/reviews/180626_Бартон.mp4",
+        ),
+    ]
+    indexes = [
+        _index("legacy", phrase, 50.0),
+        _index("viewing", phrase, 500.0),
+    ]
+
+    result = SyncMatcher(sources, indexes).match(AlignmentRequest(
+        segment_id="reordered-snh",
+        text=phrase,
+        speaker="Бартон",
+    ))
+
+    assert result.source_id == "viewing"
+    assert result.source_in_sec is not None and result.source_in_sec > 490
+    assert result.metadata["ambiguous"] is False
+
+
 @pytest.mark.parametrize("speaker", ["Ирина Котова", "Алексей Иванов", "Мария Петрова"])
 def test_multi_speaker_source_is_eligible_for_every_registered_speaker(
     speaker: str,

@@ -95,7 +95,8 @@ def test_scan_registers_viewing_as_headless_whisper_source(client) -> None:
     assert source is not None
     assert source.source_kind == "review_media"
     assert source.guide_audio == "media/reviews/Курская.mp4"
-    assert source.all_speakers is True
+    assert source.speaker == "Курская"
+    assert source.all_speakers is False
 
 
 @pytest.mark.parametrize(

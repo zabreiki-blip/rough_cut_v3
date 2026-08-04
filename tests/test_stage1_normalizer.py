@@ -581,6 +581,28 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(blocks[1]["continuation_of_type"], "sync")
             self.assertEqual(blocks[1]["speaker"], "Курская")
 
+    def test_bare_snh_marker_inherits_the_previous_named_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Бартон 00:37 — 01:07 Первый выбранный фрагмент.\n"
+                "СНХ: Фраза, вырезанная из другого места интервью.\n"
+                "СНХ: Фраза, которую сценарист переставил раньше исходника.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync"] * 3)
+            self.assertEqual([block["speaker"] for block in blocks], ["Бартон"] * 3)
+            self.assertEqual(
+                [block["continuation_of_type"] for block in blocks],
+                ["", "sync", "sync"],
+            )
+
     def test_parenthetical_editorial_prefix_before_timecode_is_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -616,6 +616,7 @@ def _snapshot_proposals(blocks: list[NormalizedBlock]) -> None:
 
 def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
     previous: NormalizedBlock | None = None
+    previous_sync: NormalizedBlock | None = None
     for block in blocks:
         if (
             previous is not None
@@ -653,6 +654,17 @@ def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
                 DecisionSource.BUILTIN_RULE.value,
                 0.9,
             )
+        # A scenario editor often marks the next quote only as "СНХ" (or
+        # leaves a bare timecode) after naming the interviewee once. Treat it
+        # as another independently searchable edit from that interview, not as
+        # a chronological continuation of the previous source range.
+        if block.type == BlockType.SYNC.value:
+            if block.speaker:
+                previous_sync = block
+            elif previous_sync is not None:
+                block.continuation_of_type = BlockType.SYNC.value
+                block.speaker = previous_sync.speaker
+                block.role = previous_sync.role
         previous = block
 
 

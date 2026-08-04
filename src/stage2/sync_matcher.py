@@ -576,13 +576,19 @@ class SyncMatcher:
             by_id = {source.id: source for source in [*values, *universal]}
             return [by_id[source.id] for source in available if source.id in by_id]
 
+        def prefer_rendered_viewings(values: list[SyncSource]) -> list[SyncSource]:
+            viewings = [
+                source for source in values if source.source_kind == "review_media"
+            ]
+            return viewings or values
+
         exact = [
             source
             for source in available
             if any(tokens == speaker_tokens for tokens in source_speaker_tokens(source))
         ]
         if exact:
-            return with_universal(exact)
+            return with_universal(prefer_rendered_viewings(exact))
         query_name = set(speaker_tokens)
         fuzzy = [
             source
@@ -596,12 +602,12 @@ class SyncMatcher:
             )
         ]
         if fuzzy:
-            return with_universal(fuzzy)
+            return with_universal(prefer_rendered_viewings(fuzzy))
         # A source registered without speaker metadata remains searchable, but
         # a clearly different named speaker is not searched in this interview.
-        return with_universal([
+        return with_universal(prefer_rendered_viewings([
             source for source in available if not source_speaker_tokens(source)
-        ])
+        ]))
 
     def match(self, request: AlignmentRequest) -> SyncMatch:
         query = normalize_text(request.text)

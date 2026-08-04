@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 from types import ModuleType
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -120,12 +121,21 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
         name = str(item.get("name") or Path(relative_path).name).strip()
         if not source_id or not relative_path or not name:
             continue
+        speaker = re.sub(r"^\d{6,8}[\s_.-]*", "", Path(name).stem)
+        speaker = re.sub(
+            r"\b(?:просмотровка|просмотр|review|proxy|render|final)\b",
+            " ",
+            speaker,
+            flags=re.IGNORECASE,
+        )
+        speaker = " ".join(speaker.replace("_", " ").split()) or Path(name).stem
         registered.append(services.SyncSource.from_dict({
             "id": source_id,
             "source_kind": "review_media",
             "premiere_sequence": Path(name).stem,
             "proxy_sequence_name": f"RC_SRC_{Path(name).stem}",
-            "all_speakers": True,
+            "speaker": speaker,
+            "all_speakers": False,
             "fps": item.get("fps") or 25.0,
             "duration_sec": item.get("duration_sec") or 0.0,
             # faster-whisper/PyAV can decode the audio stream directly from the
