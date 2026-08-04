@@ -80,6 +80,20 @@ class TtsCoordinationTests(unittest.TestCase):
         self.assertIn("running", api_module._TTS_JOBS)
         self.assertNotIn("done", api_module._TTS_JOBS)
 
+    def test_non_durable_progress_update_skips_disk_checkpoint(self) -> None:
+        created = api_module._create_tts_job("demo")
+        with patch.object(api_module, "_persist_tts_job") as persist:
+            updated = api_module._update_tts_job(
+                created["id"],
+                persist=False,
+                done=3,
+            )
+
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated["done"], 3)
+        self.assertEqual(api_module._get_tts_job(created["id"])["done"], 3)
+        persist.assert_not_called()
+
     def test_latest_status_survives_restart_as_interrupted_checkpoint(self) -> None:
         created = api_module._create_tts_job(
             "demo",

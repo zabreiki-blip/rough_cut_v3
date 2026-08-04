@@ -41,6 +41,8 @@
 - `VALIDATE_SILENCE_RMS_THRESHOLD=120` (warning, если RMS слишком низкий; `0` отключает)
 - `TTS_PROVIDER=gemini|openrouter|macos` (какой движок синтеза использовать)
 - `TTS_GENDER=female|male` (пол голоса по умолчанию)
+- `TTS_MAX_WORKERS=3` ограничивает параллельные запросы синтеза (`1–4`)
+- `ANALYZER_LLM_WORKERS=4` ограничивает параллельный анализ независимых LLM-чанков (`1–4`)
 - для `openrouter`: `OPENROUTER_TTS_MODEL`, `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
   - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
@@ -50,7 +52,8 @@
   `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
 - параметры faster-whisper: `SYNC_WHISPER_BEAM_SIZE` и
   `SYNC_WHISPER_BEST_OF` (по умолчанию `5`), `SYNC_WHISPER_BATCH_SIZE`
-  (`0` отключает batching; для CPU начинать с `4` или `8`);
+  (`0` отключает batching; для CPU начинать с `4` или `8`) и
+  `SYNC_WHISPER_CPU_THREADS` (`0` оставляет выбор числа потоков backend-у);
   одна транскрипция выполняется в отдельном процессе с hard timeout
   `SYNC_WHISPER_TIMEOUT_SECONDS` (по умолчанию 14400 секунд)
 - `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV

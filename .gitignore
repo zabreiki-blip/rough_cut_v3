@@ -3,9 +3,16 @@
 .venv-macos-arm64
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
 .DS_Store
 logs/
 data/*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+data/*.sqlite3-journal
 
 # Runtime artifacts
 speaker/*.wav

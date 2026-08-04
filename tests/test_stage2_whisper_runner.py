@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from stage2.whisper_runner import (
     _transcribe_faster,
     _words_from_mapping,
     resolve_backend,
+    transcribe_audio,
 )
 
 
@@ -109,7 +111,10 @@ class WhisperRunnerTest(unittest.TestCase):
             BatchedInferencePipeline=object,
             WhisperModel=FakeModel,
         )
-        with patch.dict("sys.modules", {"faster_whisper": fake_module}):
+        with (
+            patch.dict("sys.modules", {"faster_whisper": fake_module}),
+            patch.dict("os.environ", {}, clear=True),
+        ):
             words, metadata = _transcribe_faster(
                 Path("audio.wav"),
                 "progress-test-model",
@@ -184,6 +189,7 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertEqual(metadata["beam_size"], 5)
         self.assertEqual(metadata["best_of"], 5)
         self.assertEqual(metadata["batch_size"], 0)
+        self.assertEqual(metadata["cpu_threads"], 0)
         self.assertFalse(metadata["batched"])
 
     def test_faster_whisper_uses_configured_batch_pipeline(self) -> None:
@@ -224,6 +230,7 @@ class WhisperRunnerTest(unittest.TestCase):
             "SYNC_WHISPER_BEAM_SIZE": "1",
             "SYNC_WHISPER_BEST_OF": "2",
             "SYNC_WHISPER_BATCH_SIZE": "8",
+            "SYNC_WHISPER_CPU_THREADS": "6",
         }
         with (
             patch.dict("sys.modules", {"faster_whisper": fake_module}),
@@ -236,6 +243,13 @@ class WhisperRunnerTest(unittest.TestCase):
             )
 
         self.assertIs(calls["pipeline_model"], calls["model"])
+        self.assertEqual(
+            calls["init"],
+            (
+                ("batch-kwargs-test-model",),
+                {"device": "cpu", "compute_type": "int8", "cpu_threads": 6},
+            ),
+        )
         self.assertEqual(
             calls["transcribe"][1],
             {
@@ -252,7 +266,75 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertEqual(metadata["beam_size"], 1)
         self.assertEqual(metadata["best_of"], 2)
         self.assertEqual(metadata["batch_size"], 8)
+        self.assertEqual(metadata["cpu_threads"], 6)
         self.assertTrue(metadata["batched"])
+
+    def test_faster_whisper_uses_fast_cpu_defaults(self) -> None:
+        calls = {}
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs) -> None:
+                calls["init"] = (args, kwargs)
+
+            def transcribe(self, *_args, **kwargs):
+                calls["transcribe"] = kwargs
+                return iter([
+                    SimpleNamespace(
+                        end=1.0,
+                        words=[SimpleNamespace(word="тест", start=0.0, end=1.0)],
+                    ),
+                ]), SimpleNamespace(
+                    duration=1.0,
+                    language="ru",
+                    language_probability=0.99,
+                )
+
+        fake_module = SimpleNamespace(
+            BatchedInferencePipeline=object,
+            WhisperModel=FakeModel,
+        )
+        with (
+            patch.dict("sys.modules", {"faster_whisper": fake_module}),
+            patch.dict("os.environ", {"SYNC_WHISPER_DEVICE": "cpu"}, clear=True),
+        ):
+            _words, metadata = _transcribe_faster(
+                Path("audio.wav"),
+                "cpu-defaults-test-model",
+                "ru",
+            )
+
+        self.assertEqual(
+            calls["init"],
+            (("cpu-defaults-test-model",), {"device": "cpu", "compute_type": "int8"}),
+        )
+        self.assertEqual(calls["transcribe"]["beam_size"], 1)
+        self.assertEqual(metadata["compute_type"], "int8")
+        self.assertEqual(metadata["beam_size"], 1)
+
+    def test_transcription_duration_prefers_backend_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with (
+                patch(
+                    "stage2.whisper_runner.resolve_backend",
+                    return_value="faster-whisper",
+                ),
+                patch(
+                    "stage2.whisper_runner._transcribe_faster",
+                    return_value=(
+                        [{"word": "тест", "start": 1.0, "end": 2.0}],
+                        {"duration_sec": 10.0},
+                    ),
+                ),
+            ):
+                result = transcribe_audio(
+                    audio_path,
+                    backend="faster-whisper",
+                    model="medium",
+                )
+
+        self.assertEqual(result["duration_sec"], 10.0)
 
     def test_faster_whisper_rejects_invalid_integer_settings(self) -> None:
         fake_module = SimpleNamespace(
@@ -264,6 +346,8 @@ class WhisperRunnerTest(unittest.TestCase):
             ("SYNC_WHISPER_BEST_OF", "-1"),
             ("SYNC_WHISPER_BATCH_SIZE", "-1"),
             ("SYNC_WHISPER_BATCH_SIZE", "1.5"),
+            ("SYNC_WHISPER_CPU_THREADS", "-1"),
+            ("SYNC_WHISPER_CPU_THREADS", "1.5"),
         )
         for name, value in invalid_settings:
             with self.subTest(name=name, value=value):

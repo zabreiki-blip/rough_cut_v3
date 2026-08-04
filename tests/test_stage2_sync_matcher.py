@@ -368,6 +368,78 @@ def test_long_queries_bound_candidate_search_without_losing_rare_anchor() -> Non
     assert any(1445 <= start <= 1455 for start in starts)
 
 
+def test_no_anchor_candidate_starts_are_fixed_size_and_deterministic() -> None:
+    index = _index("s1", " ".join(["фоновый"] * 10_000), 0.0, step=0.01)
+    query = normalize_text("совершенно иная короткая реплика")
+    tokens = _timed_tokens(index)
+
+    first = _candidate_starts(query, tokens)
+    second = _candidate_starts(query, tokens)
+
+    assert first == second
+    assert len(first) == 240
+    assert first[0] == 0
+    assert first[-1] == len(tokens) - 1
+
+
+def test_no_exact_anchor_keeps_likely_whisper_spelling_match() -> None:
+    words = ["фоновый"] * 5_000
+    words[3_217:3_220] = ["необычьная", "архитиктурная", "исторея"]
+    index = _index("s1", " ".join(words), 0.0, step=0.01)
+    starts = _candidate_starts(
+        normalize_text("необычная архитектурная история"),
+        _timed_tokens(index),
+    )
+
+    assert len(starts) <= 240
+    assert any(3_215 <= start <= 3_219 for start in starts)
+
+
+def test_low_score_timecode_fallback_shares_bounded_start_budget() -> None:
+    transcript = " ".join(["фоновый"] * 4_000)
+    matcher = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 0.0, step=0.25)],
+        MatcherConfig(search_window_sec=30.0),
+    )
+    original = sync_matcher_module._candidate_starts
+    calls: list[tuple[int, set[int]]] = []
+
+    def recording_candidate_starts(
+        query: list[str],
+        tokens: list[sync_matcher_module._Token],
+        *,
+        max_starts: int = 240,
+        eligible_starts: object = None,
+    ) -> list[int]:
+        starts = original(
+            query,
+            tokens,
+            max_starts=max_starts,
+            eligible_starts=eligible_starts,  # type: ignore[arg-type]
+        )
+        calls.append((max_starts, {round(tokens[start].word.start * 1000) for start in starts}))
+        return starts
+
+    with patch.object(
+        sync_matcher_module,
+        "_candidate_starts",
+        side_effect=recording_candidate_starts,
+    ):
+        matcher.match(AlignmentRequest(
+            segment_id="bounded-fallback",
+            text="совершенно иная короткая реплика",
+            approximate_timecode=500.0,
+            source_ids=("s1",),
+        ))
+
+    assert len(calls) == 2
+    assert sum(len(starts) for _limit, starts in calls) <= 240
+    assert calls[0][0] == 120
+    assert calls[1][0] == 120
+    assert calls[0][1].isdisjoint(calls[1][1])
+
+
 def test_long_length_ranges_are_sampled_then_refined() -> None:
     lengths, step = _length_samples(70, 156, 104)
     assert step > 1

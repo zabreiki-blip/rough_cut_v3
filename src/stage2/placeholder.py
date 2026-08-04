@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import textwrap
 from pathlib import Path
 
@@ -11,6 +12,7 @@ _TEXT_COLOR = (230, 230, 230)
 _SUBTEXT_COLOR = (160, 160, 160)
 
 
+@lru_cache(maxsize=16)
 def _get_font(size: int) -> ImageFont.ImageFont:
     for name in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

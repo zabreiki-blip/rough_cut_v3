@@ -232,6 +232,7 @@ def _worker_key(
         os.getenv("SYNC_WHISPER_BEAM_SIZE", "5").strip(),
         os.getenv("SYNC_WHISPER_BEST_OF", "5").strip(),
         os.getenv("SYNC_WHISPER_BATCH_SIZE", "0").strip(),
+        os.getenv("SYNC_WHISPER_CPU_THREADS", "0").strip(),
         start_method,
     )
 

@@ -744,6 +744,20 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(result["blocks"][0]["original_label"], "")
             self.assertEqual(result["blocks"][0]["normalized_text"], "00:01:02 Иван говорит")
 
+    def test_prose_leading_date_is_not_classified_as_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("23.05 состоялась премьера\n", encoding="utf-8")
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+
+            block = result["blocks"][0]
+            self.assertEqual(block["type"], "unknown")
+            self.assertNotEqual(block["confidence"], 0.9)
+
     def test_low_confidence_llm_result_requires_manual_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

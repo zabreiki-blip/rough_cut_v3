@@ -15,10 +15,18 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable
+
+from env_utils import env_int
 
 from .config import get_settings
 from .io_utils import read_json
+from .macos_tts_backend import (
+    list_macos_voices,
+    resolve_macos_voice,
+    run_say_and_convert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +37,8 @@ def _apply_tempo(wav_bytes: bytes, speed: float) -> bytes:
     if speed == 1.0:
         return wav_bytes
     if shutil.which("ffmpeg") is None:
-        return wav_bytes  # ffmpeg not available, skip silently
+        logger.warning("ffmpeg is unavailable; requested TTS speed %.2f was not applied", speed)
+        return wav_bytes
     # atempo supports 0.5–2.0; chain filters for values outside that range
     if 0.5 <= speed <= 2.0:
         atempo = f"atempo={speed}"
@@ -41,11 +50,23 @@ def _apply_tempo(wav_bytes: bytes, speed: float) -> bytes:
         src = Path(td) / "in.wav"
         dst = Path(td) / "out.wav"
         src.write_bytes(wav_bytes)
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src), "-filter:a", atempo, str(dst)],
-            capture_output=True,
-            timeout=max(30, int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "180"))),
-        )
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src), "-filter:a", atempo, str(dst)],
+                capture_output=True,
+                timeout=env_int(
+                    "FFMPEG_TIMEOUT_SECONDS",
+                    180,
+                    minimum=30,
+                    maximum=3600,
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ffmpeg timed out; requested TTS speed %.2f was not applied",
+                speed,
+            )
+            return wav_bytes
         if result.returncode != 0 or not dst.exists():
             return wav_bytes  # fallback to original on error
         return dst.read_bytes()
@@ -248,29 +269,34 @@ def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
         timeout=240,
         stream=True,
     )
-    if response.status_code != 200:
-        try:
-            err = response.json()
-        except Exception:
-            err = {"status": response.status_code, "body": response.text[:500]}
-        raise RuntimeError(f"OpenRouter TTS failed: {err}")
+    try:
+        if response.status_code != 200:
+            try:
+                err = response.json()
+            except Exception:
+                err = {"status": response.status_code, "body": response.text[:500]}
+            error = RuntimeError(f"OpenRouter TTS failed ({response.status_code}): {err}")
+            error.status_code = response.status_code  # type: ignore[attr-defined]
+            raise error
 
-    audio_chunks: list[bytes] = []
-    for raw in response.iter_lines(decode_unicode=True):
-        if not raw or not raw.startswith("data: "):
-            continue
-        data = raw[6:].strip()
-        if data == "[DONE]":
-            break
-        try:
-            event = pyjson.loads(data)
-        except Exception:
-            continue
-        choice = (event.get("choices") or [{}])[0]
-        delta = choice.get("delta") or {}
-        audio = delta.get("audio")
-        if isinstance(audio, dict) and audio.get("data"):
-            audio_chunks.append(base64.b64decode(audio["data"]))
+        audio_chunks: list[bytes] = []
+        for raw in response.iter_lines(decode_unicode=True):
+            if not raw or not raw.startswith("data: "):
+                continue
+            data = raw[6:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                event = pyjson.loads(data)
+            except Exception:
+                continue
+            choice = (event.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            audio = delta.get("audio")
+            if isinstance(audio, dict) and audio.get("data"):
+                audio_chunks.append(base64.b64decode(audio["data"]))
+    finally:
+        response.close()
 
     if not audio_chunks:
         raise RuntimeError("OpenRouter stream returned no audio chunks")
@@ -303,40 +329,16 @@ def _synthesize_gemini_wav(text: str, settings, voice: str, client, types) -> by
 
 @lru_cache(maxsize=4)
 def _list_macos_voices(timeout: int = 15) -> tuple[str, ...]:
-    if shutil.which("say") is None:
-        return ()
-    try:
-        proc = subprocess.run(
-            ["say", "-v", "?"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.warning("Could not enumerate macOS voices: %s", exc)
-        return ()
-    voices: list[str] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        name = line.split(maxsplit=1)[0]
-        if name:
-            voices.append(name)
-    return tuple(voices)
+    return list_macos_voices(
+        timeout=timeout,
+        run=subprocess.run,
+        which=shutil.which,
+        logger=logger,
+    )
 
 
 def _resolve_macos_voice(voice: str, timeout: int = 15) -> str:
-    voices = _list_macos_voices(timeout=timeout)
-    if not voices:
-        return voice or "Alex"
-    if voice in voices:
-        return voice
-    for fallback in ("Milena", "Yuri", "Samantha", "Alex"):
-        if fallback in voices:
-            return fallback
-    return voices[0]
+    return resolve_macos_voice(voice, _list_macos_voices(timeout=timeout))
 
 
 def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
@@ -347,79 +349,15 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
 
     command_timeout = int(getattr(settings, "macos_command_timeout", 900))
     voice = _resolve_macos_voice(voice, timeout=min(30, command_timeout))
-    with tempfile.TemporaryDirectory() as td:
-        src_text = Path(td) / "tts.txt"
-        src_aiff = Path(td) / "tts.aiff"
-        out_wav = Path(td) / "tts.wav"
-        src_text.write_text(text, encoding="utf-8")
-
-        say_cmd = [
-            "say",
-            "-v",
-            voice,
-            "-r",
-            str(settings.macos_tts_rate),
-            "-o",
-            str(src_aiff),
-            "-f",
-            str(src_text),
-        ]
-        try:
-            subprocess.run(
-                say_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=command_timeout,
-            )
-        except subprocess.CalledProcessError as exc:
-            # Fallback to system default voice when the selected one is unavailable.
-            fallback_cmd = [
-                "say",
-                "-r",
-                str(settings.macos_tts_rate),
-                "-o",
-                str(src_aiff),
-                "-f",
-                str(src_text),
-            ]
-            try:
-                subprocess.run(
-                    fallback_cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=command_timeout,
-                )
-            except subprocess.CalledProcessError as fallback_exc:
-                details = (fallback_exc.stderr or fallback_exc.stdout or "").strip()
-                if not details:
-                    details = (exc.stderr or exc.stdout or "").strip()
-                if not details:
-                    details = "unknown say error"
-                raise RuntimeError(f"macOS 'say' failed: {details}") from fallback_exc
-
-        af_cmd = [
-            "afconvert",
-            "-f",
-            "WAVE",
-            "-d",
-            f"LEI16@{settings.macos_tts_sample_rate}",
-            str(src_aiff),
-            str(out_wav),
-        ]
-        try:
-            subprocess.run(
-                af_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=command_timeout,
-            )
-        except subprocess.CalledProcessError as exc:
-            details = (exc.stderr or exc.stdout or "").strip() or "unknown afconvert error"
-            raise RuntimeError(f"macOS 'afconvert' failed: {details}") from exc
-        return out_wav.read_bytes()
+    return run_say_and_convert(
+        text,
+        voice=voice,
+        rate=settings.macos_tts_rate,
+        sample_rate=settings.macos_tts_sample_rate,
+        timeout=command_timeout,
+        retry_with_default_voice=True,
+        run=subprocess.run,
+    )
 
 
 def _synthesize_macos_connector_wav(text: str, settings, voice: str) -> bytes:
@@ -465,6 +403,52 @@ def _synthesize_macos_connector_wav(text: str, settings, voice: str) -> bytes:
 
 def _is_retryable_tts_error(provider: str, exc: Exception) -> bool:
     msg = str(exc).lower()
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status_code, int):
+        return status_code == 429 or 500 <= status_code < 600
+
+    status_match = re.search(r"(?:status(?:_code)?[=:\s]+|failed\s*\()([45]\d\d)", msg)
+    if status_match:
+        status = int(status_match.group(1))
+        return status == 429 or 500 <= status < 600
+
+    permanent_markers = (
+        "invalid argument",
+        "invalid_argument",
+        "bad request",
+        "permission denied",
+        "permission_denied",
+        "unauthenticated",
+        "api_key is not set",
+        "safety",
+        "blocked",
+        "prohibited content",
+        "policy violation",
+    )
+    if any(marker in msg for marker in permanent_markers):
+        return False
+
+    transient_markers = (
+        "429",
+        "resource exhausted",
+        "resource_exhausted",
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "connection error",
+        "name or service not known",
+        "temporary failure",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "internal server error",
+        "deadline exceeded",
+        "unavailable",
+    )
     if provider == "macos":
         # Local macOS `say` errors should fail fast, but transient connector/network
         # errors can be retried a few times.
@@ -484,11 +468,9 @@ def _is_retryable_tts_error(provider: str, exc: Exception) -> bool:
             "gateway timeout",
         )
         return any(marker in msg for marker in transient_markers)
-    if "api_key is not set" in msg:
-        return False
     if "not found in backend environment" in msg:
         return False
-    return True
+    return any(marker in msg for marker in transient_markers)
 
 
 def _resolve_gender(gender: str | None, default_gender: str) -> str:
@@ -591,6 +573,259 @@ def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
         raise TtsCancelledError("TTS synthesis cancelled")
 
 
+def _emit_batch_progress(
+    progress_callback: Callable[[dict], None] | None,
+    event: str,
+    total: int,
+    completed: int,
+    generated: list[str],
+    skipped: list[str],
+) -> None:
+    _emit_progress(
+        progress_callback,
+        {
+            "event": event,
+            "total": total,
+            "completed": completed,
+            "generated": len(generated),
+            "skipped": len(skipped),
+        },
+    )
+
+
+def _emit_item_progress(
+    progress_callback: Callable[[dict], None] | None,
+    event: str,
+    block_id: str,
+    index: int,
+    total: int,
+    completed: int,
+    generated: list[str],
+    skipped: list[str],
+    *,
+    attempts: int | None = None,
+    error: str | None = None,
+) -> None:
+    payload = {
+        "event": event,
+        "id": block_id,
+        "index": index,
+        "total": total,
+        "completed": completed,
+        "generated": len(generated),
+        "skipped": len(skipped),
+    }
+    if attempts is not None:
+        payload["attempts"] = attempts
+    if error is not None:
+        payload["error"] = error
+    _emit_progress(progress_callback, payload)
+
+
+def _fingerprint_parameters(provider: str, settings) -> tuple[str, int, int]:
+    if provider == "gemini":
+        return settings.gemini_tts_model, 0, 0
+    if provider == "openrouter":
+        return (
+            settings.openrouter_tts_model,
+            settings.openrouter_tts_sample_rate,
+            0,
+        )
+    return "", settings.macos_tts_sample_rate, settings.macos_tts_rate
+
+
+def _prepare_tts_items(items: list[dict]) -> list[tuple[str, str]]:
+    prepared_items: list[tuple[str, str]] = []
+    for item in items:
+        block_id = str(item.get("id", "")).strip()
+        text = str(item.get("text_for_tts", "")).strip()
+        if block_id and text:
+            prepared_items.append((block_id, text))
+    return prepared_items
+
+
+def _plan_tts_items(
+    prepared_items: list[tuple[str, str]],
+    speaker_dir: Path,
+    provider: str,
+    voice: str,
+    resolved_gender: str,
+    speed: float,
+    settings,
+    dry_run: bool,
+    cancel_check: Callable[[], bool] | None,
+) -> list[tuple[int, str, str, Path, str, str]]:
+    fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(
+        provider, settings
+    )
+    plan: list[tuple[int, str, str, Path, str, str]] = []
+
+    for index, (block_id, text) in enumerate(prepared_items, start=1):
+        _raise_if_cancelled(cancel_check)
+        out_file = speaker_dir / f"{block_id}.wav"
+        fingerprint = _synthesis_fingerprint(
+            text,
+            provider,
+            voice,
+            resolved_gender,
+            speed,
+            fp_model,
+            fp_sample_rate,
+            fp_extra_rate,
+        )
+        cache_hit = (
+            not dry_run
+            and _is_valid_wav(out_file)
+            and _read_meta_fingerprint(out_file) == fingerprint
+        )
+        if cache_hit:
+            action = "cache"
+        elif dry_run:
+            action = "dry_run"
+        else:
+            action = "synthesize"
+        plan.append((index, block_id, text, out_file, fingerprint, action))
+
+    return plan
+
+
+def _publish_local_item(
+    planned_item: tuple[int, str, str, Path, str, str],
+    total_items: int,
+    generated: list[str],
+    skipped: list[str],
+    progress_callback: Callable[[dict], None] | None,
+) -> None:
+    index, block_id, text, out_file, _fingerprint, action = planned_item
+    _emit_item_progress(
+        progress_callback,
+        "item_started",
+        block_id,
+        index,
+        total_items,
+        index - 1,
+        generated,
+        skipped,
+    )
+    if action == "cache" or _is_valid_wav(out_file):
+        skipped.append(str(out_file))
+        event = "item_skipped"
+    else:
+        _write_silence_wav(out_file, duration_ms=max(900, int(len(text) * 55)))
+        generated.append(str(out_file))
+        event = "item_generated"
+    _emit_item_progress(
+        progress_callback,
+        event,
+        block_id,
+        index,
+        total_items,
+        index,
+        generated,
+        skipped,
+        attempts=1 if event == "item_generated" else None,
+    )
+
+
+def _synthesize_with_retry(
+    provider: str,
+    text: str,
+    settings,
+    voice: str,
+    speed: float,
+    cancel_check: Callable[[], bool] | None,
+) -> tuple[bytes | None, int, list[str], Exception | None]:
+    attempts = 0
+    retry_errors: list[str] = []
+    while True:
+        _raise_if_cancelled(cancel_check)
+        attempts += 1
+        try:
+            # Gemini SDK clients are not assumed to be thread-safe. Give every
+            # bounded task its own client; HTTP providers do not create one.
+            worker_client, worker_types = _build_tts_client(provider, settings)
+            wav_bytes = _synthesize_wav_bytes(
+                provider, text, settings, voice, worker_client, worker_types
+            )
+            _raise_if_cancelled(cancel_check)
+            return _apply_tempo(wav_bytes, speed), attempts, retry_errors, None
+        except TtsCancelledError:
+            raise
+        except Exception as exc:
+            if attempts >= 4 or not _is_retryable_tts_error(provider, exc):
+                return None, attempts, retry_errors, exc
+            retry_errors.append(str(exc))
+            time.sleep(min(60, 8 * attempts))
+
+
+def _publish_synthesized_item(
+    pending_item: tuple[int, str, str, Path, str],
+    future: Future[tuple[bytes | None, int, list[str], Exception | None]],
+    total_items: int,
+    generated: list[str],
+    skipped: list[str],
+    progress_callback: Callable[[dict], None] | None,
+) -> None:
+    index, block_id, _text, out_file, fingerprint = pending_item
+    _emit_item_progress(
+        progress_callback,
+        "item_started",
+        block_id,
+        index,
+        total_items,
+        index - 1,
+        generated,
+        skipped,
+    )
+    wav_bytes, attempts, retry_errors, final_error = future.result()
+    for retry_attempt, error_text in enumerate(retry_errors, start=1):
+        _emit_item_progress(
+            progress_callback,
+            "item_retrying",
+            block_id,
+            index,
+            total_items,
+            index - 1,
+            generated,
+            skipped,
+            attempts=retry_attempt,
+            error=error_text,
+        )
+    if final_error is not None or wav_bytes is None:
+        if final_error is None:
+            final_error = RuntimeError(
+                f"TTS synthesis returned no audio for item {block_id}"
+            )
+        _emit_item_progress(
+            progress_callback,
+            "item_failed",
+            block_id,
+            index,
+            total_items,
+            index - 1,
+            generated,
+            skipped,
+            attempts=attempts,
+            error=str(final_error),
+        )
+        raise final_error
+
+    _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
+    _write_meta_fingerprint(out_file, fingerprint)
+    generated.append(str(out_file))
+    _emit_item_progress(
+        progress_callback,
+        "item_generated",
+        block_id,
+        index,
+        total_items,
+        index,
+        generated,
+        skipped,
+        attempts=attempts,
+    )
+
+
 def synthesize_tts(
     prepared_path: Path,
     speaker_dir: Path,
@@ -628,159 +863,95 @@ def synthesize_tts(
     ):
         raise RuntimeError(_provider_unavailable_message(provider, settings))
 
-    client = None
-    types = None
-    if not dry_run:
-        client, types = _build_tts_client(provider, settings)
-
-    prepared_items: list[tuple[str, str]] = []
-    for item in items:
-        block_id = str(item.get("id", "")).strip()
-        text = str(item.get("text_for_tts", "")).strip()
-        if not block_id or not text:
-            continue
-        prepared_items.append((block_id, text))
-
-    # Collect extra params that affect audio output for fingerprinting
-    _fp_model = ""
-    _fp_sample_rate = 0
-    _fp_extra_rate = 0
-    if provider == "gemini":
-        _fp_model = settings.gemini_tts_model
-    elif provider == "openrouter":
-        _fp_model = settings.openrouter_tts_model
-        _fp_sample_rate = settings.openrouter_tts_sample_rate
-    elif provider == "macos":
-        _fp_sample_rate = settings.macos_tts_sample_rate
-        _fp_extra_rate = settings.macos_tts_rate
+    prepared_items = _prepare_tts_items(items)
 
     total_items = len(prepared_items)
-    _emit_progress(
+    _emit_batch_progress(
         progress_callback,
-        {
-            "event": "started",
-            "total": total_items,
-            "completed": 0,
-            "generated": 0,
-            "skipped": 0,
-        },
+        "started",
+        total_items,
+        0,
+        generated,
+        skipped,
+    )
+    plan = _plan_tts_items(
+        prepared_items,
+        speaker_dir,
+        provider,
+        voice,
+        resolved_gender,
+        speed,
+        settings,
+        dry_run,
+        cancel_check,
     )
 
-    for index, (block_id, text) in enumerate(prepared_items, start=1):
-        _raise_if_cancelled(cancel_check)
-        out_file = speaker_dir / f"{block_id}.wav"
-        fp = _synthesis_fingerprint(text, provider, voice, resolved_gender, speed, _fp_model, _fp_sample_rate, _fp_extra_rate)
-        _emit_progress(
-            progress_callback,
-            {
-                "event": "item_started",
-                "id": block_id,
-                "index": index,
-                "total": total_items,
-                "completed": index - 1,
-                "generated": len(generated),
-                "skipped": len(skipped),
-            },
-        )
-        if not dry_run and _is_valid_wav(out_file) and _read_meta_fingerprint(out_file) == fp:
-            skipped.append(str(out_file))
-            _emit_progress(
-                progress_callback,
-                {
-                    "event": "item_skipped",
-                    "id": block_id,
-                    "index": index,
-                    "total": total_items,
-                    "completed": index,
-                    "generated": len(generated),
-                    "skipped": len(skipped),
-                },
-            )
-            continue
-
-        if dry_run:
-            if _is_valid_wav(out_file):
-                skipped.append(str(out_file))
-                _emit_progress(
-                    progress_callback,
-                    {
-                        "event": "item_skipped",
-                        "id": block_id,
-                        "index": index,
-                        "total": total_items,
-                        "completed": index,
-                        "generated": len(generated),
-                        "skipped": len(skipped),
-                    },
+    pending = [item for item in plan if item[5] == "synthesize"]
+    if pending:
+        try:
+            configured_workers = int(os.getenv("TTS_MAX_WORKERS", "3"))
+        except ValueError:
+            configured_workers = 3
+        max_workers = max(1, min(4, configured_workers, len(pending)))
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        futures: dict[
+            int,
+            Future[tuple[bytes | None, int, list[str], Exception | None]],
+        ] = {}
+        try:
+            futures = {
+                index: pool.submit(
+                    _synthesize_with_retry,
+                    provider,
+                    text,
+                    settings,
+                    voice,
+                    speed,
+                    cancel_check,
                 )
-                continue
-            est_duration_ms = max(900, int(len(text) * 55))
-            _write_silence_wav(out_file, duration_ms=est_duration_ms)
-            generated.append(str(out_file))
-            _emit_progress(
-                progress_callback,
-                {
-                    "event": "item_generated",
-                    "id": block_id,
-                    "index": index,
-                    "total": total_items,
-                    "completed": index,
-                    "generated": len(generated),
-                    "skipped": len(skipped),
-                    "attempts": 1,
-                },
-            )
-            continue
-
-        attempts = 0
-        while True:
-            _raise_if_cancelled(cancel_check)
-            attempts += 1
-            try:
-                wav_bytes = _synthesize_wav_bytes(provider, text, settings, voice, client, types)
+                for index, _, text, _, _, _ in pending
+            }
+            # Publish files and progress in scenario order. Network synthesis is
+            # concurrent, while externally visible output remains deterministic.
+            for planned_item in plan:
                 _raise_if_cancelled(cancel_check)
-                wav_bytes = _apply_tempo(wav_bytes, speed)
-                _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
-                _write_meta_fingerprint(out_file, fp)
-                generated.append(str(out_file))
-                _emit_progress(
-                    progress_callback,
-                    {
-                        "event": "item_generated",
-                        "id": block_id,
-                        "index": index,
-                        "total": total_items,
-                        "completed": index,
-                        "generated": len(generated),
-                        "skipped": len(skipped),
-                        "attempts": attempts,
-                    },
-                )
-                break
-            except TtsCancelledError:
-                # Cancellation is control flow, not a transient provider
-                # failure. Propagate it immediately without retry events or
-                # an additional backoff sleep.
-                raise
-            except Exception as exc:
-                retryable = attempts < 4 and _is_retryable_tts_error(provider, exc)
-                _emit_progress(
-                    progress_callback,
-                    {
-                        "event": "item_retrying" if retryable else "item_failed",
-                        "id": block_id,
-                        "index": index,
-                        "total": total_items,
-                        "completed": index - 1,
-                        "generated": len(generated),
-                        "skipped": len(skipped),
-                        "attempts": attempts,
-                        "error": str(exc),
-                    },
-                )
-                if not retryable:
-                    raise
-                time.sleep(min(60, 8 * attempts))
+                if planned_item[5] == "synthesize":
+                    index, block_id, text, out_file, fingerprint, _action = planned_item
+                    _publish_synthesized_item(
+                        (index, block_id, text, out_file, fingerprint),
+                        futures[index],
+                        total_items,
+                        generated,
+                        skipped,
+                        progress_callback,
+                    )
+                else:
+                    _publish_local_item(
+                        planned_item,
+                        total_items,
+                        generated,
+                        skipped,
+                        progress_callback,
+                    )
+        except BaseException:
+            for future in futures.values():
+                future.cancel()
+            # Provider calls already in progress cannot be forcefully stopped,
+            # but queued requests must not delay cancellation or consume quota.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+    else:
+        for planned_item in plan:
+            _raise_if_cancelled(cancel_check)
+            _publish_local_item(
+                planned_item,
+                total_items,
+                generated,
+                skipped,
+                progress_callback,
+            )
 
     result = {
         "prepared_path": str(prepared_path),
@@ -794,15 +965,13 @@ def synthesize_tts(
         "dry_run": used_dry_run,
         "generated_at": datetime.now(UTC).isoformat(),
     }
-    _emit_progress(
+    _emit_batch_progress(
         progress_callback,
-        {
-            "event": "completed",
-            "total": total_items,
-            "completed": total_items,
-            "generated": len(generated),
-            "skipped": len(skipped),
-        },
+        "completed",
+        total_items,
+        total_items,
+        generated,
+        skipped,
     )
     return result
 

@@ -16,7 +16,7 @@ from atomic_io import atomic_write_json as _atomic_write_json
 from atomic_io import atomic_write_text as _atomic_write_text
 
 from .config import get_settings
-from .io_utils import extract_paragraphs, extract_text, read_json
+from .io_utils import extract_paragraphs, read_json
 from .normalization_memory import DEFAULT_MEMORY_PATH, NormalizationMemory, normalize_marker
 from .normalization_models import (
     BlockType,
@@ -26,6 +26,7 @@ from .normalization_models import (
     NormalizedScenario,
     SyncFragment,
     VALID_BLOCK_TYPES,
+    VALID_DECISION_SOURCES,
 )
 
 logger = logging.getLogger(__name__)
@@ -659,6 +660,27 @@ def _looks_like_sync_continuation(text: str) -> bool:
     return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё]|И(?:\s|$))", text.lstrip()))
 
 
+def _starts_with_unambiguous_timecode(text: str) -> bool:
+    """Recognize a bare timecode without mistaking a prose-leading date for one."""
+    stripped = text.lstrip()
+    parenthesized = re.match(rf"^\(\s*({_TIMECODE_TOKEN})\s*\)", stripped)
+    if parenthesized:
+        return True
+
+    match = _TIMECODE.match(stripped)
+    if not match:
+        return False
+    token = match.group(1)
+    inner = token.strip("[]")
+    if token.startswith("[") or ":" in inner or inner.count(".") >= 2 or "-" in inner:
+        return True
+
+    # Two-component dot notation (for example 23.05) is ambiguous with a date.
+    # Treat it as a timecode only when an explicit range removes that ambiguity.
+    remainder = stripped[match.end():]
+    return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", remainder))
+
+
 def _split_label(text: str) -> tuple[str, str]:
     # Generic labels are deliberately limited: prose containing an ordinary colon
     # should not accidentally become a learned marker.
@@ -756,7 +778,9 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
         and _TIMECODE.match(sync_content)
     ):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif _TIMECODE.match(stripped) or re.match(r"^\s*\((?:…|\.\.\.)\)", stripped):
+    elif _starts_with_unambiguous_timecode(stripped) or re.match(
+        r"^\s*\((?:…|\.\.\.)\)", stripped
+    ):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _EDITORIAL_TIMECODE_PREFIX.match(stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
@@ -1210,6 +1234,8 @@ def _validate_structure(scenario: NormalizedScenario) -> None:
             errors.append(f"Block {expected_order} has empty normalized text")
         if block.type not in VALID_BLOCK_TYPES:
             errors.append(f"Block {expected_order} has invalid type '{block.type}'")
+        if block.source not in VALID_DECISION_SOURCES:
+            errors.append(f"Block {expected_order} has invalid source '{block.source}'")
     if errors:
         raise NormalizationValidationError(errors)
 

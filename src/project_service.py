@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+from typing import Callable
+
+
+PROJECT_NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9_-]{1,64}$")
+
+
+def normalize_project_name(name: str) -> str:
+    project = (name or "").strip()
+    if not PROJECT_NAME_RE.fullmatch(project):
+        raise ValueError(
+            "project may contain 1-64 Latin/Cyrillic letters, digits, '_' or '-'"
+        )
+    return project
+
+
+def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
+    root = projects_dir / project
+    work = root / "work"
+    return {
+        "root": root,
+        "input": root / "input",
+        "work": work,
+        "speaker": root / "speaker",
+        "normalized": work / "scenario_normalized.json",
+        "prepared": work / "scenario_prepared.json",
+        "raw": work / "scenario_raw.txt",
+        "sync_sources": work / "sync_sources.json",
+        "sync_matches": work / "sync_matches.json",
+        "sync_job_status": work / "sync_job_status.json",
+        "normalization_job_status": work / "normalization_job_status.json",
+        "tts_job_status": work / "tts_job_status.json",
+        "sync_audio": work / "sync_audio",
+        "sync_transcripts": work / "transcripts",
+        "timeline": work / "full_timeline.json",
+    }
+
+
+def ensure_project(project: str, projects_dir: Path) -> dict[str, Path]:
+    paths = project_paths(project, projects_dir)
+    for key in ("input", "work", "speaker", "sync_audio", "sync_transcripts"):
+        paths[key].mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def list_projects(projects_dir: Path) -> list[str]:
+    if not projects_dir.exists():
+        return []
+    return sorted(
+        path.name
+        for path in projects_dir.iterdir()
+        if path.is_dir() and PROJECT_NAME_RE.fullmatch(path.name)
+    )
+
+
+def read_json_safe(
+    path: Path,
+    *,
+    on_error: Callable[[Path, Exception], None] | None = None,
+) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if on_error is not None:
+            on_error(path, exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def discover_input_files(input_dir: Path, root_dir: Path) -> list[str]:
+    if not input_dir.exists():
+        return []
+    return [
+        str(path.relative_to(root_dir))
+        for path in sorted(input_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in {".doc", ".docx", ".txt", ".md"}
+    ]
+
+
+def resolve_project_name(raw: str | None, projects_dir: Path) -> str:
+    if raw:
+        return normalize_project_name(raw)
+    projects = list_projects(projects_dir)
+    return projects[0] if projects else "default"
+
+
+def resolve_path(
+    value: str,
+    fallback: Path,
+    *,
+    root_dir: Path,
+    allowed_root: Path,
+) -> Path:
+    if not value:
+        return fallback
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root_dir / candidate
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(allowed_root):
+        raise ValueError(f"Path must be inside {allowed_root.name}/: {value}")
+    return resolved

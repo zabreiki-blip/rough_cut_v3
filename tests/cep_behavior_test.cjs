@@ -135,6 +135,112 @@ function testCyrillicProjectNames() {
   assert.strictEqual(valid("../demo"), false);
 }
 
+function testSequenceRoleGuards() {
+  const context = {
+    $: {_roughCutTestMode: true},
+    app: {project: {path: "/projects/current.prproj"}},
+    console, Date, JSON, Math, decodeURIComponent, encodeURIComponent, isFinite,
+    File: function File() {}, Folder: function Folder() {},
+    Time: function Time() { this.ticks = "0"; },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    fs.readFileSync(path.join(root, "cep", "host.jsx"), "utf8"),
+    context,
+    {filename: "host.jsx"},
+  );
+  const hooks = context.$._roughCutStage2Test;
+  function tracks(clips) {
+    const clipCollection = clips.slice();
+    clipCollection.numItems = clipCollection.length;
+    const collection = [{clips: clipCollection}];
+    collection.numTracks = 1;
+    return collection;
+  }
+  function markers(values) {
+    return {
+      getFirstMarker() { return values[0] || null; },
+      getNextMarker(marker) {
+        const index = values.indexOf(marker);
+        return index >= 0 ? values[index + 1] || null : null;
+      },
+    };
+  }
+  function sequence(overrides) {
+    return Object.assign({
+      sequenceID: "target-id",
+      name: "Target",
+      end: {seconds: 10},
+      zeroPoint: {seconds: 0},
+      projectItem: {nodeId: "node-1", treePath: "\\Project\\Target"},
+      markers: markers([]),
+      videoTracks: tracks([]),
+      audioTracks: tracks([]),
+      getSettings() { return {}; },
+    }, overrides || {});
+  }
+
+  const clean = hooks.sequenceRoughCutSignals(sequence());
+  assert.strictEqual(clean.inspectionComplete, true);
+  assert.strictEqual(clean.isRoughCutTarget, false);
+
+  const prepared = hooks.sequenceRoughCutSignals(sequence({
+    markers: {
+      getFirstMarker() { throw new Error("slow marker API must not be called"); },
+      getNextMarker() { throw new Error("slow marker API must not be called"); },
+    },
+    videoTracks: tracks([{name: "RC_BLOCK block-7 | Speaker", projectItem: {name: "placeholder.png"}}]),
+  }));
+  assert.strictEqual(prepared.rcBlockClips, 1);
+  assert.strictEqual(prepared.rcSyncMarkers, 0);
+  assert.strictEqual(prepared.isRoughCutTarget, true);
+
+  const conformed = hooks.sequenceRoughCutSignals(sequence({
+    markers: markers([{name: "RC_SYNC block-7"}]),
+  }));
+  assert.strictEqual(conformed.rcSyncMarkers, 1);
+  assert.strictEqual(conformed.isRoughCutTarget, true);
+
+  assert.throws(
+    () => hooks.assertSourceIsNotTarget(
+      {sequenceID: "same"},
+      {sequenceID: "same"},
+    ),
+    /conform.*саму себя запрещён/,
+  );
+
+  const target = sequence();
+  function guardList(value) {
+    const result = vm.runInContext("[]", context);
+    result.push(value);
+    return result;
+  }
+  assert.strictEqual(
+    hooks.registeredSourceMatch(target, guardList({
+      id: "source-1",
+      sequenceId: "target-id",
+      projectPath: "/different.prproj",
+    })).id,
+    "source-1",
+  );
+  assert.strictEqual(
+    hooks.registeredSourceMatch(target, guardList({
+      id: "node-collision",
+      projectItemNodeId: "node-1",
+      projectPath: "/different.prproj",
+    })),
+    null,
+  );
+  assert.strictEqual(
+    hooks.registeredSourceMatch(target, guardList({
+      id: "node-match",
+      projectItemNodeId: "node-1",
+      projectPath: "/projects/current.prproj",
+    })).id,
+    "node-match",
+  );
+}
+
 function testMarkerAwareConformResume() {
   const context = {
     $: {_roughCutTestMode: true},
@@ -247,6 +353,111 @@ function testMarkerAwareConformResume() {
   assert.strictEqual(verified.videoClip.nodeId, "video-node");
   assert.strictEqual(verified.audioClip.nodeId, "audio-node");
 
+  const repairItem = Object.assign({}, item, {
+    sourceInSeconds: 1009.82,
+    sourceOutSeconds: 1018.62,
+  });
+  const staleVideo = sourceClip("stale-video", {
+    start: {seconds: 12},
+    end: {seconds: 20.68},
+    inPoint: {seconds: 1009.8},
+    outPoint: {seconds: 1018.48},
+  });
+  const staleAudio = sourceClip("stale-audio", {
+    start: {seconds: 12},
+    end: {seconds: 20.68},
+    inPoint: {seconds: 1009.8},
+    outPoint: {seconds: 1018.48},
+  });
+  const stalePair = hooks.staleSourcePairForRepair(
+    staleVideo,
+    staleAudio,
+    sourceItem,
+    repairItem,
+  );
+  assert.strictEqual(stalePair.nodeId, "stale-video");
+  assert.strictEqual(stalePair.audioNodeId, "stale-audio");
+  assert.ok(Math.abs(stalePair.durationSeconds - 8.68) < 0.000001);
+  const markerConfirmedItem = Object.assign({}, repairItem, {
+    sourceInSeconds: 32.43,
+    sourceOutSeconds: 68.77,
+  });
+  const markerConfirmedVideo = sourceClip("marker-stale-video", {
+    inPoint: {seconds: 32.27},
+    outPoint: {seconds: 68.51},
+    end: {seconds: 48.24},
+  });
+  const markerConfirmedAudio = sourceClip("marker-stale-audio", {
+    inPoint: {seconds: 32.27},
+    outPoint: {seconds: 68.51},
+    end: {seconds: 48.24},
+  });
+  assert.strictEqual(hooks.staleSourcePairForRepair(
+    markerConfirmedVideo,
+    markerConfirmedAudio,
+    sourceItem,
+    markerConfirmedItem,
+    true,
+  ), null);
+  assert.strictEqual(hooks.staleSourcePairForRepair(
+    markerConfirmedVideo,
+    markerConfirmedAudio,
+    sourceItem,
+    markerConfirmedItem,
+    true,
+    0.5,
+    0.5,
+  ).nodeId, "marker-stale-video");
+  assert.strictEqual(hooks.staleSourcePairForRepair(
+    staleVideo,
+    sourceClip("misaligned-audio", {
+      start: {seconds: 12.2},
+      end: {seconds: 20.88},
+      inPoint: {seconds: 1009.8},
+      outPoint: {seconds: 1018.48},
+    }),
+    sourceItem,
+    repairItem,
+  ), null);
+  const globallyShiftedItem = Object.assign({}, repairItem, {
+    timelineSeconds: 22.308,
+  });
+  const globallyShiftedVideo = sourceClip("global-stale-video", {
+    start: {seconds: 22.2},
+    end: {seconds: 30.88},
+    inPoint: {seconds: 1009.8},
+    outPoint: {seconds: 1018.48},
+  });
+  const globallyShiftedAudio = sourceClip("global-stale-audio", {
+    start: {seconds: 22.2},
+    end: {seconds: 30.88},
+    inPoint: {seconds: 1009.8},
+    outPoint: {seconds: 1018.48},
+  });
+  const globalStalePair = hooks.uniqueStaleSourcePairAnywhere(
+    insertionTarget([globallyShiftedVideo], [globallyShiftedAudio]),
+    globallyShiftedItem,
+    sourceItem,
+  );
+  assert.strictEqual(globalStalePair.nodeId, "global-stale-video");
+  assert.strictEqual(globalStalePair.audioNodeId, "global-stale-audio");
+  assert.throws(
+    () => hooks.uniqueStaleSourcePairAnywhere(
+      insertionTarget(
+        [globallyShiftedVideo],
+        [globallyShiftedAudio, sourceClip("duplicate-stale-audio", {
+          start: {seconds: 22.2},
+          end: {seconds: 30.88},
+          inPoint: {seconds: 1009.8},
+          outPoint: {seconds: 1018.48},
+        })],
+      ),
+      globallyShiftedItem,
+      sourceItem,
+    ),
+    /More than one compatible stale V\/A source pair/,
+  );
+
   const driftVideo = sourceClip("drift-video", {
     start: {seconds: 21.5},
     end: {seconds: 27.225},
@@ -263,6 +474,13 @@ function testMarkerAwareConformResume() {
   );
   assert.strictEqual(driftVerified.videoClip.nodeId, "drift-video");
   assert.strictEqual(driftVerified.audioClip.nodeId, "drift-audio");
+  const recoveredAnywhere = hooks.uniqueSourcePairAnywhere(
+    insertionTarget([driftVideo], [driftAudio]),
+    item,
+    sourceItem,
+  );
+  assert.strictEqual(recoveredAnywhere.videoClip.nodeId, "drift-video");
+  assert.strictEqual(recoveredAnywhere.audioClip.nodeId, "drift-audio");
 
   assert.throws(
     () => hooks.verifyConformMarkerInsertion(
@@ -437,12 +655,22 @@ function testMarkerAwareConformResume() {
     /sequence duration does not match/,
   );
 
-  assert.throws(
-    () => hooks.conformMarkerState(
+  assert.strictEqual(
+    hooks.conformMarkerState(
       targetWith([marker({comments: marker().comments.replace("1028.400", "1028.401")})]),
       item,
+    ).status,
+    "stale_source",
+  );
+  assert.throws(
+    () => hooks.conformMarkerState(
+      targetWith([marker({comments: marker().comments.replace(
+        "Source: 100626_Васильева",
+        "Source: Другая секвенция",
+      )})]),
+      item,
     ),
-    /Source sequence\/range does not match/,
+    /Source sequence does not match/,
   );
   assert.throws(
     () => hooks.conformMarkerState(
@@ -676,6 +904,37 @@ function testWhisperPollingAndEta() {
   const element = (id) => context.document.getElementById(id);
   assert.strictEqual(hooks.etaFromProgress(100, 25, 100), 300);
   assert.strictEqual(hooks.formatDuration(3661), "1:01:01");
+  assert.match(
+    hooks.sourceRegistrationBlockReason({
+      roughCutGuard: {inspectionComplete: true, isRoughCutTarget: true},
+    }),
+    /RC_BLOCK\/RC_SYNC/,
+  );
+  assert.strictEqual(
+    hooks.sourceRegistrationBlockReason({
+      roughCutGuard: {inspectionComplete: true, isRoughCutTarget: false},
+    }),
+    "",
+  );
+  const targetIdentity = {
+    sequenceId: "target-sequence",
+    projectPath: "/projects/current.prproj",
+    projectItemNodeId: "shared-node",
+    projectItemTreePath: "\\Project\\Target",
+  };
+  assert.strictEqual(hooks.sourceIdentityMatchesSequence({
+    sequence_id: "target-sequence",
+    project_path: "/different.prproj",
+    metadata: {},
+  }, targetIdentity), true);
+  assert.strictEqual(hooks.sourceIdentityMatchesSequence({
+    project_path: "/different.prproj",
+    metadata: {project_item_node_id: "shared-node"},
+  }, targetIdentity), false);
+  assert.strictEqual(hooks.sourceIdentityMatchesSequence({
+    project_path: "/projects/current.prproj",
+    metadata: {project_item_node_id: "shared-node"},
+  }, targetIdentity), true);
 
   element("projectName").value = "RVK_ULINOVSK";
   element("apiBaseUrl").value = "http://127.0.0.1:8000";
@@ -768,5 +1027,6 @@ function testWhisperPollingAndEta() {
 
 testPlaceholderSelection();
 testCyrillicProjectNames();
+testSequenceRoleGuards();
 testMarkerAwareConformResume();
 testWhisperPollingAndEta();

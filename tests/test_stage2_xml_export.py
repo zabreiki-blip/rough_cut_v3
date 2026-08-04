@@ -70,3 +70,27 @@ def test_placeholder_xml_rejects_duplicate_block_uid() -> None:
 
     with pytest.raises(ValueError, match="duplicate placeholder block_uid"):
         build_xml(FullTimeline(project="BRIK", segments=segments))
+
+
+def test_valid_subframe_audio_segment_is_exported_as_one_frame() -> None:
+    timeline = FullTimeline(
+        project="BRIK",
+        fps=25,
+        segments=[
+            TimelineSegment(
+                id="zk1",
+                type="zk",
+                text="Короткий текст",
+                start_sec=0.001,
+                duration_sec=0.001,
+                wav_path="/tmp/zk1.wav",
+            )
+        ],
+    )
+
+    root = ET.fromstring(build_xml(timeline).split("\n", 2)[2])
+    clip = root.find("./sequence/media/audio/track/clipitem")
+
+    assert clip is not None
+    assert clip.findtext("duration") == "1"
+    assert clip.findtext("end") == str(int(clip.findtext("start")) + 1)

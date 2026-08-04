@@ -540,9 +540,10 @@
       "ID " + sequence.sequenceId +
       " · " + sequence.durationSeconds.toFixed(2) + " сек" +
       " · V" + sequence.videoTrackCount + "/A" + sequence.audioTrackCount;
-    byId("registerSequence").disabled = false;
+    byId("registerSequence").disabled = Boolean(sourceRegistrationBlockReason(sequence));
     byId("resolveSequence").disabled = false;
-    byId("exportAndTranscribe").disabled = whisperJobIsActive();
+    byId("exportAndTranscribe").disabled =
+      Boolean(sourceRegistrationBlockReason(sequence)) || whisperJobIsActive();
     if (!byId("sourceId").value.trim()) {
       sourceName = String(sequence.name || "");
       generatedId = /[^\x00-\x7F]/.test(sourceName) ? "" : sourceName
@@ -560,9 +561,55 @@
   }
 
   function setSourceActionsDisabled(disabled) {
-    byId("registerSequence").disabled = disabled;
+    var roleBlocked = Boolean(sourceRegistrationBlockReason(activeSource));
+    byId("registerSequence").disabled = disabled || roleBlocked;
     byId("resolveSequence").disabled = disabled;
-    byId("exportAndTranscribe").disabled = disabled || exportInProgress || whisperJobIsActive();
+    byId("exportAndTranscribe").disabled =
+      disabled || roleBlocked || exportInProgress || whisperJobIsActive();
+  }
+
+  function sourceRegistrationBlockReason(sequence) {
+    var guard = sequence && sequence.roughCutGuard;
+    if (!sequence) {
+      return "Сначала считайте активную секвенцию.";
+    }
+    if (!guard || !guard.inspectionComplete) {
+      return "Не удалось безопасно определить роль секвенции. Регистрация и расшифровка запрещены.";
+    }
+    if (guard.isRoughCutTarget) {
+      return "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя регистрировать или расшифровывать как sync-источник.";
+    }
+    return "";
+  }
+
+  function normalizedTreePath(value) {
+    return String(value || "").replace(/\\/g, "/");
+  }
+
+  function sourceIdentityMatchesSequence(source, sequence) {
+    var metadata = (source && source.metadata) || {};
+    return Boolean(
+      (source.sequence_id && sequence.sequenceId &&
+        String(source.sequence_id) === String(sequence.sequenceId)) ||
+      (metadata.project_item_node_id && sequence.projectItemNodeId &&
+        String(metadata.project_item_node_id) === String(sequence.projectItemNodeId) &&
+        source.project_path && sequence.projectPath &&
+        normalizedTreePath(source.project_path) === normalizedTreePath(sequence.projectPath)) ||
+      (metadata.project_item_tree_path && sequence.projectItemTreePath &&
+        normalizedTreePath(metadata.project_item_tree_path) ===
+          normalizedTreePath(sequence.projectItemTreePath))
+    );
+  }
+
+  function registeredSourceGuard(source) {
+    var metadata = source.metadata || {};
+    return {
+      id: source.id || source.source_id || "",
+      sequenceId: source.sequence_id || "",
+      projectPath: source.project_path || "",
+      projectItemNodeId: metadata.project_item_node_id || "",
+      projectItemTreePath: metadata.project_item_tree_path || ""
+    };
   }
 
   function absoluteGuidePath(source, current) {
@@ -655,7 +702,12 @@
         return;
       }
       renderSource(response.sequence);
-      log("Активная секвенция сохранена как источник.", response.sequence);
+      var blocked = sourceRegistrationBlockReason(response.sequence);
+      if (blocked) {
+        log(blocked, response.sequence);
+      } else {
+        log("Активная секвенция сохранена как источник.", response.sequence);
+      }
     });
   }
 
@@ -682,6 +734,12 @@
     if (!activeSource) {
       log("Сначала считайте активную секвенцию.");
       done(new Error("No active source."));
+      return;
+    }
+    var roleBlock = sourceRegistrationBlockReason(activeSource);
+    if (roleBlock) {
+      log("Регистрация не выполнена: " + roleBlock);
+      done(new Error(roleBlock));
       return;
     }
     if (!current.project) {
@@ -722,6 +780,10 @@
       guide_audio: guideAudioPath ? guideReference(guideAudioPath, current) : "",
       guide_offset_sec: 0,
       metadata: {
+        sequence_role: activeSource.roughCutGuard.isRoughCutTarget
+          ? "rough_cut_target"
+          : "sync_source",
+        rough_cut_target: Boolean(activeSource.roughCutGuard.isRoughCutTarget),
         guide_audio_absolute: guideAudioPath,
         project_item_node_id: activeSource.projectItemNodeId,
         project_item_tree_path: activeSource.projectItemTreePath,
@@ -884,6 +946,11 @@
       log("Сначала считайте активную sync-секвенцию.");
       return;
     }
+    var roleBlock = sourceRegistrationBlockReason(activeSource);
+    if (roleBlock) {
+      log("Экспорт и расшифровка не запущены: " + roleBlock);
+      return;
+    }
     if (!outputPath) {
       log("Укажите Guide WAV или настройте общий каталог projects, проект и Source ID.");
       return;
@@ -1002,12 +1069,43 @@
         return;
       }
       target = inspected.sequence;
-      if (activeSource && String(target.sequenceId) === String(activeSource.sequenceId)) {
-        log("Откройте отдельную монтажную секвенцию: источник нельзя применить к самому себе.");
+      request(
+        "GET",
+        "/stage2/sync-sources?project=" + encodeURIComponent(current.project),
+        null,
+        function (sourcesError, sourcesResponse) {
+      var registeredSources;
+      var sourceGuards;
+      var conflictingSource;
+      if (sourcesError) {
+        log("Conform не запущен: не удалось проверить зарегистрированные sync-источники: " + sourcesError.message);
         setConformBusy(false);
-        setConformStatus("error", "Откройте целевую монтажную секвенцию, а не секвенцию-источник.");
+        setConformStatus("error", "Не удалось безопасно проверить целевую секвенцию.");
         return;
       }
+      registeredSources = (sourcesResponse.result && sourcesResponse.result.sources) ||
+        sourcesResponse.sources;
+      if (!Array.isArray(registeredSources)) {
+        log("Conform не запущен: сервер не вернул список зарегистрированных sync-источников.");
+        setConformBusy(false);
+        setConformStatus("error", "Не удалось безопасно проверить целевую секвенцию.");
+        return;
+      }
+      conflictingSource = registeredSources.filter(function (source) {
+        return sourceIdentityMatchesSequence(source, target);
+      })[0] || null;
+      if (conflictingSource) {
+        log(
+          "Conform не запущен: активная секвенция зарегистрирована как sync-источник [" +
+          String(conflictingSource.id || conflictingSource.source_id ||
+            conflictingSource.sequence_id || "без ID") +
+          "]. Откройте отдельную монтажную секвенцию."
+        );
+        setConformBusy(false);
+        setConformStatus("error", "Нельзя применять СНХ в зарегистрированную секвенцию-источник.");
+        return;
+      }
+      sourceGuards = registeredSources.map(registeredSourceGuard);
       if (!window.confirm(
         "Применить найденные СНХ к секвенции «" + target.name + "»?\n\n" +
         (currentWhisperReviewCount > 0
@@ -1089,7 +1187,7 @@
       }
       setConformStatus("working", "Применяю СНХ: " + items.length + "…");
       log("Начинаю применение " + items.length + " СНХ. Активная секвенция будет изменена…");
-      callHost("conform", {
+      var conformPayload = {
         items: items,
         videoTrackIndex: CONFORM_VIDEO_TRACK_INDEX,
         audioTrackIndex: CONFORM_AUDIO_TRACK_INDEX,
@@ -1097,12 +1195,37 @@
         expectedTargetSequenceName: target.name,
         expectedProjectPath: target.projectPath,
         expectedTimelineDuration: Number(timeline.total_duration_sec),
-        enableExplicitTrackShiftBatch: true
-      }, function (hostError, hostResponse) {
+        registeredSourceGuards: sourceGuards,
+        enableExplicitTrackShiftBatch: true,
+        repairStaleInsertions: false
+      };
+      function submitConform() {
+        callHost("conform", conformPayload, function (hostError, hostResponse) {
         var report;
         var insertedCount;
         var existingCount;
         if (hostError) {
+          if (hostError.message.indexOf("RC_STALE_INSERTION_CONFIRM_REQUIRED: ") === 0 &&
+              !conformPayload.repairStaleInsertions) {
+            var repairDetails = hostError.message.replace(
+              "RC_STALE_INSERTION_CONFIRM_REQUIRED: ",
+              ""
+            );
+            if (window.confirm(
+              "В монтажной секвенции найдена старая вставка без актуального RC_SYNC-маркера:\n\n" +
+              repairDetails +
+              "\n\nЗаменить старую V/A-пару новым диапазоном и сдвинуть последующие клипы на разницу длительности?"
+            )) {
+              conformPayload.repairStaleInsertions = true;
+              setConformStatus("working", "Заменяю устаревшие вставки и применяю СНХ…");
+              log("Подтверждена замена устаревшей V/A-вставки: " + repairDetails);
+              submitConform();
+            } else {
+              setConformBusy(false);
+              setConformStatus("idle", "Замена устаревшей вставки отменена. Секвенция не изменена.");
+            }
+            return;
+          }
           var changedTimeline = /^Inserted\s+/i.test(hostError.message);
           log(
             (changedTimeline
@@ -1139,6 +1262,9 @@
           report
         );
       });
+      }
+      submitConform();
+    });
     });
     });
   }
@@ -1198,7 +1324,10 @@
       refreshWhisperStatus: refreshWhisperStatus,
       refreshWhisperStatusManually: refreshWhisperStatusManually,
       loadFreshTimeline: loadFreshTimeline,
-      renderWhisperJob: renderWhisperJob
+      renderWhisperJob: renderWhisperJob,
+      sourceRegistrationBlockReason: sourceRegistrationBlockReason,
+      sourceIdentityMatchesSequence: sourceIdentityMatchesSequence,
+      registeredSourceGuard: registeredSourceGuard
     };
   }
 

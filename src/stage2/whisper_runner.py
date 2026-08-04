@@ -9,6 +9,8 @@ import platform
 import threading
 from typing import Any, Callable
 
+from env_utils import env_int_strict
+
 
 class WhisperUnavailableError(RuntimeError):
     """Raised when none of the supported local Whisper backends is installed."""
@@ -25,20 +27,7 @@ ProgressCallback = Callable[[float, float, int], None]
 
 
 def _env_int(name: str, default: int, *, minimum: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None or not raw_value.strip():
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise ValueError(
-            f"{name} must be an integer greater than or equal to {minimum}"
-        ) from exc
-    if value < minimum:
-        raise ValueError(
-            f"{name} must be an integer greater than or equal to {minimum}"
-        )
-    return value
+    return env_int_strict(name, default, minimum=minimum)
 
 
 def _emit_progress(
@@ -195,13 +184,29 @@ def _transcribe_faster(
     )
 
     device = os.getenv("SYNC_WHISPER_DEVICE", "auto").strip() or "auto"
-    compute_type = os.getenv("SYNC_WHISPER_COMPUTE_TYPE", "default").strip() or "default"
-    beam_size = _env_int("SYNC_WHISPER_BEAM_SIZE", 5, minimum=1)
+    default_compute_type = "int8" if device.lower() == "cpu" else "default"
+    compute_type = (
+        os.getenv("SYNC_WHISPER_COMPUTE_TYPE", default_compute_type).strip()
+        or default_compute_type
+    )
+    default_beam_size = 1 if device.lower() == "cpu" else 5
+    beam_size = _env_int(
+        "SYNC_WHISPER_BEAM_SIZE",
+        default_beam_size,
+        minimum=1,
+    )
     best_of = _env_int("SYNC_WHISPER_BEST_OF", 5, minimum=1)
     batch_size = _env_int("SYNC_WHISPER_BATCH_SIZE", 0, minimum=0)
+    cpu_threads = _env_int("SYNC_WHISPER_CPU_THREADS", 0, minimum=0)
+    model_kwargs: dict[str, Any] = {
+        "device": device,
+        "compute_type": compute_type,
+    }
+    if cpu_threads > 0:
+        model_kwargs["cpu_threads"] = cpu_threads
     whisper_model, model_lock = _cached_model(
-        ("faster-whisper", model, device, compute_type),
-        lambda: WhisperModel(model, device=device, compute_type=compute_type),
+        ("faster-whisper", model, device, compute_type, str(cpu_threads)),
+        lambda: WhisperModel(model, **model_kwargs),
     )
     # Backend model instances are not guaranteed to be thread-safe.
     raw_words: list[dict[str, Any]] = []
@@ -248,6 +253,7 @@ def _transcribe_faster(
         "beam_size": beam_size,
         "best_of": best_of,
         "batch_size": batch_size,
+        "cpu_threads": cpu_threads,
         "batched": batch_size > 0,
     }
 
@@ -324,7 +330,7 @@ def transcribe_audio(
         "model": selected_model,
         "language": language,
         "created_at": datetime.now(UTC).isoformat(),
-        "duration_sec": words[-1]["end"],
+        "duration_sec": completed_duration,
         "word_count": len(words),
         "words": words,
         "backend_metadata": backend_meta,

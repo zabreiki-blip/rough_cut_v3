@@ -56,6 +56,64 @@ class ZkIdContractTest(unittest.TestCase):
             self.assertGreater(zk_segs[0].duration_sec, 0, "WAV must be found via canonical ID")
 
 
+class SnhSyntaxContractTest(unittest.TestCase):
+    def test_all_snh_branches_share_segment_and_continuation_contract(self) -> None:
+        cases = [
+            (
+                "prefixed",
+                "СНХ ИВАН ИВАНОВ, эксперт, 00:01:02 Первая строка.\n",
+                "ИВАН ИВАНОВ",
+                "эксперт",
+                "00:01:02",
+            ),
+            (
+                "classic",
+                "ПЕТР ПЕТРОВ, редактор: 00:02:03 Первая строка.\n",
+                "ПЕТР ПЕТРОВ",
+                "редактор",
+                "00:02:03",
+            ),
+            (
+                "flex",
+                "АННА СИДОРОВА (ведущая) 03:04 Первая строка.\n",
+                "АННА СИДОРОВА",
+                "ведущая",
+                "03:04",
+            ),
+            (
+                "name-only",
+                "ОЛЕГ СМИРНОВ (оператор)\n04.05 Первая строка.\n",
+                "ОЛЕГ СМИРНОВ",
+                "оператор",
+                "04.05",
+            ),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for branch, prefix, speaker, role, timecode in cases:
+                with self.subTest(branch=branch):
+                    timeline = parse_timeline(
+                        prefix + "Вторая строка.\nЗК1: Следующий сегмент.\n",
+                        base,
+                        base,
+                        "TEST",
+                    )
+
+                    self.assertEqual([item.type for item in timeline.segments], ["snh", "zk"])
+                    segment = timeline.segments[0]
+                    self.assertEqual(segment.id, "snh1")
+                    self.assertEqual(segment.text, "Первая строка. Вторая строка.")
+                    self.assertEqual(segment.speaker, speaker)
+                    self.assertEqual(segment.role, role)
+                    self.assertEqual(segment.timecode, timecode)
+                    self.assertEqual(segment.duration_sec, 10.0)
+                    self.assertEqual(
+                        segment.placeholder_path,
+                        str(base / "snh1_placeholder.png"),
+                    )
+
+
 class NormalizedTimelineTest(unittest.TestCase):
     def test_confirmed_blocks_build_without_regex_reparse(self) -> None:
         with TemporaryDirectory() as tmp:

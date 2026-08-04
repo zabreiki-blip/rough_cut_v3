@@ -86,6 +86,24 @@ def test_batch_conform_requires_inspected_target_guards() -> None:
     assert "expectedProjectPath: target.projectPath" in PANEL
 
 
+def test_sequence_roles_block_self_transcription_and_conform_into_sources() -> None:
+    assert "function sequenceRoughCutSignals(sequence)" in HOST
+    assert 'label.indexOf("RC_BLOCK ") === 0' in HOST
+    assert 'asString(marker.name).indexOf("RC_SYNC ") === 0' in HOST
+    assert "roughCutGuard: sequenceRoughCutSignals(sequence)" in HOST
+    assert "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя экспортировать" in HOST
+    assert "sourceRegistrationBlockReason(activeSource)" in PANEL
+    assert 'sequence_role: activeSource.roughCutGuard.isRoughCutTarget' in PANEL
+    assert "function sourceIdentityMatchesSequence(source, sequence)" in PANEL
+    assert '"/stage2/sync-sources?project="' in PANEL
+    assert "registeredSourceGuards: sourceGuards" in PANEL
+    assert "registeredSourceMatch(" in HOST
+    assert "assertSourceIsNotTarget(target, source);" in HOST
+    assert HOST.index("assertSourceIsNotTarget(target, source);") < HOST.index(
+        "markerState = conformMarkerState(target, item);"
+    )
+
+
 def test_source_switch_clears_identity_and_export_poll_retries() -> None:
     assert 'byId("sourceId").value = "";' in PANEL
     assert 'byId("speakerName").value = "";' in PANEL
@@ -117,7 +135,7 @@ def test_batch_conform_preserves_editorial_context_as_sequence_markers() -> None
 def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> None:
     assert "function conformMarkerState(target, item)" in HOST
     assert "Expected exactly one marker [" in HOST
-    assert "Source sequence/range does not match" in HOST
+    assert 'status: sourceMatches ? "valid" : "stale_source"' in HOST
     assert "item text does not match" in HOST
     assert "Sequence marker scan did not advance" in HOST
     assert "Sequence marker scan exceeded " in HOST
@@ -134,8 +152,17 @@ def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> 
     )
     assert marker_check < placeholder_lookup
     assert "recoveredMissingMarker: true" in HOST
+    assert 'markerState.status === "absent"' in HOST
+    assert "recoveredAnywhere = uniqueSourcePairAnywhere(" in HOST
+    assert "recoveredAwayFromExpectedPosition: true" in HOST
     assert "both verified video and audio are required" in HOST
-    assert "its source range is not exact" in HOST
+    assert "RC_STALE_INSERTION_CONFIRM_REQUIRED" in HOST
+    assert "repairStaleInsertions" in PANEL
+    assert "staleSourcePairForRepair(" in HOST
+    assert "uniqueStaleSourcePairAnywhere(" in HOST
+    assert "More than one compatible stale V/A source pair exists" in HOST
+    assert 'markerState.status === "stale_source"' in HOST
+    assert "markerState.timelineSeconds" in HOST
     assert "Premiere did not persist the exact completion marker" in HOST
     assert "Object identity is therefore not a" in HOST
     assert "asString(persistedMarker.name)" in HOST

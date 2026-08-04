@@ -377,6 +377,44 @@ def test_latest_sync_job_status_survives_in_memory_registry_reset(sync_api) -> N
     assert client.get(f"/stage2/sync-jobs/{created['id']}").status_code == 404
 
 
+def test_trim_sync_jobs_keeps_active_and_expires_terminal(sync_api) -> None:
+    _client, _projects = sync_api
+    old = "2020-01-01T00:00:00+00:00"
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_JOBS.update({
+            "queued": {"status": "queued", "created_at": old},
+            "running": {"status": "running", "created_at": old},
+            "done": {
+                "status": "completed",
+                "created_at": old,
+                "finished_at": old,
+            },
+        })
+        api._SYNC_CANCEL_EVENTS["done"] = api.threading.Event()
+        api._trim_sync_jobs_locked()
+
+    assert "queued" in api._SYNC_JOBS
+    assert "running" in api._SYNC_JOBS
+    assert "done" not in api._SYNC_JOBS
+    assert "done" not in api._SYNC_CANCEL_EVENTS
+
+
+def test_non_durable_sync_update_changes_memory_without_fsync(sync_api) -> None:
+    _client, _projects = sync_api
+    created = api._create_sync_job("demo")
+    with patch.object(api, "_persist_sync_job") as persist:
+        updated = api._update_sync_job(
+            created["id"],
+            persist=False,
+            done=3,
+        )
+
+    assert updated is not None
+    assert updated["done"] == 3
+    assert api._get_sync_job(created["id"])["done"] == 3
+    persist.assert_not_called()
+
+
 def test_terminal_job_status_uses_live_match_summary_after_browser_review(
     sync_api,
 ) -> None:
@@ -744,6 +782,34 @@ def test_words_ingestion_match_patch_build_and_timeline(sync_api) -> None:
     changed["revision"] = 8
     normalization_path.write_text(json.dumps(changed), encoding="utf-8")
     assert client.get("/stage2/timeline?project=demo").status_code == 409
+
+
+def test_build_writes_timeline_atomically_and_export_handles_corrupt_json(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    written_paths: list[Path] = []
+    original_atomic_write = api._atomic_write_json_file
+
+    def track_atomic_write(path: Path, payload: dict) -> None:
+        written_paths.append(path)
+        original_atomic_write(path, payload)
+
+    with (
+        patch.object(api, "generate_placeholder", return_value=None),
+        patch.object(api, "_atomic_write_json_file", side_effect=track_atomic_write),
+    ):
+        built = client.post("/stage2/build", json={"project": "demo"})
+
+    assert built.status_code == 200, built.get_json()
+    timeline_path = projects / "demo" / "work" / "full_timeline.json"
+    assert timeline_path in written_paths
+
+    timeline_path.write_text("{not valid json", encoding="utf-8")
+    exported = client.get("/stage2/export/xml?project=demo")
+    assert exported.status_code == 500
+    assert "invalid full_timeline.json" in exported.get_json()["error"]
 
 
 def test_background_match_never_overwrites_concurrent_confirmation(sync_api) -> None:
@@ -1385,7 +1451,7 @@ def test_failed_config_refresh_uses_same_audio_index_as_fallback(sync_api) -> No
     assert first.status_code == 200
 
     with (
-        patch.dict(api.os.environ, {"SYNC_WHISPER_BEAM_SIZE": "1"}),
+        patch.dict(api.os.environ, {"SYNC_WHISPER_BEAM_SIZE": "2"}),
         patch.object(
             api, "transcribe_audio", side_effect=RuntimeError("temporary failure")
         ),

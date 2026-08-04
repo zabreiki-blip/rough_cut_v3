@@ -143,11 +143,13 @@ def build_xml(timeline: FullTimeline) -> str:
         if seg.type == "tech":
             continue
 
-        start_f = _frames(seg.start_sec, fps)
-        end_f = _frames(seg.end_sec, fps)
-        dur_f = end_f - start_f
-        if dur_f <= 0:
+        if seg.end_sec <= seg.start_sec:
             continue
+        start_f = _frames(seg.start_sec, fps)
+        # Independently rounded boundaries can collapse a valid sub-frame clip.
+        # Preserve it as the smallest duration representable by FCP XML.
+        end_f = max(_frames(seg.end_sec, fps), start_f + 1)
+        dur_f = end_f - start_f
 
         if seg.type == "zk" and seg.wav_path:
             ci = ET.SubElement(atrack, "clipitem")

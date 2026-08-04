@@ -98,7 +98,7 @@ scripts/install-cep-macos
 ```text
 POST /stage2/sync-sources
 GET  /stage2/sync-sources?project=<name>
-GET  /stage2/sync-matches?project=<name>
+POST /stage2/sync-jobs/start
 ```
 
 UI использует `GET` для восстановления существующей регистрации и `POST` для
@@ -109,6 +109,12 @@ UI использует `GET` для восстановления существ
 изменения кода. Backend повторно использует индекс, только если не изменились
 аудиофайл и конфигурация распознавания; matcher использует все уже готовые
 индексы проекта.
+
+Разделение интерфейсов осознанное: браузерный UI владеет просмотром и
+подтверждением `GET|PATCH /stage2/sync-matches`, сборкой timeline и ссылкой на
+`GET /stage2/export/xml`. CEP-панель регистрирует/экспортирует активную
+Premiere sequence, запускает sync job и применяет уже подтверждённые диапазоны
+в Premiere. Поэтому панель не вызывает confirm или XML-export endpoints.
 
 Пример payload регистрации:
 

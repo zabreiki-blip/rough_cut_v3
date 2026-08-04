@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+from logging_config import configure_logging
+
 from .analyzer import analyze_script
 from .gemini_tts import synthesize_phrase, synthesize_tts
 from .normalizer import (
@@ -156,6 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_logging()
     parser = _build_parser()
     args = parser.parse_args(argv)
 

@@ -65,7 +65,10 @@ def test_process_is_reused_for_matching_configuration() -> None:
     def fake_transcribe(path, **_kwargs):
         return {"path": path, "worker_pid": os.getpid()}
 
-    with patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe):
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {}, clear=True),
+    ):
         first = transcribe_audio_in_process(
             "first.wav", timeout_seconds=2.0, _start_method="fork"
         )
@@ -82,12 +85,15 @@ def test_process_restarts_when_inference_configuration_changes() -> None:
     def fake_transcribe(_path, **_kwargs):
         return {"worker_pid": os.getpid()}
 
-    with patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe):
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {}, clear=True),
+    ):
         first = transcribe_audio_in_process(
             "first.wav", timeout_seconds=2.0, _start_method="fork"
         )
         with patch.dict(
-            "os.environ", {"SYNC_WHISPER_BEAM_SIZE": "1"}, clear=False
+            "os.environ", {"SYNC_WHISPER_CPU_THREADS": "8"}, clear=False
         ):
             second = transcribe_audio_in_process(
                 "second.wav", timeout_seconds=2.0, _start_method="fork"

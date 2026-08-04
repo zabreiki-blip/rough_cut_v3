@@ -11,7 +11,9 @@ from typing import Any, Iterator
 from .normalization_models import VALID_BLOCK_TYPES
 
 
-DEFAULT_MEMORY_PATH = Path("data/normalization_memory.sqlite3")
+DEFAULT_MEMORY_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "normalization_memory.sqlite3"
+)
 
 
 def normalize_marker(marker: str) -> str:

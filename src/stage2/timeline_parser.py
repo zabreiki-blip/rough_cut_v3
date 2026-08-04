@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 # \b after ЗАКАДР prevents false match on ЗАКАДРОВЫЙ.
 # Suffix group consumes decimal and letter variants (ЗК4.1, ЗК38А) so they don't bleed into text.
 _ZK_RE = re.compile(
-    r"^\s*(?:ЗАКАДР\b|ЗК)(\d*(?:\.\d+)?[А-ЯЁA-Za-z]?)\s*[:\-–]?\s*(.*)",
+    r"^\s*(?:ЗАКАДР\b|ЗК)(\d*(?:\.\d+)?[А-ЯЁA-Za-z]?)"
+    r"(?=\s|[:\-–]|$)\s*[:\-–]?\s*(.*)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -103,6 +104,44 @@ def _is_new_segment(line: str) -> bool:
     )
 
 
+def _collect_snh_continuation(
+    lines: list[str],
+    start_index: int,
+    text: str,
+) -> tuple[str, int]:
+    """Join continuation lines until a blank line or the next segment marker."""
+    i = start_index
+    while i < len(lines):
+        nxt = lines[i].strip()
+        if not nxt or _is_new_segment(nxt):
+            break
+        text = (text + " " + nxt).strip()
+        i += 1
+    return text, i
+
+
+def _append_snh_segment(
+    segments: list[TimelineSegment],
+    placeholder_dir: Path,
+    seg_id: str,
+    *,
+    speaker: str,
+    role: str,
+    timecode: str,
+    text: str,
+) -> None:
+    segments.append(TimelineSegment(
+        id=seg_id,
+        type="snh",
+        text=text,
+        duration_sec=SNH_PLACEHOLDER_DURATION,
+        speaker=speaker,
+        role=role,
+        timecode=timecode,
+        placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+    ))
+
+
 def parse_timeline(
     raw_text: str,
     speaker_dir: Path,
@@ -159,19 +198,16 @@ def parse_timeline(
             role = m_prefixed.group(2).strip()
             timecode = m_prefixed.group(3).strip()
             text = _strip_extra_timecodes(m_prefixed.group(4).strip())
-            while i < len(lines):
-                nxt = lines[i].strip()
-                if not nxt or _is_new_segment(nxt):
-                    break
-                text = (text + " " + nxt).strip()
-                i += 1
-            ph_path = placeholder_dir / f"{seg_id}_placeholder.png"
-            segments.append(TimelineSegment(
-                id=seg_id, type="snh", text=text,
-                duration_sec=SNH_PLACEHOLDER_DURATION,
-                speaker=speaker, role=role, timecode=timecode,
-                placeholder_path=str(ph_path),
-            ))
+            text, i = _collect_snh_continuation(lines, i, text)
+            _append_snh_segment(
+                segments,
+                placeholder_dir,
+                seg_id,
+                speaker=speaker,
+                role=role,
+                timecode=timecode,
+                text=text,
+            )
             continue
 
         # ── SNH ─────────────────────────────────────────────
@@ -183,19 +219,16 @@ def parse_timeline(
             role = m_snh.group(2).strip()
             timecode = m_snh.group(3).strip()
             text = _strip_extra_timecodes(m_snh.group(4).strip())
-            while i < len(lines):
-                nxt = lines[i].strip()
-                if not nxt or _is_new_segment(nxt):
-                    break
-                text = (text + " " + nxt).strip()
-                i += 1
-            ph_path = placeholder_dir / f"{seg_id}_placeholder.png"
-            segments.append(TimelineSegment(
-                id=seg_id, type="snh", text=text,
-                duration_sec=SNH_PLACEHOLDER_DURATION,
-                speaker=speaker, role=role, timecode=timecode,
-                placeholder_path=str(ph_path),
-            ))
+            text, i = _collect_snh_continuation(lines, i, text)
+            _append_snh_segment(
+                segments,
+                placeholder_dir,
+                seg_id,
+                speaker=speaker,
+                role=role,
+                timecode=timecode,
+                text=text,
+            )
             continue
 
         # ── SNH FLEX: "NAME[(ROLE)] TIMECODE text" ───────────
@@ -207,19 +240,16 @@ def parse_timeline(
             role = (m_flex.group(2) or "СНХ").strip()
             timecode = m_flex.group(3).strip()
             text = _strip_extra_timecodes(m_flex.group(4).strip())
-            while i < len(lines):
-                nxt = lines[i].strip()
-                if not nxt or _is_new_segment(nxt):
-                    break
-                text = (text + " " + nxt).strip()
-                i += 1
-            ph_path = placeholder_dir / f"{seg_id}_placeholder.png"
-            segments.append(TimelineSegment(
-                id=seg_id, type="snh", text=text,
-                duration_sec=SNH_PLACEHOLDER_DURATION,
-                speaker=speaker, role=role, timecode=timecode,
-                placeholder_path=str(ph_path),
-            ))
+            text, i = _collect_snh_continuation(lines, i, text)
+            _append_snh_segment(
+                segments,
+                placeholder_dir,
+                seg_id,
+                speaker=speaker,
+                role=role,
+                timecode=timecode,
+                text=text,
+            )
             continue
 
         # ── SNH NAME ONLY: name on line, timecode on next line ─
@@ -240,19 +270,16 @@ def parse_timeline(
                     role = (m_name.group(2) or "СНХ").strip()
                     timecode = m_tc.group(1).strip()
                     text = _strip_extra_timecodes(m_tc.group(2).strip())
-                    while i < len(lines):
-                        nxt = lines[i].strip()
-                        if not nxt or _is_new_segment(nxt):
-                            break
-                        text = (text + " " + nxt).strip()
-                        i += 1
-                    ph_path = placeholder_dir / f"{seg_id}_placeholder.png"
-                    segments.append(TimelineSegment(
-                        id=seg_id, type="snh", text=text,
-                        duration_sec=SNH_PLACEHOLDER_DURATION,
-                        speaker=speaker, role=role, timecode=timecode,
-                        placeholder_path=str(ph_path),
-                    ))
+                    text, i = _collect_snh_continuation(lines, i, text)
+                    _append_snh_segment(
+                        segments,
+                        placeholder_dir,
+                        seg_id,
+                        speaker=speaker,
+                        role=role,
+                        timecode=timecode,
+                        text=text,
+                    )
                     continue
 
         # ── TECH ─────────────────────────────────────────────

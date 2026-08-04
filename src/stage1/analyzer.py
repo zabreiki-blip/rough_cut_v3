@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import os
 import re
 from typing import Iterable
 
@@ -692,14 +694,24 @@ def analyze_script(
                 if not chunks:
                     chunks = [scenario_text]
 
-                for idx, chunk in enumerate(chunks, start=1):
-                    try:
-                        chunk_blocks = analyze_with_openrouter(settings, chunk)
-                        llm_blocks.extend(chunk_blocks)
-                        llm_success_chunks += 1
-                    except Exception as exc:
-                        llm_errors.append(f"chunk {idx}: {type(exc).__name__}: {exc}")
-                        llm_blocks.extend(_fallback_blocks(chunk))
+                try:
+                    configured_workers = int(os.getenv("ANALYZER_LLM_WORKERS", "4"))
+                except ValueError:
+                    configured_workers = 4
+                max_workers = max(1, min(4, configured_workers))
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as pool:
+                    futures = [
+                        pool.submit(analyze_with_openrouter, settings, chunk)
+                        for chunk in chunks
+                    ]
+                    # Consume in source order so output and error reporting stay stable.
+                    for idx, (chunk, future) in enumerate(zip(chunks, futures), start=1):
+                        try:
+                            llm_blocks.extend(future.result())
+                            llm_success_chunks += 1
+                        except Exception as exc:
+                            llm_errors.append(f"chunk {idx}: {type(exc).__name__}: {exc}")
+                            llm_blocks.extend(_fallback_blocks(chunk))
 
                 blocks = llm_blocks if llm_blocks else _fallback_blocks(scenario_text)
                 used_llm = llm_success_chunks > 0

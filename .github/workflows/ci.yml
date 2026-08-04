@@ -27,7 +27,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Python tests
-        run: python -m pytest -q
+        run: python -m pytest -q --cov=src --cov-report=term-missing --cov-report=xml
 
       - name: Python compile check
         run: python -m compileall -q src tests

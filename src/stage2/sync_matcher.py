@@ -36,6 +36,24 @@ _STOPWORDS = {
     "и", "из", "или", "к", "как", "ли", "на", "не", "но", "ну", "о", "об",
     "от", "по", "под", "при", "с", "со", "то", "у", "что", "это", "я",
 }
+_MAX_CANDIDATE_STARTS = 240
+_MAX_LOCAL_CANDIDATE_STARTS = 120
+
+# Candidate-start heuristics. Exact anchors receive a small positional drift to
+# tolerate inserted/missing Whisper words; fuzzy anchors use a stricter drift
+# and may consume at most three quarters of the fixed search budget so that
+# uniform transcript coverage is always retained.
+_EXACT_ANCHOR_LIMIT = 12
+_EXACT_ANCHOR_MAX_DRIFT = 2
+_FUZZY_ANCHOR_MAX_DRIFT = 1
+_FUZZY_MIN_TRIGRAM_SIMILARITY = 0.55
+_FUZZY_BUDGET_NUMERATOR = 3
+_FUZZY_BUDGET_DENOMINATOR = 4
+_FUZZY_DRIFT_PENALTY = 0.05
+
+# Candidate spans covering at least this share of the shorter span are treated
+# as variants of one occurrence rather than distinct alternatives.
+_DUPLICATE_MIN_OVERLAP_RATIO = 0.65
 
 
 def normalize_token(token: str) -> str:
@@ -195,15 +213,18 @@ def _score(query: list[str], candidate: list[str]) -> float:
     return min(1.0, 0.38 * ratio + 0.34 * ordered_coverage + 0.20 * content_coverage + 0.08 * char_ratio)
 
 
-def _candidate_starts(
-    query: list[str],
-    tokens: list[_Token],
-    *,
-    max_starts: int = 240,
-) -> list[int]:
+def _token_positions(tokens: list[_Token]) -> dict[str, list[int]]:
     positions: dict[str, list[int]] = {}
     for index, token in enumerate(tokens):
         positions.setdefault(token.normalized, []).append(index)
+    return positions
+
+
+def _exact_anchor_scores(
+    query: list[str],
+    positions: dict[str, list[int]],
+    eligible_starts: set[int],
+) -> dict[int, int]:
     anchors: list[tuple[int, int, str]] = []
     seen_tokens: set[str] = set()
     for query_index, token in enumerate(query):
@@ -215,24 +236,135 @@ def _candidate_starts(
             seen_tokens.add(token)
 
     # Rare exact anchors are much more informative than common words. Limiting
-    # them keeps long scenario paragraphs from producing hundreds of thousands
-    # of expensive SequenceMatcher calls.
+    # them bounds the number of expensive SequenceMatcher calls for long text.
     anchors.sort(key=lambda item: (item[0], -len(item[2]), item[1]))
-    start_scores: dict[int, int] = {0: 0}
-    for occurrence_count, query_index, token in anchors[:12]:
+    start_scores: dict[int, int] = {}
+    for occurrence_count, query_index, token in anchors[:_EXACT_ANCHOR_LIMIT]:
         rarity_weight = max(1, 8 - min(7, occurrence_count))
         for position in positions[token]:
             estimate = position - query_index
-            for drift in (-2, -1, 0, 1, 2):
+            for drift in range(
+                -_EXACT_ANCHOR_MAX_DRIFT,
+                _EXACT_ANCHOR_MAX_DRIFT + 1,
+            ):
                 start = max(0, estimate + drift)
-                start_scores[start] = start_scores.get(start, 0) + (
-                    rarity_weight * (3 - abs(drift))
+                if start not in eligible_starts:
+                    continue
+                proximity_weight = _EXACT_ANCHOR_MAX_DRIFT + 1 - abs(drift)
+                start_scores[start] = (
+                    start_scores.get(start, 0) + rarity_weight * proximity_weight
                 )
-    # When Whisper shares no exact token with the script, still sample all
-    # plausible starts; this enables partial character-level matches.
-    if len(start_scores) == 1:
-        for start in range(0, len(tokens), max(1, len(query) // 3)):
-            start_scores[start] = 1
+    return start_scores
+
+
+def _token_trigrams(token: str) -> set[str]:
+    return {token[index : index + 3] for index in range(len(token) - 2)}
+
+
+def _fuzzy_anchor_scores(
+    query: list[str],
+    tokens: list[_Token],
+    eligible_starts: set[int],
+) -> dict[int, float]:
+    query_ngrams = [
+        _token_trigrams(token)
+        if token not in _STOPWORDS and len(token) >= 4
+        else set()
+        for token in query
+    ]
+    query_positions_by_ngram: dict[str, list[int]] = {}
+    for query_index, grams in enumerate(query_ngrams):
+        for gram in grams:
+            query_positions_by_ngram.setdefault(gram, []).append(query_index)
+
+    fuzzy_scores: dict[int, float] = {}
+    for position, item in enumerate(tokens):
+        if position not in eligible_starts or len(item.normalized) < 4:
+            continue
+        token_ngrams = _token_trigrams(item.normalized)
+        overlap_counts: dict[int, int] = {}
+        for gram in token_ngrams:
+            for query_index in query_positions_by_ngram.get(gram, ()):
+                overlap_counts[query_index] = overlap_counts.get(query_index, 0) + 1
+        for query_index, overlap_count in overlap_counts.items():
+            grams = query_ngrams[query_index]
+            similarity = 2 * overlap_count / (len(grams) + len(token_ngrams))
+            if similarity < _FUZZY_MIN_TRIGRAM_SIMILARITY:
+                continue
+            estimate = position - query_index
+            for drift in range(
+                -_FUZZY_ANCHOR_MAX_DRIFT,
+                _FUZZY_ANCHOR_MAX_DRIFT + 1,
+            ):
+                start = max(0, estimate + drift)
+                if start in eligible_starts:
+                    fuzzy_scores[start] = max(
+                        fuzzy_scores.get(start, 0.0),
+                        similarity - _FUZZY_DRIFT_PENALTY * abs(drift),
+                    )
+    return fuzzy_scores
+
+
+def _uniform_sample(values: list[int], sample_count: int) -> list[int]:
+    if len(values) <= sample_count:
+        return values
+    if sample_count == 1:
+        return [values[len(values) // 2]]
+    if sample_count <= 0:
+        return []
+    indexes = {
+        round(sample * (len(values) - 1) / (sample_count - 1))
+        for sample in range(sample_count)
+    }
+    return [values[index] for index in sorted(indexes)]
+
+
+def _candidate_starts(
+    query: list[str],
+    tokens: list[_Token],
+    *,
+    max_starts: int = _MAX_CANDIDATE_STARTS,
+    eligible_starts: Iterable[int] | None = None,
+) -> list[int]:
+    if max_starts <= 0:
+        return []
+    eligible = (
+        list(range(len(tokens)))
+        if eligible_starts is None
+        else sorted({start for start in eligible_starts if 0 <= start < len(tokens)})
+    )
+    if not eligible:
+        return []
+    eligible_set = set(eligible)
+    start_scores = _exact_anchor_scores(
+        query,
+        _token_positions(tokens),
+        eligible_set,
+    )
+    # When Whisper shares no exact token with the script, retain likely starts
+    # from cheap character-trigram anchors (common Whisper spelling errors),
+    # then fill the remaining fixed budget evenly across the transcript.  The
+    # previous query-length stride could evaluate every position for short
+    # quotes.
+    if not start_scores:
+        fuzzy_scores = _fuzzy_anchor_scores(query, tokens, eligible_set)
+        fuzzy_budget = (
+            max_starts
+            * _FUZZY_BUDGET_NUMERATOR
+            // _FUZZY_BUDGET_DENOMINATOR
+        )
+        fuzzy_limit = min(len(fuzzy_scores), fuzzy_budget)
+        fuzzy_starts = {
+            start
+            for _score_value, start in sorted(
+                ((score, start) for start, score in fuzzy_scores.items()),
+                key=lambda item: (-item[0], item[1]),
+            )[:fuzzy_limit]
+        }
+        remaining = max_starts - len(fuzzy_starts)
+        uniform_pool = [start for start in eligible if start not in fuzzy_starts]
+        uniform_starts = _uniform_sample(uniform_pool, remaining)
+        return sorted([*fuzzy_starts, *uniform_starts])
     ranked = sorted(
         (
             (score, start)
@@ -267,6 +399,8 @@ def _search_one(
     window: float | None,
     strategy: str,
     timed_tokens: list[_Token] | None = None,
+    max_starts: int = _MAX_CANDIDATE_STARTS,
+    exclude_word_time_range: tuple[float, float] | None = None,
 ) -> list[_Candidate]:
     all_tokens = timed_tokens if timed_tokens is not None else _timed_tokens(index)
     if approx is not None and window is not None:
@@ -283,10 +417,29 @@ def _search_one(
         return []
 
     min_length = max(1, len(query) - max(3, len(query) // 3))
+    if len(tokens) < min_length or max_starts <= 0:
+        return []
     max_length = min(len(tokens), len(query) + max(5, len(query) // 2))
     coarse_lengths, length_step = _length_samples(min_length, max_length, len(query))
     candidates: list[_Candidate] = []
-    for start in _candidate_starts(query, tokens):
+    latest_start = len(tokens) - min_length
+    eligible_starts = range(latest_start + 1)
+    if exclude_word_time_range is not None:
+        excluded_lower, excluded_upper = exclude_word_time_range
+        eligible_starts = [
+            start
+            for start in eligible_starts
+            if not (
+                tokens[start].word.end >= excluded_lower
+                and tokens[start].word.start <= excluded_upper
+            )
+        ]
+    for start in _candidate_starts(
+        query,
+        tokens,
+        max_starts=max_starts,
+        eligible_starts=eligible_starts,
+    ):
         best: _Candidate | None = None
 
         def score_length(length: int) -> _Candidate | None:
@@ -343,7 +496,10 @@ def _deduplicate(candidates: Iterable[_Candidate]) -> list[_Candidate]:
                 max(0.0, candidate.end - candidate.start),
                 max(0.0, prior.end - prior.start),
             )
-            same_occurrence = shorter > 0 and intersection / shorter >= 0.65
+            same_occurrence = (
+                shorter > 0
+                and intersection / shorter >= _DUPLICATE_MIN_OVERLAP_RATIO
+            )
             if abs(candidate.start - prior.start) < 1.0 or same_occurrence:
                 duplicate = True
                 break
@@ -461,20 +617,34 @@ class SyncMatcher:
             )
 
         local: list[_Candidate] = []
+        local_counts: dict[str, int] = {}
+        local_word_ranges: dict[str, tuple[float, float]] = {}
         has_approx = request.approximate_timecode not in (None, "")
         for source in sources:
             approx = _approx_for_source(request, source)
-            local.extend(
-                _search_one(
-                    source,
-                    self.indexes[source.id],
-                    query,
-                    approx,
-                    self.config.search_window_sec if approx is not None else None,
-                    "near_timecode" if approx is not None else "full_transcript",
-                    self.timed_tokens[source.id],
-                )
+            window = self.config.search_window_sec if approx is not None else None
+            source_candidates = _search_one(
+                source,
+                self.indexes[source.id],
+                query,
+                approx,
+                window,
+                "near_timecode" if approx is not None else "full_transcript",
+                self.timed_tokens[source.id],
+                max_starts=(
+                    _MAX_LOCAL_CANDIDATE_STARTS
+                    if approx is not None
+                    else _MAX_CANDIDATE_STARTS
+                ),
             )
+            local.extend(source_candidates)
+            local_counts[source.id] = len(source_candidates)
+            if approx is not None and window is not None:
+                guide_approx = approx - source.guide_offset_sec
+                local_word_ranges[source.id] = (
+                    guide_approx - window,
+                    guide_approx + window,
+                )
         candidates = [
             item for item in _deduplicate(local)
             if _has_usable_range(item, self.sources[item.source_id], self.config)
@@ -483,6 +653,10 @@ class SyncMatcher:
         if has_approx and (not candidates or candidates[0].confidence < self.config.fallback_trigger):
             fallback: list[_Candidate] = []
             for source in sources:
+                remaining_starts = max(
+                    0,
+                    _MAX_CANDIDATE_STARTS - local_counts.get(source.id, 0),
+                )
                 fallback.extend(
                     _search_one(
                         source,
@@ -492,6 +666,8 @@ class SyncMatcher:
                         None,
                         "fallback_full",
                         self.timed_tokens[source.id],
+                        max_starts=remaining_starts,
+                        exclude_word_time_range=local_word_ranges.get(source.id),
                     )
                 )
             candidates = [
