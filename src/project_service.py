@@ -21,11 +21,23 @@ def normalize_project_name(name: str) -> str:
 def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
     root = projects_dir / project
     work = root / "work"
+    media = root / "media"
+    versions = root / "versions"
     return {
         "root": root,
         "input": root / "input",
         "work": work,
         "speaker": root / "speaker",
+        "media": media,
+        "media_reviews": media / "reviews",
+        "media_archive": media / "archive",
+        "media_films": media / "films",
+        "media_photos": media / "photos",
+        "media_graphics": media / "graphics",
+        "versions": versions,
+        "scenario_versions": versions / "scenarios",
+        "scenario_diffs": versions / "diffs",
+        "timeline_versions": versions / "timelines",
         "normalized": work / "scenario_normalized.json",
         "prepared": work / "scenario_prepared.json",
         "raw": work / "scenario_raw.txt",
@@ -42,7 +54,22 @@ def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
 
 def ensure_project(project: str, projects_dir: Path) -> dict[str, Path]:
     paths = project_paths(project, projects_dir)
-    for key in ("input", "work", "speaker", "sync_audio", "sync_transcripts"):
+    directory_keys = (
+        "input",
+        "work",
+        "speaker",
+        "sync_audio",
+        "sync_transcripts",
+        "media_reviews",
+        "media_archive",
+        "media_films",
+        "media_photos",
+        "media_graphics",
+        "scenario_versions",
+        "scenario_diffs",
+        "timeline_versions",
+    )
+    for key in directory_keys:
         paths[key].mkdir(parents=True, exist_ok=True)
     return paths
 

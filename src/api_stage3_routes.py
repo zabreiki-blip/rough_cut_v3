@@ -166,7 +166,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 "project directory resolves outside the projects root"
             ) from exc
         return scan_media_directory(
-            str(project_root / "media" / "reviews"),
+            str(paths.get("media_reviews", project_root / "media" / "reviews")),
             recursive=recursive,
             media_root=project_root,
         )

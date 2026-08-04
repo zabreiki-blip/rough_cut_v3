@@ -20,9 +20,25 @@ def test_project_service_builds_expected_layout(tmp_path: Path) -> None:
     paths = ensure_project("Монтаж_01", tmp_path / "projects")
 
     assert paths == project_paths("Монтаж_01", tmp_path / "projects")
-    for key in ("input", "work", "speaker", "sync_audio", "sync_transcripts"):
+    for key in (
+        "input",
+        "work",
+        "speaker",
+        "sync_audio",
+        "sync_transcripts",
+        "media_reviews",
+        "media_archive",
+        "media_films",
+        "media_photos",
+        "media_graphics",
+        "scenario_versions",
+        "scenario_diffs",
+        "timeline_versions",
+    ):
         assert paths[key].is_dir()
     assert paths["timeline"] == tmp_path / "projects/Монтаж_01/work/full_timeline.json"
+    assert paths["media_archive"] == tmp_path / "projects/Монтаж_01/media/archive"
+    assert paths["scenario_versions"] == tmp_path / "projects/Монтаж_01/versions/scenarios"
 
 
 def test_project_names_are_validated_and_listed_deterministically(tmp_path: Path) -> None:
