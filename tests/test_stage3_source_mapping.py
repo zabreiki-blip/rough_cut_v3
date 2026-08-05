@@ -141,3 +141,25 @@ def test_unrelated_similar_name_is_not_fuzzy_matched() -> None:
 
     assert result.unmapped_source_ids == ("ira",)
     assert result.details["ira"]["reason"] == "no_name_match"
+
+
+def test_source_identity_normalizes_transliteration_and_sync_markers() -> None:
+    timeline = _brik_timeline(["ulynovsk_sinh"])
+    source = _source("ulynovsk_sinh", "ULINOVSK_sync")
+    media = _media("viewing", "УЛЬЯНОВСК СНХ просмотровка.mp4")
+
+    result = map_catalog_to_timeline(timeline, [source], [media])
+
+    assert result.catalog["ulynovsk_sinh"] is media
+    assert result.details["ulynovsk_sinh"]["reason"] == "normalized_source_identity"
+
+
+def test_source_identity_keeps_unrelated_names_fail_closed() -> None:
+    timeline = _brik_timeline(["ulynovsk_sinh"])
+    result = map_catalog_to_timeline(
+        timeline,
+        [_source("ulynovsk_sinh", "ULYNOVSK_sinh")],
+        [_media("other", "ULYANOVSKAYA_sync.mp4")],
+    )
+
+    assert result.unmapped_source_ids == ("ulynovsk_sinh",)

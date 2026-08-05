@@ -12,7 +12,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from atomic_io import atomic_write_json, atomic_write_text
 from stage3.media_catalog import MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
-from stage3.source_mapping import map_catalog_to_timeline
+from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
 
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
@@ -194,7 +194,6 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
 
     source_store, _match_store = services._sync_stores(paths)
     existing = source_store.list()
-    preserved = [source for source in existing if source.source_kind != "review_media"]
     grouped: dict[str, list[dict]] = {}
     for item in catalog.get("sources", []):
         if not isinstance(item, dict):
@@ -225,6 +224,33 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
         guide_audio = str(audio.get("relative_path") or "").strip()
         if not source_id or not relative_path or not name:
             continue
+        media_identity = normalize_source_identity(name)
+        identity_matches = [
+            source
+            for source in existing
+            if media_identity
+            and media_identity in {
+                normalize_source_identity(source.premiere_sequence),
+                normalize_source_identity(source.proxy_sequence_name),
+                normalize_source_identity(source.speaker),
+            }
+        ]
+        # Prefer a manually/imported Premiere source on the first scan, then
+        # keep the same bound source on every subsequent scan. The catalog ID
+        # is file-derived and must not replace a stable Stage 2 source ID.
+        bound_source = next(
+            (
+                source
+                for source in identity_matches
+                if source.source_kind != "review_media"
+            ),
+            identity_matches[0] if identity_matches else None,
+        )
+        if bound_source is None:
+            bound_source = next(
+                (source for source in existing if source.id == source_id),
+                None,
+            )
         speaker = re.sub(r"^\d{6,8}[\s_.-]*", "", Path(name).stem)
         speaker = re.sub(
             r"\b(?:просмотровка|просмотр|review|proxy|render|final)\b",
@@ -233,27 +259,49 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
             flags=re.IGNORECASE,
         )
         speaker = " ".join(speaker.replace("_", " ").split()) or Path(name).stem
-        registered.append(services.SyncSource.from_dict({
-            "id": source_id,
+        source_payload = bound_source.to_dict() if bound_source is not None else {}
+        source_payload.update({
+            "id": bound_source.id if bound_source is not None else source_id,
             "source_kind": "review_media",
-            "premiere_sequence": Path(name).stem,
-            "proxy_sequence_name": f"RC_SRC_{Path(name).stem}",
-            "speaker": speaker,
-            "all_speakers": False,
+            "premiere_sequence": (
+                bound_source.premiere_sequence if bound_source is not None
+                else Path(name).stem
+            ),
+            "proxy_sequence_name": (
+                bound_source.proxy_sequence_name if bound_source is not None
+                else f"RC_SRC_{Path(name).stem}"
+            ),
+            "speaker": bound_source.speaker if bound_source is not None else speaker,
+            "all_speakers": bound_source.all_speakers if bound_source is not None else False,
             "fps": item.get("fps") or 25.0,
             "duration_sec": item.get("duration_sec") or 0.0,
             # faster-whisper/PyAV can decode the audio stream directly from the
             # project-local viewing; no Premiere guide export is required.
-            "guide_audio": guide_audio,
+            "guide_audio": (
+                bound_source.guide_audio
+                if bound_source is not None and bound_source.guide_audio
+                else guide_audio
+            ),
             "media_path": relative_path,
-            "media_fingerprint": audio.get("fingerprint") or "",
+            "media_fingerprint": (
+                bound_source.media_fingerprint
+                if bound_source is not None and bound_source.guide_audio
+                else audio.get("fingerprint") or ""
+            ),
             "metadata": {
+                **(bound_source.metadata if bound_source is not None else {}),
                 "managed_by": "stage3_media_scan",
                 "media_name": name,
                 "audio_guide_name": audio.get("name") or Path(guide_audio).name,
                 "has_companion_video": visual is not None,
             },
-        }))
+        })
+        registered.append(services.SyncSource.from_dict(source_payload))
+    registered_ids = {source.id for source in registered}
+    preserved = [
+        source for source in existing
+        if source.id not in registered_ids and source.source_kind != "review_media"
+    ]
     with services._SYNC_DATA_LOCK:
         source_store.replace_all(sorted(preserved + registered, key=lambda item: item.id))
     return registered

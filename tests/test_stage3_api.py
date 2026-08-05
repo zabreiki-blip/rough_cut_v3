@@ -136,6 +136,44 @@ def test_scan_pairs_same_stem_video_and_wav(client) -> None:
     assert source_store.get("media_audio") is None
 
 
+def test_scan_binds_viewing_to_existing_normalized_premiere_source(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    source_store, _match_store = services._sync_stores(paths)
+    source_store.replace_all([services.SyncSource.from_dict({
+        "id": "ulynovsk_sinh",
+        "source_kind": "premiere_sequence",
+        "premiere_sequence": "ULINOVSK_sync",
+        "all_speakers": True,
+        "guide_audio": "work/sync_audio/ulynovsk_sinh.wav",
+        "duration_sec": 6060.96,
+    })])
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews", "recursive": False,
+        "sources": [{
+            "source_id": "media_new", "fingerprint": "video-fp",
+            "name": "УЛЬЯНОВСК СНХ.mp4",
+            "relative_path": "media/reviews/УЛЬЯНОВСК СНХ.mp4",
+            "container_path": "/app/projects/BRIK/media/reviews/УЛЬЯНОВСК СНХ.mp4",
+            "duration_sec": 6060.96, "fps": 25.0, "media_kind": "video",
+        }],
+    })
+
+    response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    repeated_response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+    assert repeated_response.status_code == 200
+    sources = source_store.list()
+    assert [source.id for source in sources] == ["ulynovsk_sinh"]
+    assert sources[0].source_kind == "review_media"
+    assert sources[0].guide_audio == "work/sync_audio/ulynovsk_sinh.wav"
+    assert sources[0].media_path == "media/reviews/УЛЬЯНОВСК СНХ.mp4"
+    assert sources[0].all_speakers is True
+
+
 def test_timeline_catalog_keeps_standalone_audio_but_collapses_companion() -> None:
     catalog = {
         "sources": [

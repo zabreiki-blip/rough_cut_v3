@@ -42,6 +42,34 @@ _GENERIC_TOKENS = {
     "рендер",
     "финал",
 }
+_SOURCE_KIND_TOKENS = {
+    "dop",
+    "interview",
+    "intervyu",
+    "rvk",
+    "sinh",
+    "sinhr",
+    "sinhron",
+    "snh",
+    "sync",
+    "интервью",
+    "синх",
+    "синхрон",
+    "снх",
+}
+_IDENTITY_ALIASES = {
+    "ulianovsk": "ulyanovsk",
+    "ulinovsk": "ulyanovsk",
+    "ulynovsk": "ulyanovsk",
+}
+_TRANSLITERATION = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l",
+    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
+    "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
+    "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e",
+    "ю": "yu", "я": "ya",
+})
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
 
 
@@ -86,6 +114,16 @@ def _canonical(value: object) -> str:
         for token in normalized.split()
         if token not in _GENERIC_TOKENS and not re.fullmatch(r"v?\d+", token)
     ]
+    return " ".join(tokens)
+
+
+def normalize_source_identity(value: object) -> str:
+    tokens = []
+    for token in _canonical(value).split():
+        transliterated = token.translate(_TRANSLITERATION)
+        if transliterated in _SOURCE_KIND_TOKENS:
+            continue
+        tokens.append(_IDENTITY_ALIASES.get(transliterated, transliterated))
     return " ".join(tokens)
 
 
@@ -138,15 +176,22 @@ def _score_media(
     media_canonical = _canonical(media_name)
     canonical_sequences = {_canonical(alias) for alias in sequence_aliases}
     canonical_speakers = {_canonical(alias) for alias in speaker_aliases}
+    media_identity = normalize_source_identity(media_name)
+    sequence_identities = {normalize_source_identity(alias) for alias in sequence_aliases}
+    speaker_identities = {normalize_source_identity(alias) for alias in speaker_aliases}
 
     if media_normalized in sequence_aliases:
         return 400, "exact_sequence_name"
     if media_canonical and media_canonical in canonical_sequences:
         return 300, "normalized_sequence_name"
+    if media_identity and media_identity in sequence_identities:
+        return 280, "normalized_source_identity"
     if media_normalized in speaker_aliases:
         return 200, "exact_speaker_alias"
     if media_canonical and media_canonical in canonical_speakers:
         return 150, "normalized_speaker_alias"
+    if media_identity and media_identity in speaker_identities:
+        return 140, "normalized_speaker_identity"
     # A decorated filename such as ``BRIK просмотровка Курская`` is accepted
     # only when one complete alias remains a token. This is deliberately not a
     # fuzzy or substring comparison (e.g. ``Ира`` must not match ``Ирбе``).
