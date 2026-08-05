@@ -122,6 +122,11 @@ def run_sync_job(
                     audio_resolution_error = exc
                     audio_path = None
                     audio_is_available = False
+                audio_signature = (
+                    _audio_cache_signature(audio_path)
+                    if audio_is_available and audio_path is not None
+                    else None
+                )
 
                 cache_load_error = None
                 if index_path.is_file():
@@ -148,7 +153,10 @@ def run_sync_job(
                 ):
                     cached_index.metadata[_TRANSCRIPTION_CACHE_KEY] = (
                         _transcription_cache_metadata(
-                            audio_path, config, origin="legacy"
+                            audio_path,
+                            config,
+                            origin="legacy",
+                            audio_signature=audio_signature,
                         )
                     )
                     save_word_index(index_path, cached_index)
@@ -170,14 +178,18 @@ def run_sync_job(
                         and not stored_audio.get("sample_sha256")
                         and stored_audio == _audio_stat_signature(audio_path)
                     ):
-                        cache_metadata["audio"] = _audio_cache_signature(audio_path)
+                        cache_metadata["audio"] = audio_signature
                         save_word_index(index_path, cached_index)
 
                 cache_matches_audio = bool(
                     cached_index is not None
                     and audio_is_available
                     and audio_path is not None
-                    and _word_index_audio_matches(cached_index, audio_path)
+                    and _word_index_audio_matches(
+                        cached_index,
+                        audio_path,
+                        audio_signature=audio_signature,
+                    )
                 )
                 if source_ids and not selected_for_transcription:
                     if cached_index is None:
@@ -234,7 +246,9 @@ def run_sync_job(
                             transcription_words=word_count,
                         )
 
-                    input_audio_signature = _audio_cache_signature(audio_path)
+                    input_audio_signature = audio_signature or _audio_cache_signature(
+                        audio_path
+                    )
                     result = transcribe_audio(
                         audio_path,
                         backend=backend,

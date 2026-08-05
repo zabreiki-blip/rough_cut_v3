@@ -159,6 +159,7 @@ function testSequenceRoleGuards() {
   }
   function markers(values) {
     return {
+      get numMarkers() { return values.length; },
       getFirstMarker() { return values[0] || null; },
       getNextMarker(marker) {
         const index = values.indexOf(marker);
@@ -200,6 +201,66 @@ function testSequenceRoleGuards() {
   }));
   assert.strictEqual(conformed.rcSyncMarkers, 1);
   assert.strictEqual(conformed.isRoughCutTarget, true);
+
+  let markerScans = 0;
+  const cachedEmptyMarkers = {
+    numMarkers: 0,
+    getFirstMarker() { markerScans += 1; return null; },
+    getNextMarker() { return null; },
+  };
+  const cachedSequence = sequence({
+    sequenceID: "cache-clean",
+    markers: cachedEmptyMarkers,
+  });
+  assert.strictEqual(hooks.sequenceRoughCutSignals(cachedSequence).isRoughCutTarget, false);
+  assert.strictEqual(hooks.sequenceRoughCutSignals(cachedSequence).isRoughCutTarget, false);
+  assert.strictEqual(markerScans, 1, "unchanged sequence should reuse rough-cut signals");
+
+  cachedSequence.videoTracks[0].clips[0] = {
+    nodeId: "new-block",
+    name: "RC_BLOCK block-new | Speaker",
+    projectItem: {name: "placeholder.png"},
+  };
+  cachedSequence.videoTracks[0].clips.numItems = 1;
+  assert.strictEqual(
+    hooks.sequenceRoughCutSignals(cachedSequence).isRoughCutTarget,
+    true,
+    "clip-count changes must invalidate cached clean signals",
+  );
+
+  const sameCountSequence = sequence({
+    sequenceID: "cache-same-count",
+    markers: markers([]),
+    videoTracks: tracks([{
+      nodeId: "ordinary-node",
+      name: "Ordinary clip",
+      projectItem: {name: "ordinary.mov"},
+    }]),
+  });
+  assert.strictEqual(hooks.sequenceRoughCutSignals(sameCountSequence).isRoughCutTarget, false);
+  sameCountSequence.videoTracks[0].clips[0] = {
+    nodeId: "replacement-node",
+    name: "RC_BLOCK block-replaced | Speaker",
+    projectItem: {name: "placeholder.png"},
+  };
+  assert.strictEqual(
+    hooks.sequenceRoughCutSignals(sameCountSequence).isRoughCutTarget,
+    true,
+    "same-count boundary replacement must invalidate cached signals",
+  );
+
+  const mutableMarkerValues = [];
+  const markerChangedSequence = sequence({
+    sequenceID: "cache-marker-change",
+    markers: markers(mutableMarkerValues),
+  });
+  assert.strictEqual(hooks.sequenceRoughCutSignals(markerChangedSequence).isRoughCutTarget, false);
+  mutableMarkerValues.push({name: "RC_SYNC changed"});
+  assert.strictEqual(
+    hooks.sequenceRoughCutSignals(markerChangedSequence).isRoughCutTarget,
+    true,
+    "marker-count changes must not return cached clean signals",
+  );
 
   assert.throws(
     () => hooks.assertSourceIsNotTarget(

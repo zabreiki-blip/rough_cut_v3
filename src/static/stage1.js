@@ -112,6 +112,10 @@
     stage3_media_message: el("stage3_media_message"),
     stage3_media_list: el("stage3_media_list"),
     stage3_source_mapping: el("stage3_source_mapping"),
+    stage3_job_progress: el("stage3_job_progress"),
+    stage3_job_message: el("stage3_job_message"),
+    stage3_job_numbers: el("stage3_job_numbers"),
+    stage3_progress_bar: el("stage3_progress_bar"),
     versioning_status: el("versioning_status"),
     btn_import_revision: el("btn_import_revision"),
     revision_list: el("revision_list"),
@@ -148,6 +152,11 @@
   let stage3MediaScanning = false;
   let stage3MediaCount = 0;
   let stage3SourceMapping = [];
+  let stage3JobRunning = false;
+  let currentStage3JobId = "";
+  let currentStage3JobKind = "";
+  let stage3PollTimer = null;
+  let stage3PollFailures = 0;
   let timelineReady = Boolean(initialStatus.timeline_ready);
   const MAX_POLL_BACKOFF_MS = 10000;
   const live = {
@@ -289,10 +298,13 @@
     if (ids.voiceover_lock) ids.voiceover_lock.hidden = !blocked;
     if (ids.assembly_lock) ids.assembly_lock.hidden = !blocked;
     if (ids.assembly_gate_message) ids.assembly_gate_message.hidden = !blocked;
+    if (ids.btn_stage3_media_scan) {
+      ids.btn_stage3_media_scan.disabled = stage3JobRunning;
+    }
     if (blocked && ids.btn_export_xml) {
       ids.btn_export_xml.disabled = true;
     } else if (ids.btn_export_xml) {
-      ids.btn_export_xml.disabled = !timelineReady;
+      ids.btn_export_xml.disabled = !timelineReady || stage3JobRunning;
     }
   }
 
@@ -1422,72 +1434,170 @@
     }).join("");
   }
 
-  async function scanStage3Media() {
-    if (stage3MediaScanning) return;
-    stage3MediaScanAttempted = true;
-    stage3MediaScanning = true;
-    ids.btn_stage3_media_scan.disabled = true;
-    ids.stage3_media_status.dataset.state = "running";
-    ids.stage3_media_status.textContent = "сканирование…";
-    ids.stage3_media_message.textContent = "Читаем файлы и метаданные…";
-    try {
-      const result = await postJSON("/stage3/media/scan", { project });
+  function stage3JobPayload(value) {
+    if (!value || typeof value !== "object") return {};
+    return value.job && typeof value.job === "object" ? value.job : value;
+  }
+
+  function renderStage3Job(value) {
+    const job = stage3JobPayload(value);
+    const status = String(job.status || "queued").toLowerCase();
+    const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+    currentStage3JobId = String(job.id || job.job_id || currentStage3JobId || "");
+    currentStage3JobKind = String(job.kind || currentStage3JobKind || "");
+    stage3JobRunning = ["queued", "running"].includes(status);
+    ids.stage3_media_status.dataset.state = status;
+    ids.stage3_media_status.textContent = status === "completed"
+      ? (currentStage3JobKind === "prepare" ? "XML готов" : "готово")
+      : status === "failed" ? "ошибка"
+      : status === "interrupted" ? "прервано"
+      : status === "queued" ? "в очереди"
+      : (currentStage3JobKind === "prepare" ? "сборка…" : "сканирование…");
+    if (ids.stage3_job_progress) ids.stage3_job_progress.hidden = false;
+    if (ids.stage3_job_message) ids.stage3_job_message.textContent = job.message || "Stage 3";
+    if (ids.stage3_job_numbers) ids.stage3_job_numbers.textContent = `${Math.round(progress)}%`;
+    if (ids.stage3_progress_bar) ids.stage3_progress_bar.style.width = `${progress}%`;
+    if (job.error) ids.stage3_media_message.textContent = job.error;
+    updateActionAvailability();
+    return job;
+  }
+
+  function finishStage3Job() {
+    stage3JobRunning = false;
+    stage3MediaScanning = false;
+    stage3PollFailures = 0;
+    if (stage3PollTimer) window.clearTimeout(stage3PollTimer);
+    stage3PollTimer = null;
+    ids.btn_export_xml.textContent = "Export XML";
+    updateActionAvailability();
+  }
+
+  async function applyCompletedStage3Job(job, download) {
+    const result = job.result || {};
+    if (job.kind === "scan") {
       renderStage3Media(result);
       await loadSyncWorkspace(true);
-      ids.stage3_media_status.dataset.state = "completed";
-      ids.stage3_media_status.textContent = "готово";
       toast(`Просмотровки найдены: ${stage3MediaItems(result).length}`, "success");
       appendLog(
         `Stage 3 media: найдено ${stage3MediaItems(result).length}; `
         + `Whisper-источников=${Number(result.registered_sources || 0)}; `
         + `directory=${result.directory || "—"}`
       );
-    } catch (err) {
-      ids.stage3_media_status.dataset.state = "failed";
-      ids.stage3_media_status.textContent = "ошибка";
-      ids.stage3_media_message.textContent = err.message || String(err);
-      throw err;
-    } finally {
-      stage3MediaScanning = false;
-      ids.btn_stage3_media_scan.disabled = busy;
+      return;
+    }
+    renderStage3SourceMapping(result.source_mapping || []);
+    ids.stage3_media_message.textContent =
+      `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
+      + `плейсхолдеров: ${Number(result.placeholder_segments || 0)}.`;
+    appendLog(
+      `Timeline XML (${result.format || "nested"}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
+      + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
+    );
+    if (download && result.download_url) {
+      toast("XML готов. Начинаю загрузку.", "success");
+      window.location.href = result.download_url;
     }
   }
 
-  function scanStage3MediaOnce() {
+  async function pollStage3Job(statusUrl, downloadOnComplete) {
+    try {
+      const job = renderStage3Job(await getJSON(statusUrl));
+      stage3PollFailures = 0;
+      const status = String(job.status || "").toLowerCase();
+      if (status === "completed") {
+        finishStage3Job();
+        await applyCompletedStage3Job(job, downloadOnComplete);
+        return;
+      }
+      if (["failed", "interrupted"].includes(status)) {
+        finishStage3Job();
+        const message = job.error || job.message || "Stage 3 завершился с ошибкой";
+        ids.stage3_media_message.textContent = message;
+        toast(message, status === "failed" ? "error" : "warn");
+        appendLog(`Stage 3 ${job.kind || "job"}: ${message}`, "error");
+        return;
+      }
+      stage3PollTimer = window.setTimeout(
+        () => pollStage3Job(statusUrl, downloadOnComplete), 1200
+      );
+    } catch (err) {
+      if (!isTransientPollingError(err)) {
+        finishStage3Job();
+        const message = err.message || String(err);
+        ids.stage3_media_message.textContent = message;
+        toast(message, "error");
+        appendLog(`Stage 3 status: ${message}`, "error");
+        return;
+      }
+      stage3PollFailures += 1;
+      const delay = pollingBackoffMs(stage3PollFailures, 1200);
+      stage3PollTimer = window.setTimeout(
+        () => pollStage3Job(statusUrl, downloadOnComplete), delay
+      );
+    }
+  }
+
+  async function startStage3Job(kind) {
+    if (stage3JobRunning || stage3MediaScanning) return;
+    stage3MediaScanAttempted = stage3MediaScanAttempted || kind === "scan";
+    stage3MediaScanning = kind === "scan";
+    stage3JobRunning = true;
+    if (kind === "prepare") ids.btn_export_xml.textContent = "Подготовка XML…";
+    updateActionAvailability();
+    try {
+      const started = await postJSON(`/stage3/jobs/${kind}/start`, { project });
+      const jobId = String(started.job_id || started.id || "");
+      if (!jobId) throw new Error("Backend не вернул идентификатор Stage 3 job");
+      currentStage3JobId = jobId;
+      currentStage3JobKind = kind;
+      renderStage3Job(started);
+      stage3PollTimer = window.setTimeout(
+        () => pollStage3Job(started.status_url || `/stage3/jobs/${encodeURIComponent(jobId)}`, kind === "prepare"),
+        250,
+      );
+    } catch (err) {
+      finishStage3Job();
+      throw err;
+    }
+  }
+
+  async function restoreStage3Job() {
+    const response = await optionalRequestJSON(
+      `/stage3/jobs/status?project=${encodeURIComponent(project)}`
+    );
+    if (!response.available || !response.result) return false;
+    const job = renderStage3Job(response.result);
+    const status = String(job.status || "").toLowerCase();
+    if (["queued", "running"].includes(status)) {
+      const jobId = String(job.id || "");
+      stage3PollTimer = window.setTimeout(
+        () => pollStage3Job(`/stage3/jobs/${encodeURIComponent(jobId)}`, job.kind === "prepare"),
+        250,
+      );
+      return true;
+    }
+    if (status === "completed") await applyCompletedStage3Job(job, false);
+    finishStage3Job();
+    return false;
+  }
+
+  async function scanStage3MediaOnce() {
     if (stage3MediaScanAttempted) return;
-    scanStage3Media().catch((err) => {
+    stage3MediaScanAttempted = true;
+    try {
+      const restoredActive = await restoreStage3Job();
+      if (!restoredActive) await startStage3Job("scan");
+    } catch (err) {
       appendLog(`Stage 3 media init: ${err.message || err}`, "warn");
-    });
+    }
+  }
+
+  async function scanStage3Media() {
+    return startStage3Job("scan");
   }
 
   async function exportTimelineXml() {
-    ids.btn_export_xml.disabled = true;
-    ids.btn_export_xml.textContent = "Подготовка XML…";
-    ids.stage3_media_status.dataset.state = "running";
-    ids.stage3_media_status.textContent = "сборка…";
-    try {
-      const result = await postJSON("/stage3/timeline/prepare", { project });
-      renderStage3SourceMapping(result.source_mapping || []);
-      ids.stage3_media_status.dataset.state = "completed";
-      ids.stage3_media_status.textContent = "XML готов";
-      ids.stage3_media_message.textContent =
-        `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
-        + `плейсхолдеров: ${Number(result.placeholder_segments || 0)}.`;
-      appendLog(
-        `Timeline XML (${result.format || "nested"}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
-        + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
-      );
-      toast("XML готов. Начинаю загрузку.", "success");
-      window.location.href = result.download_url;
-    } catch (err) {
-      ids.stage3_media_status.dataset.state = "failed";
-      ids.stage3_media_status.textContent = "ошибка";
-      ids.stage3_media_message.textContent = err.message || String(err);
-      throw err;
-    } finally {
-      ids.btn_export_xml.textContent = "Export XML";
-      ids.btn_export_xml.disabled = busy || !timelineReady;
-    }
+    return startStage3Job("prepare");
   }
 
   document.querySelectorAll(".workspace-tab").forEach((tab) => {

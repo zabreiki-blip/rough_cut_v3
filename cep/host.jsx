@@ -6,6 +6,8 @@
  */
 (function () {
     var TICKS_PER_SECOND = 254016000000;
+    var roughCutSignalCache = [];
+    var ROUGH_CUT_SIGNAL_CACHE_LIMIT = 64;
 
     function fail(message, details) {
         return stringify({
@@ -275,7 +277,21 @@
         var i;
         var j;
         var k;
+        var trackCount;
+        var clipCount;
         var scannedMarkers = 0;
+        var sequenceId = "";
+        var structuralSignature = "";
+        var cached = null;
+
+        try { sequenceId = asString(sequence.sequenceID); } catch (ignoreSequenceId) {}
+        structuralSignature = sequenceRoughCutStructuralSignature(sequence);
+        if (sequenceId && structuralSignature) {
+            cached = cachedRoughCutSignals(sequenceId, structuralSignature);
+            if (cached) {
+                return cached;
+            }
+        }
 
         // Montage timelines normally expose an RC_BLOCK clip near the start.
         // Probe a small prefix before touching Premiere's much slower marker API.
@@ -287,16 +303,18 @@
         }
         for (i = 0; i < collections.length; i++) {
             collection = collections[i];
-            if (!collection || !isFinite(Number(collection.numTracks))) {
+            trackCount = collection ? Number(collection.numTracks) : NaN;
+            if (!collection || !isFinite(trackCount)) {
                 continue;
             }
-            for (j = 0; j < Number(collection.numTracks); j++) {
+            for (j = 0; j < trackCount; j++) {
                 try {
                     track = collection[j];
                     if (!track || !track.clips) {
                         continue;
                     }
-                    for (k = 0; k < Math.min(Number(track.clips.numItems), 32); k++) {
+                    clipCount = Number(track.clips.numItems);
+                    for (k = 0; k < Math.min(clipCount, 32); k++) {
                         clip = track.clips[k];
                         label = asString(clip.name);
                         if (label.indexOf("RC_BLOCK ") !== 0) {
@@ -311,6 +329,11 @@
                             result.rcBlockClips = 1;
                             result.isRoughCutTarget = true;
                             result.inspectionComplete = true;
+                            cacheRoughCutSignals(
+                                sequenceId,
+                                structuralSignature,
+                                result
+                            );
                             return result;
                         }
                     }
@@ -351,21 +374,22 @@
 
         for (i = 0; i < collections.length; i++) {
             collection = collections[i];
-            if (!collection || !isFinite(Number(collection.numTracks)) ||
-                    Number(collection.numTracks) > 1000) {
+            trackCount = collection ? Number(collection.numTracks) : NaN;
+            if (!collection || !isFinite(trackCount) || trackCount > 1000) {
                 result.inspectionComplete = false;
                 continue;
             }
-            for (j = 0; j < Number(collection.numTracks); j++) {
+            for (j = 0; j < trackCount; j++) {
                 try {
                     track = collection[j];
-                    if (!track || !track.clips ||
-                            !isFinite(Number(track.clips.numItems)) ||
-                            Number(track.clips.numItems) > 100000) {
+                    clipCount = track && track.clips ?
+                        Number(track.clips.numItems) : NaN;
+                    if (!track || !track.clips || !isFinite(clipCount) ||
+                            clipCount > 100000) {
                         result.inspectionComplete = false;
                         continue;
                     }
-                    for (k = 0; k < Number(track.clips.numItems); k++) {
+                    for (k = 0; k < clipCount; k++) {
                         clip = track.clips[k];
                         label = asString(clip.name);
                         if (label.indexOf("RC_BLOCK ") === 0) {
@@ -392,7 +416,128 @@
             }
         }
         result.isRoughCutTarget = result.rcBlockClips > 0 || result.rcSyncMarkers > 0;
+        if (result.inspectionComplete) {
+            cacheRoughCutSignals(sequenceId, structuralSignature, result);
+        }
         return result;
+    }
+
+    function sequenceRoughCutStructuralSignature(sequence) {
+        var parts = [];
+        var collections = [];
+        var collection;
+        var track;
+        var clips;
+        var clipCount;
+        var markerCount;
+        var boundaryClip;
+        var i;
+        var j;
+        var k;
+        var trackCount;
+        if (!sequence) {
+            return "";
+        }
+        try { collections.push(sequence.videoTracks); } catch (ignoreVideo) {
+            return "";
+        }
+        try { collections.push(sequence.audioTracks); } catch (ignoreAudio) {
+            return "";
+        }
+        try {
+            markerCount = Number(sequence.markers.numMarkers);
+        } catch (ignoreMarkerCount) {
+            return "";
+        }
+        // Marker-bearing timelines are not cached. Marker names can change
+        // without changing numMarkers, and ExtendScript exposes no revision.
+        if (!isFinite(markerCount) || markerCount !== 0) {
+            return "";
+        }
+        parts.push("m0", ticksOf(sequence.end));
+        for (i = 0; i < collections.length; i++) {
+            collection = collections[i];
+            trackCount = collection ? Number(collection.numTracks) : NaN;
+            if (!collection || !isFinite(trackCount) || trackCount < 0 ||
+                    trackCount > 1000) {
+                return "";
+            }
+            parts.push("c" + i + ":" + trackCount);
+            for (j = 0; j < trackCount; j++) {
+                try {
+                    track = collection[j];
+                    clips = track ? track.clips : null;
+                    clipCount = clips ? Number(clips.numItems) : NaN;
+                    if (!clips || !isFinite(clipCount) || clipCount < 0 ||
+                            clipCount > 100000) {
+                        return "";
+                    }
+                    parts.push("t" + j + ":" + clipCount);
+                    for (k = 0; k < Math.min(clipCount, 32); k++) {
+                        boundaryClip = clips[k];
+                        parts.push(
+                            "p" + k + ":" + asString(boundaryClip.nodeId) + ":" +
+                            asString(boundaryClip.name)
+                        );
+                    }
+                    if (clipCount > 32) {
+                        boundaryClip = clips[clipCount - 1];
+                        parts.push(
+                            "l:" + asString(boundaryClip.nodeId) + ":" +
+                            asString(boundaryClip.name)
+                        );
+                    }
+                } catch (ignoreTrackSignature) {
+                    return "";
+                }
+            }
+        }
+        return parts.join("|");
+    }
+
+    function copyRoughCutSignals(result) {
+        return {
+            inspectionComplete: !!result.inspectionComplete,
+            isRoughCutTarget: !!result.isRoughCutTarget,
+            rcBlockClips: Number(result.rcBlockClips) || 0,
+            rcSyncMarkers: Number(result.rcSyncMarkers) || 0
+        };
+    }
+
+    function cachedRoughCutSignals(sequenceId, structuralSignature) {
+        var i;
+        for (i = roughCutSignalCache.length - 1; i >= 0; i--) {
+            if (roughCutSignalCache[i].sequenceId === sequenceId) {
+                if (roughCutSignalCache[i].signature === structuralSignature) {
+                    return copyRoughCutSignals(roughCutSignalCache[i].result);
+                }
+                // A sequence ID is stable across edits. Discard its old entry
+                // immediately when clip/track counts or boundaries change.
+                roughCutSignalCache.splice(i, 1);
+                return null;
+            }
+        }
+        return null;
+    }
+
+    function cacheRoughCutSignals(sequenceId, structuralSignature, result) {
+        var i;
+        if (!sequenceId || !structuralSignature || !result.inspectionComplete) {
+            return;
+        }
+        for (i = roughCutSignalCache.length - 1; i >= 0; i--) {
+            if (roughCutSignalCache[i].sequenceId === sequenceId) {
+                roughCutSignalCache.splice(i, 1);
+            }
+        }
+        roughCutSignalCache.push({
+            sequenceId: sequenceId,
+            signature: structuralSignature,
+            result: copyRoughCutSignals(result)
+        });
+        if (roughCutSignalCache.length > ROUGH_CUT_SIGNAL_CACHE_LIMIT) {
+            roughCutSignalCache.shift();
+        }
     }
 
     function registeredSourceMatch(sequence, guards) {

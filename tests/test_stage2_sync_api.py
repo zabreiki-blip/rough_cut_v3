@@ -63,6 +63,34 @@ def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
     assert api._sync_matching_fingerprint(**changed) != first
 
 
+def test_audio_match_accepts_precomputed_signature_without_rereading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "guide.wav"
+    audio_path.write_bytes(b"audio")
+    signature = {"size": 5, "mtime_ns": 1, "sample_sha256": "stable"}
+    index = WordIndex(
+        source_id="source",
+        words=[WordTimestamp("слово", 0.0, 0.5)],
+        metadata={api._TRANSCRIPTION_CACHE_KEY: {
+            "version": 1,
+            "audio": dict(signature),
+        }},
+    )
+    monkeypatch.setattr(
+        api,
+        "_audio_cache_signature",
+        lambda _path: (_ for _ in ()).throw(AssertionError("unexpected reread")),
+    )
+
+    assert api._word_index_audio_matches(
+        index,
+        audio_path,
+        audio_signature=signature,
+    )
+
+
 def _wav_bytes(duration_sec: float = 1.0, sample_rate: int = 8000) -> bytes:
     output = BytesIO()
     with wave.open(output, "wb") as stream:

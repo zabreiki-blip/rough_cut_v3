@@ -13,6 +13,23 @@ from stage2.sync_models import SyncSource
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 
 
+class _ImmediateThread:
+    def __init__(self, *, target, args=(), kwargs=None, daemon=None):
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+
+    def start(self):
+        self.target(*self.args, **self.kwargs)
+
+
+class _HoldingThread(_ImmediateThread):
+    instances = []
+
+    def start(self):
+        self.instances.append(self)
+
+
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app = Flask(__name__)
@@ -262,3 +279,121 @@ def test_project_root_symlink_escape_is_rejected(client, tmp_path: Path) -> None
 
     assert response.status_code == 400
     assert "outside the projects root" in response.get_json()["error"]
+
+
+def test_scan_background_job_reports_progress_and_result(client) -> None:
+    http, _app, monkeypatch = client
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews",
+        "recursive": False,
+        "sources": [],
+    })
+
+    started = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
+
+    assert started.status_code == 200
+    start_result = started.get_json()["result"]
+    assert start_result["status"] == "queued"
+    status = http.get(start_result["status_url"])
+    assert status.status_code == 200
+    job = status.get_json()["result"]
+    assert job["kind"] == "scan"
+    assert job["status"] == "completed"
+    assert job["progress"] == 100
+    assert job["result"]["registered_sources"] == 0
+    latest = http.get("/stage3/jobs/status?project=BRIK&kind=scan")
+    assert latest.get_json()["result"]["id"] == job["id"]
+
+
+def test_prepare_background_job_returns_legacy_download_without_viewings(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "full_timeline.json").write_text(json.dumps({
+        "project": "BRIK",
+        "fps": 25,
+        "width": 1920,
+        "height": 1080,
+        "normalization_revision": "norm-1",
+        "segments": [{"id": "snh1", "type": "snh"}],
+    }), encoding="utf-8")
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews",
+        "recursive": False,
+        "sources": [],
+    })
+
+    started = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"})
+    job = http.get(started.get_json()["result"]["status_url"]).get_json()["result"]
+
+    assert job["status"] == "completed"
+    assert job["result"]["format"] == "legacy"
+    assert job["result"]["download_url"] == "/stage2/export/xml?project=BRIK"
+
+
+def test_stage3_job_in_flight_guard_is_per_project(client) -> None:
+    http, _app, monkeypatch = client
+    _HoldingThread.instances.clear()
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _HoldingThread)
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews",
+        "recursive": False,
+        "sources": [],
+    })
+
+    first = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
+    second = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"})
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "already active" in second.get_json()["error"]
+    held = _HoldingThread.instances.pop()
+    held.target(*held.args, **held.kwargs)
+
+
+def test_stage3_background_failure_is_observable_in_status(client) -> None:
+    http, _app, monkeypatch = client
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+
+    def reject(*_args, **_kwargs):
+        raise api_stage3_routes.MediaCatalogError("ffprobe failed")
+
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", reject)
+    started = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
+    job = http.get(started.get_json()["result"]["status_url"]).get_json()["result"]
+
+    assert job["status"] == "failed"
+    assert job["error"] == "ffprobe failed"
+    assert job["error_status"] == 400
+
+
+def test_latest_stage3_job_status_survives_route_registry_restart(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews",
+        "recursive": False,
+        "sources": [],
+    })
+    started = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
+    completed_id = started.get_json()["result"]["job_id"]
+
+    restarted_app = Flask(__name__)
+    restarted_app.config.update(TESTING=True)
+    api_stage3_routes.register_stage3_routes(restarted_app, services)
+    restored = restarted_app.test_client().get(
+        "/stage3/jobs/status?project=BRIK&kind=scan"
+    )
+
+    assert restored.status_code == 200
+    job = restored.get_json()["result"]
+    assert job["id"] == completed_id
+    assert job["status"] == "completed"

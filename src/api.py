@@ -842,12 +842,17 @@ def _word_index_cache_is_current(
     return cache.get("config_fingerprint") == _transcription_config_fingerprint(config)
 
 
-def _word_index_audio_matches(index: WordIndex, audio_path: Path) -> bool:
+def _word_index_audio_matches(
+    index: WordIndex,
+    audio_path: Path,
+    *,
+    audio_signature: dict[str, int | str] | None = None,
+) -> bool:
     cache = index.metadata.get(_TRANSCRIPTION_CACHE_KEY)
     if not isinstance(cache, dict) or cache.get("version") != 1:
         return False
     try:
-        audio_signature = _audio_cache_signature(audio_path)
+        current_signature = audio_signature or _audio_cache_signature(audio_path)
     except OSError:
         return False
     stored = cache.get("audio")
@@ -855,8 +860,8 @@ def _word_index_audio_matches(index: WordIndex, audio_path: Path) -> bool:
         return False
     if stored.get("sample_sha256"):
         return (
-            stored.get("size") == audio_signature.get("size")
-            and stored.get("sample_sha256") == audio_signature.get("sample_sha256")
+            stored.get("size") == current_signature.get("size")
+            and stored.get("sample_sha256") == current_signature.get("sample_sha256")
         )
     # Backward-compatible first read. The caller upgrades this metadata after
     # a successful size/mtime comparison without retranscribing the source.

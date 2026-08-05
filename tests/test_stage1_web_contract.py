@@ -38,8 +38,13 @@ def test_stage3_headless_media_scan_contract() -> None:
     assert 'id="btn_stage3_prepare"' not in PROJECT_HTML
     assert 'id="btn_export_xml"' in PROJECT_HTML
     assert "Premiere на этом этапе не нужен" in PROJECT_HTML
-    assert 'postJSON("/stage3/media/scan", { project })' in STAGE1_JS
-    assert 'postJSON("/stage3/timeline/prepare", { project })' in STAGE1_JS
+    assert "`/stage3/jobs/${kind}/start`" in STAGE1_JS
+    assert "function pollStage3Job(statusUrl, downloadOnComplete)" in STAGE1_JS
+    assert "function restoreStage3Job()" in STAGE1_JS
+    assert "/stage3/jobs/status?project=" in STAGE1_JS
+    assert "stage3PollTimer = window.setTimeout" in STAGE1_JS
+    assert "stage3JobRunning" in STAGE1_JS
+    assert 'async function exportTimelineXml() {\n    return startStage3Job("prepare");' in STAGE1_JS
     assert "function exportTimelineXml()" in STAGE1_JS
     assert "ids.btn_export_xml.href" not in STAGE1_JS
     assert "stage3MediaScanAttempted" in STAGE1_JS

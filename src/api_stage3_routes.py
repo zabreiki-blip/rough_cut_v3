@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
+import threading
 from types import ModuleType
+import uuid
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -16,6 +19,12 @@ from stage3.source_mapping import map_catalog_to_timeline, normalize_source_iden
 
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
+
+
+class Stage3OperationError(RuntimeError):
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _host_path(path: str, *, project: str, project_root: Path) -> str:
@@ -308,6 +317,13 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
 
 
 def register_stage3_routes(app: Flask, services: ModuleType) -> None:
+    jobs: dict[str, dict] = {}
+    jobs_lock = threading.RLock()
+    active_projects: set[str] = set()
+
+    def now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
     def scan_project_media(project: str, paths: dict, *, recursive: bool = False) -> dict:
         project_root = paths["root"].resolve()
         projects_root = Path(
@@ -325,6 +341,315 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             media_root=project_root,
         )
 
+    def perform_scan(project: str, *, recursive: bool = False, progress=None) -> dict:
+        paths = services._ensure_project(project)
+        if progress:
+            progress(10, "Сканирование папки просмотровок")
+        catalog = scan_project_media(project, paths, recursive=recursive)
+        if progress:
+            progress(70, "Регистрация источников Whisper")
+        registered = _register_review_sources(catalog, paths, services)
+        catalog["registered_sources"] = len(registered)
+        work_dir = paths.get("work")
+        timeline_path = Path(work_dir) / "full_timeline.json" if work_dir else None
+        if timeline_path is not None and timeline_path.is_file():
+            if progress:
+                progress(85, "Сопоставление просмотровок с таймлайном")
+            timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+            source_store, _match_store = services._sync_stores(paths)
+            mapping = map_catalog_to_timeline(
+                timeline_data,
+                {"sources": [source.to_dict() for source in source_store.list()]},
+                _timeline_catalog(catalog),
+            )
+            _annotate_media_kinds(mapping, catalog)
+            catalog["mapping"] = _mapping_summary(mapping)
+        return {"project": project, **catalog}
+
+    def perform_prepare(project: str, *, progress=None) -> dict:
+        paths = services._ensure_project(project)
+        timeline_path = paths["work"] / "full_timeline.json"
+        if not timeline_path.is_file():
+            raise Stage3OperationError(
+                "full_timeline.json not found — run Build Timeline first", 404
+            )
+        if progress:
+            progress(10, "Проверка собранного таймлайна")
+        timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+        confirmed, _reason = services._confirmed_normalization(project)
+        if (
+            not confirmed
+            or timeline_data.get("normalization_revision")
+            != confirmed.get("revision")
+        ):
+            raise Stage3OperationError(
+                "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
+                409,
+            )
+        if progress:
+            progress(25, "Проверка доступных просмотровок")
+        catalog = scan_project_media(project, paths)
+        logical_catalog = _timeline_catalog(catalog)
+        if not logical_catalog.get("sources"):
+            return {
+                "project": project,
+                "format": "legacy",
+                "filename": f"{project}_timeline.xml",
+                "download_url": f"/stage2/export/xml?project={project}",
+                "media_count": 0,
+                "audio_count": 0,
+                "mapped_source_ids": [],
+                "unmapped_source_ids": [],
+                "placeholder_segments": sum(
+                    1
+                    for segment in timeline_data.get("segments", [])
+                    if isinstance(segment, dict)
+                    and segment.get("type") in {"snh", "host"}
+                ),
+                "source_mapping": [],
+            }
+        if progress:
+            progress(50, "Подготовка заменяемых subsequence")
+        _attach_audio_placeholder_cards(
+            logical_catalog,
+            paths=paths,
+            services=services,
+            width=int(timeline_data.get("width") or 1920),
+            height=int(timeline_data.get("height") or 1080),
+        )
+        source_store, _match_store = services._sync_stores(paths)
+        sync_sources = [source.to_dict() for source in source_store.list()]
+        host_catalog = _host_catalog(
+            logical_catalog, project=project, project_root=paths["root"]
+        )
+        mapping = map_catalog_to_timeline(
+            timeline_data, {"sources": sync_sources}, host_catalog
+        )
+        _annotate_media_kinds(mapping, host_catalog)
+        mapped_timeline_source_ids = set(mapping.catalog)
+        export_timeline, placeholder_count = _placeholder_unmapped_sources(
+            _host_timeline_paths(
+                timeline_data, project=project, project_root=paths["root"]
+            ),
+            mapped_timeline_source_ids,
+        )
+        export_catalog = {
+            str(source["source_id"]): source
+            for source in host_catalog.get("sources", [])
+            if isinstance(source, dict) and source.get("source_id")
+        }
+        export_catalog.update(mapping.catalog)
+        if progress:
+            progress(80, "Генерация nested XML")
+        xml_text = build_nested_xml(export_timeline, export_catalog)
+        filename = f"{project}_nested_timeline.xml"
+        atomic_write_text(paths["work"] / filename, xml_text)
+        atomic_write_json(paths["work"] / "stage3_source_mapping.json", mapping.to_dict())
+        mapped = [
+            source_id
+            for source_id, detail in mapping.details.items()
+            if detail.get("status") == "mapped"
+        ]
+        return {
+            "project": project,
+            "format": "nested",
+            "filename": filename,
+            "download_url": f"/stage3/export/xml?project={project}",
+            "media_count": len(host_catalog.get("sources", [])),
+            "audio_count": sum(
+                1 for item in catalog.get("sources", [])
+                if isinstance(item, dict) and _media_kind(item) == "audio"
+            ),
+            "mapped_source_ids": mapped,
+            "unmapped_source_ids": list(mapping.unmapped_source_ids),
+            "placeholder_segments": placeholder_count,
+            "source_mapping": _mapping_summary(mapping),
+        }
+
+    def job_status_path(project: str) -> Path:
+        return services._ensure_project(project)["work"] / "stage3_job_status.json"
+
+    def persist_job(job: dict) -> None:
+        atomic_write_json(job_status_path(str(job["project"])), job)
+
+    def update_job(job_id: str, **updates) -> dict | None:
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                return None
+            job.update(updates)
+            snapshot = dict(job)
+        persist_job(snapshot)
+        return snapshot
+
+    def create_job(project: str, kind: str) -> dict:
+        job = {
+            "id": uuid.uuid4().hex,
+            "project": project,
+            "kind": kind,
+            "status": "queued",
+            "progress": 0,
+            "message": "Задача поставлена в очередь",
+            "result": None,
+            "error": "",
+            "created_at": now_iso(),
+            "started_at": None,
+            "finished_at": None,
+        }
+        with jobs_lock:
+            jobs[job["id"]] = job
+        persist_job(job)
+        return dict(job)
+
+    def run_job(job_id: str, project: str, kind: str, recursive: bool) -> None:
+        def progress(value: int, message: str) -> None:
+            update_job(job_id, progress=value, message=message)
+
+        update_job(
+            job_id,
+            status="running",
+            started_at=now_iso(),
+            message="Запуск Stage 3",
+        )
+        try:
+            result = (
+                perform_scan(project, recursive=recursive, progress=progress)
+                if kind == "scan"
+                else perform_prepare(project, progress=progress)
+            )
+            update_job(
+                job_id,
+                status="completed",
+                progress=100,
+                message=("Просмотровки обновлены" if kind == "scan" else "XML готов"),
+                result=result,
+                finished_at=now_iso(),
+            )
+        except Stage3OperationError as exc:
+            update_job(
+                job_id,
+                status="failed",
+                error=str(exc),
+                error_status=exc.status_code,
+                message=str(exc),
+                finished_at=now_iso(),
+            )
+        except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            update_job(
+                job_id,
+                status="failed",
+                error=str(exc),
+                error_status=400,
+                message=str(exc),
+                finished_at=now_iso(),
+            )
+        except Exception:
+            update_job(
+                job_id,
+                status="failed",
+                error="internal server error",
+                error_status=500,
+                message="Внутренняя ошибка Stage 3",
+                finished_at=now_iso(),
+            )
+        finally:
+            with jobs_lock:
+                active_projects.discard(project)
+
+    def start_job(kind: str):
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return services._json_error("JSON object is required", 400)
+        try:
+            project = services._resolve_project_name(payload.get("project"))
+            services._ensure_project(project)
+            recursive = payload.get("recursive", False)
+            if not isinstance(recursive, bool):
+                raise MediaCatalogError("recursive must be a boolean")
+        except (MediaCatalogError, ValueError) as exc:
+            return services._json_error(str(exc), 400)
+        if kind == "prepare":
+            gate = services._normalization_required(project)
+            if gate:
+                return gate
+        with jobs_lock:
+            if project in active_projects:
+                return services._json_error(
+                    f"stage3 job already active for project {project}", 409
+                )
+            active_projects.add(project)
+        try:
+            job = create_job(project, kind)
+            worker = threading.Thread(
+                target=run_job,
+                args=(job["id"], project, kind, recursive),
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            with jobs_lock:
+                active_projects.discard(project)
+            raise
+        return jsonify({
+            "ok": True,
+            "result": {
+                "project": project,
+                "job_id": job["id"],
+                "kind": kind,
+                "status": "queued",
+                "status_url": f"/stage3/jobs/{job['id']}",
+            },
+        })
+
+    @app.post("/stage3/jobs/scan/start")
+    def stage3_scan_job_start():
+        return start_job("scan")
+
+    @app.post("/stage3/jobs/prepare/start")
+    def stage3_prepare_job_start():
+        return start_job("prepare")
+
+    @app.get("/stage3/jobs/<job_id>")
+    def stage3_job_status(job_id: str):
+        with jobs_lock:
+            job = dict(jobs[job_id]) if job_id in jobs else None
+        if job is None:
+            return services._json_error("job not found", 404)
+        return jsonify({"ok": True, "result": job})
+
+    @app.get("/stage3/jobs/status")
+    def stage3_job_status_alias():
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+        except ValueError as exc:
+            return services._json_error(str(exc), 400)
+        kind = str(request.args.get("kind") or "").strip()
+        if kind and kind not in {"scan", "prepare"}:
+            return services._json_error("kind must be 'scan' or 'prepare'", 400)
+        with jobs_lock:
+            candidates = [
+                dict(job) for job in jobs.values()
+                if job.get("project") == project and (not kind or job.get("kind") == kind)
+            ]
+        if candidates:
+            latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
+            return jsonify({"ok": True, "result": latest})
+        path = job_status_path(project)
+        try:
+            restored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return services._json_error("job not found", 404)
+        if kind and restored.get("kind") != kind:
+            return services._json_error("job not found", 404)
+        if restored.get("status") in {"queued", "running"}:
+            restored.update({
+                "status": "interrupted",
+                "message": "Stage 3 был прерван перезапуском сервера",
+                "finished_at": now_iso(),
+            })
+            persist_job(restored)
+        return jsonify({"ok": True, "result": restored})
+
     @app.post("/stage3/media/scan")
     def stage3_media_scan():
         payload = request.get_json(silent=True)
@@ -332,30 +657,15 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error("JSON object is required", 400)
         try:
             project = services._resolve_project_name(payload.get("project"))
-            paths = services._ensure_project(project)
             recursive = payload.get("recursive", False)
             if not isinstance(recursive, bool):
                 raise MediaCatalogError("recursive must be a boolean")
-            catalog = scan_project_media(project, paths, recursive=recursive)
-            registered = _register_review_sources(catalog, paths, services)
-            catalog["registered_sources"] = len(registered)
-            work_dir = paths.get("work")
-            timeline_path = Path(work_dir) / "full_timeline.json" if work_dir else None
-            if timeline_path is not None and timeline_path.is_file():
-                timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
-                source_store, _match_store = services._sync_stores(paths)
-                mapping = map_catalog_to_timeline(
-                    timeline_data,
-                    {"sources": [source.to_dict() for source in source_store.list()]},
-                    _timeline_catalog(catalog),
-                )
-                _annotate_media_kinds(mapping, catalog)
-                catalog["mapping"] = _mapping_summary(mapping)
-        except (MediaCatalogError, ValueError) as exc:
+            result = perform_scan(project, recursive=recursive)
+        except (MediaCatalogError, ValueError, json.JSONDecodeError) as exc:
             return services._json_error(str(exc), 400)
         except Exception as exc:
             return services._internal_error(exc)
-        return jsonify({"ok": True, "result": {"project": project, **catalog}})
+        return jsonify({"ok": True, "result": result})
 
     @app.post("/stage3/timeline/prepare")
     def stage3_timeline_prepare():
@@ -364,114 +674,17 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error("JSON object is required", 400)
         try:
             project = services._resolve_project_name(payload.get("project"))
-            paths = services._ensure_project(project)
             gate = services._normalization_required(project)
             if gate:
                 return gate
-            timeline_path = paths["work"] / "full_timeline.json"
-            if not timeline_path.is_file():
-                return services._json_error(
-                    "full_timeline.json not found — run Build Timeline first", 404
-                )
-            timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
-            confirmed, _reason = services._confirmed_normalization(project)
-            if (
-                not confirmed
-                or timeline_data.get("normalization_revision")
-                != confirmed.get("revision")
-            ):
-                return services._json_error(
-                    "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
-                    409,
-                )
-            catalog = scan_project_media(project, paths)
-            logical_catalog = _timeline_catalog(catalog)
-            if not logical_catalog.get("sources"):
-                return jsonify({
-                    "ok": True,
-                    "result": {
-                        "project": project,
-                        "format": "legacy",
-                        "filename": f"{project}_timeline.xml",
-                        "download_url": f"/stage2/export/xml?project={project}",
-                        "media_count": 0,
-                        "audio_count": 0,
-                        "mapped_source_ids": [],
-                        "unmapped_source_ids": [],
-                        "placeholder_segments": sum(
-                            1
-                            for segment in timeline_data.get("segments", [])
-                            if isinstance(segment, dict)
-                            and segment.get("type") in {"snh", "host"}
-                        ),
-                        "source_mapping": [],
-                    },
-                })
-            _attach_audio_placeholder_cards(
-                logical_catalog,
-                paths=paths,
-                services=services,
-                width=int(timeline_data.get("width") or 1920),
-                height=int(timeline_data.get("height") or 1080),
-            )
-            source_store, _match_store = services._sync_stores(paths)
-            sync_sources = [source.to_dict() for source in source_store.list()]
-            host_catalog = _host_catalog(
-                logical_catalog, project=project, project_root=paths["root"]
-            )
-            mapping = map_catalog_to_timeline(
-                timeline_data, {"sources": sync_sources}, host_catalog
-            )
-            _annotate_media_kinds(mapping, host_catalog)
-            mapped_timeline_source_ids = set(mapping.catalog)
-            export_timeline, placeholder_count = _placeholder_unmapped_sources(
-                _host_timeline_paths(
-                    timeline_data, project=project, project_root=paths["root"]
-                ),
-                mapped_timeline_source_ids,
-            )
-            # Keep every viewing in RC_VIEWINGS, even if the current script has
-            # not selected a quote from it yet. Aliases keyed by Stage 2 source
-            # ID point at the same path and are deduplicated by the exporter.
-            export_catalog = {
-                str(source["source_id"]): source
-                for source in host_catalog.get("sources", [])
-                if isinstance(source, dict) and source.get("source_id")
-            }
-            export_catalog.update(mapping.catalog)
-            xml_text = build_nested_xml(export_timeline, export_catalog)
-            filename = f"{project}_nested_timeline.xml"
-            artifact = paths["work"] / filename
-            mapping_path = paths["work"] / "stage3_source_mapping.json"
-            atomic_write_text(artifact, xml_text)
-            atomic_write_json(mapping_path, mapping.to_dict())
+            result = perform_prepare(project)
+        except Stage3OperationError as exc:
+            return services._json_error(str(exc), exc.status_code)
         except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
             return services._json_error(str(exc), 400)
         except Exception as exc:
             return services._internal_error(exc)
-        mapped = [
-            source_id
-            for source_id, detail in mapping.details.items()
-            if detail.get("status") == "mapped"
-        ]
-        return jsonify({
-            "ok": True,
-            "result": {
-                "project": project,
-                "format": "nested",
-                "filename": filename,
-                "download_url": f"/stage3/export/xml?project={project}",
-                "media_count": len(host_catalog.get("sources", [])),
-                "audio_count": sum(
-                    1 for item in catalog.get("sources", [])
-                    if isinstance(item, dict) and _media_kind(item) == "audio"
-                ),
-                "mapped_source_ids": mapped,
-                "unmapped_source_ids": list(mapping.unmapped_source_ids),
-                "placeholder_segments": placeholder_count,
-                "source_mapping": _mapping_summary(mapping),
-            },
-        })
+        return jsonify({"ok": True, "result": result})
 
     @app.get("/stage3/export/xml")
     def stage3_export_xml():

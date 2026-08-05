@@ -7,8 +7,12 @@ from pathlib import Path
 import subprocess
 from typing import Any, Callable
 
+from atomic_io import atomic_write_json
+
 
 DEFAULT_MEDIA_ROOT = Path("/review-media")
+CACHE_VERSION = 1
+CACHE_FILENAME = "stage3_ffprobe_cache.json"
 VIDEO_EXTENSIONS = frozenset({
     ".3gp",
     ".avi",
@@ -177,6 +181,78 @@ def _fingerprint(relative_path: str, size: int, mtime_ns: int) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _metadata_cache_path(media_root: Path) -> Path:
+    root = media_root.resolve()
+    work = root / "work"
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        resolved_work = work.resolve(strict=True)
+    except OSError as exc:
+        raise MediaCatalogError("cannot create the Stage 3 metadata cache directory") from exc
+    if not _is_relative_to(resolved_work, root):
+        raise MediaCatalogError("Stage 3 metadata cache resolves outside the media root")
+    cache_path = resolved_work / CACHE_FILENAME
+    if cache_path.exists() and not _is_relative_to(cache_path.resolve(), root):
+        raise MediaCatalogError("Stage 3 metadata cache resolves outside the media root")
+    return cache_path
+
+
+def _load_metadata_cache(path: Path) -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
+        return {}
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in entries.items()
+        if isinstance(key, str) and isinstance(value, dict)
+    }
+
+
+def _cached_probe_metadata(
+    entry: dict[str, Any] | None,
+    *,
+    size_bytes: int,
+    mtime_ns: int,
+    extension: str,
+) -> dict[str, Any] | None:
+    if not entry:
+        return None
+    if (
+        entry.get("size_bytes") != size_bytes
+        or entry.get("mtime_ns") != mtime_ns
+        or entry.get("extension") != extension
+    ):
+        return None
+    metadata = entry.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    required = {"duration_sec", "fps", "width", "height", "media_kind", "has_audio"}
+    if not required.issubset(metadata):
+        return None
+    try:
+        normalized = {
+            "duration_sec": max(0.0, float(metadata["duration_sec"])),
+            "fps": float(metadata["fps"]) if metadata["fps"] is not None else None,
+            "width": int(metadata["width"]) if metadata["width"] is not None else None,
+            "height": int(metadata["height"]) if metadata["height"] is not None else None,
+            "media_kind": str(metadata["media_kind"]),
+            "has_audio": metadata["has_audio"],
+        }
+    except (TypeError, ValueError):
+        return None
+    if normalized["media_kind"] not in {"video", "audio"}:
+        return None
+    if not isinstance(normalized["has_audio"], bool):
+        return None
+    return normalized
+
+
 def scan_media_directory(
     directory: str,
     *,
@@ -189,6 +265,9 @@ def scan_media_directory(
         directory,
         media_root=media_root,
     )
+    cache_path = _metadata_cache_path(root)
+    cached_entries = _load_metadata_cache(cache_path)
+    next_entries: dict[str, dict[str, Any]] = {}
     iterator = resolved.rglob("*") if recursive else resolved.iterdir()
     sources: list[MediaSource] = []
     for candidate in sorted(iterator, key=lambda item: item.as_posix().casefold()):
@@ -202,14 +281,29 @@ def scan_media_directory(
             continue
         stat = safe_path.stat()
         relative_path = safe_path.relative_to(root).as_posix()
-        metadata = probe_media(safe_path, run=run)
+        extension = safe_path.suffix.lower()
+        metadata = _cached_probe_metadata(
+            cached_entries.get(relative_path),
+            size_bytes=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            extension=extension,
+        )
+        if metadata is None:
+            metadata = probe_media(safe_path, run=run)
+        cache_entry = {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "extension": extension,
+            "metadata": metadata,
+        }
+        next_entries[relative_path] = cache_entry
         sources.append(MediaSource(
             source_id=_source_id(relative_path),
             fingerprint=_fingerprint(relative_path, stat.st_size, stat.st_mtime_ns),
             name=safe_path.name,
             relative_path=relative_path,
             container_path=str(safe_path),
-            extension=safe_path.suffix.lower(),
+            extension=extension,
             size_bytes=stat.st_size,
             mtime=stat.st_mtime,
             mtime_ns=stat.st_mtime_ns,
@@ -220,6 +314,8 @@ def scan_media_directory(
             media_kind=str(metadata["media_kind"]),
             has_audio=bool(metadata["has_audio"]),
         ))
+    if next_entries != cached_entries:
+        atomic_write_json(cache_path, {"version": CACHE_VERSION, "entries": next_entries})
     return {
         "directory": str(resolved),
         "relative_directory": resolved.relative_to(root).as_posix(),
