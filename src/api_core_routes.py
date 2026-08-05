@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import shutil
 from types import ModuleType
 
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
+
+
+def _active_revision_input_path(paths: dict[str, Path], input_files: list[str]) -> str:
+    """Prefer the scenario file owned by the active revision."""
+
+    active_path = paths["work"] / "active_revision.json"
+    try:
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+        revision_id = str(active.get("revision_id") or "")
+        manifest_path = paths["scenario_versions"] / f"{revision_id}.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        source_file = Path(str(manifest.get("source_file") or "")).name
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        source_file = ""
+    if source_file:
+        active_input = next(
+            (value for value in input_files if Path(value).name == source_file),
+            "",
+        )
+        if active_input:
+            return active_input
+    return input_files[0] if input_files else ""
 
 
 def register_core_routes(app: Flask, services: ModuleType) -> None:
@@ -60,12 +84,11 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
         status = services._build_status(project)
 
         input_files = services._discover_input_files(paths["input"], project)
+        active_input = _active_revision_input_path(paths, input_files)
         defaults = {
             "project": project,
             "input_path": (
-                input_files[0]
-                if input_files
-                else f"projects/{project}/input/scenario.docx"
+                active_input or f"projects/{project}/input/scenario.docx"
             ),
             "output_path": f"projects/{project}/work/scenario_prepared.json",
             "raw_output_path": f"projects/{project}/work/scenario_raw.txt",

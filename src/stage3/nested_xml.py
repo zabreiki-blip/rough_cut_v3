@@ -411,6 +411,13 @@ def _marker(parent: ET.Element, segment: TimelineSegment, name: str) -> None:
     _sub(marker, "out", -1)
 
 
+def _revision_label(parent: ET.Element, segment: TimelineSegment) -> None:
+    if segment.revision_status == "added":
+        labels = _sub(parent, "labels")
+        # Premiere's built-in red label is named "Rose" in FCP7 XML.
+        _sub(labels, "label2", "Rose")
+
+
 def _nested_clip(
     track: ET.Element,
     segment: TimelineSegment,
@@ -436,6 +443,7 @@ def _nested_clip(
     _sub(clip, "in", source_in)
     _sub(clip, "out", source_out)
     _marker(clip, segment, segment.id)
+    _revision_label(clip, segment)
     ET.SubElement(clip, "sequence", {"id": sequence_id})
     source_track = _sub(clip, "sourcetrack")
     _sub(source_track, "mediatype", media_type)
@@ -462,6 +470,7 @@ def _placeholder_clip(
     _sub(clip, "in", 0)
     _sub(clip, "out", duration)
     _marker(clip, segment, label)
+    _revision_label(clip, segment)
     file_element = ET.SubElement(clip, "file", {"id": f"file-{clip_id}"})
     _sub(file_element, "name", Path(segment.placeholder_path).name)
     _sub(file_element, "pathurl", _path_url(segment.placeholder_path))
@@ -495,6 +504,7 @@ def _voiceover_clip(
     _sub(clip, "in", 0)
     _sub(clip, "out", duration)
     _marker(clip, segment, segment.id)
+    _revision_label(clip, segment)
     file_element = ET.SubElement(clip, "file", {"id": f"file-{clip_id}"})
     _sub(file_element, "name", Path(segment.wav_path).name)
     _sub(file_element, "pathurl", _path_url(segment.wav_path))

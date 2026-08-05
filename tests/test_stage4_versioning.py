@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from api_core_routes import _active_revision_input_path
 from atomic_io import atomic_write_json
 from project_service import ensure_project
 from stage4.versioning import activate_revision, compare_blocks, import_revision
@@ -77,3 +78,22 @@ def test_import_snapshots_baseline_and_inherits_stable_uid(tmp_path: Path) -> No
     paths["sync_matches"].write_text('{"schema_version": 1, "matches": []}\n', encoding="utf-8")
     rolled_back = activate_revision("rev_0001", paths)
     assert rolled_back["reused_sync_matches"] == 1
+
+
+def test_active_revision_selects_its_scenario_instead_of_first_input(tmp_path: Path) -> None:
+    paths = ensure_project("demo", tmp_path / "projects")
+    input_files = [
+        "projects/demo/input/scenario.doc",
+        "projects/demo/input/v002_scenario.docx",
+    ]
+    atomic_write_json(paths["scenario_versions"] / "rev_0002.json", {
+        "revision_id": "rev_0002",
+        "source_file": "v002_scenario.docx",
+    })
+    atomic_write_json(paths["work"] / "active_revision.json", {
+        "revision_id": "rev_0002",
+    })
+
+    selected = _active_revision_input_path(paths, input_files)
+
+    assert selected == "projects/demo/input/v002_scenario.docx"

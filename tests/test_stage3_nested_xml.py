@@ -93,6 +93,18 @@ def test_matched_clip_references_nested_sequence_with_correct_frames() -> None:
     assert len(final.findall("./media/audio/track/clipitem/sequence")) == 1
 
 
+def test_new_revision_block_is_red_on_video_and_audio_tracks() -> None:
+    timeline = _timeline()
+    timeline.segments[0].revision_status = "added"
+
+    root = _root(build_nested_xml(timeline, _catalog()))
+    final = root.find("./project/children/sequence")
+
+    assert final is not None
+    assert final.findtext("./media/video/track/clipitem/labels/label2") == "Rose"
+    assert final.findtext("./media/audio/track/clipitem/labels/label2") == "Rose"
+
+
 def test_voiceover_and_unmatched_placeholder_are_preserved() -> None:
     root = _root(build_nested_xml(_timeline(), _catalog()))
     final = root.find("./project/children/sequence")

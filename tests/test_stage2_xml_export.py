@@ -94,3 +94,22 @@ def test_valid_subframe_audio_segment_is_exported_as_one_frame() -> None:
     assert clip is not None
     assert clip.findtext("duration") == "1"
     assert clip.findtext("end") == str(int(clip.findtext("start")) + 1)
+
+
+def test_new_revision_placeholder_has_red_premiere_label() -> None:
+    timeline = FullTimeline(
+        project="BRIK",
+        segments=[TimelineSegment(
+            id="snh1",
+            type="snh",
+            text="Новый фрагмент",
+            duration_sec=10,
+            block_uid="block-new",
+            revision_status="added",
+            placeholder_path="/tmp/snh1_placeholder.png",
+        )],
+    )
+
+    root = ET.fromstring(build_xml(timeline).split("\n", 2)[2])
+
+    assert root.findtext("./sequence/media/video/track/clipitem/labels/label2") == "Rose"

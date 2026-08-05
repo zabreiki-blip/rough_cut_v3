@@ -334,6 +334,12 @@ def parse_normalized_timeline(
         block_type = str(block.get("type", "unknown")).lower()
         text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
         block_uid = str(block.get("uid") or "").strip()
+        versioning = block.get("versioning")
+        revision_status = str(
+            versioning.get("change_status")
+            if isinstance(versioning, dict)
+            else ""
+        ).strip()
 
         if block_type == "voiceover":
             counters["voiceover"] += 1
@@ -345,6 +351,7 @@ def parse_normalized_timeline(
                 text=text,
                 duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
                 block_uid=block_uid,
+                revision_status=revision_status,
                 wav_path=str(wav_path) if wav_path.exists() else "",
             ))
             continue
@@ -389,6 +396,7 @@ def parse_normalized_timeline(
                     ),
                     block_uid=fragment_uid,
                     parent_block_uid=block_uid,
+                    revision_status=revision_status,
                     speaker=str(block.get("speaker") or block.get("original_label") or prefix).strip(),
                     role=str(block.get("role") or ("СНХ" if block_type == "sync" else "ВЕДУЩИЙ")).strip(),
                     timecode=fragment["timecode_start"],
@@ -414,6 +422,7 @@ def parse_normalized_timeline(
             text=text,
             duration_sec=0.0,
             block_uid=block_uid,
+            revision_status=revision_status,
         ))
 
     cursor = 0.0

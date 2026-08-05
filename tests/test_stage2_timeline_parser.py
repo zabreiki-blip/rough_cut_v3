@@ -121,7 +121,12 @@ class NormalizedTimelineTest(unittest.TestCase):
             document = {
                 "status": "confirmed",
                 "blocks": [
-                    {"order": 1, "type": "voiceover", "normalized_text": "Закадр"},
+                    {
+                        "order": 1,
+                        "type": "voiceover",
+                        "normalized_text": "Закадр",
+                        "versioning": {"change_status": "added"},
+                    },
                     {
                         "order": 2,
                         "type": "sync",
@@ -147,6 +152,7 @@ class NormalizedTimelineTest(unittest.TestCase):
             self.assertEqual(timeline.segments[1].speaker, "Иван Иванов")
             self.assertEqual(timeline.segments[1].timecode, "01:02:03")
             self.assertEqual(timeline.segments[2].id, "host1")
+            self.assertEqual(timeline.segments[0].revision_status, "added")
 
     def test_draft_is_rejected(self) -> None:
         with TemporaryDirectory() as tmp:

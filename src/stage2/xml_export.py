@@ -64,6 +64,13 @@ def _validate_placeholder_identities(timeline: FullTimeline) -> None:
         seen.add(seg.block_uid)
 
 
+def _revision_label(parent: ET.Element, seg: TimelineSegment) -> None:
+    if seg.revision_status == "added":
+        labels = _sub(parent, "labels")
+        # Premiere's built-in red label is named "Rose" in FCP7 XML.
+        _sub(labels, "label2", "Rose")
+
+
 def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
     file_el = ET.SubElement(parent, "file")
     file_el.set("id", f"file-{seg.id}")
@@ -167,6 +174,7 @@ def build_xml(timeline: FullTimeline) -> str:
             _sub(marker, "comment", seg.text[:200])
             _sub(marker, "in", "0")
             _sub(marker, "out", "-1")
+            _revision_label(ci, seg)
             _audio_file_el(ci, seg, fps)
             st = _sub(ci, "sourcetrack")
             _sub(st, "mediatype", "audio")
@@ -189,6 +197,7 @@ def build_xml(timeline: FullTimeline) -> str:
             _sub(marker, "comment", seg.text[:200])
             _sub(marker, "in", "0")
             _sub(marker, "out", "-1")
+            _revision_label(ci, seg)
             _video_file_el(ci, seg, fps, timeline.width, timeline.height)
             clip_idx += 1
 

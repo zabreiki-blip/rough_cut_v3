@@ -18,6 +18,8 @@ class TimelineSegment:
     block_uid: str = ""
     # Parent normalization block when one speaker block expands into fragments.
     parent_block_uid: str = ""
+    # Scenario-version change status (for example ``added``).
+    revision_status: str = ""
     # SNH-specific
     speaker: str = ""
     role: str = ""
