@@ -35,6 +35,12 @@ class MediaSource:
     width: int = 1920
     height: int = 1080
     name: str = ""
+    media_kind: str = "video"
+    placeholder_path: str = ""
+
+    @property
+    def has_video(self) -> bool:
+        return self.media_kind != "audio"
 
     @classmethod
     def from_value(cls, source_id: str, value: object) -> "MediaSource":
@@ -63,6 +69,8 @@ class MediaSource:
                     or raw.get("sequence_name")
                     or ""
                 ),
+                media_kind=_media_kind(raw),
+                placeholder_path=str(raw.get("placeholder_path") or ""),
             )
         return cls(
             id=str(getattr(value, "id", getattr(value, "source_id", source_id))),
@@ -86,6 +94,8 @@ class MediaSource:
                     getattr(value, "proxy_sequence_name", ""),
                 )
             ),
+            media_kind=str(getattr(value, "media_kind", "video")),
+            placeholder_path=str(getattr(value, "placeholder_path", "")),
         )
 
 
@@ -184,6 +194,20 @@ def _coerce_sources(
     return result
 
 
+def _media_kind(value: Mapping[str, object]) -> str:
+    explicit = str(value.get("media_kind") or "").strip().lower()
+    if explicit in {"audio", "video"}:
+        return explicit
+    path = str(
+        value.get("path")
+        or value.get("media_path")
+        or value.get("container_path")
+        or value.get("name")
+        or ""
+    )
+    return "audio" if Path(path).suffix.lower() in {".mp3", ".wav"} else "video"
+
+
 def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> None:
     if timeline.fps <= 0:
         raise ValueError("timeline fps must be positive")
@@ -204,6 +228,8 @@ def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> Non
             )
         if source.width <= 0 or source.height <= 0:
             raise ValueError(f"source {source_id} dimensions must be positive")
+        if not source.has_video and not source.placeholder_path.strip():
+            raise ValueError(f"audio source {source_id} has no placeholder card")
 
     previous_end = 0.0
     for segment in timeline.segments:
@@ -298,12 +324,13 @@ def _media_file(
     _rate(file_element, fps)
     _sub(file_element, "duration", duration_frames)
     media = _sub(file_element, "media")
-    video = _sub(media, "video")
-    characteristics = _sub(video, "samplecharacteristics")
-    _sub(characteristics, "width", source.width)
-    _sub(characteristics, "height", source.height)
-    _sub(characteristics, "pixelaspectratio", "square")
-    _rate(characteristics, fps)
+    if source.has_video:
+        video = _sub(media, "video")
+        characteristics = _sub(video, "samplecharacteristics")
+        _sub(characteristics, "width", source.width)
+        _sub(characteristics, "height", source.height)
+        _sub(characteristics, "pixelaspectratio", "square")
+        _rate(characteristics, fps)
     audio = _sub(media, "audio")
     _sub(audio, "channelcount", "2")
 
@@ -329,14 +356,29 @@ def _source_sequence(
     _video_format(video, source.width, source.height, fps)
     video_track = _sub(video, "track")
     video_clip = ET.SubElement(video_track, "clipitem", {"id": f"clip-{file_id}-v"})
-    _sub(video_clip, "name", Path(source.path).name)
+    video_path = source.path if source.has_video else source.placeholder_path
+    _sub(video_clip, "name", Path(video_path).name)
     _sub(video_clip, "duration", duration)
     _rate(video_clip, fps)
     _sub(video_clip, "start", 0)
     _sub(video_clip, "end", duration)
     _sub(video_clip, "in", 0)
     _sub(video_clip, "out", duration)
-    _media_file(video_clip, source, file_id, duration)
+    if source.has_video:
+        _media_file(video_clip, source, file_id, duration)
+    else:
+        card_file = ET.SubElement(video_clip, "file", {"id": f"card-{file_id}"})
+        _sub(card_file, "name", Path(video_path).name)
+        _sub(card_file, "pathurl", _path_url(video_path))
+        _rate(card_file, fps)
+        _sub(card_file, "duration", duration)
+        card_media = _sub(card_file, "media")
+        card_video = _sub(card_media, "video")
+        characteristics = _sub(card_video, "samplecharacteristics")
+        _sub(characteristics, "width", source.width)
+        _sub(characteristics, "height", source.height)
+        _sub(characteristics, "pixelaspectratio", "square")
+        _rate(characteristics, fps)
     source_track = _sub(video_clip, "sourcetrack")
     _sub(source_track, "mediatype", "video")
     _sub(source_track, "trackindex", 1)
@@ -352,7 +394,10 @@ def _source_sequence(
     _sub(audio_clip, "end", duration)
     _sub(audio_clip, "in", 0)
     _sub(audio_clip, "out", duration)
-    ET.SubElement(audio_clip, "file", {"id": file_id})
+    if source.has_video:
+        ET.SubElement(audio_clip, "file", {"id": file_id})
+    else:
+        _media_file(audio_clip, source, file_id, duration)
     source_track = _sub(audio_clip, "sourcetrack")
     _sub(source_track, "mediatype", "audio")
     _sub(source_track, "trackindex", 1)
@@ -519,6 +564,8 @@ def build_nested_xml(
                 or canonical.fps != source.fps
                 or canonical.width != source.width
                 or canonical.height != source.height
+                or canonical.media_kind != source.media_kind
+                or canonical.placeholder_path != source.placeholder_path
             ):
                 raise ValueError(
                     f"catalog entries for {source.path} have inconsistent media metadata"

@@ -37,6 +37,7 @@ def generate_placeholder(
     out_path: Path,
     width: int = 1920,
     height: int = 1080,
+    footer_label: str = "",
 ) -> Path:
     """Generate a black PNG placeholder card for an SNH segment."""
     img = Image.new("RGB", (width, height), _BG_COLOR)
@@ -63,7 +64,8 @@ def generate_placeholder(
 
     # Bottom label
     font_id = _get_font(40)
-    draw.text((120, height - 110), f"[ЗАГЛУШКА · {seg_id} · 10 сек]",
+    footer = footer_label or f"ЗАГЛУШКА · {seg_id} · 10 сек"
+    draw.text((120, height - 110), f"[{footer}]",
               font=font_id, fill=(80, 80, 80))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -202,3 +202,46 @@ def test_accepts_media_catalog_list_contract() -> None:
     assert source.findtext("media/video/track/clipitem/file/pathurl").endswith(
         "/%D0%A1%D0%B2%D0%B8%D0%B1%D0%BB%D0%BE%D0%B2%D0%B0.mp4"
     )
+
+
+@pytest.mark.parametrize("extension", ["wav", "mp3"])
+def test_audio_only_source_uses_card_and_audio_in_nested_sequence(extension: str) -> None:
+    catalog = {
+        "свиблова": {
+            "path": f"/Volumes/L_BRICK/DOP/Свиблова.{extension}",
+            "duration": 120,
+            "fps": 25,
+            "media_kind": "audio",
+            "placeholder_path": "/tmp/НУЖНО ВИДЕО Свиблова.png",
+        }
+    }
+
+    root = _root(build_nested_xml(_timeline(), catalog))
+    source = root.find("./project/children/bin/children/sequence")
+    final = root.find("./project/children/sequence")
+
+    assert source is not None and final is not None
+    card_url = source.findtext("./media/video/track/clipitem/file/pathurl")
+    audio_url = source.findtext("./media/audio/track/clipitem/file/pathurl")
+    assert card_url is not None and "%D0%9D%D0%A3%D0%96%D0%9D%D0%9E%20" in card_url
+    assert audio_url is not None and audio_url.endswith(f".{extension}")
+    nested_video = final.findall("./media/video/track/clipitem/sequence")
+    nested_audio = final.findall("./media/audio/track[1]/clipitem/sequence")
+    assert len(nested_video) == 1
+    assert len(nested_audio) == 1
+    assert nested_video[0].get("id") == source.get("id")
+    assert nested_audio[0].get("id") == source.get("id")
+
+
+def test_audio_only_source_requires_placeholder_card() -> None:
+    catalog = {
+        "свиблова": {
+            "path": "/tmp/Свиблова.wav",
+            "duration": 120,
+            "fps": 25,
+            "media_kind": "audio",
+        }
+    }
+
+    with pytest.raises(ValueError, match="has no placeholder card"):
+        build_nested_xml(_timeline(), catalog)

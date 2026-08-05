@@ -136,6 +136,22 @@ def test_scan_pairs_same_stem_video_and_wav(client) -> None:
     assert source_store.get("media_audio") is None
 
 
+def test_timeline_catalog_keeps_standalone_audio_but_collapses_companion() -> None:
+    catalog = {
+        "sources": [
+            {"source_id": "v", "relative_path": "media/reviews/A.mp4", "media_kind": "video"},
+            {"source_id": "a", "relative_path": "media/reviews/A.wav", "media_kind": "audio"},
+            {"source_id": "only", "relative_path": "media/reviews/B.mp3", "media_kind": "audio"},
+            {"source_id": "c_mp3", "relative_path": "media/reviews/C.mp3", "media_kind": "audio"},
+            {"source_id": "c_wav", "relative_path": "media/reviews/C.wav", "media_kind": "audio"},
+        ]
+    }
+
+    result = api_stage3_routes._timeline_catalog(catalog)
+
+    assert [item["source_id"] for item in result["sources"]] == ["v", "only", "c_wav"]
+
+
 @pytest.mark.parametrize(
     ("payload", "error"),
     [

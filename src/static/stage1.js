@@ -1307,12 +1307,12 @@
     ids.stage3_source_mapping.innerHTML = items.map((item) => {
       const mapped = item.status === "mapped";
       const reason = mapped
-        ? `до ${formatMediaDuration(item.max_source_out_sec)} на исходнике`
+        ? (item.media_kind === "audio"
+          ? `карточка + звук · до ${formatMediaDuration(item.max_source_out_sec)}`
+          : `до ${formatMediaDuration(item.max_source_out_sec)} на исходнике`)
         : (item.reason === "ambiguous_name_match" ? "неоднозначное имя" :
           (item.reason === "media_too_short" ? "просмотровка короче нужного диапазона" :
-            (item.reason === "audio_only_needs_video"
-              ? "аудио готово для Whisper — для XML нужно видео"
-              : "просмотровка не найдена")));
+            "просмотровка не найдена"));
       return `<article class="stage3-map-row" data-state="${mapped ? "mapped" : "unmapped"}">
         <div><strong>${escaped(stage3MappingLabel(item))}</strong><small>${escaped(item.source_id || "")}</small></div>
         <span class="stage3-map-arrow">→</span>

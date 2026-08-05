@@ -48,6 +48,12 @@ def _host_catalog(catalog: dict, *, project: str, project_root: Path) -> dict:
                 project=project,
                 project_root=project_root,
             )
+            if source.get("placeholder_path"):
+                source["placeholder_path"] = _host_path(
+                    str(source["placeholder_path"]),
+                    project=project,
+                    project_root=project_root,
+                )
     return result
 
 
@@ -102,6 +108,7 @@ def _mapping_summary(mapping) -> list[dict]:
             "max_source_out_sec": detail.get("max_source_out_sec", 0.0),
             "sequence_aliases": detail.get("sequence_aliases", []),
             "speaker_aliases": detail.get("speaker_aliases", []),
+            "media_kind": detail.get("media_kind", "video"),
         })
     return result
 
@@ -113,27 +120,73 @@ def _media_kind(item: dict) -> str:
     return "audio" if Path(str(item.get("name") or item.get("relative_path") or "")).suffix.lower() in {".mp3", ".wav"} else "video"
 
 
-def _visual_catalog(catalog: dict) -> dict:
+def _timeline_catalog(catalog: dict) -> dict:
+    """Collapse audio companions while retaining standalone audio sources."""
+
     result = deepcopy(catalog)
-    result["sources"] = [
-        item for item in result.get("sources", [])
-        if isinstance(item, dict) and _media_kind(item) == "video"
-    ]
+    grouped: dict[str, list[dict]] = {}
+    for item in result.get("sources", []):
+        if not isinstance(item, dict):
+            continue
+        relative_path = str(item.get("relative_path") or "").strip()
+        if not relative_path:
+            continue
+        key = Path(relative_path).with_suffix("").as_posix().casefold()
+        grouped.setdefault(key, []).append(item)
+    logical_sources = []
+    for items in grouped.values():
+        visual = next((item for item in items if _media_kind(item) == "video"), None)
+        audio = min(
+            items,
+            key=lambda item: (
+                Path(str(item.get("relative_path") or "")).suffix.lower() != ".wav",
+                str(item.get("relative_path") or "").casefold(),
+            ),
+        )
+        logical_sources.append(visual or audio)
+    result["sources"] = logical_sources
     return result
 
 
-def _mark_audio_only_sources(mapping, catalog: dict) -> None:
-    audio_only = {
+def _annotate_media_kinds(mapping, catalog: dict) -> None:
+    media_by_id = {
         str(item.get("source_id") or ""): item
         for item in catalog.get("sources", [])
-        if isinstance(item, dict) and _media_kind(item) == "audio"
+        if isinstance(item, dict)
     }
-    for source_id, item in audio_only.items():
-        detail = mapping.details.get(source_id)
-        if detail is not None and detail.get("status") != "mapped":
-            detail["reason"] = "audio_only_needs_video"
-            detail["media_name"] = str(item.get("name") or Path(str(item.get("relative_path") or "")).name)
-            detail["media_source_id"] = source_id
+    for detail in mapping.details.values():
+        item = media_by_id.get(str(detail.get("media_source_id") or ""))
+        if item is not None:
+            detail["media_kind"] = _media_kind(item)
+
+
+def _attach_audio_placeholder_cards(
+    catalog: dict,
+    *,
+    paths: dict,
+    services: ModuleType,
+    width: int,
+    height: int,
+) -> None:
+    placeholder_dir = paths["work"] / "placeholders"
+    for item in catalog.get("sources", []):
+        if not isinstance(item, dict) or _media_kind(item) != "audio":
+            continue
+        source_id = str(item.get("source_id") or "audio")
+        name = str(item.get("name") or Path(str(item.get("relative_path") or "")).name)
+        card_path = placeholder_dir / f"stage3_{re.sub(r'[^A-Za-z0-9_.-]+', '-', source_id)}.png"
+        services.generate_placeholder(
+            seg_id=source_id,
+            speaker=Path(name).stem,
+            role="НУЖНО ВИДЕО",
+            timecode="AUDIO ONLY",
+            text=f"Подложите видео вместо аудиоисточника {name}",
+            out_path=card_path,
+            width=width,
+            height=height,
+            footer_label=f"НУЖНО ВИДЕО · {Path(name).stem}",
+        )
+        item["placeholder_path"] = str(card_path)
 
 
 def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -> list:
@@ -246,9 +299,9 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 mapping = map_catalog_to_timeline(
                     timeline_data,
                     {"sources": [source.to_dict() for source in source_store.list()]},
-                    _visual_catalog(catalog),
+                    _timeline_catalog(catalog),
                 )
-                _mark_audio_only_sources(mapping, catalog)
+                _annotate_media_kinds(mapping, catalog)
                 catalog["mapping"] = _mapping_summary(mapping)
         except (MediaCatalogError, ValueError) as exc:
             return services._json_error(str(exc), 400)
@@ -271,15 +324,23 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 )
             timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
             catalog = scan_project_media(project, paths)
+            logical_catalog = _timeline_catalog(catalog)
+            _attach_audio_placeholder_cards(
+                logical_catalog,
+                paths=paths,
+                services=services,
+                width=int(timeline_data.get("width") or 1920),
+                height=int(timeline_data.get("height") or 1080),
+            )
             source_store, _match_store = services._sync_stores(paths)
             sync_sources = [source.to_dict() for source in source_store.list()]
             host_catalog = _host_catalog(
-                _visual_catalog(catalog), project=project, project_root=paths["root"]
+                logical_catalog, project=project, project_root=paths["root"]
             )
             mapping = map_catalog_to_timeline(
                 timeline_data, {"sources": sync_sources}, host_catalog
             )
-            _mark_audio_only_sources(mapping, catalog)
+            _annotate_media_kinds(mapping, host_catalog)
             mapped_timeline_source_ids = set(mapping.catalog)
             export_timeline, placeholder_count = _placeholder_unmapped_sources(
                 _host_timeline_paths(
