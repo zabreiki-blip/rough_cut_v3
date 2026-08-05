@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 
 DEFAULT_MEDIA_ROOT = Path("/review-media")
-MEDIA_EXTENSIONS = frozenset({
+VIDEO_EXTENSIONS = frozenset({
     ".3gp",
     ".avi",
     ".m2ts",
@@ -23,6 +23,8 @@ MEDIA_EXTENSIONS = frozenset({
     ".mxf",
     ".webm",
 })
+AUDIO_EXTENSIONS = frozenset({".mp3", ".wav"})
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
 
 class MediaCatalogError(ValueError):
@@ -44,6 +46,8 @@ class MediaSource:
     fps: float | None
     width: int | None
     height: int | None
+    media_kind: str
+    has_audio: bool
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -102,7 +106,7 @@ def probe_media(
     path: Path,
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> dict[str, float | int | None]:
+) -> dict[str, float | int | str | bool | None]:
     try:
         result = run(
             [
@@ -137,6 +141,10 @@ def probe_media(
         (stream for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "video"),
         {},
     )
+    has_audio = any(
+        isinstance(stream, dict) and stream.get("codec_type") == "audio"
+        for stream in streams
+    )
     format_payload = payload.get("format") if isinstance(payload, dict) else {}
     format_payload = format_payload if isinstance(format_payload, dict) else {}
     try:
@@ -149,6 +157,8 @@ def probe_media(
         "fps": fps,
         "width": int(video["width"]) if video.get("width") is not None else None,
         "height": int(video["height"]) if video.get("height") is not None else None,
+        "media_kind": "video" if video else "audio",
+        "has_audio": has_audio,
     }
 
 
@@ -207,6 +217,8 @@ def scan_media_directory(
             fps=float(metadata["fps"]) if metadata["fps"] is not None else None,
             width=int(metadata["width"]) if metadata["width"] is not None else None,
             height=int(metadata["height"]) if metadata["height"] is not None else None,
+            media_kind=str(metadata["media_kind"]),
+            has_audio=bool(metadata["has_audio"]),
         ))
     return {
         "directory": str(resolved),

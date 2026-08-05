@@ -1267,9 +1267,9 @@
     }
     ids.stage3_media_message.textContent = items.length > 0
       ? `Папка просканирована. ${items.length} файл(ов) готовы как временные источники.`
-      : "В указанной папке поддерживаемые видеофайлы не найдены.";
+      : "В указанной папке поддерживаемые видео-, WAV- или MP3-файлы не найдены.";
     ids.stage3_media_list.innerHTML = items.length === 0
-      ? '<div class="empty-state compact">Проверьте путь и наличие видеофайлов.</div>'
+      ? '<div class="empty-state compact">Проверьте путь и наличие видео-, WAV- или MP3-файлов.</div>'
       : items.map((item) => {
         const path = String(item.container_path || item.relative_path || item.path || item.file || item.name || "Без имени");
         const name = String(item.name || path.split(/[\\/]/).pop() || path);
@@ -1310,7 +1310,9 @@
         ? `до ${formatMediaDuration(item.max_source_out_sec)} на исходнике`
         : (item.reason === "ambiguous_name_match" ? "неоднозначное имя" :
           (item.reason === "media_too_short" ? "просмотровка короче нужного диапазона" :
-            "просмотровка не найдена"));
+            (item.reason === "audio_only_needs_video"
+              ? "аудио готово для Whisper — для XML нужно видео"
+              : "просмотровка не найдена")));
       return `<article class="stage3-map-row" data-state="${mapped ? "mapped" : "unmapped"}">
         <div><strong>${escaped(stage3MappingLabel(item))}</strong><small>${escaped(item.source_id || "")}</small></div>
         <span class="stage3-map-arrow">→</span>

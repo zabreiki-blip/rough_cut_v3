@@ -99,6 +99,43 @@ def test_scan_registers_viewing_as_headless_whisper_source(client) -> None:
     assert source.all_speakers is False
 
 
+def test_scan_pairs_same_stem_video_and_wav(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    base = "/app/projects/BRIK/media/reviews/Курская"
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews",
+        "recursive": False,
+        "sources": [
+            {
+                "source_id": "media_video", "fingerprint": "video-fp",
+                "name": "Курская.mp4", "relative_path": "media/reviews/Курская.mp4",
+                "container_path": f"{base}.mp4", "duration_sec": 123.5,
+                "fps": 25.0, "media_kind": "video",
+            },
+            {
+                "source_id": "media_audio", "fingerprint": "audio-fp",
+                "name": "Курская.wav", "relative_path": "media/reviews/Курская.wav",
+                "container_path": f"{base}.wav", "duration_sec": 123.5,
+                "fps": None, "media_kind": "audio",
+            },
+        ],
+    })
+
+    response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    assert response.get_json()["result"]["registered_sources"] == 1
+    source_store, _match_store = services._sync_stores(services._ensure_project("BRIK"))
+    source = source_store.get("media_video")
+    assert source is not None
+    assert source.guide_audio == "media/reviews/Курская.wav"
+    assert source.media_path == "media/reviews/Курская.mp4"
+    assert source.media_fingerprint == "audio-fp"
+    assert source_store.get("media_audio") is None
+
+
 @pytest.mark.parametrize(
     ("payload", "error"),
     [

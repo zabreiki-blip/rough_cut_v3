@@ -51,6 +51,8 @@ def test_scan_filters_extensions_and_is_non_recursive_by_default(tmp_path: Path)
     assert source["fps"] == 25.0
     assert source["width"] == 1920
     assert source["height"] == 1080
+    assert source["media_kind"] == "video"
+    assert source["has_audio"] is False
     assert source["size_bytes"] == 5
     assert source["mtime"] > 0
     assert source["relative_path"] == "BRIK/Просмотровка 01.MP4"
@@ -101,3 +103,32 @@ def test_symlink_to_file_outside_root_is_never_probed(tmp_path: Path) -> None:
 
     result = scan_media_directory(str(folder), media_root=root, run=must_not_run)
     assert result["sources"] == []
+
+
+@pytest.mark.parametrize("extension", [".wav", ".mp3"])
+def test_scan_accepts_audio_only_media(tmp_path: Path, extension: str) -> None:
+    root = tmp_path / "media"
+    folder = root / "project"
+    folder.mkdir(parents=True)
+    audio = folder / f"Курская{extension}"
+    audio.write_bytes(b"audio")
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({
+                "format": {"duration": "42.25"},
+                "streams": [{"codec_type": "audio"}],
+            }), stderr="",
+        )
+
+    source = scan_media_directory(
+        str(folder), media_root=root, run=fake_run
+    )["sources"][0]
+
+    assert source["name"] == audio.name
+    assert source["duration_sec"] == 42.25
+    assert source["media_kind"] == "audio"
+    assert source["has_audio"] is True
+    assert source["fps"] is None
+    assert source["width"] is None

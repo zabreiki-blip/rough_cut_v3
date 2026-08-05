@@ -106,19 +106,70 @@ def _mapping_summary(mapping) -> list[dict]:
     return result
 
 
+def _media_kind(item: dict) -> str:
+    explicit = str(item.get("media_kind") or "").strip().lower()
+    if explicit in {"audio", "video"}:
+        return explicit
+    return "audio" if Path(str(item.get("name") or item.get("relative_path") or "")).suffix.lower() in {".mp3", ".wav"} else "video"
+
+
+def _visual_catalog(catalog: dict) -> dict:
+    result = deepcopy(catalog)
+    result["sources"] = [
+        item for item in result.get("sources", [])
+        if isinstance(item, dict) and _media_kind(item) == "video"
+    ]
+    return result
+
+
+def _mark_audio_only_sources(mapping, catalog: dict) -> None:
+    audio_only = {
+        str(item.get("source_id") or ""): item
+        for item in catalog.get("sources", [])
+        if isinstance(item, dict) and _media_kind(item) == "audio"
+    }
+    for source_id, item in audio_only.items():
+        detail = mapping.details.get(source_id)
+        if detail is not None and detail.get("status") != "mapped":
+            detail["reason"] = "audio_only_needs_video"
+            detail["media_name"] = str(item.get("name") or Path(str(item.get("relative_path") or "")).name)
+            detail["media_source_id"] = source_id
+
+
 def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -> list:
     """Mirror the current project media catalog into Stage 2 sync sources."""
 
     source_store, _match_store = services._sync_stores(paths)
     existing = source_store.list()
     preserved = [source for source in existing if source.source_kind != "review_media"]
-    registered = []
+    grouped: dict[str, list[dict]] = {}
     for item in catalog.get("sources", []):
         if not isinstance(item, dict):
             continue
         relative_path = str(item.get("relative_path") or "").strip()
+        if relative_path:
+            key = Path(relative_path).with_suffix("").as_posix().casefold()
+            grouped.setdefault(key, []).append(item)
+
+    registered = []
+    for items in grouped.values():
+        videos = [item for item in items if _media_kind(item) == "video"]
+        audios = sorted(
+            (item for item in items if _media_kind(item) == "audio"),
+            key=lambda candidate: (
+                Path(str(candidate.get("name") or candidate.get("relative_path") or "")).suffix.lower() != ".wav",
+                str(candidate.get("relative_path") or "").casefold(),
+            ),
+        )
+        visual = videos[0] if videos else None
+        audio = audios[0] if audios else visual
+        item = visual or audio
+        if item is None or audio is None:
+            continue
+        relative_path = str(item.get("relative_path") or "").strip()
         source_id = str(item.get("source_id") or "").strip()
         name = str(item.get("name") or Path(relative_path).name).strip()
+        guide_audio = str(audio.get("relative_path") or "").strip()
         if not source_id or not relative_path or not name:
             continue
         speaker = re.sub(r"^\d{6,8}[\s_.-]*", "", Path(name).stem)
@@ -140,12 +191,14 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
             "duration_sec": item.get("duration_sec") or 0.0,
             # faster-whisper/PyAV can decode the audio stream directly from the
             # project-local viewing; no Premiere guide export is required.
-            "guide_audio": relative_path,
+            "guide_audio": guide_audio,
             "media_path": relative_path,
-            "media_fingerprint": item.get("fingerprint") or "",
+            "media_fingerprint": audio.get("fingerprint") or "",
             "metadata": {
                 "managed_by": "stage3_media_scan",
                 "media_name": name,
+                "audio_guide_name": audio.get("name") or Path(guide_audio).name,
+                "has_companion_video": visual is not None,
             },
         }))
     with services._SYNC_DATA_LOCK:
@@ -193,8 +246,9 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 mapping = map_catalog_to_timeline(
                     timeline_data,
                     {"sources": [source.to_dict() for source in source_store.list()]},
-                    catalog,
+                    _visual_catalog(catalog),
                 )
+                _mark_audio_only_sources(mapping, catalog)
                 catalog["mapping"] = _mapping_summary(mapping)
         except (MediaCatalogError, ValueError) as exc:
             return services._json_error(str(exc), 400)
@@ -220,11 +274,12 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             source_store, _match_store = services._sync_stores(paths)
             sync_sources = [source.to_dict() for source in source_store.list()]
             host_catalog = _host_catalog(
-                catalog, project=project, project_root=paths["root"]
+                _visual_catalog(catalog), project=project, project_root=paths["root"]
             )
             mapping = map_catalog_to_timeline(
                 timeline_data, {"sources": sync_sources}, host_catalog
             )
+            _mark_audio_only_sources(mapping, catalog)
             mapped_timeline_source_ids = set(mapping.catalog)
             export_timeline, placeholder_count = _placeholder_unmapped_sources(
                 _host_timeline_paths(
@@ -262,7 +317,11 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 "project": project,
                 "filename": filename,
                 "download_url": f"/stage3/export/xml?project={project}",
-                "media_count": len(catalog.get("sources", [])),
+                "media_count": len(host_catalog.get("sources", [])),
+                "audio_count": sum(
+                    1 for item in catalog.get("sources", [])
+                    if isinstance(item, dict) and _media_kind(item) == "audio"
+                ),
                 "mapped_source_ids": mapped,
                 "unmapped_source_ids": list(mapping.unmapped_source_ids),
                 "placeholder_segments": placeholder_count,
