@@ -113,6 +113,16 @@
     stage3_media_message: el("stage3_media_message"),
     stage3_media_list: el("stage3_media_list"),
     stage3_source_mapping: el("stage3_source_mapping"),
+    versioning_status: el("versioning_status"),
+    btn_import_revision: el("btn_import_revision"),
+    revision_list: el("revision_list"),
+    revision_diff: el("revision_diff"),
+    versioning_plan: el("versioning_plan"),
+    ver_unchanged: el("ver_unchanged"),
+    ver_moved: el("ver_moved"),
+    ver_edited: el("ver_edited"),
+    ver_added: el("ver_added"),
+    ver_removed: el("ver_removed"),
   };
 
   const toastContainer = document.getElementById("toast-container");
@@ -224,7 +234,7 @@
       ids.btn_sync_align,
       ids.btn_normalize, ids.btn_save_normalization, ids.btn_confirm_normalization, ids.btn_add_normalization_block,
       ids.btn_reset_normalization,
-      ids.btn_add_memory, ids.btn_stage3_media_scan].forEach((b) => {
+      ids.btn_add_memory, ids.btn_stage3_media_scan, ids.btn_import_revision].forEach((b) => {
       if (b) b.disabled = state;
     });
     document.querySelectorAll("[data-action='confirm-sync-match']").forEach((button) => {
@@ -1205,6 +1215,99 @@
     });
   }
 
+  // ── Stage 4: scenario revisions ─────────────────────────────────────────
+  const versionStatusLabels = {
+    unchanged: "без изменений", moved: "переставлен", edited: "изменён",
+    added: "добавлен", removed: "удалён", type_changed: "сменён тип",
+    speaker_changed: "сменён спикер",
+  };
+
+  function renderVersionSummary(summary) {
+    const value = summary || {};
+    ids.ver_unchanged.textContent = String(value.unchanged || 0);
+    ids.ver_moved.textContent = String(value.moved || 0);
+    ids.ver_edited.textContent = String(
+      (value.edited || 0) + (value.type_changed || 0) + (value.speaker_changed || 0)
+    );
+    ids.ver_added.textContent = String(value.added || 0);
+    ids.ver_removed.textContent = String(value.removed || 0);
+  }
+
+  function renderRevisionList(revisions) {
+    if (!ids.revision_list) return;
+    const items = Array.isArray(revisions) ? revisions : [];
+    ids.versioning_status.dataset.state = items.length ? "confirmed" : "empty";
+    ids.versioning_status.textContent = items.length ? `${items.length} редакц.` : "нет версий";
+    ids.revision_list.innerHTML = items.length ? items.slice().reverse().map((item) => {
+      const canActivate = !item.active;
+      return `<article class="revision-row">
+        <div><strong>${escaped(item.revision_id)} · ${escaped(item.source_file || "сценарий")}</strong>
+        <small>${item.active ? "АКТИВНА · " : ""}${escaped(item.status || "draft")} · ${Number(item.block_count || 0)} блоков</small></div>
+        ${canActivate ? `<button class="btn btn-sm" data-action="activate-revision" data-revision-id="${escaped(item.revision_id)}">Открыть</button>` : '<span class="status-badge" data-state="confirmed">активна</span>'}
+      </article>`;
+    }).join("") : '<div class="empty-state compact">Версии ещё не созданы.</div>';
+  }
+
+  function renderRevisionDiff(diff) {
+    if (!ids.revision_diff) return;
+    const changes = Array.isArray(diff?.changes) ? diff.changes : [];
+    renderVersionSummary(diff?.summary || {});
+    const plan = diff?.execution_plan || {};
+    const reuse = plan.reuse || {};
+    const run = plan.run || {};
+    ids.versioning_plan.textContent = changes.length
+      ? `Сохраняем ${Number(reuse.blocks || 0)} блоков, ${Number(reuse.tts || 0)} WAV и ${Number(reuse.sync_matches || 0)} СНХ. Новых WAV: ${Number(run.tts || 0)}, повторных поисков СНХ: ${Number(run.sync_match || 0)}.`
+      : "Diff пока отсутствует.";
+    const visible = changes.filter((item) => item.status !== "unchanged");
+    ids.revision_diff.innerHTML = visible.length ? visible.map((item) => {
+      const text = item.new_text || item.old_text || "";
+      const speaker = item.new_speaker || item.old_speaker || item.new_type || item.old_type || "блок";
+      return `<article class="revision-change" data-state="${escaped(item.status || "edited")}">
+        <strong>${escaped(versionStatusLabels[item.status] || item.status)} · ${escaped(speaker)}</strong>
+        <small>${escaped(item.old_block_uid || "новый блок")}</small>
+        <p>${escaped(String(text).slice(0, 320))}</p>
+      </article>`;
+    }).join("") : '<div class="empty-state compact">Все блоки совпадают.</div>';
+  }
+
+  async function loadRevisions(quiet) {
+    if (!ids.revision_list) return;
+    try {
+      const result = await getJSON(`/stage4/revisions?project=${encodeURIComponent(project)}`);
+      const revisions = result.revisions || [];
+      renderRevisionList(revisions);
+      const latest = revisions[revisions.length - 1];
+      if (latest?.diff_id) {
+        const diff = await getJSON(`/stage4/diffs/${encodeURIComponent(latest.diff_id)}?project=${encodeURIComponent(project)}`);
+        renderRevisionDiff(diff);
+      }
+    } catch (err) {
+      if (!quiet) throw err;
+      appendLog(`Stage 4 versions: ${err.message || err}`, "warn");
+    }
+  }
+
+  async function importRevision() {
+    ids.btn_import_revision.textContent = "Сравнение…";
+    try {
+      const result = await postJSON("/stage4/revisions/import", { project, use_llm: false });
+      renderRevisionDiff(result.diff || {});
+      await loadRevisions(true);
+      openTab("versions");
+      toast(`Создана ${result.revision?.revision_id || "новая версия"}`, "success");
+      appendLog(`Stage 4: импортирована ${result.revision?.revision_id}; исходная работа сохранена.`);
+    } finally {
+      ids.btn_import_revision.textContent = "Импортировать новую версию";
+    }
+  }
+
+  async function activateRevision(revisionId) {
+    if (!window.confirm(`Открыть ${revisionId} как активный черновик? Текущая версия уже сохранена в истории.`)) return;
+    const result = await postJSON(`/stage4/revisions/${encodeURIComponent(revisionId)}/activate`, { project });
+    appendLog(`Stage 4: активирована ${revisionId}; сохранено sync matches: ${Number(result.reused_sync_matches || 0)}.`);
+    window.location.reload();
+  }
+
   // ── Stage 3: headless media scan ─────────────────────────────────────────
   function stage3MediaItems(result) {
     if (Array.isArray(result)) return result;
@@ -1400,6 +1503,8 @@
         loadSyncWorkspace(true).catch((err) => {
           appendLog(`Stage 2 sync: ${err.message || err}`, "warn");
         });
+      } else if (tab.dataset.tab === "versions") {
+        loadRevisions(true);
       }
     });
   });
@@ -2113,6 +2218,11 @@
   ids.btn_build_timeline.addEventListener("click", () => safely(doBuildTimeline));
   if (ids.btn_stage3_media_scan) ids.btn_stage3_media_scan.addEventListener("click", () => safely(scanStage3Media));
   if (ids.btn_stage3_prepare) ids.btn_stage3_prepare.addEventListener("click", () => safely(prepareStage3Timeline));
+  if (ids.btn_import_revision) ids.btn_import_revision.addEventListener("click", () => safely(importRevision));
+  if (ids.revision_list) ids.revision_list.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action='activate-revision']");
+    if (button) safely(() => activateRevision(button.dataset.revisionId));
+  });
 
   if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
   ids.btn_tts.addEventListener("click", () => safely(doTTS));
@@ -2145,6 +2255,7 @@
   renderLive();
   appendLog(`UI ready. project=${project}`);
   Promise.all([loadNormalization(true), loadMemory(true)]).catch((err) => appendLog(`Normalization init: ${err.message}`, "warn"));
+  loadRevisions(true);
   restoreTtsJob().catch((err) => appendLog(`TTS status init: ${err.message || err}`, "warn"));
   loadSyncWorkspace(true).catch((err) => appendLog(`Stage 2 sync init: ${err.message || err}`, "warn"));
 })();

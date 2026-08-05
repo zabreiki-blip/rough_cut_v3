@@ -67,6 +67,10 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage3/media/scan": {"POST"},
         "/stage3/timeline/prepare": {"POST"},
         "/stage3/export/xml": {"GET"},
+        "/stage4/revisions": {"GET"},
+        "/stage4/revisions/import": {"POST"},
+        "/stage4/revisions/<revision_id>/activate": {"POST"},
+        "/stage4/diffs/<diff_id>": {"GET"},
     }
     actual: dict[str, set[str]] = defaultdict(set)
     for rule in api.app.url_map.iter_rules():

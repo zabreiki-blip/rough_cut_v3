@@ -663,6 +663,18 @@ class NormalizerTests(unittest.TestCase):
                 "voiceover", "technical", "technical",
             ])
 
+    def test_plural_titles_marker_is_technical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("ТИТРЫ\n", encoding="utf-8")
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "technical")
+
     def test_sync_fragment_explicit_range_has_optional_end_timecode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

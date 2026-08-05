@@ -44,10 +44,41 @@
     </header>
 
     <nav class="workspace-tabs" aria-label="Этапы проекта">
+      <button class="workspace-tab" data-tab="versions" type="button">Версии</button>
       <button class="workspace-tab active" data-tab="normalization" type="button">Нормализация</button>
       <button class="workspace-tab" data-tab="voiceover" type="button">Озвучка <span id="voiceover_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
       <button class="workspace-tab" data-tab="assembly" type="button">Сборка <span id="assembly_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
     </nav>
+
+    <section id="tab_versions" class="workspace-panel" data-tab-panel="versions" hidden>
+      <div class="panel versioning-toolbar">
+        <div>
+          <div class="normalization-title-row">
+            <h2>Редакции сценария</h2>
+            <span id="versioning_status" class="status-badge" data-state="empty">нет версий</span>
+          </div>
+          <p class="section-copy">Новый файл из input/ сравнивается с текущей редакцией. Неизменённые UID, WAV, Whisper и подтверждённые диапазоны переиспользуются.</p>
+        </div>
+        <button id="btn_import_revision" class="btn btn-primary" type="button">Импортировать новую версию</button>
+      </div>
+      <div id="versioning_summary" class="normalization-summary versioning-summary">
+        <div class="summary-stat"><strong id="ver_unchanged">0</strong><span>Без изменений</span></div>
+        <div class="summary-stat"><strong id="ver_moved">0</strong><span>Переставлено</span></div>
+        <div class="summary-stat"><strong id="ver_edited">0</strong><span>Изменено</span></div>
+        <div class="summary-stat"><strong id="ver_added">0</strong><span>Добавлено</span></div>
+        <div class="summary-stat"><strong id="ver_removed">0</strong><span>Удалено</span></div>
+      </div>
+      <div class="versioning-grid">
+        <section class="panel">
+          <div class="panel-heading"><div><h2>История</h2><p class="section-copy">Предыдущие редакции остаются неизменяемыми.</p></div></div>
+          <div id="revision_list" class="revision-list"><div class="empty-state compact">Версии ещё не созданы.</div></div>
+        </section>
+        <section class="panel">
+          <div class="panel-heading"><div><h2>Изменения</h2><p id="versioning_plan" class="section-copy">Импортируйте вторую редакцию.</p></div></div>
+          <div id="revision_diff" class="revision-diff"><div class="empty-state compact">Diff пока отсутствует.</div></div>
+        </section>
+      </div>
+    </section>
 
     <section id="tab_normalization" class="workspace-panel active" data-tab-panel="normalization">
       <div class="normalization-toolbar panel">

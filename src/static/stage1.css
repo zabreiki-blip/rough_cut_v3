@@ -108,6 +108,29 @@ nav { display: grid; gap: 4px; }
 .tab-lock { margin-left: 5px; opacity: .65; font-size: 10px; }
 .workspace-panel[hidden] { display: none !important; }
 
+/* Scenario versions */
+.versioning-toolbar {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 20px; margin-bottom: 12px;
+}
+.versioning-summary { grid-template-columns: repeat(5, 1fr); }
+.versioning-grid { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(0, 1.5fr); gap: 12px; }
+.revision-list, .revision-diff { display: grid; gap: 7px; max-height: 620px; overflow: auto; }
+.revision-row, .revision-change {
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+.revision-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.revision-row strong, .revision-change strong { display: block; font-size: 12px; }
+.revision-row small, .revision-change small { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
+.revision-change { border-left: 3px solid var(--muted); }
+.revision-change[data-state="added"] { border-left-color: var(--green); }
+.revision-change[data-state="removed"] { border-left-color: var(--red); }
+.revision-change[data-state="edited"], .revision-change[data-state="type_changed"],
+.revision-change[data-state="speaker_changed"] { border-left-color: var(--orange); }
+.revision-change[data-state="moved"] { border-left-color: var(--blue); }
+.revision-change p { margin-top: 6px; color: var(--ink); font-size: 11px; line-height: 1.4; }
+
 /* Normalization */
 .normalization-toolbar {
   display: flex; justify-content: space-between; align-items: flex-start;
