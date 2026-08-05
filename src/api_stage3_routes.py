@@ -365,14 +365,48 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         try:
             project = services._resolve_project_name(payload.get("project"))
             paths = services._ensure_project(project)
+            gate = services._normalization_required(project)
+            if gate:
+                return gate
             timeline_path = paths["work"] / "full_timeline.json"
             if not timeline_path.is_file():
                 return services._json_error(
                     "full_timeline.json not found — run Build Timeline first", 404
                 )
             timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+            confirmed, _reason = services._confirmed_normalization(project)
+            if (
+                not confirmed
+                or timeline_data.get("normalization_revision")
+                != confirmed.get("revision")
+            ):
+                return services._json_error(
+                    "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
+                    409,
+                )
             catalog = scan_project_media(project, paths)
             logical_catalog = _timeline_catalog(catalog)
+            if not logical_catalog.get("sources"):
+                return jsonify({
+                    "ok": True,
+                    "result": {
+                        "project": project,
+                        "format": "legacy",
+                        "filename": f"{project}_timeline.xml",
+                        "download_url": f"/stage2/export/xml?project={project}",
+                        "media_count": 0,
+                        "audio_count": 0,
+                        "mapped_source_ids": [],
+                        "unmapped_source_ids": [],
+                        "placeholder_segments": sum(
+                            1
+                            for segment in timeline_data.get("segments", [])
+                            if isinstance(segment, dict)
+                            and segment.get("type") in {"snh", "host"}
+                        ),
+                        "source_mapping": [],
+                    },
+                })
             _attach_audio_placeholder_cards(
                 logical_catalog,
                 paths=paths,
@@ -424,6 +458,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             "ok": True,
             "result": {
                 "project": project,
+                "format": "nested",
                 "filename": filename,
                 "download_url": f"/stage3/export/xml?project={project}",
                 "media_count": len(host_catalog.get("sources", [])),

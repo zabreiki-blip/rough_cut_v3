@@ -107,7 +107,6 @@
     assembly_gate_message: el("assembly_gate_message"),
     stage3_media_directory: el("stage3_media_directory"),
     btn_stage3_media_scan: el("btn_stage3_media_scan"),
-    btn_stage3_prepare: el("btn_stage3_prepare"),
     stage3_media_status: el("stage3_media_status"),
     stage3_media_count: el("stage3_media_count"),
     stage3_media_message: el("stage3_media_message"),
@@ -149,6 +148,7 @@
   let stage3MediaScanning = false;
   let stage3MediaCount = 0;
   let stage3SourceMapping = [];
+  let timelineReady = Boolean(initialStatus.timeline_ready);
   const MAX_POLL_BACKOFF_MS = 10000;
   const live = {
     status: "idle",
@@ -231,7 +231,7 @@
   function setBusy(state) {
     busy = state;
     [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline,
-      ids.btn_sync_align,
+      ids.btn_sync_align, ids.btn_export_xml,
       ids.btn_normalize, ids.btn_save_normalization, ids.btn_confirm_normalization, ids.btn_add_normalization_block,
       ids.btn_reset_normalization,
       ids.btn_add_memory, ids.btn_stage3_media_scan, ids.btn_import_revision].forEach((b) => {
@@ -290,8 +290,9 @@
     if (ids.assembly_lock) ids.assembly_lock.hidden = !blocked;
     if (ids.assembly_gate_message) ids.assembly_gate_message.hidden = !blocked;
     if (blocked && ids.btn_export_xml) {
-      ids.btn_export_xml.style.pointerEvents = "none";
-      ids.btn_export_xml.style.opacity = ".4";
+      ids.btn_export_xml.disabled = true;
+    } else if (ids.btn_export_xml) {
+      ids.btn_export_xml.disabled = !timelineReady;
     }
   }
 
@@ -1365,9 +1366,6 @@
       ids.stage3_media_directory.textContent = result.directory || "Папка проекта не настроена";
     }
     ids.stage3_media_count.textContent = String(items.length);
-    if (ids.btn_stage3_prepare) {
-      ids.btn_stage3_prepare.disabled = busy || items.length === 0;
-    }
     ids.stage3_media_message.textContent = items.length > 0
       ? `Папка просканирована. ${items.length} файл(ов) готовы как временные источники.`
       : "В указанной папке поддерживаемые видео-, WAV- или MP3-файлы не найдены.";
@@ -1462,12 +1460,9 @@
     });
   }
 
-  async function prepareStage3Timeline() {
-    if (stage3MediaCount <= 0) {
-      throw new Error("Сначала добавьте просмотровки в папку проекта.");
-    }
-    ids.btn_stage3_prepare.disabled = true;
-    ids.btn_stage3_prepare.textContent = "Подготовка XML…";
+  async function exportTimelineXml() {
+    ids.btn_export_xml.disabled = true;
+    ids.btn_export_xml.textContent = "Подготовка XML…";
     ids.stage3_media_status.dataset.state = "running";
     ids.stage3_media_status.textContent = "сборка…";
     try {
@@ -1479,10 +1474,10 @@
         `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
         + `плейсхолдеров: ${Number(result.placeholder_segments || 0)}.`;
       appendLog(
-        `Stage 3 XML: mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
+        `Timeline XML (${result.format || "nested"}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
         + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
       );
-      toast("Nested XML готов. Начинаю загрузку.", "success");
+      toast("XML готов. Начинаю загрузку.", "success");
       window.location.href = result.download_url;
     } catch (err) {
       ids.stage3_media_status.dataset.state = "failed";
@@ -1490,8 +1485,8 @@
       ids.stage3_media_message.textContent = err.message || String(err);
       throw err;
     } finally {
-      ids.btn_stage3_prepare.textContent = "Подготовить таймлайн";
-      ids.btn_stage3_prepare.disabled = busy || stage3MediaCount <= 0;
+      ids.btn_export_xml.textContent = "Export XML";
+      ids.btn_export_xml.disabled = busy || !timelineReady;
     }
   }
 
@@ -2153,9 +2148,8 @@
     ids.ts_dur.textContent = `${m}:${String(s).padStart(2, "0")}`;
     ids.timeline_stats.style.display = "flex";
 
-    ids.btn_export_xml.href = `/stage2/export/xml?project=${encodeURIComponent(project)}`;
-    ids.btn_export_xml.style.pointerEvents = "";
-    ids.btn_export_xml.style.opacity = "";
+    timelineReady = true;
+    ids.btn_export_xml.disabled = false;
   }
 
   ids.btn_sync_align.addEventListener("click", () => safely(startSyncAlignment));
@@ -2216,8 +2210,8 @@
     if (Number.isFinite(end) && audio.currentTime >= end) audio.pause();
   }, true);
   ids.btn_build_timeline.addEventListener("click", () => safely(doBuildTimeline));
+  ids.btn_export_xml.addEventListener("click", () => safely(exportTimelineXml));
   if (ids.btn_stage3_media_scan) ids.btn_stage3_media_scan.addEventListener("click", () => safely(scanStage3Media));
-  if (ids.btn_stage3_prepare) ids.btn_stage3_prepare.addEventListener("click", () => safely(prepareStage3Timeline));
   if (ids.btn_import_revision) ids.btn_import_revision.addEventListener("click", () => safely(importRevision));
   if (ids.revision_list) ids.revision_list.addEventListener("click", (event) => {
     const button = event.target.closest("[data-action='activate-revision']");

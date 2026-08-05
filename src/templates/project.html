@@ -422,10 +422,7 @@
             <div class="empty-state compact">Соответствия ещё не рассчитаны.</div>
           </div>
 
-          <div class="stage3-media-next">
-            <button id="btn_stage3_prepare" class="btn btn-primary" type="button" disabled>Подготовить таймлайн</button>
-            <span>Создаёт XML с `RC_VIEWINGS`, заменяемыми `RC_SRC_*` и готовой `ROUGH_CUT_*` sequence.</span>
-          </div>
+          <p class="stage3-media-hint">При Export XML найденные и сопоставленные просмотровки подставятся автоматически. Для остальных СНХ останутся плейсхолдеры.</p>
         </section>
 
         <section class="sync-workspace" aria-labelledby="sync_workspace_title">
@@ -522,10 +519,10 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="4" rx="1"/><rect x="3" y="10" width="11" height="4" rx="1"/><rect x="3" y="17" width="15" height="4" rx="1"/></svg>
             Build Timeline
           </button>
-          <a id="btn_export_xml" class="btn btn-ghost" style="pointer-events:none;opacity:.4">
+          <button id="btn_export_xml" class="btn btn-ghost" type="button" disabled>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             Export XML
-          </a>
+          </button>
         </div>
         <div id="timeline_stats" class="timeline-stats" style="display:none">
           <span>ЗК: <strong id="ts_zk">0</strong></span>

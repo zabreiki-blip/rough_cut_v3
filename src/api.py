@@ -358,6 +358,7 @@ def _build_status(project: str) -> dict:
     prepared = _read_json_safe(prepared_path)
     manifest = _read_json_safe(manifest_path)
     normalization = _read_json_safe(paths["normalized"])
+    timeline = _read_json_safe(paths["timeline"])
     confirmed_normalization, normalization_reason = _confirmed_normalization(project)
 
     prepared_items = prepared.get("items", []) if isinstance(prepared, dict) else []
@@ -391,6 +392,12 @@ def _build_status(project: str) -> dict:
         "normalization_revision": normalization.get("revision"),
         "normalization_confirmed": confirmed_normalization is not None,
         "normalization_reason": normalization_reason,
+        "timeline_ready": bool(
+            paths["timeline"].is_file()
+            and confirmed_normalization
+            and timeline.get("normalization_revision")
+            == confirmed_normalization.get("revision")
+        ),
     }
 
 

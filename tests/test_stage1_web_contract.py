@@ -35,9 +35,13 @@ def test_stage3_headless_media_scan_contract() -> None:
     assert 'id="stage3_media_directory"' in PROJECT_HTML
     assert 'id="btn_stage3_media_scan"' in PROJECT_HTML
     assert 'id="stage3_media_list"' in PROJECT_HTML
-    assert 'id="btn_stage3_prepare"' in PROJECT_HTML
+    assert 'id="btn_stage3_prepare"' not in PROJECT_HTML
+    assert 'id="btn_export_xml"' in PROJECT_HTML
     assert "Premiere на этом этапе не нужен" in PROJECT_HTML
     assert 'postJSON("/stage3/media/scan", { project })' in STAGE1_JS
+    assert 'postJSON("/stage3/timeline/prepare", { project })' in STAGE1_JS
+    assert "function exportTimelineXml()" in STAGE1_JS
+    assert "ids.btn_export_xml.href" not in STAGE1_JS
     assert "stage3MediaScanAttempted" in STAGE1_JS
     assert "scanStage3MediaOnce();" in STAGE1_JS
     assert "localStorage" not in STAGE1_JS

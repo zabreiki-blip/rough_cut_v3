@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import threading
 
 from flask import Flask, jsonify
@@ -34,12 +35,43 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         ),
         SyncSource=SyncSource,
         _SYNC_DATA_LOCK=threading.RLock(),
+        _normalization_required=lambda _project: None,
+        _confirmed_normalization=lambda _project: ({"revision": "norm-1"}, ""),
         _json_error=lambda message, status=400: (jsonify({"ok": False, "error": message}), status),
         _internal_error=lambda _exc: (jsonify({"ok": False, "error": "internal server error"}), 500),
     )
     app.config["TEST_STAGE3_SERVICES"] = services
     api_stage3_routes.register_stage3_routes(app, services)
     return app.test_client(), app, monkeypatch
+
+
+def test_prepare_uses_legacy_export_when_project_has_no_viewings(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "full_timeline.json").write_text(json.dumps({
+        "project": "BRIK",
+        "fps": 25,
+        "width": 1920,
+        "height": 1080,
+        "normalization_revision": "norm-1",
+        "segments": [{"id": "snh1", "type": "snh"}],
+    }), encoding="utf-8")
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "directory": "/app/projects/BRIK/media/reviews",
+        "relative_directory": "media/reviews",
+        "recursive": False,
+        "sources": [],
+    })
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    assert result["format"] == "legacy"
+    assert result["download_url"] == "/stage2/export/xml?project=BRIK"
+    assert result["placeholder_segments"] == 1
 
 
 def test_scan_api_uses_project_review_directory_automatically(client) -> None:
