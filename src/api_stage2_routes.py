@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -10,8 +11,46 @@ import wave
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 
+def _scenario_revision_matches(stored: object, current: object) -> bool:
+    """Compare scenario identities while accepting artifacts from legacy files.
+
+    An empty ID on either side means that the artifact predates scenario-level
+    versioning. Explicit, different IDs are always stale.
+    """
+    stored_id = str(stored or "").strip()
+    current_id = str(current or "").strip()
+    return not stored_id or not current_id or stored_id == current_id
+
+
+def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
+    return (
+        timeline.get("normalization_revision") == normalization.get("revision")
+        and _scenario_revision_matches(
+            timeline.get("scenario_revision_id"),
+            normalization.get("scenario_revision_id"),
+        )
+    )
+
+
 def register_stage2_routes(app: Flask, services: ModuleType) -> None:
     """Register Stage 2 routes while resolving mutable services via the API facade."""
+
+    def serialize_project_mutation(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            payload = request.get_json(silent=True) or {}
+            raw_project = (
+                request.args.get("project")
+                if request.method == "GET"
+                else payload.get("project")
+            )
+            try:
+                project = services._resolve_project_name(raw_project)
+            except ValueError as exc:
+                return services._json_error(str(exc), 400)
+            with services._project_transition_lock(project):
+                return view(*args, **kwargs)
+        return wrapped
 
     @app.route("/stage2/sync-sources", methods=["GET", "POST", "DELETE"])
     def stage2_sync_sources():
@@ -400,6 +439,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
 
     @app.route("/stage2/sync-matches", methods=["GET", "PATCH"])
     @app.patch("/stage2/sync-matches/<block_uid>")
+    @serialize_project_mutation
     def stage2_sync_matches(block_uid: str | None = None):
         payload = request.get_json(silent=True) or {}
         raw_project = (
@@ -429,10 +469,17 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
                         if str(unit.get("segment_id") or "")
                     }
                     revision = normalization_document.get("revision")
+                    scenario_revision_id = normalization_document.get(
+                        "scenario_revision_id"
+                    )
                     matches = [
                         item for item in matches
                         if item.segment_id in valid_ids
                         and item.metadata.get("normalization_revision") in (None, "", revision)
+                        and _scenario_revision_matches(
+                            item.metadata.get("scenario_revision_id"),
+                            scenario_revision_id,
+                        )
                     ]
                 return jsonify({
                     "ok": True,
@@ -471,6 +518,9 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             sources_by_id = {item.id: item for item in source_store.list()}
             source_ids = set(sources_by_id)
             revision = confirmed.get("revision")
+            scenario_revision_id = str(
+                confirmed.get("scenario_revision_id") or ""
+            )
             saved: list[services.SyncMatch] = []
             with services._SYNC_DATA_LOCK:
                 stored_by_id = {
@@ -504,6 +554,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
                     merged.update(values)
                     metadata = dict(merged.get("metadata") or {})
                     metadata["normalization_revision"] = revision
+                    metadata["scenario_revision_id"] = scenario_revision_id
                     unit = valid_units[segment_id]
                     metadata["parent_block_uid"] = str(
                         unit.get("parent_block_uid") or segment_id
@@ -559,7 +610,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
         confirmed, _reason = services._confirmed_normalization(project)
         if (
             confirmed is None
-            or timeline.get("normalization_revision") != confirmed.get("revision")
+            or not _timeline_is_current(timeline, confirmed)
         ):
             return services._json_error(
                 "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
@@ -569,6 +620,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
 
 
     @app.post("/stage2/build")
+    @serialize_project_mutation
     def stage2_build():
         """Build full_timeline.json from confirmed normalization + speaker WAVs."""
         payload = request.get_json(silent=True) or {}
@@ -577,6 +629,11 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             project = services._resolve_project_name(payload.get("project"))
         except ValueError as exc:
             return services._json_error(str(exc), 400)
+
+        if services._project_has_active_mutation(project):
+            return services._json_error(
+                "another mutating job is active for this project", 409
+            )
 
         with services._SYNC_JOBS_LOCK:
             sync_job_active = project in services._SYNC_ACTIVE_PROJECTS
@@ -609,16 +666,31 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error("fps must be at least 1", 400)
 
         try:
+            repair_revision_metadata = getattr(
+                services, "repair_active_revision_metadata", None
+            )
+            revision_repair = (
+                repair_revision_metadata(paths)
+                if callable(repair_revision_metadata)
+                else {"repaired": False, "reason": "service_unavailable"}
+            )
             normalization = services.load_normalization(paths["normalized"])
             source_store, match_store = services._sync_stores(paths)
             sources = source_store.list()
             stored_matches = match_store.list()
             normalization_revision = normalization.get("revision")
+            scenario_revision_id = normalization.get("scenario_revision_id")
             stale_match_ids: list[str] = []
             current_matches: list[services.SyncMatch] = []
             for match in stored_matches:
                 match_revision = match.metadata.get("normalization_revision")
                 if match_revision not in (None, "", normalization_revision):
+                    stale_match_ids.append(match.segment_id)
+                    continue
+                if not _scenario_revision_matches(
+                    match.metadata.get("scenario_revision_id"),
+                    scenario_revision_id,
+                ):
                     stale_match_ids.append(match.segment_id)
                     continue
                 current_matches.append(match)
@@ -641,8 +713,28 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
         for seg in timeline.segments:
             if seg.type in {"snh", "host"} and seg.placeholder_path:
                 from pathlib import Path as _Path
+                stable_uid = str(seg.block_uid or seg.parent_block_uid or "").strip()
                 ph = _Path(seg.placeholder_path)
-                if not ph.exists():
+                if stable_uid:
+                    try:
+                        ph = services.generate_versioned_placeholder(
+                            block_uid=stable_uid,
+                            speaker=seg.speaker,
+                            role=seg.role,
+                            timecode=seg.timecode,
+                            text=seg.text,
+                            output_dir=placeholder_dir,
+                            segment_type=seg.type,
+                            width=timeline.width,
+                            height=timeline.height,
+                        )
+                        seg.placeholder_path = str(ph)
+                    except Exception as _ph_exc:
+                        placeholder_warnings.append(
+                            f"Placeholder не создан для {seg.id}: {_ph_exc}"
+                        )
+                        seg.placeholder_path = ""
+                elif not ph.exists():
                     try:
                         services.generate_placeholder(
                             seg_id=seg.id,
@@ -664,6 +756,9 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
         timeline_path = paths["work"] / "full_timeline.json"
         timeline_payload = timeline.to_dict()
         timeline_payload["normalization_revision"] = normalization.get("revision")
+        timeline_payload["scenario_revision_id"] = str(
+            normalization.get("scenario_revision_id") or ""
+        )
         services._atomic_write_json_file(timeline_path, timeline_payload)
 
         zk_count = sum(1 for s in timeline.segments if s.type == "zk")
@@ -684,6 +779,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             "ok": True,
             "result": {
                 "project": project,
+                "revision_metadata_repair": revision_repair,
                 "segments": len(timeline.segments),
                 "zk": zk_count,
                 "snh": snh_count,
@@ -733,7 +829,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
         except (OSError, json.JSONDecodeError) as exc:
             return services._json_error(f"invalid full_timeline.json: {exc}", 500)
         confirmed, _reason = services._confirmed_normalization(project)
-        if not confirmed or data.get("normalization_revision") != confirmed.get("revision"):
+        if not confirmed or not _timeline_is_current(data, confirmed):
             return services._json_error(
                 "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
                 409,

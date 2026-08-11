@@ -634,18 +634,36 @@ def _fingerprint_parameters(provider: str, settings) -> tuple[str, int, int]:
     return "", settings.macos_tts_sample_rate, settings.macos_tts_rate
 
 
-def _prepare_tts_items(items: list[dict]) -> list[tuple[str, str]]:
-    prepared_items: list[tuple[str, str]] = []
+def _prepare_tts_items(items: list[dict]) -> list[tuple[str, str, str]]:
+    prepared_items: list[tuple[str, str, str]] = []
     for item in items:
         block_id = str(item.get("id", "")).strip()
+        block_uid = str(item.get("block_uid") or block_id).strip()
         text = str(item.get("text_for_tts", "")).strip()
         if block_id and text:
-            prepared_items.append((block_id, text))
+            prepared_items.append((block_id, block_uid, text))
     return prepared_items
 
 
+def _asset_uid(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+        return value
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def _materialize_voiceover_alias(asset: Path, alias: Path, fingerprint: str) -> None:
+    if (
+        _is_valid_wav(alias)
+        and _read_meta_fingerprint(alias) == fingerprint
+    ):
+        return
+    if asset != alias:
+        _atomic_write_bytes(alias, asset.read_bytes(), validate_wav=True)
+    _write_meta_fingerprint(alias, fingerprint)
+
+
 def _plan_tts_items(
-    prepared_items: list[tuple[str, str]],
+    prepared_items: list[tuple[str, str, str]],
     speaker_dir: Path,
     provider: str,
     voice: str,
@@ -654,13 +672,13 @@ def _plan_tts_items(
     settings,
     dry_run: bool,
     cancel_check: Callable[[], bool] | None,
-) -> list[tuple[int, str, str, Path, str, str]]:
+) -> list[tuple[int, str, str, str, Path, Path, str, str]]:
     fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(
         provider, settings
     )
-    plan: list[tuple[int, str, str, Path, str, str]] = []
+    plan: list[tuple[int, str, str, str, Path, Path, str, str]] = []
 
-    for index, (block_id, text) in enumerate(prepared_items, start=1):
+    for index, (block_id, block_uid, text) in enumerate(prepared_items, start=1):
         _raise_if_cancelled(cancel_check)
         out_file = speaker_dir / f"{block_id}.wav"
         fingerprint = _synthesis_fingerprint(
@@ -673,10 +691,17 @@ def _plan_tts_items(
             fp_sample_rate,
             fp_extra_rate,
         )
-        cache_hit = (
+        asset_file = speaker_dir / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
+        legacy_cache_hit = (
             not dry_run
             and _is_valid_wav(out_file)
             and _read_meta_fingerprint(out_file) == fingerprint
+        )
+        if legacy_cache_hit and not asset_file.is_file():
+            _atomic_write_bytes(asset_file, out_file.read_bytes(), validate_wav=True)
+        cache_hit = (
+            not dry_run
+            and _is_valid_wav(asset_file)
         )
         if cache_hit:
             action = "cache"
@@ -684,19 +709,21 @@ def _plan_tts_items(
             action = "dry_run"
         else:
             action = "synthesize"
-        plan.append((index, block_id, text, out_file, fingerprint, action))
+        plan.append((
+            index, block_id, block_uid, text, out_file, asset_file, fingerprint, action
+        ))
 
     return plan
 
 
 def _publish_local_item(
-    planned_item: tuple[int, str, str, Path, str, str],
+    planned_item: tuple[int, str, str, str, Path, Path, str, str],
     total_items: int,
     generated: list[str],
     skipped: list[str],
     progress_callback: Callable[[dict], None] | None,
 ) -> None:
-    index, block_id, text, out_file, _fingerprint, action = planned_item
+    index, block_id, _block_uid, text, out_file, asset_file, fingerprint, action = planned_item
     _emit_item_progress(
         progress_callback,
         "item_started",
@@ -707,11 +734,16 @@ def _publish_local_item(
         generated,
         skipped,
     )
-    if action == "cache" or _is_valid_wav(out_file):
+    if action == "cache":
+        _materialize_voiceover_alias(asset_file, out_file, fingerprint)
+        skipped.append(str(out_file))
+        event = "item_skipped"
+    elif _block_uid == block_id and _is_valid_wav(out_file):
         skipped.append(str(out_file))
         event = "item_skipped"
     else:
-        _write_silence_wav(out_file, duration_ms=max(900, int(len(text) * 55)))
+        _write_silence_wav(asset_file, duration_ms=max(900, int(len(text) * 55)))
+        _materialize_voiceover_alias(asset_file, out_file, fingerprint)
         generated.append(str(out_file))
         event = "item_generated"
     _emit_item_progress(
@@ -759,14 +791,14 @@ def _synthesize_with_retry(
 
 
 def _publish_synthesized_item(
-    pending_item: tuple[int, str, str, Path, str],
+    pending_item: tuple[int, str, str, str, Path, Path, str],
     future: Future[tuple[bytes | None, int, list[str], Exception | None]],
     total_items: int,
     generated: list[str],
     skipped: list[str],
     progress_callback: Callable[[dict], None] | None,
 ) -> None:
-    index, block_id, _text, out_file, fingerprint = pending_item
+    index, block_id, _block_uid, _text, out_file, asset_file, fingerprint = pending_item
     _emit_item_progress(
         progress_callback,
         "item_started",
@@ -810,8 +842,8 @@ def _publish_synthesized_item(
         )
         raise final_error
 
-    _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
-    _write_meta_fingerprint(out_file, fingerprint)
+    _atomic_write_bytes(asset_file, wav_bytes, validate_wav=True)
+    _materialize_voiceover_alias(asset_file, out_file, fingerprint)
     generated.append(str(out_file))
     _emit_item_progress(
         progress_callback,
@@ -886,7 +918,7 @@ def synthesize_tts(
         cancel_check,
     )
 
-    pending = [item for item in plan if item[5] == "synthesize"]
+    pending = [item for item in plan if item[7] == "synthesize"]
     if pending:
         try:
             configured_workers = int(os.getenv("TTS_MAX_WORKERS", "3"))
@@ -909,16 +941,22 @@ def synthesize_tts(
                     speed,
                     cancel_check,
                 )
-                for index, _, text, _, _, _ in pending
+                for index, _, _, text, _, _, _, _ in pending
             }
             # Publish files and progress in scenario order. Network synthesis is
             # concurrent, while externally visible output remains deterministic.
             for planned_item in plan:
                 _raise_if_cancelled(cancel_check)
-                if planned_item[5] == "synthesize":
-                    index, block_id, text, out_file, fingerprint, _action = planned_item
+                if planned_item[7] == "synthesize":
+                    (
+                        index, block_id, block_uid, text, out_file,
+                        asset_file, fingerprint, _action,
+                    ) = planned_item
                     _publish_synthesized_item(
-                        (index, block_id, text, out_file, fingerprint),
+                        (
+                            index, block_id, block_uid, text, out_file,
+                            asset_file, fingerprint,
+                        ),
                         futures[index],
                         total_items,
                         generated,
@@ -964,6 +1002,20 @@ def synthesize_tts(
         "gender": resolved_gender,
         "dry_run": used_dry_run,
         "generated_at": datetime.now(UTC).isoformat(),
+        "scenario_revision_id": str(payload.get("scenario_revision_id") or ""),
+        "voiceover_assets": [
+            {
+                "id": block_id,
+                "block_uid": block_uid,
+                "fingerprint": fingerprint,
+                "asset": str(asset_file),
+            }
+            for (
+                _index, block_id, block_uid, _text, _out_file,
+                asset_file, fingerprint, _action,
+            ) in plan
+            if asset_file.is_file()
+        ],
     }
     _emit_batch_progress(
         progress_callback,

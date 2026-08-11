@@ -77,3 +77,12 @@ def test_headless_whisper_model_and_source_scope_controls() -> None:
     assert '<option value="medium">Medium — точнее</option>' in PROJECT_HTML
     assert 'model: ids.sync_whisper_model?.value || "small"' in STAGE1_JS
     assert 'source_scope: stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
+
+
+def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
+    assert "if (normalizationDirty)" in STAGE1_JS
+    assert "await saveNormalization();" in STAGE1_JS
+    assert "let selectedDiffRequest = 0;" in STAGE1_JS
+    assert "if (requestId !== selectedDiffRequest) return;" in STAGE1_JS
+    assert "Активная редакция не определена" in STAGE1_JS
+    assert "use_llm: Boolean(ids.normalization_use_llm?.checked)" in STAGE1_JS

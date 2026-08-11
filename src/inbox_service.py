@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Iterable, Literal
+
+
+SCENARIO_EXTENSIONS = frozenset({".doc", ".docx", ".md", ".txt"})
+VIDEO_EXTENSIONS = frozenset({
+    ".3gp",
+    ".avi",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".mxf",
+    ".webm",
+})
+AUDIO_EXTENSIONS = frozenset({".mp3", ".wav"})
+REVIEW_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+
+InboxKind = Literal["scenario", "video", "audio"]
+
+
+@dataclass(frozen=True)
+class InboxFile:
+    """A safe, JSON-serializable reference to a file supplied by a user."""
+
+    file_id: str
+    fingerprint: str
+    kind: InboxKind
+    name: str
+    relative_path: str
+    extension: str
+    size_bytes: int
+    mtime_ns: int
+    source: Literal["upload", "legacy"]
+    duplicate_paths: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["duplicate_paths"] = list(self.duplicate_paths)
+        return payload
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_files(
+    directory: Path,
+    *,
+    project_root: Path,
+    extensions: frozenset[str],
+) -> Iterable[Path]:
+    """Yield direct child files without following user-created symbolic links."""
+
+    if not directory.exists() or not directory.is_dir():
+        return
+    safe_root = project_root.resolve()
+    safe_directory = directory.resolve()
+    if not _is_relative_to(safe_directory, safe_root):
+        return
+    try:
+        candidates = sorted(directory.iterdir(), key=lambda path: path.name.casefold())
+    except OSError:
+        return
+    for candidate in candidates:
+        if candidate.is_symlink() or candidate.suffix.lower() not in extensions:
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if (
+            resolved.is_file()
+            and _is_relative_to(resolved, safe_directory)
+            and _is_relative_to(resolved, safe_root)
+        ):
+            yield resolved
+
+
+def _discover_category(
+    locations: tuple[tuple[Path, Literal["upload", "legacy"]], ...],
+    *,
+    project_root: Path,
+    extensions: frozenset[str],
+    default_kind: InboxKind,
+    hash_content: bool = True,
+) -> list[InboxFile]:
+    # Locations are ordered by preference. This makes a copy placed in the new,
+    # user-facing folder canonical while preserving visibility of legacy inputs.
+    by_fingerprint: dict[str, InboxFile] = {}
+    duplicates: dict[str, list[str]] = {}
+    safe_root = project_root.resolve()
+
+    for directory, source in locations:
+        for path in _safe_files(
+            directory,
+            project_root=safe_root,
+            extensions=extensions,
+        ):
+            try:
+                stat = path.stat()
+                relative_path = path.relative_to(safe_root).as_posix()
+                if hash_content:
+                    identity_hash = _sha256(path)
+                else:
+                    identity = json.dumps(
+                        {
+                            "path": relative_path,
+                            "size": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            except (OSError, ValueError):
+                # A concurrently removed file, permission error, or unexpected
+                # path must not break discovery of the rest of the inbox.
+                continue
+            fingerprint = f"sha256:{identity_hash}"
+            if fingerprint in by_fingerprint:
+                duplicates[fingerprint].append(relative_path)
+                continue
+            extension = path.suffix.lower()
+            kind: InboxKind = default_kind
+            if default_kind != "scenario":
+                kind = "audio" if extension in AUDIO_EXTENSIONS else "video"
+            by_fingerprint[fingerprint] = InboxFile(
+                file_id=f"inbox_{identity_hash[:20]}",
+                fingerprint=fingerprint,
+                kind=kind,
+                name=path.name,
+                relative_path=relative_path,
+                extension=extension,
+                size_bytes=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,
+                source=source,
+            )
+            duplicates[fingerprint] = []
+
+    files = []
+    for fingerprint, item in by_fingerprint.items():
+        files.append(InboxFile(
+            **{
+                **asdict(item),
+                "duplicate_paths": tuple(duplicates[fingerprint]),
+            }
+        ))
+    return sorted(
+        files,
+        key=lambda item: (item.source != "upload", item.name.casefold(), item.relative_path.casefold()),
+    )
+
+
+def discover_project_inbox(project_root: Path) -> dict[str, Any]:
+    """Discover supported files in the friendly and legacy project folders.
+
+    The function is read-only. It never moves, copies, renames, or deletes a
+    supplied file. Identical content is returned once, with alternate locations
+    listed in ``duplicate_paths``.
+    """
+
+    root = project_root.resolve()
+    scenarios = _discover_category(
+        (
+            (root / "ЗАГРУЗИТЬ" / "Сценарии", "upload"),
+            (root / "input", "legacy"),
+        ),
+        project_root=root,
+        extensions=SCENARIO_EXTENSIONS,
+        default_kind="scenario",
+    )
+    reviews = _discover_category(
+        (
+            (root / "ЗАГРУЗИТЬ" / "Просмотровки", "upload"),
+            (root / "media" / "reviews", "legacy"),
+        ),
+        project_root=root,
+        extensions=REVIEW_EXTENSIONS,
+        default_kind="video",
+        hash_content=False,
+    )
+    return {
+        "scenario_files": [item.to_dict() for item in scenarios],
+        "review_files": [item.to_dict() for item in reviews],
+    }

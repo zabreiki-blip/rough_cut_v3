@@ -65,9 +65,9 @@ def _validate_placeholder_identities(timeline: FullTimeline) -> None:
 
 
 def _revision_label(parent: ET.Element, seg: TimelineSegment) -> None:
-    if seg.revision_status == "added":
+    if seg.revision_status not in {"", "unchanged"}:
         labels = _sub(parent, "labels")
-        # Premiere's built-in red label is named "Rose" in FCP7 XML.
+        # Premiere's built-in red/pink label is named "Rose" in FCP7 XML.
         _sub(labels, "label2", "Rose")
 
 

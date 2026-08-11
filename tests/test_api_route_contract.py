@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from pathlib import Path
 
 import pytest
@@ -72,8 +73,10 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage3/jobs/status": {"GET"},
         "/stage3/export/xml": {"GET"},
         "/stage4/revisions": {"GET"},
+        "/stage4/inbox": {"GET"},
         "/stage4/revisions/import": {"POST"},
         "/stage4/revisions/<revision_id>/activate": {"POST"},
+        "/stage4/revisions/<revision_id>/reconcile": {"POST"},
         "/stage4/diffs/<diff_id>": {"GET"},
     }
     actual: dict[str, set[str]] = defaultdict(set)
@@ -160,6 +163,90 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
             "unmatched": 0,
         },
     }
+
+
+def test_stage4_inbox_lists_friendly_scenario_and_review_files(client, tmp_path: Path) -> None:
+    assert client.post("/projects", json={"project": "demo"}).status_code == 200
+    project = tmp_path / "projects" / "demo" / "ЗАГРУЗИТЬ"
+    (project / "Сценарии" / "Редакция 2.docx").write_bytes(b"scenario-v2")
+    (project / "Просмотровки" / "Интервью.wav").write_bytes(b"audio")
+
+    response = client.get("/stage4/inbox?project=demo")
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    assert [item["name"] for item in result["scenario_files"]] == ["Редакция 2.docx"]
+    assert [item["name"] for item in result["review_files"]] == ["Интервью.wav"]
+
+
+def test_stage4_activation_is_blocked_while_project_tts_is_running(client) -> None:
+    with api._TTS_JOBS_LOCK:
+        api._TTS_ACTIVE_PROJECTS.add("demo")
+    try:
+        response = client.post(
+            "/stage4/revisions/rev_0001/activate",
+            json={"project": "demo"},
+        )
+    finally:
+        with api._TTS_JOBS_LOCK:
+            api._TTS_ACTIVE_PROJECTS.discard("demo")
+
+    assert response.status_code == 409
+    assert "озвучки" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("lock_name", "active_name", "job_label"),
+    [
+        ("_NORMALIZATION_JOBS_LOCK", "_NORMALIZATION_ACTIVE_PROJECTS", "нормализации"),
+        ("_SYNC_JOBS_LOCK", "_SYNC_ACTIVE_PROJECTS", "сопоставления СНХ"),
+        ("_STAGE3_JOBS_LOCK", "_STAGE3_ACTIVE_PROJECTS", "подготовки Stage 3"),
+    ],
+)
+def test_stage4_activation_is_blocked_by_other_mutating_jobs(
+    client, lock_name: str, active_name: str, job_label: str
+) -> None:
+    lock = getattr(api, lock_name)
+    active = getattr(api, active_name)
+    with lock:
+        active.add("demo")
+    try:
+        response = client.post(
+            "/stage4/revisions/rev_0001/activate",
+            json={"project": "demo"},
+        )
+    finally:
+        with lock:
+            active.discard("demo")
+
+    assert response.status_code == 409
+    assert job_label in response.get_json()["error"]
+
+
+def test_stage4_mismatched_work_state_is_reported_and_activation_is_blocked(
+    client,
+) -> None:
+    paths = api._ensure_project("demo")
+    (paths["scenario_versions"] / "rev_0001.json").write_text(
+        json.dumps({"revision_id": "rev_0001"}), encoding="utf-8"
+    )
+    (paths["work"] / "active_revision.json").write_text(
+        json.dumps({"revision_id": "rev_0001"}), encoding="utf-8"
+    )
+    paths["normalized"].write_text(
+        json.dumps({"scenario_revision_id": "rev_0002", "blocks": []}),
+        encoding="utf-8",
+    )
+
+    listed = client.get("/stage4/revisions?project=demo")
+    activated = client.post(
+        "/stage4/revisions/rev_0001/activate", json={"project": "demo"}
+    )
+
+    integrity = listed.get_json()["result"]["integrity"]
+    assert integrity["status"] == "active_work_mismatch"
+    assert integrity["blocking"] is True
+    assert activated.status_code == 409
 
 
 @pytest.mark.parametrize(

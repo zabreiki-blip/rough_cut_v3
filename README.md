@@ -8,11 +8,59 @@
 - `projects/<project>/input/` — исходный сценарий проекта.
 - `projects/<project>/work/` — canonical `scenario_normalized.json` и производные `scenario_raw.txt`/`scenario_prepared.json`.
 - `projects/<project>/speaker/` — файлы озвучки `zk1.wav`, `zk2.wav`, ...
+- `projects/<project>/versions/` — история редакций: сценарии, diff, снимки таймлайна и recovery-копии.
 - `src/stage1/` — core-логика и CLI.
 - `src/stage2/` — таймлайн, sync-источники, Whisper word index и fuzzy matching.
 - `cep/` — панель Premiere для регистрации, экспорта аудиогида и conform.
 - `src/api.py` — Flask API.
 - `scripts/` — shell-обертки для CLI.
+
+## Простая загрузка файлов
+
+После создания проекта приложение автоматически создаёт две пользовательские
+папки:
+
+```text
+projects/<project>/ЗАГРУЗИТЬ/Сценарии/
+projects/<project>/ЗАГРУЗИТЬ/Просмотровки/
+```
+
+- в `Сценарии` кладутся `.doc`, `.docx`, `.txt` или `.md`;
+- в `Просмотровки` кладутся видео и отдельные `.wav`/`.mp3`;
+- видео и отдельный звук с одинаковым именем связываются автоматически;
+- старые `input/` и `media/reviews/` продолжают поддерживаться.
+
+### Версии сценария
+
+История работает одинаково для любого проекта из `projects/`; имя проекта не
+зашито в механизм версий. Рабочий цикл во вкладке «Версии»:
+
+1. Создай, проверь и сохрани исходную нормализацию. При первом импорте она
+   автоматически фиксируется как baseline `rev_0001`.
+2. Положи новый `.doc`, `.docx`, `.txt` или `.md` в
+   `ЗАГРУЗИТЬ/Сценарии`, выбери его и нажми «Загрузить новую редакцию».
+3. Приложение создаст следующий уникальный `rev_NNNN`, сравнит его с активной
+   редакцией и сохранит как отдельный черновик. Импорт сам по себе не меняет
+   активную редакцию.
+4. Проверь diff и нажми «Открыть» у нужной редакции. Несохранённые правки
+   нормализации интерфейс сначала предложит сохранить. После переключения
+   редакцию нужно проверить и подтвердить перед TTS, Stage 2 и Stage 3.
+
+Каждая редакция хранит собственные снимки исходного файла, нормализации,
+подготовленного сценария и карты озвучки; при наличии также сохраняются sync
+matches и таймлайн. Озвучка привязана к стабильному UID блока: `zk1`, `zk2`, …
+остаются позиционными экспортными именами, поэтому WAV неизменившихся или
+перемещённых блоков можно переиспользовать между редакциями.
+
+Перед импортом и переключением API сверяет `work/active_revision.json` с
+`scenario_revision_id` рабочей нормализации. Если они расходятся, операции
+блокируются, а вкладка предлагает «Восстановить». Восстановление сначала
+сохраняет текущее состояние в `versions/recovery/<timestamp>/`, затем разворачивает
+выбранную известную редакцию. Не редактируй файлы в `versions/` вручную.
+
+Импорт, переключение и восстановление также блокируются, пока в этом же проекте
+активна нормализация, TTS, sync или подготовка Stage 3. Задачи других проектов
+могут выполняться независимо.
 
 ## Локальные зависимости
 
@@ -197,11 +245,17 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 
 Эндпоинты:
 - `GET /` — стартовая страница: создать проект / выбрать проект.
+- `GET|POST /projects` — список и создание проектов.
+- `DELETE /projects/<project>` — удалить проект.
 - `GET /project/<project>` — UI первого этапа для конкретного проекта.
 - `GET /health`
 - `GET /stage1/status?project=<project>`
 - `POST /stage1/normalization/generate`
+- `POST /stage1/normalization/reset`
 - `GET|PUT /stage1/normalization`
+- `POST /stage1/normalization-jobs/start`
+- `GET /stage1/normalization-jobs/<job_id>`
+- `GET /stage1/normalization-jobs/status?project=<project>`
 - `POST /stage1/normalization/confirm/preview` — показать варианты обучения по ручным исправлениям
 - `POST /stage1/normalization/confirm`
 - `GET|POST /stage1/normalization/memory`
@@ -226,6 +280,19 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `GET|PATCH /stage2/sync-matches`
 - `PATCH /stage2/sync-matches/<block_uid>`
 - `GET /stage2/timeline?project=<project>`
+- `POST /stage3/jobs/scan/start`
+- `POST /stage3/jobs/prepare/start`
+- `GET /stage3/jobs/<job_id>`
+- `GET /stage3/jobs/status?project=<project>`
+- `POST /stage3/media/scan` — синхронный fallback сканирования.
+- `POST /stage3/timeline/prepare` — синхронный fallback подготовки.
+- `GET /stage3/export/xml?project=<project>`
+- `GET /stage4/inbox?project=<project>` — найденные сценарии и просмотровки
+- `GET /stage4/revisions?project=<project>` — история и состояние целостности
+- `POST /stage4/revisions/import` — создать редакцию из нового сценария
+- `GET /stage4/diffs/<diff_id>?project=<project>` — получить сохранённый diff
+- `POST /stage4/revisions/<revision_id>/activate` — открыть редакцию
+- `POST /stage4/revisions/<revision_id>/reconcile` — восстановить рассогласованный проект
 
 Последний статус TTS и sync атомарно сохраняется в каталоге `work` проекта.
 После рестарта незавершённая задача показывается как `interrupted`: повторный
@@ -250,7 +317,7 @@ LLM-нормализация сохраняет успешные batch-реше�
 Видео остаётся в Premiere и не загружается в backend.
 
 Для headless-монтажа по отрендеренным просмотровкам см.
-[`STAGE_3_PLAN.md`](STAGE_3_PLAN.md): Docker автоматически читает
+[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md): Docker автоматически читает
 `projects/<project>/media/reviews`, создаёт заменяемые `RC_SRC_*` sequences и
 готовый nested XML. Premiere нужен только для импорта результата.
 

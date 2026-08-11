@@ -44,7 +44,7 @@
     </header>
 
     <nav class="workspace-tabs" aria-label="Этапы проекта">
-      <button class="workspace-tab" data-tab="versions" type="button">Версии</button>
+      <button class="workspace-tab" data-tab="versions" type="button">Редакции</button>
       <button class="workspace-tab active" data-tab="normalization" type="button">Нормализация</button>
       <button class="workspace-tab" data-tab="voiceover" type="button">Озвучка <span id="voiceover_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
       <button class="workspace-tab" data-tab="assembly" type="button">Сборка <span id="assembly_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
@@ -57,27 +57,93 @@
             <h2>Редакции сценария</h2>
             <span id="versioning_status" class="status-badge" data-state="empty">нет версий</span>
           </div>
-          <p class="section-copy">Новый файл из input/ сравнивается с текущей редакцией. Неизменённые UID, WAV, Whisper и подтверждённые диапазоны переиспользуются.</p>
+          <p id="revisions_active_line" class="section-copy">Редакции ещё не созданы.</p>
         </div>
-        <button id="btn_import_revision" class="btn btn-primary" type="button">Импортировать новую версию</button>
+        <div class="versioning-import-controls">
+          <label class="field">
+            <span>Новая редакция</span>
+            <select id="inbox_scenario_select" aria-label="Новая редакция сценария"><option value="">Файлы не найдены</option></select>
+          </label>
+          <small id="inbox_review_summary" class="section-copy">Просмотровки ещё не проверены.</small>
+          <button id="btn_import_revision" class="btn btn-primary" type="button">Загрузить новую редакцию</button>
+        </div>
       </div>
-      <div id="versioning_summary" class="normalization-summary versioning-summary">
-        <div class="summary-stat"><strong id="ver_unchanged">0</strong><span>Без изменений</span></div>
-        <div class="summary-stat"><strong id="ver_moved">0</strong><span>Переставлено</span></div>
-        <div class="summary-stat"><strong id="ver_edited">0</strong><span>Изменено</span></div>
-        <div class="summary-stat"><strong id="ver_added">0</strong><span>Добавлено</span></div>
-        <div class="summary-stat"><strong id="ver_removed">0</strong><span>Удалено</span></div>
-      </div>
-      <div class="versioning-grid">
-        <section class="panel">
-          <div class="panel-heading"><div><h2>История</h2><p class="section-copy">Предыдущие редакции остаются неизменяемыми.</p></div></div>
-          <div id="revision_list" class="revision-list"><div class="empty-state compact">Версии ещё не созданы.</div></div>
-        </section>
-        <section class="panel">
-          <div class="panel-heading"><div><h2>Изменения</h2><p id="versioning_plan" class="section-copy">Импортируйте вторую редакцию.</p></div></div>
-          <div id="revision_diff" class="revision-diff"><div class="empty-state compact">Diff пока отсутствует.</div></div>
-        </section>
-      </div>
+
+      <section class="panel revisions-compare">
+        <div class="revisions-compare-heading">
+          <div>
+            <h3 id="revisions_compare_title">Сравнение</h3>
+          </div>
+          <label class="field dashboard-revision-field">
+            <span>Сравнить</span>
+            <select id="dashboard_revision_select" aria-label="Выбор сравнения редакций"></select>
+          </label>
+        </div>
+        <div id="revisions_summary_chips" class="revisions-summary-chips"></div>
+
+        <div class="revisions-mode-switch" role="tablist" aria-label="Режим просмотра изменений">
+          <button type="button" class="mode-tab active" data-mode="list" role="tab" aria-selected="true">Список изменений</button>
+          <button type="button" class="mode-tab" data-mode="map" role="tab" aria-selected="false">Карта перемещений</button>
+        </div>
+
+        <div id="revisions_compare_state" class="revisions-compare-state" hidden>
+          <p id="revisions_compare_state_text"></p>
+          <button id="btn_revisions_compare_retry" class="btn btn-sm" type="button" hidden>Повторить</button>
+        </div>
+
+        <div id="revision_filters_bar" class="revision-toolbar-controls">
+          <div class="revision-filter-bar" role="group" aria-label="Фильтр изменений">
+            <button type="button" class="revision-filter active" data-filter="all" aria-pressed="true">Все</button>
+            <button type="button" class="revision-filter" data-filter="edited" aria-pressed="false">Изменено</button>
+            <button type="button" class="revision-filter" data-filter="added" aria-pressed="false">Добавлено</button>
+            <button type="button" class="revision-filter" data-filter="removed" aria-pressed="false">Удалено</button>
+            <button type="button" class="revision-filter" data-filter="moved" aria-pressed="false">Перемещено</button>
+          </div>
+          <div class="revision-search-nav">
+            <input type="search" id="revision_search" class="revision-search-input" placeholder="Поиск по тексту или спикеру" aria-label="Поиск по тексту или спикеру">
+            <div class="revision-nav-buttons">
+              <button type="button" id="btn_revision_prev" class="btn btn-sm">← Предыдущее</button>
+              <button type="button" id="btn_revision_next" class="btn btn-sm">Следующее →</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="revision_changes_list" class="revision-changes-list"></div>
+
+        <div id="revisions_map_view" class="revisions-map-view" hidden>
+          <div class="dashboard-legend">
+            <span class="dashboard-legend-item" data-status="unchanged"><i></i>Без изменений</span>
+            <span class="dashboard-legend-item" data-status="edited"><i></i>Изменён</span>
+            <span class="dashboard-legend-item" data-status="moved"><i></i>Переставлен</span>
+            <span class="dashboard-legend-item" data-status="added"><i></i>Добавлен</span>
+            <span class="dashboard-legend-item" data-status="removed"><i></i>Удалён</span>
+            <span class="dashboard-legend-item" data-status="type_changed"><i></i>Сменён тип/спикер</span>
+          </div>
+          <div class="dashboard-map-toolbar">
+            <div class="dashboard-map-headers">
+              <span id="dashboard_map_old_label" class="dashboard-map-header">Было</span>
+              <span id="dashboard_map_new_label" class="dashboard-map-header">Стало</span>
+            </div>
+            <button id="btn_dashboard_fit" class="btn btn-sm" type="button">Вписать в экран</button>
+          </div>
+          <div class="dashboard-stage">
+            <div id="dashboard_canvas" class="dashboard-canvas">
+              <svg id="dashboard_svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            </div>
+            <aside id="dashboard_detail" class="dashboard-detail" hidden>
+              <button id="btn_dashboard_detail_close" class="btn-icon btn-sm dashboard-detail-close" type="button" title="Закрыть">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+              <div id="dashboard_detail_body" class="dashboard-detail-body"></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <details class="panel revisions-history">
+        <summary>История редакций</summary>
+        <div id="revision_list" class="revision-list"><div class="empty-state compact">Версии ещё не созданы.</div></div>
+      </details>
     </section>
 
     <section id="tab_normalization" class="workspace-panel active" data-tab-panel="normalization">

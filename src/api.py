@@ -32,6 +32,7 @@ from api_stage4_routes import register_stage4_routes
 from api_sync_worker import run_sync_job
 from atomic_io import atomic_write_json
 from job_runtime import JobRegistry, get_job, release_project, reserve_project, update_job
+from inbox_service import discover_project_inbox
 from logging_config import configure_logging
 from project_service import (
     PROJECT_NAME_RE,
@@ -71,7 +72,7 @@ from stage2.timeline_parser import (
     parse_normalized_timeline,
     sync_fragment_id,
 )
-from stage2.placeholder import generate_placeholder
+from stage2.placeholder import generate_placeholder, generate_versioned_placeholder
 from stage2.sync_llm_review import SemanticCandidate, review_candidates_with_llm
 from stage2.sync_matcher import MatcherConfig, SyncMatcher, normalize_text
 from stage2.sync_models import (
@@ -88,6 +89,8 @@ from stage2.whisper_process import (
     transcribe_audio_in_process as transcribe_audio,
 )
 from stage2.xml_export import build_xml
+from stage4.revision_assets import save_tts_manifest as save_voiceover_tts_manifest
+from stage4.versioning import inspect_revision_state, repair_active_revision_metadata
 
 
 configure_logging()
@@ -123,6 +126,8 @@ _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
 _NORMALIZATION_ACTIVE_PROJECTS = _NORMALIZATION_RUNTIME.active_projects
 _NORMALIZATION_JOBS_MAX = 50
+_PROJECT_TRANSITION_LOCKS: dict[str, threading.RLock] = {}
+_PROJECT_TRANSITION_LOCKS_GUARD = threading.Lock()
 
 
 class AudioUploadTooLargeError(ValueError):
@@ -131,6 +136,32 @@ class AudioUploadTooLargeError(ValueError):
 
 class _JobCancelled(RuntimeError):
     """Internal control-flow signal for cooperative background-job stops."""
+
+
+def _project_transition_lock(project: str) -> threading.RLock:
+    """Serialize job reservations with scenario-version transitions per project."""
+
+    with _PROJECT_TRANSITION_LOCKS_GUARD:
+        return _PROJECT_TRANSITION_LOCKS.setdefault(project, threading.RLock())
+
+
+def _project_has_active_mutation(project: str) -> bool:
+    registries = (
+        (_TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS),
+        (_SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS),
+        (_NORMALIZATION_JOBS_LOCK, _NORMALIZATION_ACTIVE_PROJECTS),
+    )
+    for lock, active_projects in registries:
+        with lock:
+            if project in active_projects:
+                return True
+    stage3_lock = globals().get("_STAGE3_JOBS_LOCK")
+    stage3_active = globals().get("_STAGE3_ACTIVE_PROJECTS")
+    if stage3_lock is not None and stage3_active is not None:
+        with stage3_lock:
+            if project in stage3_active:
+                return True
+    return False
 
 
 def _api_token() -> str:
@@ -231,6 +262,14 @@ def _project_paths(project: str) -> dict[str, Path]:
     return build_project_paths(project, PROJECTS_DIR)
 
 
+def _save_voiceover_revision_assets(project: str, result: dict) -> dict:
+    return save_voiceover_tts_manifest(_ensure_project(project), result)
+
+
+def _discover_project_inbox(project: str) -> dict:
+    return discover_project_inbox(_ensure_project(project)["root"])
+
+
 def _ensure_project(project: str) -> dict[str, Path]:
     return ensure_project_layout(project, PROJECTS_DIR)
 
@@ -298,6 +337,11 @@ def _confirmed_normalization(project: str) -> tuple[dict | None, str]:
         document = load_normalization(normalized_path)
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None, "invalid"
+    try:
+        if inspect_revision_state(paths).get("blocking"):
+            return None, "revision_state_conflict"
+    except (OSError, ValueError):
+        return None, "revision_state_conflict"
     if str(document.get("status", "")).lower() != "confirmed":
         return None, "draft"
     if not _normalization_source_is_current(document, paths["root"]):
@@ -346,8 +390,19 @@ def _confirmed_prepared_path(payload: dict, paths: dict[str, Path]) -> Path:
 
 
 def _discover_input_files(input_dir: Path, project: str) -> list[str]:
-    del project  # compatibility parameter for existing callers
-    return discover_project_input_files(input_dir, ROOT_DIR)
+    legacy = discover_project_input_files(input_dir, ROOT_DIR)
+    try:
+        paths = _ensure_project(project)
+        inbox = discover_project_inbox(paths["root"])
+        prefix = paths["root"].relative_to(ROOT_DIR)
+        friendly = [
+            str(prefix / str(item["relative_path"]))
+            for item in inbox.get("scenario_files", [])
+            if item.get("source") == "upload"
+        ]
+    except (OSError, ValueError):
+        friendly = []
+    return list(dict.fromkeys(friendly + legacy))
 
 
 def _build_status(project: str) -> dict:
@@ -360,6 +415,14 @@ def _build_status(project: str) -> dict:
     normalization = _read_json_safe(paths["normalized"])
     timeline = _read_json_safe(paths["timeline"])
     confirmed_normalization, normalization_reason = _confirmed_normalization(project)
+    try:
+        revision_integrity = inspect_revision_state(paths)
+    except (OSError, ValueError):
+        revision_integrity = {
+            "status": "invalid",
+            "blocking": True,
+            "message": "Не удалось проверить состояние редакций.",
+        }
 
     prepared_items = prepared.get("items", []) if isinstance(prepared, dict) else []
     manifest_items = manifest.get("items", []) if isinstance(manifest, dict) else []
@@ -390,6 +453,8 @@ def _build_status(project: str) -> dict:
         "normalization_exists": paths["normalized"].exists(),
         "normalization_status": str(normalization.get("status") or "missing"),
         "normalization_revision": normalization.get("revision"),
+        "scenario_revision_id": str(normalization.get("scenario_revision_id") or ""),
+        "revision_integrity": revision_integrity,
         "normalization_confirmed": confirmed_normalization is not None,
         "normalization_reason": normalization_reason,
         "timeline_ready": bool(
@@ -436,7 +501,10 @@ def _trim_tts_jobs_locked() -> None:
 
 
 def _reserve_tts_project(project: str) -> bool:
-    return stage1_jobs.reserve_tts_project(_stage1_job_services(), project)
+    with _project_transition_lock(project):
+        if _project_has_active_mutation(project):
+            return False
+        return stage1_jobs.reserve_tts_project(_stage1_job_services(), project)
 
 
 def _release_tts_project(project: str) -> None:
@@ -603,10 +671,13 @@ def _get_normalization_job(job_id: str) -> dict | None:
 
 
 def _reserve_normalization_project(project: str) -> bool:
-    return stage1_jobs.reserve_normalization_project(
-        _stage1_job_services(),
-        project,
-    )
+    with _project_transition_lock(project):
+        if _project_has_active_mutation(project):
+            return False
+        return stage1_jobs.reserve_normalization_project(
+            _stage1_job_services(),
+            project,
+        )
 
 
 def _release_normalization_project(project: str) -> None:
@@ -1022,6 +1093,21 @@ def _sync_job_with_live_summary(job: dict) -> dict:
             "Could not refresh sync summary project=%s error=%s", project, exc
         )
         return snapshot
+    confirmed, _reason = _confirmed_normalization(project)
+    if confirmed is not None:
+        normalization_revision = confirmed.get("revision")
+        scenario_revision_id = str(confirmed.get("scenario_revision_id") or "")
+        matches = [
+            item for item in matches
+            if item.metadata.get("normalization_revision")
+            in (None, "", normalization_revision)
+            and (
+                not str(item.metadata.get("scenario_revision_id") or "")
+                or not scenario_revision_id
+                or str(item.metadata.get("scenario_revision_id") or "")
+                == scenario_revision_id
+            )
+        ]
     snapshot.update(_sync_summary(matches))
     return snapshot
 
@@ -1038,11 +1124,13 @@ def _sync_matching_fingerprint(
     llm_model: str,
     llm_threshold: float,
     llm_limit: int,
+    scenario_revision_id: object = "",
 ) -> str:
     """Identify every durable input that can change a matching decision."""
     payload = {
-        "version": 1,
+        "version": 2,
         "normalization_revision": normalization_revision,
+        "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,
         "search_window_sec": round(float(search_window_sec), 6),
         "llm": {
@@ -1293,7 +1381,10 @@ def _sync_cancel_event(job_id: str) -> threading.Event | None:
 
 
 def _reserve_sync_project(project: str) -> bool:
-    return reserve_project(_SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS, project)
+    with _project_transition_lock(project):
+        if _project_has_active_mutation(project):
+            return False
+        return reserve_project(_SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS, project)
 
 
 def _release_sync_project(project: str) -> None:

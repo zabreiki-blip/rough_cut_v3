@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -13,9 +14,26 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from atomic_io import atomic_write_json, atomic_write_text
-from stage3.media_catalog import MediaCatalogError, scan_media_directory
+from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
+
+
+def _scenario_revision_matches(stored: object, current: object) -> bool:
+    """Accept legacy empty IDs, but reject explicit cross-revision artifacts."""
+    stored_id = str(stored or "").strip()
+    current_id = str(current or "").strip()
+    return not stored_id or not current_id or stored_id == current_id
+
+
+def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
+    return (
+        timeline.get("normalization_revision") == normalization.get("revision")
+        and _scenario_revision_matches(
+            timeline.get("scenario_revision_id"),
+            normalization.get("scenario_revision_id"),
+        )
+    )
 
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
@@ -320,6 +338,14 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
     jobs: dict[str, dict] = {}
     jobs_lock = threading.RLock()
     active_projects: set[str] = set()
+    # Expose the registry through the API facade so scenario-version transitions
+    # can atomically coordinate with Stage 3 jobs as well.
+    services._STAGE3_JOBS_LOCK = jobs_lock
+    services._STAGE3_ACTIVE_PROJECTS = active_projects
+
+    def project_transition(project: str):
+        factory = getattr(services, "_project_transition_lock", None)
+        return factory(project) if callable(factory) else nullcontext()
 
     def now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -335,8 +361,16 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             raise MediaCatalogError(
                 "project directory resolves outside the projects root"
             ) from exc
+        inbox_reviews = paths.get("inbox_reviews", project_root / "ЗАГРУЗИТЬ" / "Просмотровки")
+        legacy_reviews = paths.get("media_reviews", project_root / "media" / "reviews")
+        inbox_path = Path(inbox_reviews)
+        has_inbox_media = inbox_path.is_dir() and any(
+            item.is_file() and item.suffix.lower() in MEDIA_EXTENSIONS
+            for item in inbox_path.iterdir()
+        )
+        review_directory = inbox_reviews if has_inbox_media else legacy_reviews
         return scan_media_directory(
-            str(paths.get("media_reviews", project_root / "media" / "reviews")),
+            str(review_directory),
             recursive=recursive,
             media_root=project_root,
         )
@@ -356,14 +390,16 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             if progress:
                 progress(85, "Сопоставление просмотровок с таймлайном")
             timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
-            source_store, _match_store = services._sync_stores(paths)
-            mapping = map_catalog_to_timeline(
-                timeline_data,
-                {"sources": [source.to_dict() for source in source_store.list()]},
-                _timeline_catalog(catalog),
-            )
-            _annotate_media_kinds(mapping, catalog)
-            catalog["mapping"] = _mapping_summary(mapping)
+            confirmed, _reason = services._confirmed_normalization(project)
+            if confirmed and _timeline_is_current(timeline_data, confirmed):
+                source_store, _match_store = services._sync_stores(paths)
+                mapping = map_catalog_to_timeline(
+                    timeline_data,
+                    {"sources": [source.to_dict() for source in source_store.list()]},
+                    _timeline_catalog(catalog),
+                )
+                _annotate_media_kinds(mapping, catalog)
+                catalog["mapping"] = _mapping_summary(mapping)
         return {"project": project, **catalog}
 
     def perform_prepare(project: str, *, progress=None) -> dict:
@@ -379,8 +415,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         confirmed, _reason = services._confirmed_normalization(project)
         if (
             not confirmed
-            or timeline_data.get("normalization_revision")
-            != confirmed.get("revision")
+            or not _timeline_is_current(timeline_data, confirmed)
         ):
             raise Stage3OperationError(
                 "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
@@ -444,7 +479,16 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         xml_text = build_nested_xml(export_timeline, export_catalog)
         filename = f"{project}_nested_timeline.xml"
         atomic_write_text(paths["work"] / filename, xml_text)
-        atomic_write_json(paths["work"] / "stage3_source_mapping.json", mapping.to_dict())
+        mapping_payload = mapping.to_dict()
+        mapping_payload["normalization_revision"] = timeline_data.get(
+            "normalization_revision"
+        )
+        mapping_payload["scenario_revision_id"] = str(
+            timeline_data.get("scenario_revision_id") or ""
+        )
+        atomic_write_json(
+            paths["work"] / "stage3_source_mapping.json", mapping_payload
+        )
         mapped = [
             source_id
             for source_id, detail in mapping.details.items()
@@ -572,12 +616,20 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             gate = services._normalization_required(project)
             if gate:
                 return gate
-        with jobs_lock:
-            if project in active_projects:
+        with project_transition(project):
+            has_active_mutation = getattr(
+                services, "_project_has_active_mutation", None
+            )
+            if callable(has_active_mutation) and has_active_mutation(project):
                 return services._json_error(
-                    f"stage3 job already active for project {project}", 409
+                    f"another mutating job is active for project {project}", 409
                 )
-            active_projects.add(project)
+            with jobs_lock:
+                if project in active_projects:
+                    return services._json_error(
+                        f"stage3 job already active for project {project}", 409
+                    )
+                active_projects.add(project)
         try:
             job = create_job(project, kind)
             worker = threading.Thread(
@@ -660,7 +712,8 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             recursive = payload.get("recursive", False)
             if not isinstance(recursive, bool):
                 raise MediaCatalogError("recursive must be a boolean")
-            result = perform_scan(project, recursive=recursive)
+            with project_transition(project):
+                result = perform_scan(project, recursive=recursive)
         except (MediaCatalogError, ValueError, json.JSONDecodeError) as exc:
             return services._json_error(str(exc), 400)
         except Exception as exc:
@@ -677,7 +730,8 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             gate = services._normalization_required(project)
             if gate:
                 return gate
-            result = perform_prepare(project)
+            with project_transition(project):
+                result = perform_prepare(project)
         except Stage3OperationError as exc:
             return services._json_error(str(exc), exc.status_code)
         except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -697,6 +751,44 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         if not (paths["work"] / filename).is_file():
             return services._json_error(
                 "nested timeline not found — prepare Stage 3 first", 404
+            )
+        timeline_path = paths["work"] / "full_timeline.json"
+        try:
+            timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return services._json_error(
+                "full_timeline.json not found — run Build Timeline first", 404
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            return services._json_error(f"invalid full_timeline.json: {exc}", 500)
+        confirmed, _reason = services._confirmed_normalization(project)
+        if not confirmed or not _timeline_is_current(timeline_data, confirmed):
+            return services._json_error(
+                "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
+                409,
+            )
+        mapping_path = paths["work"] / "stage3_source_mapping.json"
+        try:
+            mapping_data = json.loads(mapping_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # Legacy Stage 3 exports did not always persist mapping metadata.
+            mapping_data = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            return services._json_error(
+                f"invalid stage3_source_mapping.json: {exc}", 500
+            )
+        mapping_normalization_revision = mapping_data.get("normalization_revision")
+        if (
+            mapping_normalization_revision not in (None, "")
+            and mapping_normalization_revision
+            != timeline_data.get("normalization_revision")
+        ) or not _scenario_revision_matches(
+            mapping_data.get("scenario_revision_id"),
+            timeline_data.get("scenario_revision_id"),
+        ):
+            return services._json_error(
+                "stage3_rebuild_required: редакция изменилась после подготовки Stage 3",
+                409,
             )
         return send_from_directory(
             paths["work"], filename, as_attachment=True, mimetype="application/xml"

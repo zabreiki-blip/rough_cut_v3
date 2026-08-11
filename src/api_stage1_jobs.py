@@ -270,6 +270,7 @@ def run_tts_job(
             cancel_check=(cancel_event.is_set if cancel_event is not None else None),
             speed=speed,
         )
+        services._save_voiceover_revision_assets(project, result)
         total = int(result.get("items_total") or 0)
         generated = int(result.get("files_count") or 0)
         skipped = int(result.get("skipped_count") or 0)

@@ -14,6 +14,7 @@ from stage1.normalization_memory import NormalizationMemory, normalize_marker
 from stage1.normalizer import (
     NormalizationValidationError,
     RevisionConflictError,
+    SourceChangedError,
     confirm_normalization,
     generate_normalization,
     import_legacy_normalization,
@@ -94,6 +95,33 @@ class NormalizationMemoryTests(unittest.TestCase):
 
 
 class NormalizerTests(unittest.TestCase):
+    def test_load_preserves_stage4_block_versioning_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "normalized.json"
+            path.write_text(json.dumps({
+                "source": "/tmp/scenario.docx",
+                "source_hash": "abc",
+                "blocks": [{
+                    "uid": "stable-block",
+                    "order": 1,
+                    "original_text": "Изменённый текст",
+                    "normalized_text": "Изменённый текст",
+                    "versioning": {
+                        "import_uid": "import-block",
+                        "parent_block_uid": "stable-block",
+                        "change_status": "edited",
+                    },
+                }],
+            }), encoding="utf-8")
+
+            loaded = load_normalization(path)
+
+            self.assertEqual(loaded["blocks"][0]["versioning"], {
+                "import_uid": "import-block",
+                "parent_block_uid": "stable-block",
+                "change_status": "edited",
+            })
+
     def test_docx_soft_line_break_stays_inside_voiceover_block(self) -> None:
         from docx import Document
         from docx.enum.text import WD_BREAK
@@ -174,6 +202,55 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(result["blocks"][2]["type"], "technical")
             self.assertEqual(result["blocks"][3]["type"], "unknown")
             self.assertEqual(result["blocks"][0]["original_text"], "ДИКТОР: Первый закадр")
+
+    def test_regenerate_active_revision_preserves_identity_and_increments_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            output = root / "normalized.json"
+            source.write_text("ДИКТОР: Текст\n", encoding="utf-8")
+            first = generate_normalization(
+                source, output, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            first["scenario_revision_id"] = "rev_0003"
+            first["parent_revision_id"] = "rev_0002"
+            first["blocks"][0]["versioning"] = {"change_status": "unchanged"}
+            output.write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
+
+            regenerated = generate_normalization(
+                source, output, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+
+            self.assertEqual(regenerated["revision"], 2)
+            self.assertEqual(regenerated["scenario_revision_id"], "rev_0003")
+            self.assertEqual(regenerated["parent_revision_id"], "rev_0002")
+            self.assertEqual(regenerated["blocks"][0]["uid"], first["blocks"][0]["uid"])
+            self.assertEqual(
+                regenerated["blocks"][0]["versioning"],
+                {"change_status": "unchanged"},
+            )
+
+    def test_regenerate_active_revision_rejects_another_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source = root / "first.txt"
+            second_source = root / "second.txt"
+            output = root / "normalized.json"
+            first_source.write_text("ДИКТОР: Первый\n", encoding="utf-8")
+            second_source.write_text("ДИКТОР: Второй\n", encoding="utf-8")
+            first = generate_normalization(
+                first_source, output, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            first["scenario_revision_id"] = "rev_0001"
+            output.write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
+
+            with self.assertRaises(SourceChangedError):
+                generate_normalization(
+                    second_source,
+                    output,
+                    memory_path=root / "memory.sqlite3",
+                    use_llm=False,
+                )
 
     def test_memory_applies_across_scenarios(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

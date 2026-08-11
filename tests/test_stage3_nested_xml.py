@@ -93,9 +93,14 @@ def test_matched_clip_references_nested_sequence_with_correct_frames() -> None:
     assert len(final.findall("./media/audio/track/clipitem/sequence")) == 1
 
 
-def test_new_revision_block_is_red_on_video_and_audio_tracks() -> None:
+@pytest.mark.parametrize("revision_status", [
+    "added", "edited", "type_changed", "speaker_changed", "moved",
+])
+def test_changed_revision_block_is_red_on_video_and_audio_tracks(
+    revision_status: str,
+) -> None:
     timeline = _timeline()
-    timeline.segments[0].revision_status = "added"
+    timeline.segments[0].revision_status = revision_status
 
     root = _root(build_nested_xml(timeline, _catalog()))
     final = root.find("./project/children/sequence")

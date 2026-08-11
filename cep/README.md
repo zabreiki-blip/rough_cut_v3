@@ -8,8 +8,9 @@ backend.
 ## Что уже реализовано
 
 - чтение метаданных активной секвенции;
-- безопасное разрешение секвенции: сохранённый `sequenceID`/`projectItem.nodeId`
-  обязаны совпасть; fallback по имени используется только для legacy-записи без ID;
+- безопасное разрешение секвенции: сохранённый `sequenceID` имеет приоритет;
+  `projectItem.nodeId` используется, когда `sequenceID` отсутствует, а fallback
+  по уникальному имени — только для legacy-записи без обоих ID;
 - `POST /stage2/sync-sources` с метаданными активной секвенции;
 - автоматический export полного guide WAV через Adobe Media Encoder;
 - polling размера/даты WAV до завершения записи, регистрация guide и запуск
@@ -87,9 +88,9 @@ scripts/install-cep-macos
 
 3. Открыть `Window → Extensions → Rough Cut — Синхронизация`.
 
-В текущей development-среде symlink уже установлен, а `PlayerDebugMode` включён
-для CSXS 11/12. После изменения панели достаточно перезапустить Premiere.
-Перед распространением расширение нужно подписать ZXP и поднять bundle version.
+Скрипт включает `PlayerDebugMode` для CSXS 11/12. После изменения панели
+достаточно перезапустить Premiere. Перед распространением расширение нужно
+подписать ZXP и поднять bundle version.
 
 ## Backend contract
 
@@ -120,7 +121,7 @@ Premiere sequence, запускает sync job и применяет уже по
 
 ```json
 {
-  "project": "BRIK",
+  "project": "my_project",
   "id": "vasilieva_01",
   "source_id": "vasilieva_01",
   "speaker": "Татьяна Васильева",

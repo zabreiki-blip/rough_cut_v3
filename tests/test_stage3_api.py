@@ -46,6 +46,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         PROJECTS_DIR=tmp_path / "projects",
         _resolve_project_name=lambda value: str(value or "default"),
         _ensure_project=lambda _project: paths,
+        _project_paths=lambda _project: paths,
         _sync_stores=lambda current: (
             SyncSourceStore(current["sync_sources"]),
             SyncMatchStore(current["sync_matches"]),
@@ -91,6 +92,68 @@ def test_prepare_uses_legacy_export_when_project_has_no_viewings(client) -> None
     assert result["placeholder_segments"] == 1
 
 
+def test_prepare_rejects_timeline_from_another_scenario_revision(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    services._confirmed_normalization = lambda _project: ({
+        "revision": "norm-1",
+        "scenario_revision_id": "rev_0002",
+    }, "")
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "full_timeline.json").write_text(json.dumps({
+        "project": "BRIK",
+        "normalization_revision": "norm-1",
+        "scenario_revision_id": "rev_0001",
+        "segments": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
+        "sources": [],
+    })
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+
+    assert response.status_code == 409
+    assert "timeline_rebuild_required" in response.get_json()["error"]
+
+
+def test_stage3_export_rejects_other_revision_and_accepts_legacy_identity(client) -> None:
+    http, app, _monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    services._confirmed_normalization = lambda _project: ({
+        "revision": "norm-1",
+        "scenario_revision_id": "rev_0002",
+    }, "")
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "BRIK_nested_timeline.xml").write_text("<xml/>", encoding="utf-8")
+    timeline_path = paths["work"] / "full_timeline.json"
+    timeline_path.write_text(json.dumps({
+        "normalization_revision": "norm-1",
+        "scenario_revision_id": "rev_0001",
+        "segments": [],
+    }), encoding="utf-8")
+
+    assert http.get("/stage3/export/xml?project=BRIK").status_code == 409
+
+    timeline_path.write_text(json.dumps({
+        "normalization_revision": "norm-1",
+        "segments": [],
+    }), encoding="utf-8")
+    assert http.get("/stage3/export/xml?project=BRIK").status_code == 200
+
+    timeline_path.write_text(json.dumps({
+        "normalization_revision": "norm-1",
+        "scenario_revision_id": "rev_0002",
+        "segments": [],
+    }), encoding="utf-8")
+    (paths["work"] / "stage3_source_mapping.json").write_text(json.dumps({
+        "normalization_revision": "norm-1",
+        "scenario_revision_id": "rev_0001",
+    }), encoding="utf-8")
+    assert http.get("/stage3/export/xml?project=BRIK").status_code == 409
+
+
 def test_scan_api_uses_project_review_directory_automatically(client) -> None:
     http, app, monkeypatch = client
     captured = {}
@@ -113,6 +176,32 @@ def test_scan_api_uses_project_review_directory_automatically(client) -> None:
     assert response.get_json()["result"]["registered_sources"] == 0
     assert Path(captured["directory"]) == captured["media_root"] / "media" / "reviews"
     assert captured["recursive"] is True
+
+
+def test_scan_api_prefers_friendly_review_inbox_when_it_has_media(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    inbox_reviews = paths["root"] / "ЗАГРУЗИТЬ" / "Просмотровки"
+    inbox_reviews.mkdir(parents=True)
+    (inbox_reviews / "Интервью.wav").write_bytes(b"audio")
+    captured = {}
+
+    def fake_scan(directory, **kwargs):
+        captured.update(directory=directory, **kwargs)
+        return {
+            "directory": directory,
+            "relative_directory": "ЗАГРУЗИТЬ/Просмотровки",
+            "recursive": False,
+            "sources": [],
+        }
+
+    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", fake_scan)
+
+    response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    assert Path(captured["directory"]) == inbox_reviews
     assert captured["media_root"].name == "BRIK"
 
 

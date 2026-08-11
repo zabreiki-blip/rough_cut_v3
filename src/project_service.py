@@ -20,14 +20,19 @@ def normalize_project_name(name: str) -> str:
 
 def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
     root = projects_dir / project
+    inbox = root / "ЗАГРУЗИТЬ"
     work = root / "work"
     media = root / "media"
     versions = root / "versions"
     return {
         "root": root,
+        "inbox": inbox,
+        "inbox_scenarios": inbox / "Сценарии",
+        "inbox_reviews": inbox / "Просмотровки",
         "input": root / "input",
         "work": work,
         "speaker": root / "speaker",
+        "voiceover_assets": root / "speaker" / "assets",
         "media": media,
         "media_reviews": media / "reviews",
         "media_archive": media / "archive",
@@ -46,6 +51,7 @@ def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
         "sync_job_status": work / "sync_job_status.json",
         "normalization_job_status": work / "normalization_job_status.json",
         "tts_job_status": work / "tts_job_status.json",
+        "active_voiceover_manifest": work / "voiceover_manifest.json",
         "sync_audio": work / "sync_audio",
         "sync_transcripts": work / "transcripts",
         "timeline": work / "full_timeline.json",
@@ -55,9 +61,12 @@ def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
 def ensure_project(project: str, projects_dir: Path) -> dict[str, Path]:
     paths = project_paths(project, projects_dir)
     directory_keys = (
+        "inbox_scenarios",
+        "inbox_reviews",
         "input",
         "work",
         "speaker",
+        "voiceover_assets",
         "sync_audio",
         "sync_transcripts",
         "media_reviews",

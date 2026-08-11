@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict, deque
 from hashlib import sha256
 import json
 import logging
@@ -155,8 +156,24 @@ def _generate_normalization_unlocked(
     input_path = Path(input_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
+    output_path = Path(output_path)
+    previous: NormalizedScenario | None = None
+    if output_path.is_file():
+        try:
+            previous = NormalizedScenario.from_dict(read_json(output_path))
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            previous = None
     logger.info("Normalization started source=%s llm=%s", input_path, use_llm)
     source_hash = _file_hash(input_path)
+    if (
+        previous is not None
+        and previous.scenario_revision_id
+        and previous.source_hash != source_hash
+    ):
+        raise SourceChangedError(
+            "Active scenario revision cannot be replaced by another source; "
+            "import it as a new scenario revision"
+        )
     paragraphs = _extract_paragraphs(input_path)
     now = _utcnow()
     blocks: list[NormalizedBlock] = []
@@ -267,6 +284,20 @@ def _generate_normalization_unlocked(
         created_at=now,
         updated_at=now,
     )
+    if previous is not None and previous.source_hash == source_hash:
+        scenario.revision = previous.revision + 1
+        scenario.scenario_revision_id = previous.scenario_revision_id
+        scenario.parent_revision_id = previous.parent_revision_id
+        previous_by_text: dict[str, deque[NormalizedBlock]] = defaultdict(deque)
+        for block in previous.blocks:
+            previous_by_text[block.original_text].append(block)
+        for block in scenario.blocks:
+            candidates = previous_by_text.get(block.original_text)
+            if not candidates:
+                continue
+            old = candidates.popleft()
+            block.uid = old.uid
+            block.versioning = dict(old.versioning)
     payload = scenario.to_dict()
     _atomic_write_json(Path(output_path), payload)
     logger.info("Normalization draft written source=%s blocks=%d", input_path, len(blocks))
@@ -1260,9 +1291,12 @@ def _prepared_projection(scenario: NormalizedScenario) -> dict[str, Any]:
         "manual_markers_used": any(block.source == DecisionSource.MANUAL.value for block in scenario.blocks),
         "extraction_method": "normalization",
         "normalization_revision": scenario.revision,
+        "scenario_revision_id": scenario.scenario_revision_id,
+        "parent_revision_id": scenario.parent_revision_id,
         "items": [
             {
                 "id": f"zk{index}",
+                "block_uid": block.uid,
                 "text_original": block.normalized_text,
                 "text_for_tts": block.text_for_tts,
                 "pause_ms": 300,

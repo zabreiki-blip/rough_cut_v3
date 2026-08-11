@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from functools import wraps
 import hashlib
 from pathlib import Path
 import re
 import shutil
+from threading import Lock, RLock
 from typing import Any, Callable
 import unicodedata
 
 from atomic_io import atomic_write_json
+from stage4.revision_assets import (
+    create_revision_asset_snapshots,
+    restore_revision_assets,
+    snapshot_revision_assets,
+    validate_revision_assets,
+)
 
 
 SUPPORTED_SCENARIOS = {".doc", ".docx", ".md", ".txt"}
@@ -21,6 +30,38 @@ _CLASSIFICATION_FIELDS = (
     "proposed_label_confirmed", "proposed_source", "proposed_memory_rule_id",
     "continuation_of_type",
 )
+_DOWNSTREAM_FIELDS = (
+    "type", "speaker", "role", "text_for_tts", "timecode_start", "timecode_end",
+    "sync_fragments",
+)
+_PROJECT_LOCKS: dict[str, RLock] = {}
+_PROJECT_LOCKS_GUARD = Lock()
+
+
+class RevisionStateConflictError(ValueError):
+    """The active marker and mutable work projection describe different revisions."""
+
+
+@contextmanager
+def _project_lock(project_paths: dict[str, Path]):
+    key = str(project_paths["root"].resolve())
+    with _PROJECT_LOCKS_GUARD:
+        lock = _PROJECT_LOCKS.setdefault(key, RLock())
+    with lock:
+        yield
+
+
+def _locked_project_paths(index: int):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            project_paths = (
+                args[index] if len(args) > index else kwargs["project_paths"]
+            )
+            with _project_lock(project_paths):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
 def _utcnow() -> str:
@@ -62,6 +103,20 @@ def _block_uid(block: dict[str, Any]) -> str:
     return str(block.get("uid") or block.get("block_uid") or "").strip()
 
 
+def _downstream_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    changed = []
+    for field in _DOWNSTREAM_FIELDS:
+        if field == "sync_fragments":
+            old_value = old.get(field) if isinstance(old.get(field), list) else []
+            new_value = new.get(field) if isinstance(new.get(field), list) else []
+        else:
+            old_value = str(old.get(field) or "")
+            new_value = str(new.get(field) or "")
+        if old_value != new_value:
+            changed.append(field)
+    return changed
+
+
 def _paths(project_paths: dict[str, Path]) -> dict[str, Path]:
     scenarios = project_paths["scenario_versions"]
     diffs = project_paths["scenario_diffs"]
@@ -76,7 +131,7 @@ def list_revisions(project_paths: dict[str, Path]) -> list[dict[str, Any]]:
     storage = _paths(project_paths)
     revisions = []
     for path in sorted(storage["scenarios"].glob("rev_*.json")):
-        if ".normalized." in path.name:
+        if not re.fullmatch(r"rev_\d+\.json", path.name):
             continue
         try:
             revisions.append(_read_json(path))
@@ -94,16 +149,70 @@ def list_revisions(project_paths: dict[str, Path]) -> list[dict[str, Any]]:
     return revisions
 
 
+def inspect_revision_state(project_paths: dict[str, Path]) -> dict[str, Any]:
+    """Describe whether the mutable work projection belongs to the active revision."""
+
+    revisions = list_revisions(project_paths)
+    if not revisions:
+        return {"status": "no_history", "blocking": False, "message": ""}
+    active_path = project_paths["work"] / "active_revision.json"
+    if not active_path.is_file():
+        return {
+            "status": "missing_active_revision",
+            "blocking": True,
+            "message": "История существует, но активная редакция не определена.",
+        }
+    try:
+        active_id = str(_read_json(active_path).get("revision_id") or "")
+    except (OSError, ValueError):
+        active_id = ""
+    known_ids = {str(item.get("revision_id") or "") for item in revisions}
+    if active_id not in known_ids:
+        return {
+            "status": "invalid_active_revision",
+            "blocking": True,
+            "active_revision_id": active_id,
+            "message": "Указатель активной редакции не соответствует истории.",
+        }
+    try:
+        working_id = str(_read_json(project_paths["normalized"]).get("scenario_revision_id") or "")
+    except (OSError, ValueError):
+        working_id = ""
+    if working_id != active_id:
+        return {
+            "status": "active_work_mismatch",
+            "blocking": True,
+            "active_revision_id": active_id,
+            "working_revision_id": working_id,
+            "message": (
+                "Активная редакция и рабочий сценарий расходятся. "
+                "Переключение и импорт заблокированы до восстановления проекта."
+            ),
+        }
+    return {
+        "status": "ok",
+        "blocking": False,
+        "active_revision_id": active_id,
+        "working_revision_id": working_id,
+        "message": "",
+    }
+
+
 def _revision_number(revision_id: str) -> int:
     match = re.fullmatch(r"rev_(\d+)", revision_id)
     return int(match.group(1)) if match else 0
 
 
 def _find_source(project_paths: dict[str, Path], source_hash: str) -> Path:
-    candidates = [
-        path for path in project_paths["input"].iterdir()
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SCENARIOS
-    ]
+    candidates = []
+    for directory in (
+        project_paths["input"],
+        project_paths.get("inbox_scenarios", project_paths["input"]),
+    ):
+        candidates.extend(
+            path for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SCENARIOS
+        )
     for path in candidates:
         if _sha256(path) == source_hash:
             return path
@@ -112,9 +221,12 @@ def _find_source(project_paths: dict[str, Path], source_hash: str) -> Path:
 
 def _snapshot_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    shutil.copy2(source, temporary)
+    temporary.replace(destination)
 
 
+@_locked_project_paths(1)
 def ensure_baseline(project: str, project_paths: dict[str, Path]) -> dict[str, Any]:
     existing = list_revisions(project_paths)
     if existing:
@@ -127,10 +239,15 @@ def ensure_baseline(project: str, project_paths: dict[str, Path]) -> dict[str, A
     source = _find_source(project_paths, source_hash)
     storage = _paths(project_paths)
     revision_id = "rev_0001"
+    normalized["scenario_revision_id"] = revision_id
+    normalized["parent_revision_id"] = ""
+    atomic_write_json(normalized_path, normalized)
     normalized_snapshot = storage["scenarios"] / f"{revision_id}.normalized.json"
     source_snapshot = storage["scenarios"] / f"{revision_id}.source{source.suffix.lower()}"
-    atomic_write_json(normalized_snapshot, normalized)
     _snapshot_file(source, source_snapshot)
+    normalized["source"] = str(source_snapshot.resolve())
+    atomic_write_json(normalized_path, normalized)
+    atomic_write_json(normalized_snapshot, normalized)
 
     timeline_snapshot = ""
     if project_paths["timeline"].is_file():
@@ -162,7 +279,7 @@ def ensure_baseline(project: str, project_paths: dict[str, Path]) -> dict[str, A
     atomic_write_json(project_paths["work"] / "active_revision.json", {
         "revision_id": revision_id, "activated_at": _utcnow()
     })
-    return manifest
+    return snapshot_revision_assets(revision_id, project_paths) or manifest
 
 
 def _exact_pairs(old_blocks: list[dict], new_blocks: list[dict]) -> tuple[list[tuple[int, int, str]], set[int], set[int]]:
@@ -235,11 +352,14 @@ def compare_blocks(old_blocks: list[dict], new_blocks: list[dict]) -> dict[str, 
     for old_index, new_index, status in sorted(pairs, key=lambda item: item[1]):
         old = old_blocks[old_index]
         new = new_blocks[new_index]
+        downstream_changes = _downstream_changes(old, new)
         if status in {"unchanged", "moved"}:
             if new.get("type") not in {"", "unknown", old.get("type")}:
                 status = "type_changed"
             elif _speaker(new) and _speaker(old) != _speaker(new):
                 status = "speaker_changed"
+            elif downstream_changes:
+                status = "edited"
         changes.append({
             "status": status,
             "old_index": old_index,
@@ -255,6 +375,7 @@ def compare_blocks(old_blocks: list[dict], new_blocks: list[dict]) -> dict[str, 
             "new_speaker": new.get("speaker", ""),
             "old_text": old.get("normalized_text") or old.get("original_text") or "",
             "new_text": new.get("normalized_text") or new.get("original_text") or "",
+            "downstream_changed_fields": downstream_changes,
         })
     for new_index, new in enumerate(new_blocks):
         if new_index not in used_new:
@@ -284,6 +405,77 @@ def compare_blocks(old_blocks: list[dict], new_blocks: list[dict]) -> dict[str, 
     return {"summary": dict(summary), "changes": changes}
 
 
+def repair_active_revision_metadata(
+    project_paths: dict[str, Path],
+) -> dict[str, Any]:
+    """Restore Stage 4 metadata lost by older normalization round-trips.
+
+    Early Stage 4 builds did not preserve ``scenario_revision_id`` and block
+    ``versioning`` during confirmation.  Match the active revision snapshot to
+    the confirmed working copy by content and restore only that metadata,
+    leaving the user's confirmed classifications and text untouched.
+    """
+    active_path = project_paths["work"] / "active_revision.json"
+    if not active_path.is_file():
+        return {"repaired": False, "reason": "no_active_revision"}
+    active = _read_json(active_path)
+    revision_id = str(active.get("revision_id") or "")
+    if not re.fullmatch(r"rev_\d+", revision_id):
+        return {"repaired": False, "reason": "no_active_revision"}
+    current = _read_json(project_paths["normalized"])
+    blocks = current.get("blocks")
+    if not isinstance(blocks, list):
+        return {"repaired": False, "reason": "normalization_missing"}
+    has_revision_id = str(current.get("scenario_revision_id") or "") == revision_id
+    has_block_metadata = all(
+        isinstance(block, dict) and isinstance(block.get("versioning"), dict)
+        for block in blocks
+    ) if blocks else True
+    if has_revision_id and has_block_metadata:
+        return {"repaired": False, "reason": "metadata_present"}
+
+    manifest = _read_json(project_paths["scenario_versions"] / f"{revision_id}.json")
+    snapshot_name = str(manifest.get("normalized_snapshot") or "")
+    if snapshot_name != f"{revision_id}.normalized.json":
+        return {"repaired": False, "reason": "snapshot_missing"}
+    snapshot = _read_json(project_paths["scenario_versions"] / snapshot_name)
+    snapshot_blocks = snapshot.get("blocks")
+    if not isinstance(snapshot_blocks, list):
+        return {"repaired": False, "reason": "snapshot_invalid"}
+
+    alignment = compare_blocks(snapshot_blocks, blocks)
+    paired = [
+        change for change in alignment["changes"]
+        if change["old_index"] is not None and change["new_index"] is not None
+    ]
+    if len(paired) != len(snapshot_blocks) or len(paired) != len(blocks):
+        return {"repaired": False, "reason": "scenario_diverged"}
+
+    restored = 0
+    for change in paired:
+        old = snapshot_blocks[change["old_index"]]
+        new = blocks[change["new_index"]]
+        metadata = old.get("versioning")
+        if isinstance(metadata, dict):
+            new["versioning"] = dict(metadata)
+            restored += 1
+    current["scenario_revision_id"] = revision_id
+    current["parent_revision_id"] = str(manifest.get("parent_revision_id") or "")
+    source_snapshot_name = str(manifest.get("source_snapshot") or "")
+    source_snapshot = project_paths["scenario_versions"] / source_snapshot_name
+    if source_snapshot_name and source_snapshot.is_file():
+        expected_hash = str(manifest.get("source_sha256") or "")
+        if not expected_hash or _sha256(source_snapshot) == expected_hash:
+            current["source"] = str(source_snapshot.resolve())
+            current["source_hash"] = expected_hash or _sha256(source_snapshot)
+    atomic_write_json(project_paths["normalized"], current)
+    return {
+        "repaired": True,
+        "revision_id": revision_id,
+        "blocks": restored,
+    }
+
+
 def _inherit_blocks(old_blocks: list[dict], new_blocks: list[dict], diff: dict[str, Any]) -> None:
     for change in diff["changes"]:
         if change["old_index"] is None or change["new_index"] is None:
@@ -297,16 +489,12 @@ def _inherit_blocks(old_blocks: list[dict], new_blocks: list[dict], diff: dict[s
             "parent_block_uid": _block_uid(old),
             "change_status": change["status"],
         }
-        explicit_change = (
-            new.get("type") not in {"", "unknown"}
-            and bool(new.get("original_label"))
-            and new.get("type") != old.get("type")
-        )
-        if not explicit_change and (
+        if change["status"] not in {"type_changed", "speaker_changed"} and (
             change["text_similarity"] == 1.0 or new.get("type") in {"", "unknown"}
         ):
+            changed_fields = set(change.get("downstream_changed_fields") or [])
             for field in _CLASSIFICATION_FIELDS:
-                if field in old:
+                if field in old and field not in changed_fields:
                     new[field] = old[field]
             if change["text_similarity"] != 1.0 and new.get("type") == "voiceover":
                 new["text_for_tts"] = new.get("normalized_text", "")
@@ -368,6 +556,7 @@ def _execution_plan(diff: dict[str, Any], old_blocks: list[dict], new_blocks: li
     }
 
 
+@_locked_project_paths(1)
 def import_revision(
     project: str,
     project_paths: dict[str, Path],
@@ -379,6 +568,9 @@ def import_revision(
     hint: str = "",
 ) -> dict[str, Any]:
     baseline = ensure_baseline(project, project_paths)
+    integrity = inspect_revision_state(project_paths)
+    if integrity.get("blocking"):
+        raise RevisionStateConflictError(str(integrity.get("message") or "revision state conflict"))
     revisions = list_revisions(project_paths)
     known_hashes = {str(item.get("source_sha256") or "") for item in revisions}
     if input_path is None:
@@ -397,8 +589,25 @@ def import_revision(
     if source_hash in known_hashes:
         raise ValueError("This scenario revision has already been imported")
 
-    parent = max(revisions, key=lambda item: _revision_number(item["revision_id"]))
-    revision_id = f"rev_{_revision_number(parent['revision_id']) + 1:04d}"
+    latest = max(revisions, key=lambda item: _revision_number(item["revision_id"]))
+    parent = latest
+    active_path = project_paths["work"] / "active_revision.json"
+    if active_path.is_file():
+        active_id = str(_read_json(active_path).get("revision_id") or "")
+        active = next(
+            (item for item in revisions if item.get("revision_id") == active_id),
+            None,
+        )
+        if active is not None:
+            active_snapshot = str(active.get("normalized_snapshot") or "")
+            if active_snapshot == f"{active_id}.normalized.json":
+                try:
+                    _read_json(_paths(project_paths)["scenarios"] / active_snapshot)
+                except (OSError, ValueError):
+                    pass
+                else:
+                    parent = active
+    revision_id = f"rev_{_revision_number(latest['revision_id']) + 1:04d}"
     storage = _paths(project_paths)
     normalized_path = storage["scenarios"] / f"{revision_id}.normalized.json"
     generated = generate_normalization(
@@ -413,11 +622,17 @@ def import_revision(
     diff = compare_blocks(old_blocks, new_blocks)
     _inherit_blocks(old_blocks, new_blocks, diff)
     generated["blocks"] = new_blocks
-    parent_source = Path(str(parent_normalized.get("source") or input_path))
-    generated["source"] = str(parent_source.parent / input_path.name)
+    generated["source"] = str(input_path)
     generated["scenario_revision_id"] = revision_id
     generated["parent_revision_id"] = parent["revision_id"]
+    source_snapshot = storage["scenarios"] / f"{revision_id}.source{input_path.suffix.lower()}"
+    _snapshot_file(input_path, source_snapshot)
+    generated["source"] = str(source_snapshot.resolve())
     atomic_write_json(normalized_path, generated)
+
+    prepared_snapshot, voiceover_manifest_snapshot = create_revision_asset_snapshots(
+        revision_id, generated, project_paths
+    )
 
     diff_id = f"diff_{parent['revision_id']}_{revision_id}"
     plan = _execution_plan(diff, old_blocks, new_blocks)
@@ -428,8 +643,6 @@ def import_revision(
     }
     diff_path = storage["diffs"] / f"{diff_id}.json"
     atomic_write_json(diff_path, diff_document)
-    source_snapshot = storage["scenarios"] / f"{revision_id}.source{input_path.suffix.lower()}"
-    _snapshot_file(input_path, source_snapshot)
     manifest = {
         "schema_version": 1, "revision_id": revision_id,
         "parent_revision_id": parent["revision_id"], "project": project,
@@ -437,12 +650,72 @@ def import_revision(
         "source_sha256": source_hash, "normalized_snapshot": normalized_path.name,
         "diff_id": diff_id, "diff_file": diff_path.name,
         "created_at": _utcnow(), "status": "draft", "block_count": len(new_blocks),
+        "prepared_snapshot": prepared_snapshot,
+        "voiceover_manifest_snapshot": voiceover_manifest_snapshot,
         "summary": diff["summary"], "execution_plan": plan,
     }
     atomic_write_json(storage["scenarios"] / f"{revision_id}.json", manifest)
     return {"revision": manifest, "diff": diff_document, "baseline": baseline}
 
 
+def _activation_matches(
+    revision_id: str,
+    manifest: dict[str, Any],
+    diff: dict[str, Any],
+    project_paths: dict[str, Path],
+    storage: dict[str, Path],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    reusable: set[str] = set()
+    source_matches_path = project_paths["sync_matches"]
+    has_own_snapshot = bool(manifest.get("sync_matches_snapshot"))
+    if has_own_snapshot:
+        snapshot_name = str(manifest["sync_matches_snapshot"])
+        if snapshot_name != f"{revision_id}.sync_matches.json":
+            raise ValueError("invalid sync matches snapshot")
+        source_matches_path = storage["timelines"] / snapshot_name
+        if not source_matches_path.is_file():
+            raise FileNotFoundError(f"Sync matches snapshot not found: {snapshot_name}")
+    elif manifest.get("diff_file"):
+        reusable = set(diff.get("execution_plan", {}).get("reusable_block_uids", []))
+        parent_id = str(manifest.get("parent_revision_id") or "")
+        parent_path = storage["scenarios"] / f"{parent_id}.json"
+        if parent_path.is_file():
+            parent = _read_json(parent_path)
+            if parent.get("sync_matches_snapshot"):
+                parent_snapshot = str(parent["sync_matches_snapshot"])
+                if parent_snapshot != f"{parent_id}.sync_matches.json":
+                    raise ValueError("invalid parent sync matches snapshot")
+                source_matches_path = storage["timelines"] / parent_snapshot
+                if not source_matches_path.is_file():
+                    raise FileNotFoundError(
+                        f"Parent sync matches snapshot not found: {parent_snapshot}"
+                    )
+    matches = (
+        _read_json(source_matches_path)
+        if source_matches_path.is_file()
+        else {"schema_version": 1, "matches": []}
+    )
+    raw_matches = matches.get("matches", [])
+    if not isinstance(raw_matches, list):
+        raise ValueError("invalid sync matches snapshot")
+    kept = list(raw_matches)
+    if manifest.get("diff_file") and not has_own_snapshot:
+        kept = []
+        for match in raw_matches:
+            if not isinstance(match, dict):
+                raise ValueError("invalid sync match")
+            metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+            parent_uid = str(
+                metadata.get("parent_block_uid") or match.get("segment_id") or ""
+            ).split("::fragment:", 1)[0]
+            if parent_uid in reusable:
+                kept.append(match)
+    result = dict(matches)
+    result["matches"] = kept
+    return result, kept
+
+
+@_locked_project_paths(1)
 def activate_revision(
     revision_id: str,
     project_paths: dict[str, Path],
@@ -451,40 +724,121 @@ def activate_revision(
     manifest_path = storage["scenarios"] / f"{revision_id}.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Revision not found: {revision_id}")
+    active_path = project_paths["work"] / "active_revision.json"
+    if active_path.is_file():
+        active_id = str(_read_json(active_path).get("revision_id") or "")
+        working = _read_json(project_paths["normalized"])
+        working_id = str(working.get("scenario_revision_id") or "")
+        if active_id and working_id != active_id:
+            raise RevisionStateConflictError(
+                "active revision does not match the working scenario; "
+                "repair or reconcile the project before switching revisions"
+            )
     manifest = _read_json(manifest_path)
-    normalized = _read_json(storage["scenarios"] / manifest["normalized_snapshot"])
-    atomic_write_json(project_paths["normalized"], normalized)
+    if str(manifest.get("revision_id") or "") != revision_id:
+        raise ValueError("revision manifest id mismatch")
+    normalized_snapshot = str(manifest.get("normalized_snapshot") or "")
+    if normalized_snapshot != f"{revision_id}.normalized.json":
+        raise ValueError("invalid normalized snapshot")
+    normalized_path = storage["scenarios"] / normalized_snapshot
+    if not normalized_path.is_file():
+        raise FileNotFoundError(f"Normalized snapshot not found: {normalized_snapshot}")
+    normalized = _read_json(normalized_path)
+    normalized["scenario_revision_id"] = revision_id
+    normalized["parent_revision_id"] = str(manifest.get("parent_revision_id") or "")
+    source_snapshot = storage["scenarios"] / str(manifest.get("source_snapshot") or "")
+    normalized["source"] = str(source_snapshot.resolve())
+    validate_revision_assets(revision_id, manifest, normalized, project_paths)
 
-    reusable: set[str] = set()
-    source_matches_path = project_paths["sync_matches"]
-    if manifest.get("sync_matches_snapshot"):
-        source_matches_path = storage["timelines"] / manifest["sync_matches_snapshot"]
-    if manifest.get("diff_file"):
-        diff = _read_json(storage["diffs"] / manifest["diff_file"])
-        reusable = set(diff.get("execution_plan", {}).get("reusable_block_uids", []))
-        parent_id = str(manifest.get("parent_revision_id") or "")
-        parent_path = storage["scenarios"] / f"{parent_id}.json"
-        if parent_path.is_file():
-            parent = _read_json(parent_path)
-            if parent.get("sync_matches_snapshot"):
-                source_matches_path = storage["timelines"] / parent["sync_matches_snapshot"]
-    matches = _read_json(source_matches_path) if source_matches_path.is_file() else {"schema_version": 1, "matches": []}
-    kept = list(matches.get("matches", []))
-    if manifest.get("diff_file"):
-        kept = []
-        for match in matches.get("matches", []):
-            metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
-            parent_uid = str(metadata.get("parent_block_uid") or match.get("segment_id") or "").split("::fragment:", 1)[0]
-            if parent_uid in reusable:
-                kept.append(match)
-    matches["matches"] = kept
+    # Validate the remaining projections before snapshotting or changing any
+    # outgoing state.  After this point activation only performs staged/atomic
+    # copies of already checked inputs.
+    timeline_snapshot = str(manifest.get("timeline_snapshot") or "")
+    if timeline_snapshot:
+        if timeline_snapshot != f"{revision_id}.full_timeline.json":
+            raise ValueError("invalid timeline snapshot")
+        _read_json(storage["timelines"] / timeline_snapshot)
+    diff: dict[str, Any] = {}
+    diff_file = str(manifest.get("diff_file") or "")
+    if diff_file:
+        expected_diff = f"diff_{manifest.get('parent_revision_id')}_{revision_id}.json"
+        if diff_file != expected_diff:
+            raise ValueError("invalid revision diff")
+        diff = _read_json(storage["diffs"] / diff_file)
+    matches, kept = _activation_matches(
+        revision_id, manifest, diff, project_paths, storage
+    )
+    if active_path.is_file():
+        active_id = str(_read_json(active_path).get("revision_id") or "")
+        if active_id and active_id != revision_id:
+            snapshot_revision_assets(active_id, project_paths)
+            manifest = _read_json(manifest_path)
+    restore_revision_assets(revision_id, manifest, normalized, project_paths)
+    atomic_write_json(project_paths["normalized"], normalized)
     atomic_write_json(project_paths["sync_matches"], matches)
+    if manifest.get("timeline_snapshot"):
+        _snapshot_file(
+            storage["timelines"] / timeline_snapshot,
+            project_paths["timeline"],
+        )
+    else:
+        project_paths["timeline"].unlink(missing_ok=True)
     atomic_write_json(project_paths["work"] / "active_revision.json", {
         "revision_id": revision_id, "activated_at": _utcnow()
     })
-    if manifest.get("timeline_snapshot"):
-        _snapshot_file(
-            storage["timelines"] / manifest["timeline_snapshot"],
-            project_paths["timeline"],
-        )
     return {"revision": manifest, "reused_sync_matches": len(kept)}
+
+
+@_locked_project_paths(1)
+def reconcile_revision_state(
+    revision_id: str,
+    project_paths: dict[str, Path],
+) -> dict[str, Any]:
+    """Back up a divergent work projection and restore a chosen known revision."""
+
+    manifest_path = project_paths["scenario_versions"] / f"{revision_id}.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Revision not found: {revision_id}")
+    integrity = inspect_revision_state(project_paths)
+    if not integrity.get("blocking"):
+        return activate_revision(revision_id, project_paths)
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_root = project_paths["versions"] / "recovery" / stamp
+    work_backup = backup_root / "work"
+    speaker_backup = backup_root / "speaker"
+    work_backup.mkdir(parents=True, exist_ok=False)
+    speaker_backup.mkdir(parents=True, exist_ok=True)
+    backup_files = (
+        project_paths["normalized"],
+        project_paths["prepared"],
+        project_paths["sync_matches"],
+        project_paths["timeline"],
+        project_paths["active_voiceover_manifest"],
+        project_paths["work"] / "active_revision.json",
+    )
+    for source in backup_files:
+        if source.is_file():
+            _snapshot_file(source, work_backup / source.name)
+    for pattern in ("zk*.wav", "zk*.wav.meta"):
+        for source in project_paths["speaker"].glob(pattern):
+            if source.is_file():
+                _snapshot_file(source, speaker_backup / source.name)
+
+    active_path = project_paths["work"] / "active_revision.json"
+    previous_active = _read_json(active_path) if active_path.is_file() else None
+    atomic_write_json(active_path, {
+        "revision_id": "",
+        "recovery_backup": str(backup_root.relative_to(project_paths["root"])),
+    })
+    try:
+        result = activate_revision(revision_id, project_paths)
+    except Exception:
+        if previous_active is None:
+            active_path.unlink(missing_ok=True)
+        else:
+            atomic_write_json(active_path, previous_active)
+        raise
+    result["recovery_backup"] = str(backup_root.relative_to(project_paths["root"]))
+    result["reconciled"] = True
+    return result

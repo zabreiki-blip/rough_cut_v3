@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import wraps
 from types import ModuleType
 
 from flask import Flask, jsonify, request
@@ -7,6 +8,22 @@ from flask import Flask, jsonify, request
 
 def register_stage1_routes(app: Flask, services: ModuleType) -> None:
     """Register Stage 1 routes while resolving mutable services via the API facade."""
+
+    def serialize_project_mutation(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            payload = request.get_json(silent=True) or {}
+            try:
+                project = services._resolve_project_name(payload.get("project"))
+            except ValueError as exc:
+                return services._json_error(str(exc), 400)
+            with services._project_transition_lock(project):
+                if services._project_has_active_mutation(project):
+                    return services._json_error(
+                        "another mutating job is active for this project", 409
+                    )
+                return view(*args, **kwargs)
+        return wrapped
 
     @app.post("/stage1/analyze")
     def stage1_analyze():
@@ -139,6 +156,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
         return jsonify({"ok": True, "result": latest or {}})
 
     @app.post("/stage1/normalization/generate")
+    @serialize_project_mutation
     def stage1_normalization_generate():
         payload = request.get_json(silent=True) or {}
         try:
@@ -184,6 +202,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
         return jsonify({"ok": True, "project": project, "result": result})
 
     @app.put("/stage1/normalization")
+    @serialize_project_mutation
     def stage1_normalization_save():
         payload = request.get_json(silent=True) or {}
         try:
@@ -204,6 +223,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
         return jsonify({"ok": True, "project": project, "result": result})
 
     @app.post("/stage1/normalization/reset")
+    @serialize_project_mutation
     def stage1_normalization_reset():
         payload = request.get_json(silent=True) or {}
         try:
@@ -222,6 +242,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
         return jsonify({"ok": True, "project": project, "result": result})
 
     @app.post("/stage1/normalization/confirm")
+    @serialize_project_mutation
     def stage1_normalization_confirm():
         payload = request.get_json(silent=True) or {}
         try:
@@ -417,6 +438,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
                 gender=gender,
                 dry_run=bool(payload.get("dry_run", False)),
             )
+            services._save_voiceover_revision_assets(project, result)
         except ValueError as exc:
             return services._json_error(str(exc), 400)
         except FileNotFoundError as exc:

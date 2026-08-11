@@ -412,9 +412,9 @@ def _marker(parent: ET.Element, segment: TimelineSegment, name: str) -> None:
 
 
 def _revision_label(parent: ET.Element, segment: TimelineSegment) -> None:
-    if segment.revision_status == "added":
+    if segment.revision_status not in {"", "unchanged"}:
         labels = _sub(parent, "labels")
-        # Premiere's built-in red label is named "Rose" in FCP7 XML.
+        # Premiere's built-in red/pink label is named "Rose" in FCP7 XML.
         _sub(labels, "label2", "Rose")
 
 

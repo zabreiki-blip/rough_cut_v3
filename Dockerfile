@@ -17,7 +17,6 @@ RUN pip install --no-cache-dir -r requirements-whisper.txt
 
 COPY src ./src
 COPY scripts ./scripts
-COPY STAGE_1_PLAN.md ./STAGE_1_PLAN.md
 
 RUN chmod +x ./scripts/analyze-script ./scripts/synthesize-tts ./scripts/validate-stage1 \
     && mkdir -p /app/projects /app/data /app/.cache/huggingface \

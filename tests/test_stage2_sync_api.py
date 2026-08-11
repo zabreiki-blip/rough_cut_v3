@@ -62,6 +62,9 @@ def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
     )]
     assert api._sync_matching_fingerprint(**changed) != first
 
+    changed = dict(arguments, scenario_revision_id="rev_0002")
+    assert api._sync_matching_fingerprint(**changed) != first
+
 
 def test_audio_match_accepts_precomputed_signature_without_rereading(
     monkeypatch: pytest.MonkeyPatch,
@@ -120,7 +123,11 @@ def sync_api():
             yield api.app.test_client(), projects
 
 
-def _write_confirmed_normalization(projects: Path, revision: int = 7) -> Path:
+def _write_confirmed_normalization(
+    projects: Path,
+    revision: int = 7,
+    scenario_revision_id: str = "",
+) -> Path:
     path = projects / "demo" / "work" / "scenario_normalized.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -130,6 +137,7 @@ def _write_confirmed_normalization(projects: Path, revision: int = 7) -> Path:
                 "source_hash": "",
                 "status": "confirmed",
                 "revision": revision,
+                "scenario_revision_id": scenario_revision_id,
                 "blocks": [
                     {
                         "uid": "stable-sync-uid",
@@ -856,7 +864,7 @@ def test_sync_job_rejects_unknown_source_scope(sync_api) -> None:
 
 def test_words_ingestion_match_patch_build_and_timeline(sync_api) -> None:
     client, projects = sync_api
-    _write_confirmed_normalization(projects)
+    _write_confirmed_normalization(projects, scenario_revision_id="rev_0002")
     assert _post_source(client).status_code == 201
     words = [
         {"word": "маленькая", "start": 10.0, "end": 10.5},
@@ -889,6 +897,7 @@ def test_words_ingestion_match_patch_build_and_timeline(sync_api) -> None:
     assert found["segment_id"] == "stable-sync-uid"
     assert found["query_text"] == "Маленькая женщина покоряла великих людей"
     assert found["metadata"]["normalization_revision"] == 7
+    assert found["metadata"]["scenario_revision_id"] == "rev_0002"
     assert found["status"] == "auto_matched"
 
     patched = client.patch(
@@ -926,6 +935,7 @@ def test_words_ingestion_match_patch_build_and_timeline(sync_api) -> None:
 
     timeline = client.get("/stage2/timeline?project=demo")
     assert timeline.status_code == 200
+    assert timeline.get_json()["result"]["scenario_revision_id"] == "rev_0002"
     segments = timeline.get_json()["result"]["segments"]
     first = segments[0]
     assert first["block_uid"] == "stable-sync-uid"
@@ -1190,6 +1200,109 @@ def test_build_ignores_match_from_another_normalization_revision(sync_api) -> No
     listed = client.get("/stage2/sync-matches?project=demo").get_json()["result"]
     assert listed["matches"] == []
     assert listed["matched"] == 0
+
+
+def test_scenario_revision_identity_flows_through_matches_and_timeline(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(
+        projects, revision=7, scenario_revision_id="rev_0002"
+    )
+    assert _post_source(client).status_code == 201
+
+    patched = client.patch(
+        "/stage2/sync-matches/stable-sync-uid",
+        json={
+            "project": "demo",
+            "status": "confirmed",
+            "source_id": "vasilieva_01",
+            "source_in_sec": 1.0,
+            "source_out_sec": 2.0,
+        },
+    )
+    assert patched.status_code == 200
+    assert (
+        patched.get_json()["result"]["matches"][0]["metadata"][
+            "scenario_revision_id"
+        ]
+        == "rev_0002"
+    )
+
+    with patch.object(api, "generate_placeholder", return_value=None):
+        built = client.post("/stage2/build", json={"project": "demo"})
+    assert built.status_code == 200
+    timeline = client.get("/stage2/timeline?project=demo")
+    assert timeline.status_code == 200
+    assert timeline.get_json()["result"]["scenario_revision_id"] == "rev_0002"
+
+
+def test_explicit_other_scenario_revision_is_stale_but_legacy_match_is_accepted(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(
+        projects, revision=7, scenario_revision_id="rev_0002"
+    )
+    assert _post_source(client).status_code == 201
+    match_path = projects / "demo" / "work" / "sync_matches.json"
+
+    def write_match(scenario_revision_id: str | None) -> None:
+        metadata = {"normalization_revision": 7}
+        if scenario_revision_id is not None:
+            metadata["scenario_revision_id"] = scenario_revision_id
+        match_path.write_text(json.dumps({"matches": [{
+            "segment_id": "stable-sync-uid",
+            "query_text": "цитата",
+            "source_id": "vasilieva_01",
+            "source_in_sec": 1.0,
+            "source_out_sec": 2.0,
+            "confidence": 1.0,
+            "status": "confirmed",
+            "metadata": metadata,
+        }]}), encoding="utf-8")
+
+    write_match("rev_0001")
+    assert client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"] == []
+    with patch.object(api, "generate_placeholder", return_value=None):
+        stale_build = client.post("/stage2/build", json={"project": "demo"})
+    assert stale_build.status_code == 200
+    assert stale_build.get_json()["result"]["matched"] == 0
+
+    write_match(None)
+    listed = client.get("/stage2/sync-matches?project=demo").get_json()["result"]
+    assert len(listed["matches"]) == 1
+    with patch.object(api, "generate_placeholder", return_value=None):
+        legacy_build = client.post("/stage2/build", json={"project": "demo"})
+    assert legacy_build.status_code == 200
+    assert legacy_build.get_json()["result"]["matched"] == 1
+
+
+def test_timeline_rejects_explicit_other_scenario_revision(sync_api) -> None:
+    client, projects = sync_api
+    normalization_path = _write_confirmed_normalization(
+        projects, revision=7, scenario_revision_id="rev_0002"
+    )
+    timeline_path = normalization_path.parent / "full_timeline.json"
+    timeline_path.write_text(json.dumps({
+        "project": "demo",
+        "fps": 25,
+        "width": 1920,
+        "height": 1080,
+        "normalization_revision": 7,
+        "scenario_revision_id": "rev_0001",
+        "segments": [],
+    }), encoding="utf-8")
+
+    assert client.get("/stage2/timeline?project=demo").status_code == 409
+    assert client.get("/stage2/export/xml?project=demo").status_code == 409
+
+    # A timeline created before scenario IDs existed remains readable when its
+    # numeric normalization revision is still current.
+    legacy = json.loads(timeline_path.read_text(encoding="utf-8"))
+    legacy.pop("scenario_revision_id")
+    timeline_path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert client.get("/stage2/timeline?project=demo").status_code == 200
 
 
 def test_job_can_force_selected_source_and_custom_search_window(sync_api) -> None:

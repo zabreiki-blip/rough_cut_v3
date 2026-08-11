@@ -306,6 +306,9 @@ def run_sync_job(
 
         normalization = load_normalization(paths["normalized"])
         normalization_revision = normalization.get("revision")
+        scenario_revision_id = str(
+            normalization.get("scenario_revision_id") or ""
+        )
         blocks = [
             block
             for block in sorted(
@@ -357,8 +360,23 @@ def run_sync_job(
                 }
                 # Manual edits made while matching was running are authoritative.
                 for persisted_id, persisted_match in persisted.items():
-                    if persisted_match.status == "confirmed" or persisted_match.metadata.get(
-                        "manual_updated_at"
+                    persisted_revision = persisted_match.metadata.get(
+                        "normalization_revision"
+                    )
+                    persisted_scenario_revision_id = str(
+                        persisted_match.metadata.get("scenario_revision_id") or ""
+                    )
+                    persisted_is_current = (
+                        persisted_revision in (None, "", normalization_revision)
+                        and (
+                            not persisted_scenario_revision_id
+                            or not scenario_revision_id
+                            or persisted_scenario_revision_id == scenario_revision_id
+                        )
+                    )
+                    if persisted_is_current and (
+                        persisted_match.status == "confirmed"
+                        or persisted_match.metadata.get("manual_updated_at")
                     ):
                         existing[persisted_id] = persisted_match
                     elif persisted_id not in existing:
@@ -381,6 +399,7 @@ def run_sync_job(
             llm_model=settings.openrouter_model,
             llm_threshold=llm_review_threshold,
             llm_limit=llm_review_limit,
+            scenario_revision_id=scenario_revision_id,
         )
         total_segments = len(current_ids)
         _update_sync_job(
@@ -391,6 +410,7 @@ def run_sync_job(
             current_source_id="",
             matching_started_at=_utc_now_iso(),
             matching_fingerprint=matching_fingerprint,
+            scenario_revision_id=scenario_revision_id,
         )
 
         segment_failures: list[dict[str, str]] = []
@@ -413,13 +433,29 @@ def run_sync_job(
             prior_revision = (
                 prior.metadata.get("normalization_revision") if prior else None
             )
+            prior_scenario_revision_id = (
+                str(prior.metadata.get("scenario_revision_id") or "")
+                if prior else ""
+            )
             prior_is_current = (
                 prior_revision in (None, "", normalization_revision)
+                # Legacy matches predate scenario identities. Keep accepting an
+                # empty ID, but never reuse a match explicitly owned by another
+                # scenario revision even when numeric revisions happen to match.
+                and (
+                    not prior_scenario_revision_id
+                    or not scenario_revision_id
+                    or prior_scenario_revision_id == scenario_revision_id
+                )
             )
             prior_matching_fingerprint = (
                 str(prior.metadata.get("matching_fingerprint") or "")
                 if prior else ""
             )
+            if prior and not prior_is_current:
+                # Do not let a stale match contribute to progress/final summary
+                # or survive a failed rematch for the active scenario revision.
+                existing.pop(segment_id, None)
             if (
                 prior
                 and prior_is_current
@@ -490,6 +526,7 @@ def run_sync_job(
                             "error": str(exc),
                         })
                 match.metadata["normalization_revision"] = normalization_revision
+                match.metadata["scenario_revision_id"] = scenario_revision_id
                 match.metadata["matching_fingerprint"] = matching_fingerprint
                 match.metadata["parent_block_uid"] = str(
                     unit.get("parent_block_uid") or segment_id
