@@ -24,3 +24,6 @@ projects/*/speaker/
 projects/*/input/
 projects/*/media/
 projects/*/versions/
+
+# Local runtime scratch space (may contain real user project data)
+artifacts/
