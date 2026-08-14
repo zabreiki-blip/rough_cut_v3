@@ -28,4 +28,8 @@ EXPOSE 8000
 
 USER roughcut
 
+# Single worker by design: revision activation and normalizer state use
+# in-process locks (see src/api.py, src/stage4/versioning.py), not
+# cross-process locks. Do not raise --workers without adding an
+# inter-process file lock (e.g. fcntl/filelock) around project writes.
 CMD ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "3600", "api:app"]

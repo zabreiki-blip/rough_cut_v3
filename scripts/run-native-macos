@@ -18,6 +18,9 @@ export HF_HOME="${HF_HOME:-${ROOT_DIR}/.cache/huggingface}"
 mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data" "${HF_HOME}"
 
 cd "${ROOT_DIR}"
+# Single worker by design: revision activation and normalizer state rely
+# on in-process locks, not cross-process locks. Do not raise --workers
+# without adding an inter-process file lock around project writes.
 exec "${VENV_DIR}/bin/gunicorn" \
   -b "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}" \
   --workers 1 \
