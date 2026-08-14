@@ -183,6 +183,21 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(result["blocks"][1]["continuation_of_type"], "voiceover")
             self.assertEqual(result["blocks"][1]["text_for_tts"], "Продолжение закадра")
 
+    def test_standalone_voiceover_marker_is_non_tts_cue_for_next_paragraph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("З.к.\nСам закадровый текст.\n", encoding="utf-8")
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["technical", "voiceover"])
+            self.assertEqual(blocks[0]["text_for_tts"], "")
+            self.assertEqual(blocks[0]["notes"], "section_marker_for=voiceover")
+            self.assertEqual(blocks[1]["text_for_tts"], "Сам закадровый текст.")
+
     def test_generate_preserves_every_paragraph_and_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -490,6 +505,110 @@ class NormalizerTests(unittest.TestCase):
                 "Стратегия Лили — Она учится слышать собственный голос.",
             )
             self.assertEqual(block["text_for_tts"], block["normalized_text"])
+
+    def test_dotted_and_glued_voiceover_markers_from_editorial_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "З.к. Первый закадровый абзац.\n"
+                "З.КВ 1915 году произошла встреча.\n"
+                "З. Третий закадровый абзац.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["voiceover"] * 3)
+            self.assertEqual(
+                [block["normalized_text"] for block in blocks],
+                [
+                    "Первый закадровый абзац.",
+                    "В 1915 году произошла встреча.",
+                    "Третий закадровый абзац.",
+                ],
+            )
+
+    def test_speaker_can_be_glued_to_timecode_or_use_spaced_three_part_timecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СТОРОЖЕВА00:04:00 Первый ответ эксперта о футуристах.\n"
+                "ИРБЕ. 00.28 45 Второй ответ эксперта о семье Брик.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
+            self.assertEqual([block["speaker"] for block in blocks], ["СТОРОЖЕВА", "ИРБЕ"])
+            self.assertEqual(
+                [block["timecode_start"] for block in blocks],
+                ["00:04:00", "00:28:45"],
+            )
+
+    def test_long_all_caps_speaker_prefix_without_timecode_is_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "КРАСНОВА Она объясняет происхождение галстука и подробно описывает экспонат музея.\n",
+                encoding="utf-8",
+            )
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["speaker"], "КРАСНОВА")
+            self.assertEqual(
+                block["normalized_text"],
+                "Она объясняет происхождение галстука и подробно описывает экспонат музея.",
+            )
+
+    def test_mixed_name_and_glued_period_speaker_prefixes_are_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Мария СМОЛЬНИКОВ Я благодарна Лиле за эту роль, потому что такой героини у меня не было.\n"
+                "КРАСНОЩЕКОВА.Про Маяковского и Бриков всегда очень много сплетничали современники.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
+            self.assertEqual(
+                [block["speaker"] for block in blocks],
+                ["Мария СМОЛЬНИКОВ", "КРАСНОЩЕКОВА"],
+            )
+
+    def test_structural_heading_is_technical_not_voiceover_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "ЗК Основной текст.\nЧАСТЬ ВТОРАЯ. РЕПЕТИЦИЯ\nЗАСТАВКА МУЗА\n10.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual(
+                [block["type"] for block in blocks],
+                ["voiceover", "technical", "technical", "technical"],
+            )
 
     def test_single_word_speaker_can_precede_timecode_without_colon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

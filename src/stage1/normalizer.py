@@ -58,6 +58,8 @@ _BUILTIN_MARKERS = {
     "vo": BlockType.VOICEOVER.value,
     "narrator": BlockType.VOICEOVER.value,
     "зк": BlockType.VOICEOVER.value,
+    "з к": BlockType.VOICEOVER.value,
+    "з": BlockType.VOICEOVER.value,
     "закадр": BlockType.VOICEOVER.value,
     "закадровый текст": BlockType.VOICEOVER.value,
     "диктор": BlockType.VOICEOVER.value,
@@ -74,7 +76,8 @@ _TECH_MARKERS = {
     "архив", "отбивка", "шапка", "склейка", "ремарка", "техническое",
 }
 _TIMECODE_TOKEN = (
-    r"(?:\[?\d{1,2}[:.]\d{2}(?:[:.]\d{2})?\]?|\[?\d{1,2}-\d{2}\]?)"
+    r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
+    r"\[?\d{1,2}[:.]\d{2}\]?|\[?\d{1,2}-\d{2}\]?)"
 )
 _TIMECODE = re.compile(rf"({_TIMECODE_TOKEN})")
 _SYNC_METADATA = re.compile(
@@ -102,6 +105,32 @@ _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"^\s*\((?:[^)\n]{{1,240}}\)\s*:?\s*|[^:\n]{{1,240}}:\s*)"
     rf"{_TIMECODE_TOKEN}",
     re.DOTALL,
+)
+_VOICEOVER_ZK_PREFIX = re.compile(
+    r"^\s*(?P<label>з\s*\.?\s*[кК]\.?)"
+    r"(?:(?=\s)|(?<=\.)(?=[А-ЯЁA-Z«(])|\s*[:\-–—]\s*|$)"
+    r"(?P<content>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_VOICEOVER_ZK_GLUED_PREFIX = re.compile(
+    r"^\s*(?P<label>з\s*\.\s*[кК]\.?)"
+    r"(?=[А-ЯЁA-Z«(])(?P<content>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_VOICEOVER_Z_PREFIX = re.compile(
+    r"^\s*(?P<label>з\.?)"
+    r"(?:\s+|\s*[:\-–—]\s*|$)"
+    r"(?P<content>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_BARE_SPEAKER_PREFIX = re.compile(
+    r"^\s*(?P<speaker>(?:[А-ЯЁ][а-яё]+\s+)?[А-ЯЁ]{3,})"
+    r"(?:[.:\-–—]?\s+|[.:](?=[А-ЯЁ])|(?=[а-яё]))(?P<content>.+)$",
+    re.DOTALL,
+)
+_STRUCTURAL_HEADING = re.compile(
+    r"^(?:часть\b|глава\b|заставка\b|эпизод\b|\d+\s*\.\s*$)",
+    re.IGNORECASE,
 )
 _LLM_CONFIDENCE_THRESHOLD = 0.65
 _LLM_CACHE_VERSION = 1
@@ -192,7 +221,20 @@ def _generate_normalization_unlocked(
             _classify_by_rules(block, memory)
             if block.type != BlockType.UNKNOWN.value and block.original_label:
                 block.label_confirmed = True
-                block.normalized_text = content or original
+                if content:
+                    block.normalized_text = content
+                elif block.type == BlockType.VOICEOVER.value:
+                    # A marker-only paragraph (very common as ``З.к.`` on its
+                    # own line) is a production cue for the following block,
+                    # not text that should ever reach TTS.
+                    _apply_type(
+                        block,
+                        BlockType.TECHNICAL.value,
+                        DecisionSource.BUILTIN_RULE.value,
+                        1.0,
+                    )
+                    block.notes = "section_marker_for=voiceover"
+                    block.text_for_tts = ""
             _extract_block_metadata(block)
             if block.type == BlockType.VOICEOVER.value:
                 block.text_for_tts = block.normalized_text
@@ -671,7 +713,10 @@ def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
             previous is not None
             and block.type == BlockType.UNKNOWN.value
             and not block.original_label
-            and previous.type == BlockType.VOICEOVER.value
+            and (
+                previous.type == BlockType.VOICEOVER.value
+                or previous.notes == "section_marker_for=voiceover"
+            )
         ):
             block.continuation_of_type = BlockType.VOICEOVER.value
             if not block.suggested_type:
@@ -729,6 +774,17 @@ def _split_label(text: str) -> tuple[str, str]:
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
         return "", text.strip()
+    # Real editorial drafts commonly spell the voice-over marker as ``З.к.``,
+    # ``З.К`` or glue it directly to the first word (``З.КВ 1915 году``).
+    # Marker normalization alone cannot recover that punctuation, so split it
+    # before the generic label machinery.
+    voiceover = (
+        _VOICEOVER_ZK_GLUED_PREFIX.match(text)
+        or _VOICEOVER_ZK_PREFIX.match(text)
+        or _VOICEOVER_Z_PREFIX.match(text)
+    )
+    if voiceover:
+        return voiceover.group("label").strip(), voiceover.group("content").strip()
     # Built-in structural markers take precedence over generic dash-separated
     # labels. Documentary headings such as "ЗК Стратегия Лили — ..." otherwise
     # look like one long, unknown label instead of a known voiceover marker.
@@ -759,7 +815,7 @@ def _split_label(text: str) -> tuple[str, str]:
     # colon: "Бартон 00:37 — 01:07 ...". Validate the prefix as a name or a
     # name-and-role credit before treating it as a label.
     timecoded_speaker = re.match(
-        rf"^\s*(.{{2,240}}?)\s+({_TIMECODE_TOKEN}.*)$", text, flags=re.DOTALL
+        rf"^\s*(.{{2,240}}?)[.\s]*({_TIMECODE_TOKEN}.*)$", text, flags=re.DOTALL
     )
     if timecoded_speaker:
         candidate = timecoded_speaker.group(1).strip()
@@ -773,6 +829,12 @@ def _split_label(text: str) -> tuple[str, str]:
         candidate = generic.group(1).strip()
         if not candidate.startswith("(") and len(candidate.split()) <= 3:
             return candidate, generic.group(2).strip()
+    bare_speaker = _BARE_SPEAKER_PREFIX.match(text)
+    if bare_speaker:
+        content = bare_speaker.group("content").strip()
+        # Avoid turning short all-caps production headings into interviewees.
+        if len(content) >= 40 and re.search(r"[а-яё]", content):
+            return bare_speaker.group("speaker"), content
     normalized_text = normalize_marker(text)
     if normalized_text in set(_BUILTIN_MARKERS) | _TECH_MARKERS:
         return text.strip(), ""
@@ -827,6 +889,14 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _EDITORIAL_TIMECODE_PREFIX.match(stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+    elif _STRUCTURAL_HEADING.match(stripped):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif (
+        _BARE_SPEAKER_PREFIX.match(stripped)
+        and block.original_label
+        and len(content) >= 40
+    ):
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
     elif stripped.startswith("(") and stripped.endswith(")"):
@@ -869,6 +939,12 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         elif name_only_match and _TIMECODE.match(fragment_source):
             block.speaker = block.original_label.strip()
             has_sync_metadata = True
+        elif (
+            block.original_label
+            and normalize_marker(block.original_label) not in _BUILTIN_MARKERS
+            and _BARE_SPEAKER_PREFIX.match(block.original_text)
+        ):
+            block.speaker = block.original_label.strip()
 
     # A bare timecoded paragraph is an older supported sync form whose
     # normalized_text intentionally retains the leading timecode. Structured
@@ -904,6 +980,9 @@ def _canonicalize_timecode(value: str) -> str:
     value = value.strip().strip("[]")
     if re.fullmatch(r"\d{1,2}-\d{2}", value):
         return value.replace("-", ":")
+    if re.fullmatch(r"\d{1,2}[.:]\d{2}\s+\d{2}", value):
+        parts = re.split(r"[.:\s]+", value)
+        return ":".join(parts)
     return value
 
 
