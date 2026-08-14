@@ -303,3 +303,76 @@ def test_reconcile_backs_up_divergent_work_and_restores_selected_revision(
     restored = __import__("json").loads(paths["normalized"].read_text(encoding="utf-8"))
     assert restored["scenario_revision_id"] == "rev_0001"
     assert restored["blocks"][0]["uid"] == "one"
+
+
+def test_activation_interrupted_between_files_is_detected_and_recoverable(
+    tmp_path: Path,
+) -> None:
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    atomic_write_json(paths["normalized"], {
+        "source": str(source_v1), "source_hash": hashlib.sha256(b"v1").hexdigest(),
+        "status": "confirmed", "blocks": [_block("one", "Первая")],
+    })
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path), "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft", "blocks": [_block("two", "Вторая")],
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo", paths, generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3", input_path=source_v2,
+    )
+
+    real_atomic_write_json = atomic_write_json
+    calls = {"count": 0}
+
+    def flaky_atomic_write_json(path, payload, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("simulated crash")
+        return real_atomic_write_json(path, payload, *args, **kwargs)
+
+    import pytest
+    from unittest.mock import patch
+
+    with patch("stage4.versioning.atomic_write_json", side_effect=flaky_atomic_write_json):
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            activate_revision("rev_0002", paths)
+
+    normalized_after_crash = __import__("json").loads(
+        paths["normalized"].read_text(encoding="utf-8")
+    )
+    active_after_crash = __import__("json").loads(
+        (paths["work"] / "active_revision.json").read_text(encoding="utf-8")
+    )
+    assert normalized_after_crash["scenario_revision_id"] == "rev_0002"
+    assert active_after_crash["revision_id"] == "rev_0001"
+
+    with pytest.raises(RevisionStateConflictError, match="does not match"):
+        activate_revision("rev_0001", paths)
+
+    result = reconcile_revision_state("rev_0002", paths)
+
+    assert result["reconciled"] is True
+    backup = paths["root"] / result["recovery_backup"] / "work" / "scenario_normalized.json"
+    backed_up = __import__("json").loads(backup.read_text(encoding="utf-8"))
+    assert backed_up["scenario_revision_id"] == "rev_0002"
+
+    normalized_after = __import__("json").loads(
+        paths["normalized"].read_text(encoding="utf-8")
+    )
+    active_after = __import__("json").loads(
+        (paths["work"] / "active_revision.json").read_text(encoding="utf-8")
+    )
+    assert normalized_after["scenario_revision_id"] == "rev_0002"
+    assert active_after["revision_id"] == "rev_0002"
