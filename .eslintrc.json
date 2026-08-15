@@ -1,0 +1,51 @@
+{
+  "root": true,
+  "extends": "eslint:recommended",
+  "env": {
+    "es2021": true
+  },
+  "overrides": [
+    {
+      "files": [
+        "cep/host.jsx"
+      ],
+      "parserOptions": {
+        "ecmaVersion": 5,
+        "sourceType": "script"
+      },
+      "globals": {
+        "app": "readonly",
+        "File": "readonly",
+        "Folder": "readonly",
+        "$": "readonly",
+        "Time": "readonly"
+      }
+    },
+    {
+      "files": [
+        "cep/js/**/*.js"
+      ],
+      "parserOptions": {
+        "ecmaVersion": 2018,
+        "sourceType": "script"
+      },
+      "env": {
+        "browser": true,
+        "es2018": true
+      }
+    },
+    {
+      "files": [
+        "tests/cep_behavior_test.cjs"
+      ],
+      "parserOptions": {
+        "ecmaVersion": 2020,
+        "sourceType": "script"
+      },
+      "env": {
+        "node": true,
+        "commonjs": true
+      }
+    }
+  ]
+}

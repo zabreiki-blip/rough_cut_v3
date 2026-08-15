@@ -45,6 +45,12 @@ jobs:
       - name: Mypy type check (non-blocking, gradual rollout)
         run: mypy src || true
 
+      - name: Install JS dev dependencies
+        run: npm ci
+
+      - name: ESLint (non-blocking, gradual rollout)
+        run: npx eslint cep tests/cep_behavior_test.cjs || true
+
       - name: CEP behavior test
         run: node tests/cep_behavior_test.cjs
 
