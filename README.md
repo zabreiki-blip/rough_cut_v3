@@ -80,7 +80,7 @@ matches и таймлайн. Озвучка привязана к стабиль
 
 Если используешь только `TTS_PROVIDER=macos`, ключи для TTS не нужны.
 
-Важно для `macos`: backend должен работать локально на macOS, либо через коннектор (ниже).  
+Важно для `macos`: backend должен работать локально на macOS, либо через коннектор (ниже).
 В Docker/Linux команда `say` недоступна напрямую.
 
 Опционально:
@@ -383,6 +383,14 @@ docker compose config --quiet
 как `ruff format src tests` и может вводиться постепенно без массового diff.
 
 `requirements-lock.txt` — полная фиксация версий прямых и транзитивных зависимостей (сгенерирован на Python 3.11 через `pip freeze` после установки `requirements-dev.txt` и `requirements-whisper.txt`). Источник истины для версий — `requirements*.txt`; lock-файл используется для воспроизводимости и диагностики, обновляйте его после любых изменений `requirements-*.txt`.
+
+### pre-commit хуки
+
+Установка один раз: `pip install pre-commit && pre-commit install`. Локально
+хуки проверяют только то, что уже обязательно и в CI — `ruff check`,
+`gitleaks` и базовую гигиену файлов (trailing whitespace, EOF, YAML/TOML/JSON).
+`mypy` и `eslint` пока намеренно не входят в pre-commit из-за накопленного
+технического долга и остаются non-blocking шагами CI.
 
 ## Локальная автоматизация
 
