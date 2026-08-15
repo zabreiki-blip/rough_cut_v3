@@ -382,6 +382,8 @@ docker compose config --quiet
 правила Ruff запускаются командой `ruff check src tests`; форматтер доступен
 как `ruff format src tests` и может вводиться постепенно без массового diff.
 
+`requirements-lock.txt` — полная фиксация версий прямых и транзитивных зависимостей (сгенерирован на Python 3.11 через `pip freeze` после установки `requirements-dev.txt` и `requirements-whisper.txt`). Источник истины для версий — `requirements*.txt`; lock-файл используется для воспроизводимости и диагностики, обновляйте его после любых изменений `requirements-*.txt`.
+
 ## Локальная автоматизация
 
 ```bash
