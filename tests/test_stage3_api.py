@@ -342,6 +342,22 @@ def test_scan_api_validates_payload(client, payload, error: str) -> None:
     assert response.get_json() == {"ok": False, "error": error}
 
 
+def test_direct_scan_is_blocked_while_project_mutation_is_active(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    services._project_has_active_mutation = lambda _project: True
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_args, **_kwargs: pytest.fail("scan must not start while project is busy"),
+    )
+
+    response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+
+    assert response.status_code == 409
+    assert "another mutating job" in response.get_json()["error"]
+
+
 def test_scan_api_returns_catalog_validation_error(client) -> None:
     http, _app, monkeypatch = client
 

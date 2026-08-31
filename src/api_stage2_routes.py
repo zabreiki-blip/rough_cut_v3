@@ -52,7 +52,36 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
                 return view(*args, **kwargs)
         return wrapped
 
+    def serialize_sync_data_mutation(view=None, *, multipart: bool = False):
+        """Reject source/transcript writes while a project job owns the data."""
+
+        def decorate(target):
+            @wraps(target)
+            def wrapped(*args, **kwargs):
+                if request.method == "GET":
+                    return target(*args, **kwargs)
+                payload = request.get_json(silent=True) or {}
+                raw_project = (
+                    request.form.get("project")
+                    if multipart
+                    else payload.get("project")
+                )
+                try:
+                    project = services._resolve_project_name(raw_project)
+                except ValueError as exc:
+                    return services._json_error(str(exc), 400)
+                with services._project_transition_lock(project):
+                    if services._project_has_active_mutation(project):
+                        return services._json_error(
+                            "another mutating job is active for this project", 409
+                        )
+                    return target(*args, **kwargs)
+            return wrapped
+
+        return decorate if view is None else decorate(view)
+
     @app.route("/stage2/sync-sources", methods=["GET", "POST", "DELETE"])
+    @serialize_sync_data_mutation
     def stage2_sync_sources():
         payload = request.get_json(silent=True) or {}
         raw_project = (
@@ -150,6 +179,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
 
 
     @app.route("/stage2/sync-sources/<source_id>/audio", methods=["GET", "PUT"])
+    @serialize_sync_data_mutation(multipart=True)
     def stage2_sync_source_audio(source_id: str):
         try:
             source_id = services._sync_source_id(source_id)
@@ -235,6 +265,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
 
 
     @app.put("/stage2/sync-sources/<source_id>/words")
+    @serialize_sync_data_mutation
     def stage2_sync_source_words(source_id: str):
         payload = request.get_json(silent=True)
         if payload is None:

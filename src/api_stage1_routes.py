@@ -26,6 +26,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
         return wrapped
 
     @app.post("/stage1/analyze")
+    @serialize_project_mutation
     def stage1_analyze():
         payload = request.get_json(silent=True) or {}
 
@@ -41,8 +42,8 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
             if input_files
             else str((paths["input"] / "scenario.docx").relative_to(services.ROOT_DIR))
         )
-        output_default = paths["work"] / "scenario_prepared.json"
-        raw_default = paths["work"] / "scenario_raw.txt"
+        output_default = paths["prepared"]
+        raw_default = paths["raw"]
 
         try:
             input_path = services._abs_path(
@@ -56,6 +57,14 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
             raw_output_path = services._abs_path(
                 payload.get("raw_output_path", ""), raw_default, paths["root"]
             )
+            if output_path.resolve() != output_default.resolve():
+                raise ValueError(
+                    "output_path must be the project's canonical scenario_prepared.json"
+                )
+            if raw_output_path.resolve() != raw_default.resolve():
+                raise ValueError(
+                    "raw_output_path must be the project's canonical scenario_raw.txt"
+                )
             result = services.analyze_script(
                 input_path=input_path,
                 output_path=output_path,

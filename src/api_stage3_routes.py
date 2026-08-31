@@ -713,7 +713,24 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             if not isinstance(recursive, bool):
                 raise MediaCatalogError("recursive must be a boolean")
             with project_transition(project):
+                has_active_mutation = getattr(
+                    services, "_project_has_active_mutation", None
+                )
+                if callable(has_active_mutation) and has_active_mutation(project):
+                    return services._json_error(
+                        f"another mutating job is active for project {project}", 409
+                    )
+                with jobs_lock:
+                    if project in active_projects:
+                        return services._json_error(
+                            f"stage3 job already active for project {project}", 409
+                        )
+                    active_projects.add(project)
+            try:
                 result = perform_scan(project, recursive=recursive)
+            finally:
+                with jobs_lock:
+                    active_projects.discard(project)
         except (MediaCatalogError, ValueError, json.JSONDecodeError) as exc:
             return services._json_error(str(exc), 400)
         except Exception as exc:

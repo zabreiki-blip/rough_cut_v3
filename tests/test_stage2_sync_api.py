@@ -343,6 +343,36 @@ def test_source_crud_and_server_named_validated_audio(sync_api) -> None:
     assert not fixed.exists()
 
 
+def test_source_and_transcript_mutations_are_blocked_while_job_is_active(sync_api) -> None:
+    client, _projects = sync_api
+    assert _post_source(client).status_code == 201
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_ACTIVE_PROJECTS.add("demo")
+    try:
+        assert client.get("/stage2/sync-sources?project=demo").status_code == 200
+        assert client.post("/stage2/sync-sources", json={
+            "project": "demo", "id": "another", "premiere_sequence": "SYNC_ANOTHER",
+        }).status_code == 409
+        assert client.delete("/stage2/sync-sources", json={
+            "project": "demo", "source_id": "vasilieva_01",
+        }).status_code == 409
+        assert client.put(
+            "/stage2/sync-sources/vasilieva_01/audio",
+            data={
+                "project": "demo",
+                "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+            },
+            content_type="multipart/form-data",
+        ).status_code == 409
+        assert client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={"project": "demo", "words": []},
+        ).status_code == 409
+    finally:
+        with api._SYNC_JOBS_LOCK:
+            api._SYNC_ACTIVE_PROJECTS.discard("demo")
+
+
 def test_review_media_registration_stores_opaque_path_without_reading_it(sync_api) -> None:
     client, projects = sync_api
     media_path = "/Volumes/L_BRICK/DOP/Брик_просмотровки/missing-review.mp4"

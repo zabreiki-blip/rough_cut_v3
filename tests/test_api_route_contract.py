@@ -146,7 +146,6 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
         "ok": True,
         "result": {"project": "demo", "sources": []},
     }
-
     matches = client.get("/stage2/sync-matches?project=demo")
     assert matches.status_code == 200
     assert matches.get_json() == {
@@ -163,6 +162,78 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
             "unmatched": 0,
         },
     }
+
+
+def test_legacy_stage1_analyze_only_writes_canonical_outputs(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = api._ensure_project("demo")
+    source = paths["input"] / "scenario.txt"
+    source.write_text("ДИКТОР: Текст.", encoding="utf-8")
+    captured: dict[str, Path] = {}
+
+    def fake_analyze(*, input_path: Path, output_path: Path, raw_output_path: Path, **_):
+        captured.update(
+            input_path=input_path,
+            output_path=output_path,
+            raw_output_path=raw_output_path,
+        )
+        return {"blocks_count": 1}
+
+    monkeypatch.setattr(api, "analyze_script", fake_analyze)
+    response = client.post(
+        "/stage1/analyze",
+        json={
+            "project": "demo",
+            "input_path": str(source),
+            "output_path": str(paths["prepared"]),
+            "raw_output_path": str(paths["raw"]),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["output_path"] == paths["prepared"]
+    assert captured["raw_output_path"] == paths["raw"]
+
+
+@pytest.mark.parametrize(
+    ("field", "filename"),
+    [
+        ("output_path", "full_timeline.json"),
+        ("raw_output_path", "alternate_raw.txt"),
+    ],
+)
+def test_legacy_stage1_analyze_rejects_noncanonical_output_paths(
+    client, field: str, filename: str
+) -> None:
+    paths = api._ensure_project("demo")
+    source = paths["input"] / "scenario.txt"
+    source.write_text("ДИКТОР: Текст.", encoding="utf-8")
+    target = paths["work"] / filename
+    target.write_text("sentinel", encoding="utf-8")
+
+    response = client.post(
+        "/stage1/analyze",
+        json={"project": "demo", "input_path": str(source), field: str(target)},
+    )
+
+    assert response.status_code == 400
+    assert "canonical" in response.get_json()["error"]
+    assert target.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_legacy_stage1_analyze_is_blocked_by_active_project_mutation(client) -> None:
+    with api._TTS_JOBS_LOCK:
+        api._TTS_ACTIVE_PROJECTS.add("demo")
+    try:
+        response = client.post("/stage1/analyze", json={"project": "demo"})
+    finally:
+        with api._TTS_JOBS_LOCK:
+            api._TTS_ACTIVE_PROJECTS.discard("demo")
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "another mutating job is active for this project"
 
 
 def test_stage4_inbox_lists_friendly_scenario_and_review_files(client, tmp_path: Path) -> None:
