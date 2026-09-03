@@ -29,6 +29,18 @@ def _make_prepared_json(path: Path, block_id: str = "zk1", text: str = "Тест
     )
 
 
+def _patch_say_available() -> unittest.mock._patch:
+    """Pretend the macOS `say`/`afconvert` binaries are installed.
+
+    Lets provider="macos" tests exercise the real synthesize_tts/synthesize_phrase
+    preflight path (and stay meaningful) on any platform, e.g. Linux CI, without
+    depending on the actual `say` binary being present.
+    """
+    return unittest.mock.patch(
+        "stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"
+    )
+
+
 def _make_wav_bytes(duration_ms: int = 1000) -> bytes:
     import io
 
@@ -91,7 +103,7 @@ class AtomicTtsPublicationTest(unittest.TestCase):
             old_bytes = _make_wav_bytes(500)
             wav.write_bytes(old_bytes)
 
-            with unittest.mock.patch(
+            with _patch_say_available(), unittest.mock.patch(
                 "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
             ), unittest.mock.patch(
                 "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
@@ -111,7 +123,7 @@ class AtomicTtsPublicationTest(unittest.TestCase):
             old_bytes = _make_wav_bytes(500)
             wav.write_bytes(old_bytes)
 
-            with unittest.mock.patch(
+            with _patch_say_available(), unittest.mock.patch(
                 "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
             ), unittest.mock.patch(
                 "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
@@ -278,7 +290,7 @@ class StaleWavRegenerationTest(unittest.TestCase):
             original_mtime = wav.stat().st_mtime_ns
 
             prepared = self._prepared(speaker_dir, "Тест")
-            with unittest.mock.patch(
+            with _patch_say_available(), unittest.mock.patch(
                 "stage1.gemini_tts._synthesize_wav_bytes",
                 return_value=self._FAKE_WAV_BYTES,
             ) as mock_synth:
@@ -300,7 +312,7 @@ class StaleWavRegenerationTest(unittest.TestCase):
             # No meta file — fingerprint unknown
 
             prepared = self._prepared(speaker_dir, "Текст")
-            with unittest.mock.patch(
+            with _patch_say_available(), unittest.mock.patch(
                 "stage1.gemini_tts._synthesize_wav_bytes",
                 return_value=self._FAKE_WAV_BYTES,
             ) as mock_synth:
@@ -321,7 +333,7 @@ class StaleWavRegenerationTest(unittest.TestCase):
             _write_meta_fingerprint(wav, old_fp)
 
             prepared = self._prepared(speaker_dir, "Новый текст")
-            with unittest.mock.patch(
+            with _patch_say_available(), unittest.mock.patch(
                 "stage1.gemini_tts._synthesize_wav_bytes",
                 return_value=self._FAKE_WAV_BYTES,
             ) as mock_synth:
@@ -339,7 +351,7 @@ class StaleWavRegenerationTest(unittest.TestCase):
             wav = speaker_dir / "zk1.wav"
 
             prepared = self._prepared(speaker_dir, "Текст")
-            with unittest.mock.patch(
+            with _patch_say_available(), unittest.mock.patch(
                 "stage1.gemini_tts._synthesize_wav_bytes",
                 return_value=self._FAKE_WAV_BYTES,
             ):
