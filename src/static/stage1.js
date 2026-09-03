@@ -754,12 +754,67 @@
     });
   }
 
+  function confirmDialog({ title, message, confirmLabel, cancelLabel, danger }) {
+    const dialog = ids.confirm_dialog;
+    const acceptBtn = ids.btn_confirm_dialog_accept;
+    const cancelBtn = ids.btn_confirm_dialog_cancel;
+    ids.confirm_dialog_title.textContent = title || "";
+    ids.confirm_dialog_message.textContent = message || "";
+    acceptBtn.textContent = confirmLabel || "Подтвердить";
+    cancelBtn.textContent = cancelLabel || "Отмена";
+    acceptBtn.classList.toggle("danger", Boolean(danger));
+    acceptBtn.disabled = false;
+    const previouslyFocused = document.activeElement;
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        dialog.removeEventListener("cancel", onCancel);
+        dialog.removeEventListener("click", onBackdropClick);
+        dialog.removeEventListener("keydown", onKeydown);
+        acceptBtn.onclick = null;
+        cancelBtn.onclick = null;
+        dialog.close();
+        if (previouslyFocused && typeof previouslyFocused.focus === "function") {
+          previouslyFocused.focus();
+        }
+        resolve(result);
+      };
+      const onCancel = (event) => { event.preventDefault(); finish(false); };
+      const onBackdropClick = (event) => { if (event.target === dialog) finish(false); };
+      const onKeydown = (event) => {
+        if (event.key !== "Tab") return;
+        const focusable = [cancelBtn, acceptBtn];
+        const currentIndex = focusable.indexOf(document.activeElement);
+        event.preventDefault();
+        const nextIndex = event.shiftKey
+          ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+          : (currentIndex === -1 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+        focusable[nextIndex].focus();
+      };
+      cancelBtn.onclick = () => finish(false);
+      acceptBtn.onclick = () => {
+        if (acceptBtn.disabled) return;
+        acceptBtn.disabled = true;
+        finish(true);
+      };
+      dialog.addEventListener("cancel", onCancel);
+      dialog.addEventListener("click", onBackdropClick);
+      dialog.addEventListener("keydown", onKeydown);
+      dialog.showModal();
+      acceptBtn.focus();
+    });
+  }
+
   async function resetNormalization() {
     if (!normalization) return;
-    const accepted = window.confirm(
-      "Очистить всю нормализацию? Все блоки и ручные правки будут удалены. " +
-      "Исходник, WAV и память обозначений не изменятся."
-    );
+    const accepted = await confirmDialog({
+      title: "Очистить всю нормализацию?",
+      message: "Все блоки и ручные правки будут удалены. " +
+        "Исходник, WAV и память обозначений не изменятся.",
+      danger: true,
+    });
     if (!accepted) return;
     const result = await requestJSON("/stage1/normalization/reset", "POST", {
       project, revision: normalization.revision,
@@ -898,7 +953,12 @@
   }
 
   async function deleteMemoryRule(ruleId) {
-    if (!window.confirm("Удалить это правило из общей памяти обозначений?")) return;
+    const accepted = await confirmDialog({
+      title: "Удалить правило из памяти?",
+      message: "Удалить это правило из общей памяти обозначений?",
+      danger: true,
+    });
+    if (!accepted) return;
     await requestJSON(`/stage1/normalization/memory/${encodeURIComponent(ruleId)}?project=${encodeURIComponent(project)}`, "DELETE");
     await loadMemory(false);
     toast("Правило памяти удалено", "success");
@@ -1760,13 +1820,18 @@
   async function activateRevision(revisionId) {
     const revision = revisionsState.revisions.find((item) => item.revision_id === revisionId);
     if (normalizationDirty) {
-      const saveFirst = window.confirm(
-        "В нормализации есть несохранённые правки. Сохранить их перед переключением редакции?"
-      );
+      const saveFirst = await confirmDialog({
+        title: "Сохранить несохранённые правки?",
+        message: "В нормализации есть несохранённые правки. Сохранить их перед переключением редакции?",
+      });
       if (!saveFirst) return;
       await saveNormalization();
     }
-    if (!window.confirm(`Открыть ${revisionTitle(revision) || "эту редакцию"} как активный черновик?`)) return;
+    const accepted = await confirmDialog({
+      title: "Открыть эту редакцию?",
+      message: `Открыть ${revisionTitle(revision) || "эту редакцию"} как активный черновик?`,
+    });
+    if (!accepted) return;
     const result = await postJSON(`/stage4/revisions/${encodeURIComponent(revisionId)}/activate`, { project });
     appendLog(`Редакции: активирована ${revisionId}; сохранено sync matches: ${Number(result.reused_sync_matches || 0)}.`);
     window.location.reload();
@@ -1774,10 +1839,11 @@
 
   async function reconcileRevision(revisionId) {
     const revision = revisionsState.revisions.find((item) => item.revision_id === revisionId);
-    const accepted = window.confirm(
-      `Восстановить ${revisionTitle(revision) || "эту редакцию"}? `
-      + "Текущее рассогласованное рабочее состояние будет сохранено в versions/recovery."
-    );
+    const accepted = await confirmDialog({
+      title: `Восстановить ${revisionTitle(revision) || "эту редакцию"}?`,
+      message: "Текущее рассогласованное рабочее состояние будет сохранено в versions/recovery.",
+      danger: true,
+    });
     if (!accepted) return;
     const result = await postJSON(
       `/stage4/revisions/${encodeURIComponent(revisionId)}/reconcile`,
