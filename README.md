@@ -3,6 +3,90 @@
 Пайплайн: нормализация сценария (`.doc/.docx`) → подтверждение блоков →
 синтез TTS → Whisper-сопоставление СНХ → сборка в Premiere.
 
+## Быстрый старт
+
+Минимальный путь до первого результата на macOS, без платных API-ключей
+(используется системный голос `say`).
+
+1. Установи зависимости и создай `.env`:
+
+   ```bash
+   scripts/setup-local
+   ```
+
+   Скрипт создаёт `.venv`, ставит зависимости из `requirements-dev.txt`,
+   копирует `.env.example` в `.env` (с сгенерированным `ROUGH_CUT_API_TOKEN`),
+   создаёт папки `projects/` и `data/`, затем запускает быструю диагностику.
+   В конце выведет `Готово. Запуск API: scripts/run-local`.
+
+2. Открой `.env` и укажи путь без ключей LLM/TTS-провайдеров:
+
+   ```bash
+   TTS_PROVIDER=macos
+   ```
+
+   Ключи `OPENROUTER_API_KEY`/`GEMINI_API_KEY` в этом режиме не нужны.
+
+3. (Опционально) Проверь окружение подробнее:
+
+   ```bash
+   scripts/doctor
+   ```
+
+   Покажет ✅/⚠️/❌ по Python, `ffmpeg`, `.env`, токену, backend на `:8000` и,
+   на macOS, по `say`/`afconvert`.
+
+4. Запусти локальный API:
+
+   ```bash
+   scripts/run-local
+   ```
+
+   Ожидаемый результат: процесс висит в терминале, backend слушает
+   `http://127.0.0.1:8000`. Открой этот адрес в браузере — должна появиться
+   стартовая страница создания/выбора проекта.
+
+5. Пробный прогон без реального синтеза и без LLM (создай проект и положи
+   сценарий в `projects/my_project/input/scenario.docx`, затем):
+
+   ```bash
+   scripts/analyze-script --in projects/my_project/input/scenario.docx --no-llm
+   scripts/synthesize-tts --in projects/my_project/work/scenario_prepared.json --out projects/my_project/speaker --dry-run
+   scripts/validate-stage1 --in projects/my_project/work/scenario_prepared.json --speaker projects/my_project/speaker
+   ```
+
+   Ожидаемый результат: в `projects/my_project/work/` появится
+   `scenario_prepared.json`, в `projects/my_project/speaker/` — WAV-заглушки
+   без реального голоса, а `validate-stage1` выведет отчёт без ошибок.
+
+Дальше — обычный веб-workflow: открой проект в браузере, вкладка
+«Нормализация» → проверка блоков → подтверждение → TTS (уже с
+`TTS_PROVIDER=macos` или платным провайдером) → Stage 2 (Whisper-синхрон) →
+сборка в Premiere. Подробности — в разделах ниже и в
+[`docs/STAGE1_GUIDE.md`](docs/STAGE1_GUIDE.md).
+
+## Оглавление
+
+- [Структура](#структура)
+- [Простая загрузка файлов](#простая-загрузка-файлов)
+  - [Версии сценария](#версии-сценария)
+- [Локальные зависимости](#локальные-зависимости)
+- [Переменные окружения](#переменные-окружения)
+  - [macOS Connector (для Docker backend)](#macos-connector-для-docker-backend)
+- [Локальный запуск (CLI)](#локальный-запуск-cli)
+- [Ручная разметка диктора](#ручная-разметка-диктора)
+- [Dry run (без API-ключей)](#dry-run-без-api-ключей)
+- [API (Flask)](#api-flask)
+- [Stage 2.1: автоматическое подключение синхронов](#stage-21-автоматическое-подключение-синхронов)
+- [Тесты](#тесты)
+  - [pre-commit хуки](#pre-commit-хуки)
+- [Локальная автоматизация](#локальная-автоматизация)
+- [Docker](#docker)
+  - [Быстрое развёртывание на другой машине](#быстрое-развёртывание-на-другой-машине)
+  - [Apple Silicon M1–M4: Metal/MLX](#apple-silicon-m1m4-metalmlx)
+  - [Ручной Docker-запуск](#ручной-docker-запуск)
+- [Документация](#документация)
+
 ## Структура
 
 - `projects/<project>/input/` — исходный сценарий проекта.
@@ -408,6 +492,12 @@ confirm → TTS → validate. Для проверки без платного TT
 
 ## Docker
 
+Контейнер слушает `0.0.0.0:8000` — у приложения нет TLS, только токен
+(`ROUGH_CUT_API_TOKEN`). Не публикуй порт 8000 напрямую в интернет: для
+локальной работы обращайся к нему только с `127.0.0.1` этой же машины, а для
+доступа снаружи ставь перед контейнером reverse proxy с TLS (nginx/Caddy и
+т.п.).
+
 ### Быстрое развёртывание на другой машине
 
 Linux, Windows/WSL2, Intel Mac и универсальный CPU-вариант для Apple Silicon:
@@ -482,3 +572,19 @@ curl -X POST http://localhost:8000/stage1/analyze \
 Новый веб-workflow запускает фоновую задачу через
 `/stage1/normalization-jobs/start`; синхронный `/stage1/normalization/generate`
 сохранён для совместимости и тестовых интеграций.
+
+## Документация
+
+- [`docs/STAGE1_GUIDE.md`](docs/STAGE1_GUIDE.md) — подробное руководство по
+  работе со сценарием на Stage 1: разметка диктора, нормализация, TTS.
+- [`docs/E2E_PILOT_CHECKLIST.md`](docs/E2E_PILOT_CHECKLIST.md) — пошаговый
+  чек-лист для сквозного пилота в реальном Premiere Pro (сценарий → озвучка →
+  синхронизация → conform → XML).
+- [`docs/DEPENDENCY_POLICY.md`](docs/DEPENDENCY_POLICY.md) — политика
+  зависимостей и поддерживаемых платформ (Docker, macOS Apple Silicon, CI).
+- [`docs/COMPETITOR_COMPARISON.md`](docs/COMPETITOR_COMPARISON.md) —
+  конкурентный анализ (для контекста продукта, не для эксплуатации).
+- [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — план разработки и roadmap
+  (уже упомянут выше в разделе про Stage 2.1).
+- [`AUDIT.md`](AUDIT.md) — сводный аудит производительности и версии
+  сценариев с историей закрытых и открытых пунктов.

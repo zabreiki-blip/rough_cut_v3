@@ -32,4 +32,9 @@ USER roughcut
 # in-process locks (see src/api.py, src/stage4/versioning.py), not
 # cross-process locks. Do not raise --workers without adding an
 # inter-process file lock (e.g. fcntl/filelock) around project writes.
+#
+# Network note: binds 0.0.0.0:8000 with no TLS, only token auth
+# (ROUGH_CUT_API_TOKEN). Do not expose this port to the internet directly;
+# publish it as 127.0.0.1:8000 on the host, or put a TLS-terminating
+# reverse proxy in front of it.
 CMD ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "3600", "api:app"]

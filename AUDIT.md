@@ -1,6 +1,7 @@
 # Единый аудит rough_cut_v3
 
-Дата консолидации: 2026-08-05. Последняя актуализация: 2026-08-11.
+Дата консолидации: 2026-08-05. Последняя актуализация: 2026-09-03 (закрыты
+P1-7 и P0-4, см. пометки ниже).
 Источники: `PERF_AUDIT.md` (2026-08-05, свежий — основа раздела производительности),
 `AUDIT_REPORT.md` (2026-06-09), `REVIEW_REPORT.md` (2026-06-09).
 Проверка проведена по текущему рабочему дереву (`git log --oneline -30`, grep
@@ -128,15 +129,16 @@ Stage 2 (`api_stage2_routes.py:251-373`), кэш word-index по сигнату�
    комментарий: «имена маркеров могут меняться без изменения numMarkers»).
    Для рабочих (уже размеченных) секвенций горячий путь остаётся некэшированным.
 
-4. **CEP conform: O(items × (маркеры + клипы)) — ОСТАЁТСЯ ОТКРЫТЫМ.**
-   Проверено: `conformOnePass` (`cep/host.jsx:1695`) по-прежнему вызывает
-   `exactMarkersNamed` многократно за проход без переиспользования результата
-   (`cep/host.jsx:2882,2939,2963`, полный скан маркеров через COM на каждый
-   вызов, `cep/host.jsx:2441`); `findTrackItemByNodeId`
-   (`cep/host.jsx:1053`), `matchingSourceClips` (`cep/host.jsx:2653`) — без
-   изменений, линейные сканы клипов сохраняются.
-   Рекомендация из PERF_AUDIT в силе: один скан маркеров на весь проход,
-   индекс `nodeId → clip` на трек.
+4. **CEP conform: O(items × (маркеры + клипы)) — ЗАКРЫТО (частично) коммитом
+   `13c9e9a` (2026-09-03, «Index sequence markers by name during conform»).
+   Проверено 2026-09-03.**
+   `exactMarkersNamed` (`cep/host.jsx:2512-2521`) теперь ищет по индексу
+   `markerIndexCache` (`cep/host.jsx:25`, объявление; `buildMarkerIndex` строит
+   его один раз за скан) вместо полного COM-обхода маркеров на каждый вызов;
+   поиск по имени стал O(1) после построения индекса. Индекс инвалидируется во
+   всех точках мутации маркеров и на входе каждой публичной операции. Индекс
+   `nodeId → clip` для `findTrackItemByNodeId`/`matchingSourceClips` не
+   реализован — линейные сканы клипов остаются открытой частью рекомендации.
 
 ### P1 — существенно (без изменений, проверено против текущего кода)
 
@@ -147,10 +149,14 @@ Stage 2 (`api_stage2_routes.py:251-373`), кэш word-index по сигнату�
 6. **~~Whisper по умолчанию не MLX на Apple Silicon~~ — ЗАКРЫТО** на Apple Silicon
    auto-выбор ставит `mlx-whisper` первым (`src/stage2/whisper_runner.py:100-102`,
    fallback-порядок только для не-ARM платформ).
-7. **Нет кэша LLM-анализа в `analyzer.py`** — подтверждено, сравнение
-   `stage1/normalizer.py` (есть sha256-кэш) с `stage1/analyzer.py` (кэша по
-   хэшу текста/настроек не найдено) показывает, что рекомендация ещё не
-   реализована.
+7. **Кэш LLM-анализа в `analyzer.py` — ЗАКРЫТО. Проверено 2026-09-03.**
+   Реализован по тому же принципу, что и в `normalizer.py`:
+   `_llm_cache_path`/`_load_llm_cache`/`_llm_cache_fingerprint`/
+   `_cached_llm_blocks`/`_cache_llm_blocks` (`src/stage1/analyzer.py:655-769`)
+   кэшируют успешные batch-результаты по sha256 от текста чанка и
+   идентичности LLM-конфигурации (`_llm_identity`) в
+   `work/analysis_llm_cache.json`. Покрыто тестом
+   `tests/test_stage1_analyzer_llm_cache.py`.
 8. ffmpeg atempo отдельным subprocess на блок (`stage1/gemini_tts.py:35-64`) —
    не менялось.
 9. Блокирующие backoff-sleep в ретраях (`gemini_tts.py:758,1051`,
@@ -179,10 +185,11 @@ Stage 2 (`api_stage2_routes.py:251-373`), кэш word-index по сигнату�
 2. ~~`SYNC_WHISPER_BACKEND=mlx` на Apple Silicon~~ — уже не требуется
    (auto-выбор предпочитает `mlx-whisper` на Apple Silicon; переменная нужна лишь
    если mlx-whisper не установлен — тогда установить пакет).
-3. Один скан маркеров на conform-проход + индекс nodeId→clip (P0-4, всё ещё
-   не сделано; кэш сигналов inspect — уже частично сделан).
+3. ~~Один скан маркеров на conform-проход (P0-4)~~ — сделано (`13c9e9a`,
+   2026-09-03); индекс nodeId→clip для клипов пока не сделан.
 4. In-memory кэш JSON-хранилищ по mtime (api.py) — не сделано.
-5. Кэш LLM-анализа в analyzer.py — не сделано.
+5. ~~Кэш LLM-анализа в analyzer.py~~ — сделано (`src/stage1/analyzer.py:655-769`,
+   проверено 2026-09-03).
 6. Единый poller с in-flight guard в cep/js/main.js — не сделано.
 7. Timing-харнесс/бенчмарки этапов pipeline — не сделано, инструментов в
    репозитории по-прежнему нет.
