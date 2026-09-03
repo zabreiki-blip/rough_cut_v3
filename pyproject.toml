@@ -21,7 +21,16 @@ extend-exclude = ["projects", "data", ".venv", ".venv-macos-arm64"]
 [tool.ruff.lint]
 # Start with correctness rules. Style/formatting can be enabled incrementally
 # without burying functional changes in a repository-wide rewrite.
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# src/api.py intentionally imports many stage-module functions/classes it
+# does not call by their unqualified name in this file: tests patch them via
+# `patch.object(api, "name", ...)`/`monkeypatch.setattr(api, "name", ...)`
+# (see tests/test_stage2_sync_api.py, tests/test_normalization_api.py, etc.).
+# Removing these "unused" imports would silently break that dependency-
+# injection pattern, so F401 is not actionable here.
+"src/api.py" = ["F401"]
 
 [tool.mypy]
 python_version = "3.11"
