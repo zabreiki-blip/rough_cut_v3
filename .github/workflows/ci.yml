@@ -48,8 +48,8 @@ jobs:
       - name: Install JS dev dependencies
         run: npm ci
 
-      - name: ESLint (non-blocking, gradual rollout)
-        run: npx eslint cep tests/cep_behavior_test.cjs || true
+      - name: ESLint
+        run: npx eslint cep tests/cep_behavior_test.cjs
 
       - name: CEP behavior test
         run: node tests/cep_behavior_test.cjs

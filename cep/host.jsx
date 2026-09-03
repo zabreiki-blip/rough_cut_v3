@@ -4,6 +4,11 @@
  * Public entry points return JSON strings and accept URI-encoded JSON strings.
  * UI and transport live in js/main.js; Premiere-specific work stays here.
  */
+/* exported rcStage2_ping, rcStage2_listProjects, rcStage2_inspectActiveSequence,
+   rcStage2_inspectActiveSequenceLayout, rcStage2_resolveSequence,
+   rcStage2_insertSequenceRange, rcStage2_conformSequenceRanges,
+   rcStage2_exportActiveSequenceAudio, rcStage2_fileInfo -- public host API,
+   invoked from cep/js/main.js via evalScript */
 (function () {
     var TICKS_PER_SECOND = 254016000000;
     var roughCutSignalCache = [];
@@ -32,6 +37,7 @@
                 .replace(/\n/g, "\\n")
                 .replace(/\t/g, "\\t")
                 .replace(/\f/g, "\\f")
+                // eslint-disable-next-line no-control-regex -- backspace control char must be escaped per JSON spec
                 .replace(/\x08/g, "\\b") + '"';
         }
 
@@ -61,7 +67,7 @@
             if (typeof item === "object") {
                 parts = [];
                 for (key in item) {
-                    if (item.hasOwnProperty(key) && typeof item[key] !== "function") {
+                    if (Object.prototype.hasOwnProperty.call(item, key) && typeof item[key] !== "function") {
                         parts.push(quote(key) + ":" + encode(item[key]));
                     }
                 }
@@ -104,7 +110,7 @@
             if (timeValue.ticks !== undefined) {
                 return String(timeValue.ticks);
             }
-        } catch (ignoreTicks) {}
+        } catch (ignoreTicks) { /* .ticks недоступен на этом объекте */ }
         return "";
     }
 
@@ -118,13 +124,13 @@
             if (isFinite(value)) {
                 return value;
             }
-        } catch (ignoreSeconds) {}
+        } catch (ignoreSeconds) { /* .seconds недоступен, пробуем .ticks */ }
         try {
             value = Number(timeValue.ticks) / TICKS_PER_SECOND;
             if (isFinite(value)) {
                 return value;
             }
-        } catch (ignoreTicks) {}
+        } catch (ignoreTicks) { /* .ticks тоже недоступен, используем строковое значение */ }
         // Sequence.end and Sequence.zeroPoint are tick strings, while numeric
         // values passed by this panel are seconds.
         if (typeof timeValue === "string") {
@@ -156,8 +162,8 @@
         if (!sequence) {
             return 0;
         }
-        try { collections.push(sequence.videoTracks); } catch (ignoreVideoTracks) {}
-        try { collections.push(sequence.audioTracks); } catch (ignoreAudioTracks) {}
+        try { collections.push(sequence.videoTracks); } catch (ignoreVideoTracks) { /* videoTracks недоступны для этой последовательности */ }
+        try { collections.push(sequence.audioTracks); } catch (ignoreAudioTracks) { /* audioTracks недоступны для этой последовательности */ }
         for (i = 0; i < collections.length; i++) {
             collection = collections[i];
             if (!collection) {
@@ -172,7 +178,7 @@
                             duration = clipEnd;
                         }
                     }
-                } catch (ignoreTrackEnd) {}
+                } catch (ignoreTrackEnd) { /* клип без валидного end, пропускаем трек */ }
             }
         }
         return isFinite(duration) && duration > 0 ? duration : 0;
@@ -232,14 +238,14 @@
         var displayFormat = null;
         try {
             item = sequence.projectItem;
-        } catch (ignoreItem) {}
+        } catch (ignoreItem) { /* элемент проекта недоступен, пропускаем */ }
         try {
             settings = sequence.getSettings();
             if (settings) {
                 timebaseTicks = ticksOf(settings.videoFrameRate);
                 displayFormat = settings.videoDisplayFormat;
             }
-        } catch (ignoreSettings) {}
+        } catch (ignoreSettings) { /* настройки последовательности недоступны */ }
 
         return {
             sequenceId: asString(sequence.sequenceID),
@@ -284,7 +290,7 @@
         var structuralSignature = "";
         var cached = null;
 
-        try { sequenceId = asString(sequence.sequenceID); } catch (ignoreSequenceId) {}
+        try { sequenceId = asString(sequence.sequenceID); } catch (ignoreSequenceId) { /* sequenceID недоступен на старых версиях API */ }
         structuralSignature = sequenceRoughCutStructuralSignature(sequence);
         if (sequenceId && structuralSignature) {
             cached = cachedRoughCutSignals(sequenceId, structuralSignature);
@@ -337,7 +343,7 @@
                             return result;
                         }
                     }
-                } catch (ignoreFastTrack) {}
+                } catch (ignoreFastTrack) { /* fast-track недоступен, используем обычный путь */ }
             }
         }
 
@@ -602,7 +608,7 @@
                     if (item && asString(item.nodeId) === wantedNode) {
                         byNode.push(sequence);
                     }
-                } catch (ignoreNode) {}
+                } catch (ignoreNode) { /* узел дерева недоступен, пропускаем */ }
             }
             if (wantedName && asString(sequence.name) === wantedName) {
                 byName.push(sequence);
@@ -653,28 +659,28 @@
     }
 
     function restoreRange(projectItem, state) {
-        try { projectItem.clearInPoint(); } catch (ignoreClearIn) {}
-        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) {}
+        try { projectItem.clearInPoint(); } catch (ignoreClearIn) { /* нет установленной точки in, игнорируем */ }
+        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) { /* нет установленной точки out, игнорируем */ }
         if (state.video.hasIn && state.audio.hasIn &&
                 ticksOf(state.video.inPoint) === ticksOf(state.audio.inPoint)) {
-            try { projectItem.setInPoint(ticksOf(state.video.inPoint), 4); } catch (ignoreSetAllIn) {}
+            try { projectItem.setInPoint(ticksOf(state.video.inPoint), 4); } catch (ignoreSetAllIn) { /* установка общей in-точки не поддерживается для этого клипа */ }
         } else {
             if (state.video.hasIn) {
-                try { projectItem.setInPoint(ticksOf(state.video.inPoint), 1); } catch (ignoreSetVideoIn) {}
+                try { projectItem.setInPoint(ticksOf(state.video.inPoint), 1); } catch (ignoreSetVideoIn) { /* установка video in-точки не поддерживается */ }
             }
             if (state.audio.hasIn) {
-                try { projectItem.setInPoint(ticksOf(state.audio.inPoint), 2); } catch (ignoreSetAudioIn) {}
+                try { projectItem.setInPoint(ticksOf(state.audio.inPoint), 2); } catch (ignoreSetAudioIn) { /* установка audio in-точки не поддерживается */ }
             }
         }
         if (state.video.hasOut && state.audio.hasOut &&
                 ticksOf(state.video.outPoint) === ticksOf(state.audio.outPoint)) {
-            try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 4); } catch (ignoreSetAllOut) {}
+            try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 4); } catch (ignoreSetAllOut) { /* установка общей out-точки не поддерживается */ }
         } else {
             if (state.video.hasOut) {
-                try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 1); } catch (ignoreSetVideoOut) {}
+                try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 1); } catch (ignoreSetVideoOut) { /* установка video out-точки не поддерживается */ }
             }
             if (state.audio.hasOut) {
-                try { projectItem.setOutPoint(ticksOf(state.audio.outPoint), 2); } catch (ignoreSetAudioOut) {}
+                try { projectItem.setOutPoint(ticksOf(state.audio.outPoint), 2); } catch (ignoreSetAudioOut) { /* установка audio out-точки не поддерживается */ }
             }
         }
     }
@@ -687,8 +693,8 @@
         var videoOut;
         var audioIn;
         var audioOut;
-        try { projectItem.clearInPoint(); } catch (ignoreClearIn) {}
-        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) {}
+        try { projectItem.clearInPoint(); } catch (ignoreClearIn) { /* нет установленной точки in, игнорируем */ }
+        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) { /* нет установленной точки out, игнорируем */ }
         inResult = projectItem.setInPoint(secondsToTicks(inSeconds), 4);
         outResult = projectItem.setOutPoint(secondsToTicks(outSeconds), 4);
         videoIn = secondsOf(projectItem.getInPoint(1));
@@ -754,7 +760,7 @@
                     match = clip;
                 }
             }
-        } catch (ignoreScan) {}
+        } catch (ignoreScan) { /* сканирование прервалось, продолжаем с тем что есть */ }
         if (ambiguous) {
             throw new Error(
                 "More than one matching source clip exists at " +
@@ -1117,7 +1123,6 @@
         var clip;
         var currentStart;
         var expectedStart;
-        var moveResult;
         var i;
         entries.sort(function (left, right) {
             if (deltaSeconds > 0) {
@@ -1148,7 +1153,7 @@
                     "s; expected " + entry.originalStartSeconds.toFixed(3) + "s."
                 );
             }
-            moveResult = clip.move(timeFromSeconds(deltaSeconds));
+            clip.move(timeFromSeconds(deltaSeconds));
             clip = findTrackItemByNodeId(track, entry.nodeId);
             if (!clip || Math.abs(secondsOf(clip.start) - expectedStart) > 0.05) {
                 throw new Error(
@@ -1516,7 +1521,7 @@
         }
 
         for (key in excludedNodeIds) {
-            if (excludedNodeIds.hasOwnProperty(key)) {
+            if (Object.prototype.hasOwnProperty.call(excludedNodeIds, key)) {
                 excluded[key] = true;
             }
         }
@@ -1549,7 +1554,6 @@
         var track;
         var clip;
         var currentStart;
-        var moveResult;
         var moved = 0;
         var alreadyMoved = 0;
         var i;
@@ -1590,7 +1594,7 @@
                     ": " + currentStart.toFixed(3) + "s."
                 );
             }
-            moveResult = clip.move(
+            clip.move(
                 timeFromSeconds(entry.finalStartSeconds - currentStart)
             );
             clip = findTrackItemByNodeId(track, entry.nodeId);
@@ -2240,7 +2244,7 @@
             } else {
                 try {
                     previousPlayerTicks = ticksOf(target.getPlayerPosition());
-                } catch (ignorePlayerRead) {}
+                } catch (ignorePlayerRead) { /* позиция плеера недоступна */ }
                 if (typeof target.setPlayerPosition === "function") {
                     target.setPlayerPosition(secondsToTicks(params.timelineSeconds));
                     playerPositionForced = true;
@@ -2281,14 +2285,14 @@
                     if (mode === "overwrite") {
                         audioTrack.overwriteClip(sourceItem, secondsToTicks(params.timelineSeconds));
                     }
-                } catch (ignoreAudioFallback) {}
+                } catch (ignoreAudioFallback) { /* аудио-фолбэк недоступен */ }
             }
         }
 
         videoAfter = trackClipCount(videoTrack);
         audioAfter = trackClipCount(audioTrack);
         if (previousPlayerTicks && typeof target.setPlayerPosition === "function") {
-            try { target.setPlayerPosition(previousPlayerTicks); } catch (ignorePlayerRestore) {}
+            try { target.setPlayerPosition(previousPlayerTicks); } catch (ignorePlayerRestore) { /* восстановление позиции плеера не критично */ }
         }
         return {
             requestedMode: requestedMode,
@@ -2319,6 +2323,7 @@
         };
     }
 
+    // eslint-disable-next-line no-unused-vars -- public host API contract, pinned by tests/test_cep_contract.py
     function insertThenRippleReplace(target, sourceItem, params) {
         var sequenceDurationBefore = sequenceDurationSeconds(target);
         var originalPlaceholder = placeholderForRipple(target, params);
@@ -2424,15 +2429,15 @@
     function markerPositionKey(marker) {
         var start = "";
         var end = "";
-        try { start = ticksOf(marker.start); } catch (ignoreMarkerStart) {}
-        try { end = ticksOf(marker.end); } catch (ignoreMarkerEnd) {}
+        try { start = ticksOf(marker.start); } catch (ignoreMarkerStart) { /* маркер без ticks-начала */ }
+        try { end = ticksOf(marker.end); } catch (ignoreMarkerEnd) { /* маркер без ticks-конца */ }
         if (!start) {
             try { start = Number(secondsOf(marker.start)).toFixed(6); }
-            catch (ignoreMarkerStartSeconds) {}
+            catch (ignoreMarkerStartSeconds) { /* секунды начала маркера недоступны */ }
         }
         if (!end) {
             try { end = Number(secondsOf(marker.end)).toFixed(6); }
-            catch (ignoreMarkerEndSeconds) {}
+            catch (ignoreMarkerEndSeconds) { /* секунды конца маркера недоступны */ }
         }
         return asString(marker.name) + "\n" + start + "\n" + end + "\n" +
             asString(marker.comments);
@@ -2834,7 +2839,7 @@
                 marker.start = expectedStart;
                 marker.end = expectedEnd;
             }
-        } catch (ignoreDirectMarkerWrite) {}
+        } catch (ignoreDirectMarkerWrite) { /* прямая запись маркера не удалась, используем запасной путь */ }
         if (!markerTimingMatches(marker, expectedStart, expectedEnd)) {
             try {
                 markers = target.markers;
@@ -2859,7 +2864,7 @@
                         expectedEnd
                     )) {
                     try { markers.deleteMarker(temporary); }
-                    catch (ignoreTemporaryDelete) {}
+                    catch (ignoreTemporaryDelete) { /* временный элемент уже удалён */ }
                     temporary = null;
                     throw new Error(
                         "temporary marker timing did not verify"
@@ -2872,7 +2877,7 @@
                     }
                 } catch (oldMarkerDeleteError) {
                     try { markers.deleteMarker(temporary); }
-                    catch (ignoreTemporaryCleanup) {}
+                    catch (ignoreTemporaryCleanup) { /* очистка временных данных не критична */ }
                     temporary = null;
                     throw oldMarkerDeleteError;
                 }
@@ -2959,7 +2964,7 @@
                     marker.start = markerStart;
                     marker.end = markerEnd;
                 }
-            } catch (ignoreMarkerTiming) {}
+            } catch (ignoreMarkerTiming) { /* тайминг маркера недоступен */ }
             matches = exactMarkersNamed(target, markerName);
             persistedMarker = matches.length === 1 ? matches[0] : null;
             // Premiere may return a fresh host proxy when the marker

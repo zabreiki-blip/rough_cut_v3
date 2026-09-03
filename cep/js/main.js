@@ -113,7 +113,7 @@
       project: byId("projectName").value.trim(),
       apiBaseUrl: normalizeBaseUrl(byId("apiBaseUrl").value),
       token: byId("apiToken").value,
-      projectsRoot: String(byId("projectsRoot").value || "").replace(/[\/\\]+$/, ""),
+      projectsRoot: String(byId("projectsRoot").value || "").replace(/[/\\]+$/, ""),
       transcribePath: byId("transcribePath").value.trim()
     };
   }
@@ -546,6 +546,7 @@
       Boolean(sourceRegistrationBlockReason(sequence)) || whisperJobIsActive();
     if (!byId("sourceId").value.trim()) {
       sourceName = String(sequence.name || "");
+      // eslint-disable-next-line no-control-regex -- \x00-\x7F range intentionally detects non-ASCII source names
       generatedId = /[^\x00-\x7F]/.test(sourceName) ? "" : sourceName
           .toLowerCase()
           .replace(/\s+/g, "_")
