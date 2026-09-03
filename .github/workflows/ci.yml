@@ -55,6 +55,9 @@ jobs:
       - name: CEP behavior test
         run: node tests/cep_behavior_test.cjs
 
+      - name: Stage 1 UI behavior test
+        run: node tests/stage1_behavior_test.cjs
+
       - name: Docker Compose config
         run: |
           cp .env.example .env

@@ -145,9 +145,7 @@ def test_readiness_ui_contract_in_template_and_script() -> None:
     # `stage1.js` is a thin ES-module entry point (see U7); the readiness DOM
     # references live in `state.js` and the fetch call lives in `readiness.js`.
     state_js = (root / "src" / "static" / "stage1" / "state.js").read_text(encoding="utf-8")
-    readiness_js = (root / "src" / "static" / "stage1" / "readiness.js").read_text(
-        encoding="utf-8"
-    )
+    readiness_js = (root / "src" / "static" / "stage1" / "readiness.js").read_text(encoding="utf-8")
     project_html = (root / "src" / "templates" / "project.html").read_text(encoding="utf-8")
 
     assert 'id="readiness_panel"' in project_html

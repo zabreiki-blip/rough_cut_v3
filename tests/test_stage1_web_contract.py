@@ -48,9 +48,7 @@ def test_stage3_headless_media_scan_contract() -> None:
     assert "/stage3/jobs/status?project=" in STAGE1_JS
     assert "stage3PollTimer = window.setTimeout" in STAGE1_JS
     assert "stage3JobRunning" in STAGE1_JS
-    assert (
-        'async function exportTimelineXml() {\n  return startStage3Job("prepare");' in STAGE1_JS
-    )
+    assert 'async function exportTimelineXml() {\n  return startStage3Job("prepare");' in STAGE1_JS
     assert "function exportTimelineXml()" in STAGE1_JS
     assert "ids.btn_export_xml.href" not in STAGE1_JS
     assert "stage3MediaScanAttempted" in STAGE1_JS

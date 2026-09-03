@@ -7,6 +7,7 @@
     "eslint": "8.57.1"
   },
   "scripts": {
-    "lint:cep": "eslint cep tests/cep_behavior_test.cjs"
+    "lint:cep": "eslint cep tests/cep_behavior_test.cjs",
+    "test:stage1": "node tests/stage1_behavior_test.cjs"
   }
 }
