@@ -18,7 +18,16 @@
     <main>
       <div id="panelNotice" class="panel-notice" role="status" aria-live="polite">Подключение к Premiere…</div>
 
-      <details class="card config-card">
+      <div id="offlineNotice" class="sync-review-notice" role="alert" hidden>
+        <strong>Backend недоступен</strong>
+        <span>Запустите scripts/run-local и проверьте адрес сервера в «Дополнительных настройках».</span>
+      </div>
+      <div class="button-row">
+        <button id="checkConnection" class="button button-secondary" type="button">Проверить соединение</button>
+        <button id="requestRetry" class="button button-secondary" type="button" hidden>Повторить</button>
+      </div>
+
+      <details id="configCard" class="card config-card">
         <summary>Настройки проекта</summary>
         <div class="card-body grid">
           <div class="field-group">

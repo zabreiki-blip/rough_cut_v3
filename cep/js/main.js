@@ -31,7 +31,12 @@
     return date.toLocaleTimeString ? date.toLocaleTimeString() : String(date);
   }
 
-  function log(message, data) {
+  // `level` ("error" | "success" | "info") is the source of truth for the
+  // notice styling when the caller knows it (e.g. derived from an HTTP
+  // status or an explicit success/error branch). The Russian-word regex
+  // below is only a last-resort fallback for messages logged without a
+  // known level.
+  function log(message, data, level) {
     var target = byId("log");
     var notice = byId("panelNotice");
     var line = "[" + now() + "] " + message;
@@ -45,9 +50,13 @@
     target.textContent = target.textContent ? line + "\n\n" + target.textContent : line;
     if (notice) {
       notice.className = "panel-notice";
-      if (/(ошиб|недоступ|не удалось|не выполн|не запущ|не загруж|не найден|не разреш|нельзя|отклон|остановлен|проверьте|укажите|введите|отмен)/i.test(message)) {
+      if (level === "error") {
         notice.className += " panel-notice-error";
-      } else if (/(готов|заверш|зарегистрирован|сохран|обновл|получен|выбран|поставлен)/i.test(message)) {
+      } else if (level === "success" || level === "ok") {
+        notice.className += " panel-notice-success";
+      } else if (!level && /(ошиб|недоступ|не удалось|не выполн|не запущ|не загруж|не найден|не разреш|нельзя|отклон|остановлен|проверьте|укажите|введите|отмен)/i.test(message)) {
+        notice.className += " panel-notice-error";
+      } else if (!level && /(готов|заверш|зарегистрирован|сохран|обновл|получен|выбран|поставлен)/i.test(message)) {
         notice.className += " panel-notice-success";
       }
       notice.textContent = message;
@@ -155,17 +164,21 @@
     function loadFromBackend(hostError) {
       if (!current.token) {
         refresh.disabled = false;
-        log("Список проектов не загружен: " + hostError.message);
+        log("Список проектов не загружен: " + hostError.message, undefined, "error");
         return;
       }
       request("GET", "/projects", null, function (error, response) {
         refresh.disabled = false;
         if (error) {
-          log("Список проектов не загружен: " + error.message);
+          log("Список проектов не загружен: " + error.message, undefined, "error");
           return;
         }
         replaceProjectOptions(response.projects || [], selected);
-        log("Список проектов получен из backend: " + (response.projects || []).length + ".");
+        log(
+          "Список проектов получен из backend: " + (response.projects || []).length + ".",
+          undefined,
+          "success"
+        );
       });
     }
 
@@ -180,8 +193,38 @@
       }
       refresh.disabled = false;
       replaceProjectOptions(response.projects || [], selected);
-      log("Список проектов обновлён: " + (response.projects || []).length + ".");
+      log(
+        "Список проектов обновлён: " + (response.projects || []).length + ".",
+        undefined,
+        "success"
+      );
     });
+  }
+
+  function configComplete() {
+    var current = config();
+    return Boolean(current.project && current.apiBaseUrl && current.token && current.projectsRoot);
+  }
+
+  // The token is memory-only (never persisted), so this re-opens the
+  // settings card at the start of every session until the user fills it
+  // in again, and folds it away once the required fields are complete.
+  function syncConfigCardOpenState() {
+    var card = byId("configCard");
+    if (!card) {
+      return;
+    }
+    if (configComplete()) {
+      card.removeAttribute("open");
+    } else {
+      card.setAttribute("open", "");
+    }
+  }
+
+  function checkConnection() {
+    log("Проверяю соединение с backend…", undefined, "info");
+    loadProjects();
+    refreshWhisperStatus();
   }
 
   function saveConfig() {
@@ -192,7 +235,9 @@
     window.localStorage.setItem("roughCutStage2.transcribePath", current.transcribePath);
     // The token intentionally remains memory-only.
     byId("apiBaseUrl").value = current.apiBaseUrl;
-    log("Настройки сохранены. API token не записан на диск.");
+    log("Настройки сохранены. API token не записан на диск.", undefined, "success");
+    syncConfigCardOpenState();
+    hideManualRetry();
     loadProjects();
     refreshWhisperStatus();
   }
@@ -210,14 +255,96 @@
       "/stage2/sync-jobs/start";
   }
 
-  function request(method, path, body, callback) {
+  // Auto-retry delays for idempotent (GET) requests: ~1s, then ~3s — 3
+  // attempts in total. State-changing requests (POST) are never retried
+  // automatically; see offerManualRetry below.
+  var RETRY_DELAYS_MS = [1000, 3000];
+  var pendingManualRetry = null;
+
+  function authHint() {
+    return " Проверьте ключ доступа: он должен совпадать с переменной окружения " +
+      "ROUGH_CUT_API_TOKEN на backend.";
+  }
+
+  function serverErrorHint() {
+    return " Подробности смотрите в «Техническом журнале» ниже и в логах backend.";
+  }
+
+  function offlineHint() {
+    return " Запустите scripts/run-local и проверьте адрес сервера в «Дополнительных настройках».";
+  }
+
+  function showOfflineNotice(show) {
+    var el = byId("offlineNotice");
+    if (el) {
+      el.hidden = !show;
+    }
+  }
+
+  function hideManualRetry() {
+    pendingManualRetry = null;
+    var button = byId("requestRetry");
+    if (button) {
+      button.hidden = true;
+      button.textContent = "Повторить";
+    }
+  }
+
+  // Non-idempotent (POST/PUT/DELETE) requests that failed due to a network
+  // drop or timeout are ambiguous: the backend may have already applied the
+  // change before the response was lost. Warn the user instead of
+  // presenting a plain "Повторить" as if nothing happened.
+  function manualRetryButtonText(pending) {
+    if (pending.method === "GET") {
+      return "Повторить";
+    }
+    if (pending.networkError) {
+      return "Повторить (операция могла уже выполниться — проверьте таймлайн)";
+    }
+    return "Повторить";
+  }
+
+  function offerManualRetry(method, path, body, callback, error) {
+    pendingManualRetry = {
+      method: method,
+      path: path,
+      body: body,
+      callback: callback,
+      networkError: Boolean(error && error.network)
+    };
+    var button = byId("requestRetry");
+    if (button) {
+      button.hidden = false;
+      button.textContent = manualRetryButtonText(pendingManualRetry);
+    }
+  }
+
+  function retryPendingRequest() {
+    if (!pendingManualRetry) {
+      return;
+    }
+    var pending = pendingManualRetry;
+    hideManualRetry();
+    log("Повторяю запрос…", undefined, "info");
+    request(pending.method, pending.path, pending.body, pending.callback);
+  }
+
+  function request(method, path, body, callback, retryState) {
+    // retryState is shared (by reference) across every recursive retry of
+    // the same logical operation, so the "finished" flag it carries
+    // guarantees the external callback fires exactly once no matter how
+    // many attempts are made or in what order the XHR events land.
+    retryState = retryState || {attempt: 0, finished: false};
     var current = config();
-    var finished = false;
     function finish(error, payload) {
-      if (finished) {
+      if (retryState.finished) {
         return;
       }
-      finished = true;
+      retryState.finished = true;
+      if (!error) {
+        showOfflineNotice(false);
+        hideManualRetry();
+      }
       callback(error, payload);
     }
     if (!current.apiBaseUrl) {
@@ -227,6 +354,33 @@
     if (!current.token) {
       finish(new Error("Введите API token."));
       return;
+    }
+
+    var isIdempotent = method === "GET";
+
+    // Only network errors and timeouts are ever retried, and only for
+    // idempotent (GET) requests — retrying a POST (conform/build/insert)
+    // automatically could apply the same state change twice.
+    function retryOrFail(error) {
+      error.network = true;
+      if (isIdempotent && retryState.attempt < RETRY_DELAYS_MS.length) {
+        var delayMs = RETRY_DELAYS_MS[retryState.attempt];
+        log(
+          "Повтор через " + Math.round(delayMs / 1000) + " с… (" + error.message + ")",
+          undefined,
+          "info"
+        );
+        retryState.attempt += 1;
+        window.setTimeout(function () {
+          request(method, path, body, callback, retryState);
+        }, delayMs);
+        return;
+      }
+      showOfflineNotice(true);
+      if (!isIdempotent) {
+        offerManualRetry(method, path, body, callback, error);
+      }
+      finish(error);
     }
 
     var xhr = new XMLHttpRequest();
@@ -239,17 +393,40 @@
     }
     xhr.onreadystatechange = function () {
       var parsed;
+      var message;
       if (xhr.readyState !== 4) {
+        return;
+      }
+      if (xhr.status === 0) {
+        // The connection was dropped/refused before any HTTP response was
+        // received (backend down, DNS failure, aborted request, etc.).
+        // readyState can reach 4 with status 0 *before* onerror/ontimeout
+        // fires; treating that as a successful empty response would report
+        // a false "success" for the outer callback. Ignore it here and let
+        // onerror/ontimeout drive the retry/failure path exactly once.
         return;
       }
       try {
         parsed = xhr.responseText ? JSON.parse(xhr.responseText) : {};
       } catch (error) {
-        finish(new Error("Backend вернул не JSON (HTTP " + xhr.status + ")."));
+        message = "Backend вернул не JSON (HTTP " + xhr.status + ").";
+        if (xhr.status >= 500) {
+          message += serverErrorHint();
+        }
+        finish(new Error(message));
         return;
       }
+      // The HTTP status is the source of truth for success/error, not any
+      // wording in the payload. Only the 2xx range counts as success; the
+      // branches below only add actionable hints for specific status codes.
       if (xhr.status < 200 || xhr.status >= 300) {
-        finish(new Error(parsed.error || parsed.message || ("HTTP " + xhr.status)), parsed);
+        message = parsed.error || parsed.message || ("HTTP " + xhr.status);
+        if (xhr.status === 401 || xhr.status === 403) {
+          message += authHint();
+        } else if (xhr.status >= 500) {
+          message += serverErrorHint();
+        }
+        finish(new Error(message), parsed);
         return;
       }
       if (parsed.ok === false) {
@@ -259,10 +436,10 @@
       finish(null, parsed);
     };
     xhr.onerror = function () {
-      finish(new Error("Backend недоступен или соединение было прервано."));
+      retryOrFail(new Error("Backend недоступен или соединение было прервано." + offlineHint()));
     };
     xhr.ontimeout = function () {
-      finish(new Error("Backend не ответил за 30 секунд."));
+      retryOrFail(new Error("Backend не ответил за 30 секунд." + offlineHint()));
     };
     xhr.send(body === null ? null : JSON.stringify(body));
   }
@@ -468,7 +645,11 @@
     if (!current.project || !current.apiBaseUrl || !current.token) {
       renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
       if (manual) {
-        log("Статус распознавания не обновлён: проверьте проект, адрес сервера и ключ доступа.");
+        log(
+          "Статус распознавания не обновлён: проверьте проект, адрес сервера и ключ доступа.",
+          undefined,
+          "error"
+        );
       }
       return;
     }
@@ -492,7 +673,7 @@
           renderWhisperIdle("Статус распознавания недоступен: " + error.message);
         }
         if (manual) {
-          log("Статус распознавания не обновлён: " + error.message);
+          log("Статус распознавания не обновлён: " + error.message, undefined, "error");
         }
         scheduleWhisperPoll(10000);
         return;
@@ -501,7 +682,7 @@
       currentWhisperJobId = job.id || currentWhisperJobId;
       renderWhisperJob(job);
       if (manual) {
-        log("Статус распознавания обновлён.", job);
+        log("Статус распознавания обновлён.", job, "success");
       }
       scheduleWhisperPoll(
         job.status === "queued" || job.status === "running" || job.status === "cancelling" ? 2500 : 10000
@@ -647,7 +828,7 @@
         }
         setSourceActionsDisabled(false);
         if (error) {
-          log("Не удалось проверить регистрацию sync-источника: " + error.message);
+          log("Не удалось проверить регистрацию sync-источника: " + error.message, undefined, "error");
           return;
         }
         items = (response.result && response.result.sources) || response.sources || [];
@@ -676,7 +857,7 @@
         byId("allSpeakers").checked = Boolean(existing.all_speakers);
         guideAudioPath = absoluteGuidePath(existing, current);
         byId("guideOutputPath").value = guideAudioPath || defaultGuideOutput();
-        log("Найдена существующая регистрация sync-источника.", existing);
+        log("Найдена существующая регистрация sync-источника.", existing, "success");
       }
     );
   }
@@ -699,15 +880,15 @@
     log("Считываю активную секвенцию…");
     callHost("inspect", undefined, function (error, response) {
       if (error) {
-        log("Не удалось считать секвенцию: " + error.message);
+        log("Не удалось считать секвенцию: " + error.message, undefined, "error");
         return;
       }
       renderSource(response.sequence);
       var blocked = sourceRegistrationBlockReason(response.sequence);
       if (blocked) {
-        log(blocked, response.sequence);
+        log(blocked, response.sequence, "error");
       } else {
-        log("Активная секвенция сохранена как источник.", response.sequence);
+        log("Активная секвенция сохранена как источник.", response.sequence, "success");
       }
     });
   }
@@ -800,11 +981,11 @@
     log("Регистрирую sync-источник…");
     request("POST", "/stage2/sync-sources", payload, function (error, response) {
       if (error) {
-        log("Регистрация не выполнена: " + error.message, response);
+        log("Регистрация не выполнена: " + error.message, response, "error");
         done(error);
         return;
       }
-      log("Sync-источник зарегистрирован.", response);
+      log("Sync-источник зарегистрирован.", response, "success");
       done(null, response);
     });
   }
@@ -827,10 +1008,14 @@
       source_ids: [sourceId]
     }, function (error, response) {
       if (error) {
-        log("WAV готов и зарегистрирован, но Whisper job не запущен: " + error.message, response);
+        log(
+          "WAV готов и зарегистрирован, но Whisper job не запущен: " + error.message,
+          response,
+          "error"
+        );
         return;
       }
-      log("Whisper job запущен.", response);
+      log("Whisper job запущен.", response, "success");
       var job = response.result || response;
       currentWhisperJobId = job.job_id || job.id || "";
       renderWhisperJob({
@@ -869,10 +1054,14 @@
       function (error, response) {
         byId("cancelWhisper").disabled = false;
         if (error) {
-          log("Остановка не выполнена: " + error.message, response);
+          log("Остановка не выполнена: " + error.message, response, "error");
           return;
         }
-        log("Остановка запрошена. Индексы и найденные диапазоны сохраняются.", response);
+        log(
+          "Остановка запрошена. Индексы и найденные диапазоны сохраняются.",
+          response,
+          "success"
+        );
         renderWhisperJob(response.result || response);
         scheduleWhisperPoll(500);
       }
@@ -1273,20 +1462,30 @@
   function bind() {
     byId("saveConfig").addEventListener("click", saveConfig);
     byId("refreshProjects").addEventListener("click", loadProjects);
+    byId("requestRetry").addEventListener("click", retryPendingRequest);
+    byId("checkConnection").addEventListener("click", checkConnection);
     byId("refreshWhisper").addEventListener("click", refreshWhisperStatusManually);
     byId("resumeWhisper").addEventListener("click", resumeTranscriptionJob);
     byId("cancelWhisper").addEventListener("click", cancelTranscriptionJob);
     byId("apiToken").addEventListener("change", function () {
       loadProjects();
       refreshWhisperStatus();
+      syncConfigCardOpenState();
+      hideManualRetry();
     });
-    byId("projectsRoot").addEventListener("change", loadProjects);
+    byId("projectsRoot").addEventListener("change", function () {
+      loadProjects();
+      syncConfigCardOpenState();
+      hideManualRetry();
+    });
     byId("projectName").addEventListener("change", function () {
       window.localStorage.setItem("roughCutStage2.project", byId("projectName").value);
       currentWhisperJobId = "";
       guideAudioPath = "";
       byId("guideOutputPath").value = defaultGuideOutput();
       refreshWhisperStatus();
+      syncConfigCardOpenState();
+      hideManualRetry();
       if (activeSource) {
         hydrateSourceForm(activeSource);
       }
@@ -1304,17 +1503,18 @@
   function init() {
     loadConfig();
     bind();
+    syncConfigCardOpenState();
     renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
     loadProjects();
     callHost("ping", undefined, function (error, response) {
       if (error) {
         setHostBadge("error", "Premiere: ошибка");
-        log("Модуль Premiere недоступен: " + error.message);
+        log("Модуль Premiere недоступен: " + error.message, undefined, "error");
         return;
       }
       setHostBadge("ok", response.host || "Premiere");
       byId("log").textContent = "";
-      log("Панель готова.", response);
+      log("Панель готова.", response, "success");
     });
   }
 
@@ -1328,7 +1528,13 @@
       renderWhisperJob: renderWhisperJob,
       sourceRegistrationBlockReason: sourceRegistrationBlockReason,
       sourceIdentityMatchesSequence: sourceIdentityMatchesSequence,
-      registeredSourceGuard: registeredSourceGuard
+      registeredSourceGuard: registeredSourceGuard,
+      request: request,
+      saveConfig: saveConfig,
+      hideManualRetry: hideManualRetry,
+      hasPendingManualRetry: function () {
+        return pendingManualRetry !== null;
+      }
     };
   }
 
