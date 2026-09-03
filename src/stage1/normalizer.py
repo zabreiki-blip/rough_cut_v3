@@ -141,6 +141,33 @@ _STRUCTURAL_HEADING = re.compile(
     r"^(?:часть\b|глава\b|заставка\b|эпизод\b|\d+\s*\.\s*$)",
     re.IGNORECASE,
 )
+# Seed lexicon for an unmarked "video cue" paragraph: a shot-list remark
+# describing what footage should be shown on screen (portraits, busts,
+# archival photos, drone/copter passes, etc.) rather than spoken narration.
+# This is a hand-picked starting list; it is deliberately kept as a plain
+# module constant so it can later be promoted into a learnable
+# NormalizationMemory rule instead of a hardcoded regex.
+_VIDEO_CUE_KEYWORDS = (
+    "планы", "план", "портреты", "портрет", "бюст", "камень", "интерьер",
+    "экстерьер", "детали", "деталь", "крупный план", "панорама", "проход",
+    "коптер", "дрон", "архив", "фотографии", "фотография", "фото",
+    "съёмка", "съемка", "кадры", "кадр", "виды", "вид",
+)
+_VIDEO_CUE_KEYWORD_RE = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(word) for word in sorted(_VIDEO_CUE_KEYWORDS, key=len, reverse=True)
+    ) + r")\b",
+    re.IGNORECASE,
+)
+# Coarse heuristic for a Russian personal (finite) verb form: past tense
+# (-л/-ла/-ло/-ли, incl. reflexive -лся/-лась/-лись) and present/future
+# 3rd-person and plural endings. It is intentionally approximate: a false
+# positive here only keeps the safer voiceover classification.
+_PERSONAL_VERB_RE = re.compile(
+    r"\b[а-яё]{3,}(?:лся|лась|лись|ла|ло|ли|л|ете|ите|ешь|ишь|ют|ат|ят|ет|ит|ем|им)\b",
+    re.IGNORECASE,
+)
+_VIDEO_CUE_MAX_WORDS = 12
 _LLM_CONFIDENCE_THRESHOLD = 0.65
 _LLM_CACHE_VERSION = 1
 _LLM_CACHE_MAX_ENTRIES = 2000
@@ -742,6 +769,10 @@ def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
                 previous.type == BlockType.VOICEOVER.value
                 or previous.notes == "section_marker_for=voiceover"
             )
+            # A footage/shot-list remark must not inherit voiceover just
+            # because it follows one without its own marker (see
+            # _looks_like_video_cue).
+            and not _looks_like_video_cue(block.original_text)
         ):
             block.continuation_of_type = BlockType.VOICEOVER.value
             if not block.suggested_type:
@@ -771,6 +802,25 @@ def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
 
 def _looks_like_sync_continuation(text: str) -> bool:
     return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё]|И(?:\s|$))", text.lstrip()))
+
+
+def _looks_like_video_cue(text: str) -> bool:
+    """Detect an unmarked "video cue": a shot-list remark describing footage
+    to show on screen (e.g. "Мраморный бюст Марии"), not spoken narration.
+
+    Paired with :func:`_looks_like_sync_continuation`: a short nominal
+    phrase naming what to show, containing no personal (finite) verb form.
+    The verb/length check is the primary signal; the keyword lexicon only
+    narrows it to paragraphs that plausibly describe footage at all.
+    """
+    stripped = text.strip()
+    if not stripped or not _VIDEO_CUE_KEYWORD_RE.search(stripped):
+        return False
+    if _PERSONAL_VERB_RE.search(stripped):
+        return False
+    if len(stripped.split()) > _VIDEO_CUE_MAX_WORDS:
+        return False
+    return True
 
 
 def _starts_with_unambiguous_timecode(text: str) -> bool:
@@ -922,7 +972,9 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
         and len(content) >= 40
     ):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
-    elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE):
+    elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE) or (
+        not block.original_label and _looks_like_video_cue(stripped)
+    ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
     elif stripped.startswith("(") and stripped.endswith(")"):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.8)
