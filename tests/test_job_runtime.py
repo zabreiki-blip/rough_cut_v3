@@ -46,9 +46,7 @@ def test_api_job_facade_honors_reassigned_legacy_state(monkeypatch) -> None:
 
     assert api._reserve_tts_project("demo")
     jobs["job-1"] = {"status": "queued"}
-    assert api._update_tts_job("job-1", persist=False, status="running") == {
-        "status": "running"
-    }
+    assert api._update_tts_job("job-1", persist=False, status="running") == {"status": "running"}
     assert api._get_tts_job("job-1") == {"status": "running"}
     api._release_tts_project("demo")
     assert active == set()

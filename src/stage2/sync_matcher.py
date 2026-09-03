@@ -1,4 +1,5 @@
 """Russian-aware fuzzy alignment of scenario quotes to timed transcripts."""
+
 from __future__ import annotations
 
 import re
@@ -22,20 +23,94 @@ _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 _RUSSIAN_ENDINGS = tuple(
     sorted(
         {
-            "иями", "ями", "ами", "его", "ого", "ему", "ому", "ими", "ыми",
-            "ая", "яя", "ою", "ею", "ий", "ый", "ой", "ие", "ые", "ое",
-            "им", "ым", "ем", "ом", "их", "ых", "ую", "юю", "ах", "ях",
-            "ам", "ям", "ами", "ями", "ов", "ев", "ей", "ою", "ею",
-            "а", "я", "ы", "и", "ь", "й", "у", "ю", "о", "е",
+            "иями",
+            "ями",
+            "ами",
+            "его",
+            "ого",
+            "ему",
+            "ому",
+            "ими",
+            "ыми",
+            "ая",
+            "яя",
+            "ою",
+            "ею",
+            "ий",
+            "ый",
+            "ой",
+            "ие",
+            "ые",
+            "ое",
+            "им",
+            "ым",
+            "ем",
+            "ом",
+            "их",
+            "ых",
+            "ую",
+            "юю",
+            "ах",
+            "ях",
+            "ам",
+            "ям",
+            "ами",
+            "ями",
+            "ов",
+            "ев",
+            "ей",
+            "ою",
+            "ею",
+            "а",
+            "я",
+            "ы",
+            "и",
+            "ь",
+            "й",
+            "у",
+            "ю",
+            "о",
+            "е",
         },
         key=len,
         reverse=True,
     )
 )
 _STOPWORDS = {
-    "а", "без", "бы", "в", "во", "вот", "да", "для", "до", "же", "за",
-    "и", "из", "или", "к", "как", "ли", "на", "не", "но", "ну", "о", "об",
-    "от", "по", "под", "при", "с", "со", "то", "у", "что", "это", "я",
+    "а",
+    "без",
+    "бы",
+    "в",
+    "во",
+    "вот",
+    "да",
+    "для",
+    "до",
+    "же",
+    "за",
+    "и",
+    "из",
+    "или",
+    "к",
+    "как",
+    "ли",
+    "на",
+    "не",
+    "но",
+    "ну",
+    "о",
+    "об",
+    "от",
+    "по",
+    "под",
+    "при",
+    "с",
+    "со",
+    "то",
+    "у",
+    "что",
+    "это",
+    "я",
 }
 _MAX_CANDIDATE_STARTS = 240
 _MAX_LOCAL_CANDIDATE_STARTS = 120
@@ -206,12 +281,12 @@ def _score(query: list[str], candidate: list[str]) -> float:
     # short spelling differences, but becomes quadratic on long paragraphs
     # with repeated Cyrillic characters.
     if max(len(query_chars), len(candidate_chars)) <= 480:
-        char_ratio = SequenceMatcher(
-            None, query_chars, candidate_chars, autojunk=False
-        ).ratio()
+        char_ratio = SequenceMatcher(None, query_chars, candidate_chars, autojunk=False).ratio()
     else:
         char_ratio = ratio
-    return min(1.0, 0.38 * ratio + 0.34 * ordered_coverage + 0.20 * content_coverage + 0.08 * char_ratio)
+    return min(
+        1.0, 0.38 * ratio + 0.34 * ordered_coverage + 0.20 * content_coverage + 0.08 * char_ratio
+    )
 
 
 def _token_positions(tokens: list[_Token]) -> dict[str, list[int]]:
@@ -252,9 +327,7 @@ def _exact_anchor_scores(
                 if start not in eligible_starts:
                     continue
                 proximity_weight = _EXACT_ANCHOR_MAX_DRIFT + 1 - abs(drift)
-                start_scores[start] = (
-                    start_scores.get(start, 0) + rarity_weight * proximity_weight
-                )
+                start_scores[start] = start_scores.get(start, 0) + rarity_weight * proximity_weight
     return start_scores
 
 
@@ -268,9 +341,7 @@ def _fuzzy_anchor_scores(
     eligible_starts: set[int],
 ) -> dict[int, float]:
     query_ngrams = [
-        _token_trigrams(token)
-        if token not in _STOPWORDS and len(token) >= 4
-        else set()
+        _token_trigrams(token) if token not in _STOPWORDS and len(token) >= 4 else set()
         for token in query
     ]
     query_positions_by_ngram: dict[str, list[int]] = {}
@@ -314,8 +385,7 @@ def _uniform_sample(values: list[int], sample_count: int) -> list[int]:
     if sample_count <= 0:
         return []
     indexes = {
-        round(sample * (len(values) - 1) / (sample_count - 1))
-        for sample in range(sample_count)
+        round(sample * (len(values) - 1) / (sample_count - 1)) for sample in range(sample_count)
     }
     return [values[index] for index in sorted(indexes)]
 
@@ -349,11 +419,7 @@ def _candidate_starts(
     # quotes.
     if not start_scores:
         fuzzy_scores = _fuzzy_anchor_scores(query, tokens, eligible_set)
-        fuzzy_budget = (
-            max_starts
-            * _FUZZY_BUDGET_NUMERATOR
-            // _FUZZY_BUDGET_DENOMINATOR
-        )
+        fuzzy_budget = max_starts * _FUZZY_BUDGET_NUMERATOR // _FUZZY_BUDGET_DENOMINATOR
         fuzzy_limit = min(len(fuzzy_scores), fuzzy_budget)
         fuzzy_starts = {
             start
@@ -367,11 +433,7 @@ def _candidate_starts(
         uniform_starts = _uniform_sample(uniform_pool, remaining)
         return sorted([*fuzzy_starts, *uniform_starts])
     ranked = sorted(
-        (
-            (score, start)
-            for start, score in start_scores.items()
-            if start < len(tokens)
-        ),
+        ((score, start) for start, score in start_scores.items() if start < len(tokens)),
         key=lambda item: (-item[0], item[1]),
     )
     return sorted(start for _score_value, start in ranked[:max_starts])
@@ -408,9 +470,7 @@ def _search_one(
         guide_approx = approx - source.guide_offset_sec
         lower, upper = guide_approx - window, guide_approx + window
         tokens = [
-            item
-            for item in all_tokens
-            if item.word.end >= lower and item.word.start <= upper
+            item for item in all_tokens if item.word.end >= lower and item.word.start <= upper
         ]
     else:
         tokens = all_tokens
@@ -497,10 +557,7 @@ def _deduplicate(candidates: Iterable[_Candidate]) -> list[_Candidate]:
                 max(0.0, candidate.end - candidate.start),
                 max(0.0, prior.end - prior.start),
             )
-            same_occurrence = (
-                shorter > 0
-                and intersection / shorter >= _DUPLICATE_MIN_OVERLAP_RATIO
-            )
+            same_occurrence = shorter > 0 and intersection / shorter >= _DUPLICATE_MIN_OVERLAP_RATIO
             if abs(candidate.start - prior.start) < 1.0 or same_occurrence:
                 duplicate = True
                 break
@@ -542,15 +599,10 @@ class SyncMatcher:
         self.sources = {item.id: item for item in sources}
         self.indexes = {item.source_id: item for item in indexes}
         self.timed_tokens = {
-            source_id: _timed_tokens(index)
-            for source_id, index in self.indexes.items()
+            source_id: _timed_tokens(index) for source_id, index in self.indexes.items()
         }
         self.speaker_tokens = {
-            source_id: [
-                tokens
-                for name in source.speaker_names
-                if (tokens := normalize_text(name))
-            ]
+            source_id: [tokens for name in source.speaker_names if (tokens := normalize_text(name))]
             for source_id, source in self.sources.items()
         }
         self.config = config or MatcherConfig()
@@ -562,9 +614,7 @@ class SyncMatcher:
                 for source_id in request.source_ids
                 if source_id in self.sources and source_id in self.indexes
             ]
-        available = [
-            source for source in self.sources.values() if source.id in self.indexes
-        ]
+        available = [source for source in self.sources.values() if source.id in self.indexes]
         speaker_tokens = normalize_text(request.speaker)
         if not speaker_tokens:
             return available
@@ -578,9 +628,7 @@ class SyncMatcher:
             return [by_id[source.id] for source in available if source.id in by_id]
 
         def prefer_rendered_viewings(values: list[SyncSource]) -> list[SyncSource]:
-            viewings = [
-                source for source in values if source.source_kind == "review_media"
-            ]
+            viewings = [source for source in values if source.source_kind == "review_media"]
             return viewings or values
 
         exact = [
@@ -598,7 +646,8 @@ class SyncMatcher:
                 query_name.intersection(tokens)
                 or SequenceMatcher(
                     None, " ".join(speaker_tokens), " ".join(tokens), autojunk=False
-                ).ratio() >= 0.72
+                ).ratio()
+                >= 0.72
                 for tokens in source_speaker_tokens(source)
             )
         ]
@@ -606,9 +655,11 @@ class SyncMatcher:
             return with_universal(prefer_rendered_viewings(fuzzy))
         # A source registered without speaker metadata remains searchable, but
         # a clearly different named speaker is not searched in this interview.
-        return with_universal(prefer_rendered_viewings([
-            source for source in available if not source_speaker_tokens(source)
-        ]))
+        return with_universal(
+            prefer_rendered_viewings(
+                [source for source in available if not source_speaker_tokens(source)]
+            )
+        )
 
     def match(self, request: AlignmentRequest) -> SyncMatch:
         query = normalize_text(request.text)
@@ -639,9 +690,7 @@ class SyncMatcher:
                 "near_timecode" if approx is not None else "full_transcript",
                 self.timed_tokens[source.id],
                 max_starts=(
-                    _MAX_LOCAL_CANDIDATE_STARTS
-                    if approx is not None
-                    else _MAX_CANDIDATE_STARTS
+                    _MAX_LOCAL_CANDIDATE_STARTS if approx is not None else _MAX_CANDIDATE_STARTS
                 ),
             )
             local.extend(source_candidates)
@@ -653,11 +702,14 @@ class SyncMatcher:
                     guide_approx + window,
                 )
         candidates = [
-            item for item in _deduplicate(local)
+            item
+            for item in _deduplicate(local)
             if _has_usable_range(item, self.sources[item.source_id], self.config)
         ]
 
-        if has_approx and (not candidates or candidates[0].confidence < self.config.fallback_trigger):
+        if has_approx and (
+            not candidates or candidates[0].confidence < self.config.fallback_trigger
+        ):
             fallback: list[_Candidate] = []
             for source in sources:
                 remaining_starts = max(
@@ -678,16 +730,15 @@ class SyncMatcher:
                     )
                 )
             candidates = [
-                item for item in _deduplicate([*candidates, *fallback])
+                item
+                for item in _deduplicate([*candidates, *fallback])
                 if _has_usable_range(item, self.sources[item.source_id], self.config)
             ]
 
         if not candidates or candidates[0].confidence < self.config.review_threshold:
             alternatives: list[SyncAlternative] = []
             for item in candidates[: self.config.max_alternatives]:
-                item_in, item_out = _padded_range(
-                    item, self.sources[item.source_id], self.config
-                )
+                item_in, item_out = _padded_range(item, self.sources[item.source_id], self.config)
                 alternatives.append(
                     SyncAlternative(
                         item.source_id,
@@ -711,8 +762,7 @@ class SyncMatcher:
         best = candidates[0]
         other = candidates[1] if len(candidates) > 1 else None
         ambiguous = bool(
-            other
-            and best.confidence - other.confidence < self.config.ambiguity_margin
+            other and best.confidence - other.confidence < self.config.ambiguity_margin
         )
         # A strong global fallback is useful, but its disagreement with the
         # supplied timecode must remain visible to an editor.
@@ -724,9 +774,7 @@ class SyncMatcher:
         status: MatchStatus = "auto_matched" if auto else "needs_review"
         alternatives = []
         for item in candidates[1 : 1 + self.config.max_alternatives]:
-            item_in, item_out = _padded_range(
-                item, self.sources[item.source_id], self.config
-            )
+            item_in, item_out = _padded_range(item, self.sources[item.source_id], self.config)
             alternatives.append(
                 SyncAlternative(
                     item.source_id,
@@ -736,9 +784,7 @@ class SyncMatcher:
                     item.text,
                 )
             )
-        source_in, source_out = _padded_range(
-            best, self.sources[best.source_id], self.config
-        )
+        source_in, source_out = _padded_range(best, self.sources[best.source_id], self.config)
         return SyncMatch(
             segment_id=request.segment_id,
             query_text=request.text,

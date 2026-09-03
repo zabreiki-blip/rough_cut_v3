@@ -1,4 +1,5 @@
 """Tests for Stage 2 timeline_parser ZK ID contract."""
+
 from __future__ import annotations
 
 import unittest
@@ -148,7 +149,9 @@ class NormalizedTimelineTest(unittest.TestCase):
 
             timeline = parse_normalized_timeline(document, base, base, "TEST")
 
-            self.assertEqual([item.type for item in timeline.segments], ["zk", "snh", "host", "tech"])
+            self.assertEqual(
+                [item.type for item in timeline.segments], ["zk", "snh", "host", "tech"]
+            )
             self.assertEqual(timeline.segments[1].speaker, "Иван Иванов")
             self.assertEqual(timeline.segments[1].timecode, "01:02:03")
             self.assertEqual(timeline.segments[2].id, "host1")
@@ -265,18 +268,34 @@ class NormalizedTimelineTest(unittest.TestCase):
             }
 
             timeline = parse_normalized_timeline(
-                document, base, base, "TEST", sync_matches=matches,
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=matches,
             )
 
-            self.assertEqual([item.block_uid for item in timeline.segments], [
-                "teaser-block", "full-block",
-            ])
-            self.assertEqual([item.source_in_sec for item in timeline.segments], [
-                120.0, 120.0,
-            ])
-            self.assertEqual([item.source_out_sec for item in timeline.segments], [
-                124.0, 132.0,
-            ])
+            self.assertEqual(
+                [item.block_uid for item in timeline.segments],
+                [
+                    "teaser-block",
+                    "full-block",
+                ],
+            )
+            self.assertEqual(
+                [item.source_in_sec for item in timeline.segments],
+                [
+                    120.0,
+                    120.0,
+                ],
+            )
+            self.assertEqual(
+                [item.source_out_sec for item in timeline.segments],
+                [
+                    124.0,
+                    132.0,
+                ],
+            )
             self.assertEqual([item.start_sec for item in timeline.segments], [0.0, 4.0])
             self.assertEqual([item.duration_sec for item in timeline.segments], [4.0, 12.0])
 
@@ -285,19 +304,21 @@ class NormalizedTimelineTest(unittest.TestCase):
             base = Path(tmp)
             document = {
                 "status": "confirmed",
-                "blocks": [{
-                    "uid": "irina-block",
-                    "order": 1,
-                    "type": "sync",
-                    "speaker": "ИРИНА КОТОВА",
-                    "role": "ИСТОРИК",
-                    "normalized_text": "Первая цитата Вторая цитата Третья цитата",
-                    "sync_fragments": [
-                        {"timecode_start": "01:22:29", "text": "Первая цитата"},
-                        {"timecode_start": "01:23:36", "text": "Вторая цитата"},
-                        {"timecode_start": "01:24:11", "text": "Третья цитата"},
-                    ],
-                }],
+                "blocks": [
+                    {
+                        "uid": "irina-block",
+                        "order": 1,
+                        "type": "sync",
+                        "speaker": "ИРИНА КОТОВА",
+                        "role": "ИСТОРИК",
+                        "normalized_text": "Первая цитата Вторая цитата Третья цитата",
+                        "sync_fragments": [
+                            {"timecode_start": "01:22:29", "text": "Первая цитата"},
+                            {"timecode_start": "01:23:36", "text": "Вторая цитата"},
+                            {"timecode_start": "01:24:11", "text": "Третья цитата"},
+                        ],
+                    }
+                ],
             }
             matches = {
                 f"irina-block::fragment:{index}": {
@@ -317,8 +338,12 @@ class NormalizedTimelineTest(unittest.TestCase):
             }
 
             timeline = parse_normalized_timeline(
-                document, base, base, "TEST",
-                sync_matches=matches, sync_sources=sources,
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=matches,
+                sync_sources=sources,
             )
 
             self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2", "snh3"])
@@ -330,7 +355,9 @@ class NormalizedTimelineTest(unittest.TestCase):
                     "irina-block::fragment:3",
                 ],
             )
-            self.assertTrue(all(item.parent_block_uid == "irina-block" for item in timeline.segments))
+            self.assertTrue(
+                all(item.parent_block_uid == "irina-block" for item in timeline.segments)
+            )
             self.assertEqual(
                 [item.timecode for item in timeline.segments],
                 ["01:22:29", "01:23:36", "01:24:11"],
@@ -343,16 +370,18 @@ class NormalizedTimelineTest(unittest.TestCase):
             base = Path(tmp)
             document = {
                 "status": "confirmed",
-                "blocks": [{
-                    "uid": "expanded-block",
-                    "order": 1,
-                    "type": "sync",
-                    "normalized_text": "Первая часть Вторая часть",
-                    "sync_fragments": [
-                        {"timecode_start": "00:10", "text": "Первая часть"},
-                        {"timecode_start": "00:20", "text": "Вторая часть"},
-                    ],
-                }],
+                "blocks": [
+                    {
+                        "uid": "expanded-block",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Первая часть Вторая часть",
+                        "sync_fragments": [
+                            {"timecode_start": "00:10", "text": "Первая часть"},
+                            {"timecode_start": "00:20", "text": "Вторая часть"},
+                        ],
+                    }
+                ],
             }
             legacy_matches = {
                 "snh2": {
@@ -365,7 +394,11 @@ class NormalizedTimelineTest(unittest.TestCase):
             }
 
             timeline = parse_normalized_timeline(
-                document, base, base, "TEST", sync_matches=legacy_matches,
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=legacy_matches,
             )
 
             self.assertEqual([item.match_status for item in timeline.segments], ["", ""])

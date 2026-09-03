@@ -51,9 +51,7 @@ class VideoCueMemoryTests(unittest.TestCase):
             memory_path = Path(tmp) / "memory.sqlite3"
             with NormalizationMemory(memory_path) as memory:
                 memory.record_manual("фреска", "technical", scope="video_cue")
-            self.assertEqual(
-                self._classify(memory_path, "Старинная фреска на стене"), "technical"
-            )
+            self.assertEqual(self._classify(memory_path, "Старинная фреска на стене"), "technical")
 
     def test_disabled_seed_keyword_stops_matching(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -82,14 +80,11 @@ class VideoCueMemoryTests(unittest.TestCase):
     def test_empty_memory_matches_current_builtin_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_path = Path(tmp) / "memory.sqlite3"
-            self.assertEqual(
-                self._classify(memory_path, "Мраморный бюст Марии"), "technical"
-            )
+            self.assertEqual(self._classify(memory_path, "Мраморный бюст Марии"), "technical")
             self.assertEqual(
                 self._classify_after_voiceover(
                     memory_path,
-                    "Игнатий появился на свет в 1822-ом году в семье Иосифа "
-                    "и Дороты Лопатинских",
+                    "Игнатий появился на свет в 1822-ом году в семье Иосифа и Дороты Лопатинских",
                 ),
                 "voiceover",
             )
@@ -117,9 +112,9 @@ class VideoCueMemoryTests(unittest.TestCase):
             # "съемка") intentionally seed a single shared rule; the expected
             # row count is therefore the number of *distinct normalized*
             # markers, not the raw keyword tuple length.
-            expected_marker_count = len({
-                normalize_marker(keyword) for keyword in _VIDEO_CUE_KEYWORDS
-            })
+            expected_marker_count = len(
+                {normalize_marker(keyword) for keyword in _VIDEO_CUE_KEYWORDS}
+            )
             self.assertEqual(len(rules), expected_marker_count)
 
     def test_video_cue_rule_change_invalidates_llm_cache_signature(self) -> None:

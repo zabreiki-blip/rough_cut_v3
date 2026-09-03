@@ -26,17 +26,19 @@ def _brik_timeline(source_ids: list[str]) -> FullTimeline:
     segments = []
     cursor = 0.0
     for index, source_id in enumerate(source_ids, start=1):
-        segments.append(TimelineSegment(
-            id=f"snh{index}",
-            type="snh",
-            text="СНХ",
-            duration_sec=2,
-            start_sec=cursor,
-            source_id=source_id,
-            source_in_sec=100,
-            source_out_sec=102,
-            match_status="confirmed",
-        ))
+        segments.append(
+            TimelineSegment(
+                id=f"snh{index}",
+                type="snh",
+                text="СНХ",
+                duration_sec=2,
+                start_sec=cursor,
+                source_id=source_id,
+                source_in_sec=100,
+                source_out_sec=102,
+                match_status="confirmed",
+            )
+        )
         cursor += 2
     return FullTimeline(project="BRIK", fps=25, segments=segments)
 
@@ -52,22 +54,29 @@ def test_brik_maps_six_viewings_and_leaves_missing_people_unmapped() -> None:
         _source("krasnova", "220626_Краснова", "Краснова"),
         _source("shpagin", "Шпагин", "Шпагин"),
     ]
-    catalog = {"sources": [
-        _media("m1", "080626_Курская.mp4"),
-        _media("m2", "080626_Смехов.mp4"),
-        _media("m3", "130626_Свиблова.mp4"),
-        _media("m4", "100626_Васильева.mp4"),
-        _media("m5", "180626_Бартон.mp4"),
-        _media("m6", "070626_Смольникова.mp4"),
-        _media("m7", "080526_Родионов.mp4"),
-        _media("m8", "080626_Воденников.mp4"),
-    ]}
+    catalog = {
+        "sources": [
+            _media("m1", "080626_Курская.mp4"),
+            _media("m2", "080626_Смехов.mp4"),
+            _media("m3", "130626_Свиблова.mp4"),
+            _media("m4", "100626_Васильева.mp4"),
+            _media("m5", "180626_Бартон.mp4"),
+            _media("m6", "070626_Смольникова.mp4"),
+            _media("m7", "080526_Родионов.mp4"),
+            _media("m8", "080626_Воденников.mp4"),
+        ]
+    }
     timeline = _brik_timeline([source["id"] for source in sources])
 
     result = map_catalog_to_timeline(timeline, {"sources": sources}, catalog)
 
     assert set(result.catalog) == {
-        "kurskaya", "smekhov", "sviblova", "vasilieva", "barton", "smolnikova"
+        "kurskaya",
+        "smekhov",
+        "sviblova",
+        "vasilieva",
+        "barton",
+        "smolnikova",
     }
     assert result.unmapped_source_ids == ("krasnova", "shpagin")
     assert result.details["kurskaya"]["media_name"] == "080626_Курская.mp4"

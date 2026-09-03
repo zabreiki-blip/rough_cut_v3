@@ -151,8 +151,7 @@ def generate_placeholder(
     # Bottom label
     font_id = _get_font(40)
     footer = footer_label or f"ЗАГЛУШКА · {seg_id} · 10 сек"
-    draw.text((120, height - 110), f"[{footer}]",
-              font=font_id, fill=(80, 80, 80))
+    draw.text((120, height - 110), f"[{footer}]", font=font_id, fill=(80, 80, 80))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(out_path), "PNG")

@@ -24,14 +24,31 @@ from stage4.revision_assets import (
 
 SUPPORTED_SCENARIOS = {".doc", ".docx", ".md", ".txt"}
 _CLASSIFICATION_FIELDS = (
-    "type", "text_for_tts", "original_label", "label_confirmed", "source",
-    "confidence", "memory_rule_id", "speaker", "role", "suggested_type",
-    "suggested_label", "proposed_type", "proposed_label",
-    "proposed_label_confirmed", "proposed_source", "proposed_memory_rule_id",
+    "type",
+    "text_for_tts",
+    "original_label",
+    "label_confirmed",
+    "source",
+    "confidence",
+    "memory_rule_id",
+    "speaker",
+    "role",
+    "suggested_type",
+    "suggested_label",
+    "proposed_type",
+    "proposed_label",
+    "proposed_label_confirmed",
+    "proposed_source",
+    "proposed_memory_rule_id",
     "continuation_of_type",
 )
 _DOWNSTREAM_FIELDS = (
-    "type", "speaker", "role", "text_for_tts", "timecode_start", "timecode_end",
+    "type",
+    "speaker",
+    "role",
+    "text_for_tts",
+    "timecode_start",
+    "timecode_end",
     "sync_fragments",
 )
 _PROJECT_LOCKS: dict[str, RLock] = {}
@@ -55,12 +72,12 @@ def _locked_project_paths(index: int):
     def decorate(function):
         @wraps(function)
         def wrapped(*args, **kwargs):
-            project_paths = (
-                args[index] if len(args) > index else kwargs["project_paths"]
-            )
+            project_paths = args[index] if len(args) > index else kwargs["project_paths"]
             with _project_lock(project_paths):
                 return function(*args, **kwargs)
+
         return wrapped
+
     return decorate
 
 
@@ -210,7 +227,8 @@ def _find_source(project_paths: dict[str, Path], source_hash: str) -> Path:
         project_paths.get("inbox_scenarios", project_paths["input"]),
     ):
         candidates.extend(
-            path for path in directory.iterdir()
+            path
+            for path in directory.iterdir()
             if path.is_file() and path.suffix.lower() in SUPPORTED_SCENARIOS
         )
     for path in candidates:
@@ -276,13 +294,16 @@ def ensure_baseline(project: str, project_paths: dict[str, Path]) -> dict[str, A
         "block_count": len(normalized.get("blocks", [])),
     }
     atomic_write_json(storage["scenarios"] / f"{revision_id}.json", manifest)
-    atomic_write_json(project_paths["work"] / "active_revision.json", {
-        "revision_id": revision_id, "activated_at": _utcnow()
-    })
+    atomic_write_json(
+        project_paths["work"] / "active_revision.json",
+        {"revision_id": revision_id, "activated_at": _utcnow()},
+    )
     return snapshot_revision_assets(revision_id, project_paths) or manifest
 
 
-def _exact_pairs(old_blocks: list[dict], new_blocks: list[dict]) -> tuple[list[tuple[int, int, str]], set[int], set[int]]:
+def _exact_pairs(
+    old_blocks: list[dict], new_blocks: list[dict]
+) -> tuple[list[tuple[int, int, str]], set[int], set[int]]:
     old_texts = [_block_text(block) for block in old_blocks]
     new_texts = [_block_text(block) for block in new_blocks]
     pairs: list[tuple[int, int, str]] = []
@@ -323,9 +344,7 @@ def compare_blocks(old_blocks: list[dict], new_blocks: list[dict]) -> dict[str, 
         for new_index, new in enumerate(new_blocks):
             if new_index in used_new:
                 continue
-            similarity = SequenceMatcher(
-                None, old_text, _block_text(new), autojunk=False
-            ).ratio()
+            similarity = SequenceMatcher(None, old_text, _block_text(new), autojunk=False).ratio()
             score = similarity
             if old.get("type") == new.get("type"):
                 score += 0.06
@@ -360,45 +379,70 @@ def compare_blocks(old_blocks: list[dict], new_blocks: list[dict]) -> dict[str, 
                 status = "speaker_changed"
             elif downstream_changes:
                 status = "edited"
-        changes.append({
-            "status": status,
-            "old_index": old_index,
-            "new_index": new_index,
-            "old_block_uid": _block_uid(old),
-            "new_import_uid": _block_uid(new),
-            "text_similarity": round(
-                SequenceMatcher(None, _block_text(old), _block_text(new), autojunk=False).ratio(), 4
-            ),
-            "old_type": old.get("type", ""),
-            "new_type": new.get("type", ""),
-            "old_speaker": old.get("speaker", ""),
-            "new_speaker": new.get("speaker", ""),
-            "old_text": old.get("normalized_text") or old.get("original_text") or "",
-            "new_text": new.get("normalized_text") or new.get("original_text") or "",
-            "downstream_changed_fields": downstream_changes,
-        })
+        changes.append(
+            {
+                "status": status,
+                "old_index": old_index,
+                "new_index": new_index,
+                "old_block_uid": _block_uid(old),
+                "new_import_uid": _block_uid(new),
+                "text_similarity": round(
+                    SequenceMatcher(
+                        None, _block_text(old), _block_text(new), autojunk=False
+                    ).ratio(),
+                    4,
+                ),
+                "old_type": old.get("type", ""),
+                "new_type": new.get("type", ""),
+                "old_speaker": old.get("speaker", ""),
+                "new_speaker": new.get("speaker", ""),
+                "old_text": old.get("normalized_text") or old.get("original_text") or "",
+                "new_text": new.get("normalized_text") or new.get("original_text") or "",
+                "downstream_changed_fields": downstream_changes,
+            }
+        )
     for new_index, new in enumerate(new_blocks):
         if new_index not in used_new:
-            changes.append({
-                "status": "added", "old_index": None, "new_index": new_index,
-                "old_block_uid": "", "new_import_uid": _block_uid(new),
-                "text_similarity": 0.0, "old_type": "", "new_type": new.get("type", ""),
-                "old_speaker": "", "new_speaker": new.get("speaker", ""),
-                "old_text": "", "new_text": new.get("normalized_text") or new.get("original_text") or "",
-            })
+            changes.append(
+                {
+                    "status": "added",
+                    "old_index": None,
+                    "new_index": new_index,
+                    "old_block_uid": "",
+                    "new_import_uid": _block_uid(new),
+                    "text_similarity": 0.0,
+                    "old_type": "",
+                    "new_type": new.get("type", ""),
+                    "old_speaker": "",
+                    "new_speaker": new.get("speaker", ""),
+                    "old_text": "",
+                    "new_text": new.get("normalized_text") or new.get("original_text") or "",
+                }
+            )
     for old_index, old in enumerate(old_blocks):
         if old_index not in used_old:
-            changes.append({
-                "status": "removed", "old_index": old_index, "new_index": None,
-                "old_block_uid": _block_uid(old), "new_import_uid": "",
-                "text_similarity": 0.0, "old_type": old.get("type", ""), "new_type": "",
-                "old_speaker": old.get("speaker", ""), "new_speaker": "",
-                "old_text": old.get("normalized_text") or old.get("original_text") or "", "new_text": "",
-            })
-    changes.sort(key=lambda item: (
-        item["new_index"] is None,
-        item["new_index"] if item["new_index"] is not None else item["old_index"],
-    ))
+            changes.append(
+                {
+                    "status": "removed",
+                    "old_index": old_index,
+                    "new_index": None,
+                    "old_block_uid": _block_uid(old),
+                    "new_import_uid": "",
+                    "text_similarity": 0.0,
+                    "old_type": old.get("type", ""),
+                    "new_type": "",
+                    "old_speaker": old.get("speaker", ""),
+                    "new_speaker": "",
+                    "old_text": old.get("normalized_text") or old.get("original_text") or "",
+                    "new_text": "",
+                }
+            )
+    changes.sort(
+        key=lambda item: (
+            item["new_index"] is None,
+            item["new_index"] if item["new_index"] is not None else item["old_index"],
+        )
+    )
     summary: dict[str, int] = defaultdict(int)
     for change in changes:
         summary[change["status"]] += 1
@@ -427,10 +471,14 @@ def repair_active_revision_metadata(
     if not isinstance(blocks, list):
         return {"repaired": False, "reason": "normalization_missing"}
     has_revision_id = str(current.get("scenario_revision_id") or "") == revision_id
-    has_block_metadata = all(
-        isinstance(block, dict) and isinstance(block.get("versioning"), dict)
-        for block in blocks
-    ) if blocks else True
+    has_block_metadata = (
+        all(
+            isinstance(block, dict) and isinstance(block.get("versioning"), dict)
+            for block in blocks
+        )
+        if blocks
+        else True
+    )
     if has_revision_id and has_block_metadata:
         return {"repaired": False, "reason": "metadata_present"}
 
@@ -445,7 +493,8 @@ def repair_active_revision_metadata(
 
     alignment = compare_blocks(snapshot_blocks, blocks)
     paired = [
-        change for change in alignment["changes"]
+        change
+        for change in alignment["changes"]
         if change["old_index"] is not None and change["new_index"] is not None
     ]
     if len(paired) != len(snapshot_blocks) or len(paired) != len(blocks):
@@ -511,14 +560,21 @@ def _inherit_blocks(old_blocks: list[dict], new_blocks: list[dict], diff: dict[s
         if _normalize(text) == "титры" or (
             text.startswith((",", ";")) and previous_type == "technical"
         ):
-            block.update({
-                "type": "technical", "source": "builtin_rule", "confidence": 1.0,
-                "proposed_type": "technical", "proposed_source": "builtin_rule",
-                "continuation_of_type": previous_type if text.startswith((",", ";")) else "",
-            })
+            block.update(
+                {
+                    "type": "technical",
+                    "source": "builtin_rule",
+                    "confidence": 1.0,
+                    "proposed_type": "technical",
+                    "proposed_source": "builtin_rule",
+                    "continuation_of_type": previous_type if text.startswith((",", ";")) else "",
+                }
+            )
 
 
-def _execution_plan(diff: dict[str, Any], old_blocks: list[dict], new_blocks: list[dict]) -> dict[str, Any]:
+def _execution_plan(
+    diff: dict[str, Any], old_blocks: list[dict], new_blocks: list[dict]
+) -> dict[str, Any]:
     reusable = {"unchanged", "moved"}
     reuse_uids = []
     reuse_tts = 0
@@ -545,12 +601,16 @@ def _execution_plan(diff: dict[str, Any], old_blocks: list[dict], new_blocks: li
                 new_speakers.add(str(block.get("speaker") or block.get("original_label") or ""))
     return {
         "reuse": {
-            "blocks": len(reuse_uids), "tts": reuse_tts,
-            "sync_matches": reuse_matches, "whisper_transcripts": "all_existing",
+            "blocks": len(reuse_uids),
+            "tts": reuse_tts,
+            "sync_matches": reuse_matches,
+            "whisper_transcripts": "all_existing",
         },
         "run": {
-            "tts": new_tts, "sync_match": rematch,
-            "new_speakers": sorted(new_speakers), "timeline_xml": 1,
+            "tts": new_tts,
+            "sync_match": rematch,
+            "new_speakers": sorted(new_speakers),
+            "timeline_xml": 1,
         },
         "reusable_block_uids": reuse_uids,
     }
@@ -575,8 +635,10 @@ def import_revision(
     known_hashes = {str(item.get("source_sha256") or "") for item in revisions}
     if input_path is None:
         candidates = [
-            path for path in project_paths["input"].iterdir()
-            if path.is_file() and path.suffix.lower() in SUPPORTED_SCENARIOS
+            path
+            for path in project_paths["input"].iterdir()
+            if path.is_file()
+            and path.suffix.lower() in SUPPORTED_SCENARIOS
             and _sha256(path) not in known_hashes
         ]
         if not candidates:
@@ -611,12 +673,13 @@ def import_revision(
     storage = _paths(project_paths)
     normalized_path = storage["scenarios"] / f"{revision_id}.normalized.json"
     generated = generate_normalization(
-        input_path, normalized_path, memory_path=memory_path,
-        use_llm=use_llm, hint=hint,
+        input_path,
+        normalized_path,
+        memory_path=memory_path,
+        use_llm=use_llm,
+        hint=hint,
     )
-    parent_normalized = _read_json(
-        storage["scenarios"] / str(parent["normalized_snapshot"])
-    )
+    parent_normalized = _read_json(storage["scenarios"] / str(parent["normalized_snapshot"]))
     old_blocks = list(parent_normalized.get("blocks", []))
     new_blocks = list(generated.get("blocks", []))
     diff = compare_blocks(old_blocks, new_blocks)
@@ -637,22 +700,35 @@ def import_revision(
     diff_id = f"diff_{parent['revision_id']}_{revision_id}"
     plan = _execution_plan(diff, old_blocks, new_blocks)
     diff_document = {
-        "schema_version": 1, "diff_id": diff_id, "project": project,
-        "from_revision_id": parent["revision_id"], "to_revision_id": revision_id,
-        "created_at": _utcnow(), **diff, "execution_plan": plan,
+        "schema_version": 1,
+        "diff_id": diff_id,
+        "project": project,
+        "from_revision_id": parent["revision_id"],
+        "to_revision_id": revision_id,
+        "created_at": _utcnow(),
+        **diff,
+        "execution_plan": plan,
     }
     diff_path = storage["diffs"] / f"{diff_id}.json"
     atomic_write_json(diff_path, diff_document)
     manifest = {
-        "schema_version": 1, "revision_id": revision_id,
-        "parent_revision_id": parent["revision_id"], "project": project,
-        "source_file": input_path.name, "source_snapshot": source_snapshot.name,
-        "source_sha256": source_hash, "normalized_snapshot": normalized_path.name,
-        "diff_id": diff_id, "diff_file": diff_path.name,
-        "created_at": _utcnow(), "status": "draft", "block_count": len(new_blocks),
+        "schema_version": 1,
+        "revision_id": revision_id,
+        "parent_revision_id": parent["revision_id"],
+        "project": project,
+        "source_file": input_path.name,
+        "source_snapshot": source_snapshot.name,
+        "source_sha256": source_hash,
+        "normalized_snapshot": normalized_path.name,
+        "diff_id": diff_id,
+        "diff_file": diff_path.name,
+        "created_at": _utcnow(),
+        "status": "draft",
+        "block_count": len(new_blocks),
         "prepared_snapshot": prepared_snapshot,
         "voiceover_manifest_snapshot": voiceover_manifest_snapshot,
-        "summary": diff["summary"], "execution_plan": plan,
+        "summary": diff["summary"],
+        "execution_plan": plan,
     }
     atomic_write_json(storage["scenarios"] / f"{revision_id}.json", manifest)
     return {"revision": manifest, "diff": diff_document, "baseline": baseline}
@@ -766,9 +842,7 @@ def activate_revision(
         if diff_file != expected_diff:
             raise ValueError("invalid revision diff")
         diff = _read_json(storage["diffs"] / diff_file)
-    matches, kept = _activation_matches(
-        revision_id, manifest, diff, project_paths, storage
-    )
+    matches, kept = _activation_matches(revision_id, manifest, diff, project_paths, storage)
     if active_path.is_file():
         active_id = str(_read_json(active_path).get("revision_id") or "")
         if active_id and active_id != revision_id:
@@ -784,9 +858,10 @@ def activate_revision(
         )
     else:
         project_paths["timeline"].unlink(missing_ok=True)
-    atomic_write_json(project_paths["work"] / "active_revision.json", {
-        "revision_id": revision_id, "activated_at": _utcnow()
-    })
+    atomic_write_json(
+        project_paths["work"] / "active_revision.json",
+        {"revision_id": revision_id, "activated_at": _utcnow()},
+    )
     return {"revision": manifest, "reused_sync_matches": len(kept)}
 
 
@@ -828,10 +903,13 @@ def reconcile_revision_state(
 
     active_path = project_paths["work"] / "active_revision.json"
     previous_active = _read_json(active_path) if active_path.is_file() else None
-    atomic_write_json(active_path, {
-        "revision_id": "",
-        "recovery_backup": str(backup_root.relative_to(project_paths["root"])),
-    })
+    atomic_write_json(
+        active_path,
+        {
+            "revision_id": "",
+            "recovery_backup": str(backup_root.relative_to(project_paths["root"])),
+        },
+    )
     try:
         result = activate_revision(revision_id, project_paths)
     except Exception:

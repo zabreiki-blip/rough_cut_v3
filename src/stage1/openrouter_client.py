@@ -134,6 +134,7 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
     }
+
     def _do_request():
         resp = requests.post(
             f"{settings.openrouter_base_url}/chat/completions",
@@ -145,10 +146,12 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         return resp
 
     if retry is not None:
+
         def _is_retryable(exc: BaseException) -> bool:
             if isinstance(exc, (ConnectionError, Timeout)):
                 return True
             import requests as _req
+
             if isinstance(exc, _req.HTTPError):
                 code = exc.response.status_code if exc.response is not None else 0
                 return code in (429, 500, 502, 503, 504)

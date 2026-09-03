@@ -209,7 +209,9 @@ class Stage1AnalyzerTests(unittest.TestCase):
                 return [NarrationBlock(id="", text_original=text, text_for_tts=text)]
 
             with (
-                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key", "ANALYZER_LLM_WORKERS": "2"}),
+                patch.dict(
+                    os.environ, {"OPENROUTER_API_KEY": "test-key", "ANALYZER_LLM_WORKERS": "2"}
+                ),
                 patch("stage1.analyzer._chunk_for_llm", return_value=chunks),
                 patch("stage1.analyzer.analyze_with_openrouter", side_effect=analyze_chunk),
             ):

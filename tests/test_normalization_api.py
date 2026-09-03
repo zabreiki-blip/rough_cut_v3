@@ -282,13 +282,23 @@ class NormalizationApiTest(unittest.TestCase):
         source = self._source()
         work = source.parent.parent / "work"
         work.mkdir(parents=True)
-        (work / "scenario_prepared.json").write_text(json.dumps({
-            "source": str(source),
-            "items": [{
-                "id": "zk1", "text_original": "Старый текст",
-                "text_for_tts": "Старый текст", "pause_ms": 300,
-            }],
-        }, ensure_ascii=False), encoding="utf-8")
+        (work / "scenario_prepared.json").write_text(
+            json.dumps(
+                {
+                    "source": str(source),
+                    "items": [
+                        {
+                            "id": "zk1",
+                            "text_original": "Старый текст",
+                            "text_for_tts": "Старый текст",
+                            "pause_ms": 300,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         (work / "scenario_raw.txt").write_text("ЗК1: Старый текст\n", encoding="utf-8")
 
         response = self.client.get("/stage1/normalization?project=demo")
@@ -396,10 +406,14 @@ class NormalizationApiTest(unittest.TestCase):
         confirmed = self.client.post(
             "/stage1/normalization/confirm",
             json={
-                "project": "demo", "revision": saved["revision"],
-                "learning_decisions": [{
-                    "candidate_id": candidates[0]["id"], "action": "this_time",
-                }],
+                "project": "demo",
+                "revision": saved["revision"],
+                "learning_decisions": [
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "action": "this_time",
+                    }
+                ],
             },
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
@@ -426,9 +440,12 @@ class NormalizationApiTest(unittest.TestCase):
             json={
                 "project": "demo",
                 "revision": saved["revision"],
-                "learning_decisions": [{
-                    "candidate_id": "forged-candidate", "action": "remember",
-                }],
+                "learning_decisions": [
+                    {
+                        "candidate_id": "forged-candidate",
+                        "action": "remember",
+                    }
+                ],
             },
         )
 

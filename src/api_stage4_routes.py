@@ -44,14 +44,16 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
             integrity = inspect_revision_state(paths)
         except Exception as exc:
             return services._internal_error(exc)
-        return jsonify({
-            "ok": True,
-            "result": {
-                "project": project,
-                "revisions": revisions,
-                "integrity": integrity,
-            },
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "result": {
+                    "project": project,
+                    "revisions": revisions,
+                    "integrity": integrity,
+                },
+            }
+        )
 
     @app.post("/stage4/revisions/import")
     def stage4_revision_import():
@@ -65,9 +67,7 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
                 requested = Path(raw_input)
                 if not requested.is_absolute():
                     requested = paths["root"] / requested
-                input_path = services._abs_path(
-                    str(requested), requested, paths["root"]
-                )
+                input_path = services._abs_path(str(requested), requested, paths["root"])
             with services._project_transition_lock(project):
                 active_job = _active_project_job(services, project)
                 if active_job:
@@ -76,7 +76,8 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
                         409,
                     )
                 result = import_revision(
-                    project, paths,
+                    project,
+                    paths,
                     generate_normalization=services.generate_normalization,
                     memory_path=services.NORMALIZATION_MEMORY_PATH,
                     input_path=input_path,
@@ -156,4 +157,6 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
 
 
 def re_fullmatch_id(value: str) -> bool:
-    return bool(value) and all(character.isalnum() or character in {"_", "-"} for character in value)
+    return bool(value) and all(
+        character.isalnum() or character in {"_", "-"} for character in value
+    )

@@ -165,6 +165,7 @@ def extract_marked_blocks_from_docx(path: Path) -> list[str]:
 @dataclass
 class DocxParagraph:
     """Paragraph with formatting metadata from a .docx file."""
+
     text: str
     is_bold: bool
     has_highlight: bool
@@ -203,12 +204,14 @@ def extract_paragraphs_from_docx(path: Path) -> list[DocxParagraph]:
 
         is_bold = total_chars > 0 and bold_chars > total_chars * 0.5
 
-        result.append(DocxParagraph(
-            text=text,
-            is_bold=is_bold,
-            has_highlight=has_highlight,
-            index=idx,
-        ))
+        result.append(
+            DocxParagraph(
+                text=text,
+                is_bold=is_bold,
+                has_highlight=has_highlight,
+                index=idx,
+            )
+        )
 
     return result
 

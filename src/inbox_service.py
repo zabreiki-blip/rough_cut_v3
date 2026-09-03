@@ -8,20 +8,22 @@ from typing import Any, Iterable, Literal
 
 
 SCENARIO_EXTENSIONS = frozenset({".doc", ".docx", ".md", ".txt"})
-VIDEO_EXTENSIONS = frozenset({
-    ".3gp",
-    ".avi",
-    ".m2ts",
-    ".m4v",
-    ".mkv",
-    ".mov",
-    ".mp4",
-    ".mpeg",
-    ".mpg",
-    ".mts",
-    ".mxf",
-    ".webm",
-})
+VIDEO_EXTENSIONS = frozenset(
+    {
+        ".3gp",
+        ".avi",
+        ".m2ts",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".mts",
+        ".mxf",
+        ".webm",
+    }
+)
 AUDIO_EXTENSIONS = frozenset({".mp3", ".wav"})
 REVIEW_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
@@ -162,15 +164,21 @@ def _discover_category(
 
     files = []
     for fingerprint, item in by_fingerprint.items():
-        files.append(InboxFile(
-            **{
-                **asdict(item),
-                "duplicate_paths": tuple(duplicates[fingerprint]),
-            }
-        ))
+        files.append(
+            InboxFile(
+                **{
+                    **asdict(item),
+                    "duplicate_paths": tuple(duplicates[fingerprint]),
+                }
+            )
+        )
     return sorted(
         files,
-        key=lambda item: (item.source != "upload", item.name.casefold(), item.relative_path.casefold()),
+        key=lambda item: (
+            item.source != "upload",
+            item.name.casefold(),
+            item.relative_path.casefold(),
+        ),
     )
 
 

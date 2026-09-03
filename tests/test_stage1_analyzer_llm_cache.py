@@ -29,9 +29,7 @@ class Stage1AnalyzerLLMCacheTests(unittest.TestCase):
 
             def fake_analyze(settings, chunk):
                 calls.append(chunk)
-                return [
-                    NarrationBlock(id="zk1", text_original=chunk, text_for_tts=chunk)
-                ]
+                return [NarrationBlock(id="zk1", text_original=chunk, text_for_tts=chunk)]
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}),
@@ -69,9 +67,7 @@ class Stage1AnalyzerLLMCacheTests(unittest.TestCase):
 
             def fake_analyze(settings, chunk):
                 calls.append(chunk)
-                return [
-                    NarrationBlock(id="zk1", text_original=chunk, text_for_tts=chunk)
-                ]
+                return [NarrationBlock(id="zk1", text_original=chunk, text_for_tts=chunk)]
 
             with (
                 patch.dict(
@@ -115,9 +111,7 @@ class Stage1AnalyzerLLMCacheTests(unittest.TestCase):
 
             def fake_analyze(settings, chunk):
                 calls.append(chunk)
-                return [
-                    NarrationBlock(id="zk1", text_original=chunk, text_for_tts=chunk)
-                ]
+                return [NarrationBlock(id="zk1", text_original=chunk, text_for_tts=chunk)]
 
             chunks_v1 = ["chunk one", "chunk two"]
             chunks_v2 = ["chunk one CHANGED", "chunk two"]

@@ -66,18 +66,22 @@ def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
             text = str(value.get("text") or "").strip()
             if not text:
                 continue
-            fragments.append({
-                "text": text,
-                "timecode_start": str(value.get("timecode_start") or "").strip(),
-                "timecode_end": str(value.get("timecode_end") or "").strip(),
-            })
+            fragments.append(
+                {
+                    "text": text,
+                    "timecode_start": str(value.get("timecode_start") or "").strip(),
+                    "timecode_end": str(value.get("timecode_end") or "").strip(),
+                }
+            )
     if fragments:
         return fragments
-    return [{
-        "text": str(block.get("normalized_text") or block.get("original_text") or "").strip(),
-        "timecode_start": str(block.get("timecode_start") or "").strip(),
-        "timecode_end": str(block.get("timecode_end") or "").strip(),
-    }]
+    return [
+        {
+            "text": str(block.get("normalized_text") or block.get("original_text") or "").strip(),
+            "timecode_start": str(block.get("timecode_start") or "").strip(),
+            "timecode_end": str(block.get("timecode_end") or "").strip(),
+        }
+    ]
 
 
 def _wav_duration(path: Path) -> float:
@@ -131,16 +135,18 @@ def _append_snh_segment(
     timecode: str,
     text: str,
 ) -> None:
-    segments.append(TimelineSegment(
-        id=seg_id,
-        type="snh",
-        text=text,
-        duration_sec=SNH_PLACEHOLDER_DURATION,
-        speaker=speaker,
-        role=role,
-        timecode=timecode,
-        placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
-    ))
+    segments.append(
+        TimelineSegment(
+            id=seg_id,
+            type="snh",
+            text=text,
+            duration_sec=SNH_PLACEHOLDER_DURATION,
+            speaker=speaker,
+            role=role,
+            timecode=timecode,
+            placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+        )
+    )
 
 
 def parse_timeline(
@@ -181,13 +187,15 @@ def parse_timeline(
             text = " ".join(p for p in text_parts if p)
             wav_path = speaker_dir / f"{seg_id}.wav"
             duration = _wav_duration(wav_path) if wav_path.exists() else 0.0
-            segments.append(TimelineSegment(
-                id=seg_id,
-                type="zk",
-                text=text,
-                duration_sec=duration,
-                wav_path=str(wav_path) if wav_path.exists() else "",
-            ))
+            segments.append(
+                TimelineSegment(
+                    id=seg_id,
+                    type="zk",
+                    text=text,
+                    duration_sec=duration,
+                    wav_path=str(wav_path) if wav_path.exists() else "",
+                )
+            )
             continue
 
         # ── SNH prefixed: "СНХ NAME, ROLE, TC text" ─────────
@@ -285,12 +293,14 @@ def parse_timeline(
 
         # ── TECH ─────────────────────────────────────────────
         tech_counter += 1
-        segments.append(TimelineSegment(
-            id=f"tech{tech_counter}",
-            type="tech",
-            text=line,
-            duration_sec=0.0,
-        ))
+        segments.append(
+            TimelineSegment(
+                id=f"tech{tech_counter}",
+                type="tech",
+                text=line,
+                duration_sec=0.0,
+            )
+        )
 
     # Calculate timeline positions (tech = zero duration, no shift)
     cursor = 0.0
@@ -337,24 +347,24 @@ def parse_normalized_timeline(
         block_uid = str(block.get("uid") or "").strip()
         versioning = block.get("versioning")
         revision_status = str(
-            versioning.get("change_status")
-            if isinstance(versioning, dict)
-            else ""
+            versioning.get("change_status") if isinstance(versioning, dict) else ""
         ).strip()
 
         if block_type == "voiceover":
             counters["voiceover"] += 1
             seg_id = f"zk{counters['voiceover']}"
             wav_path = speaker_dir / f"{seg_id}.wav"
-            segments.append(TimelineSegment(
-                id=seg_id,
-                type="zk",
-                text=text,
-                duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
-                block_uid=block_uid,
-                revision_status=revision_status,
-                wav_path=str(wav_path) if wav_path.exists() else "",
-            ))
+            segments.append(
+                TimelineSegment(
+                    id=seg_id,
+                    type="zk",
+                    text=text,
+                    duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
+                    block_uid=block_uid,
+                    revision_status=revision_status,
+                    wav_path=str(wav_path) if wav_path.exists() else "",
+                )
+            )
             continue
 
         if block_type in {"sync", "host"}:
@@ -362,11 +372,13 @@ def parse_normalized_timeline(
             fragments = (
                 normalized_sync_fragments(block)
                 if block_type == "sync"
-                else [{
-                    "text": text,
-                    "timecode_start": str(block.get("timecode_start") or "").strip(),
-                    "timecode_end": str(block.get("timecode_end") or "").strip(),
-                }]
+                else [
+                    {
+                        "text": text,
+                        "timecode_start": str(block.get("timecode_start") or "").strip(),
+                        "timecode_end": str(block.get("timecode_end") or "").strip(),
+                    }
+                ]
             )
             for fragment_index, fragment in enumerate(fragments):
                 counters[block_type] += 1
@@ -388,43 +400,51 @@ def parse_normalized_timeline(
                     and source_id
                     and source_out > source_in >= 0
                 )
-                segments.append(TimelineSegment(
-                    id=seg_id,
-                    type="snh" if block_type == "sync" else "host",
-                    text=fragment["text"],
-                    duration_sec=(
-                        source_out - source_in if matched else SNH_PLACEHOLDER_DURATION
-                    ),
-                    block_uid=fragment_uid,
-                    parent_block_uid=block_uid,
-                    revision_status=revision_status,
-                    speaker=str(block.get("speaker") or block.get("original_label") or prefix).strip(),
-                    role=str(block.get("role") or ("СНХ" if block_type == "sync" else "ВЕДУЩИЙ")).strip(),
-                    timecode=fragment["timecode_start"],
-                    timecode_end=fragment["timecode_end"],
-                    source_id=source_id,
-                    sequence_name=str(
-                        field(source, "premiere_sequence", field(source, "sequence_name", ""))
-                        or ""
-                    ),
-                    sequence_id=str(field(source, "sequence_id", "") or ""),
-                    source_in_sec=source_in,
-                    source_out_sec=source_out,
-                    match_status=match_status,
-                    match_confidence=float(field(match, "confidence", 0.0) or 0.0),
-                    placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
-                ))
+                segments.append(
+                    TimelineSegment(
+                        id=seg_id,
+                        type="snh" if block_type == "sync" else "host",
+                        text=fragment["text"],
+                        duration_sec=(
+                            source_out - source_in if matched else SNH_PLACEHOLDER_DURATION
+                        ),
+                        block_uid=fragment_uid,
+                        parent_block_uid=block_uid,
+                        revision_status=revision_status,
+                        speaker=str(
+                            block.get("speaker") or block.get("original_label") or prefix
+                        ).strip(),
+                        role=str(
+                            block.get("role") or ("СНХ" if block_type == "sync" else "ВЕДУЩИЙ")
+                        ).strip(),
+                        timecode=fragment["timecode_start"],
+                        timecode_end=fragment["timecode_end"],
+                        source_id=source_id,
+                        sequence_name=str(
+                            field(source, "premiere_sequence", field(source, "sequence_name", ""))
+                            or ""
+                        ),
+                        sequence_id=str(field(source, "sequence_id", "") or ""),
+                        source_in_sec=source_in,
+                        source_out_sec=source_out,
+                        match_status=match_status,
+                        match_confidence=float(field(match, "confidence", 0.0) or 0.0),
+                        placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+                    )
+                )
             continue
 
         counters["tech"] += 1
-        segments.append(TimelineSegment(
-            id=f"tech{counters['tech']}",
-            type="tech",
-            text=text,
-            duration_sec=0.0,
-            block_uid=block_uid,
-            revision_status=revision_status,
-        ))
+        segments.append(
+            TimelineSegment(
+                id=f"tech{counters['tech']}",
+                type="tech",
+                text=text,
+                duration_sec=0.0,
+                block_uid=block_uid,
+                revision_status=revision_status,
+            )
+        )
 
     cursor = 0.0
     for segment in segments:

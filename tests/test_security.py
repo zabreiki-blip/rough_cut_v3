@@ -21,9 +21,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 class ApiAuthenticationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TemporaryDirectory()
-        self.projects_patch = patch.object(
-            api, "PROJECTS_DIR", Path(self.temp.name) / "projects"
-        )
+        self.projects_patch = patch.object(api, "PROJECTS_DIR", Path(self.temp.name) / "projects")
         self.projects_patch.start()
 
         self.had_api_token = "API_TOKEN" in api.app.config
@@ -55,9 +53,7 @@ class ApiAuthenticationTest(unittest.TestCase):
     def test_wrong_token_is_unauthorized(self) -> None:
         api.app.config["API_TOKEN"] = "correct-token"
 
-        response = self.client.get(
-            "/", headers={"Authorization": "Bearer wrong-token"}
-        )
+        response = self.client.get("/", headers={"Authorization": "Bearer wrong-token"})
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.get_json()["error"], "unauthorized")
@@ -77,9 +73,7 @@ class ApiAuthenticationTest(unittest.TestCase):
     def test_bearer_token_is_accepted(self) -> None:
         api.app.config["API_TOKEN"] = "correct-token"
 
-        response = self.client.get(
-            "/", headers={"Authorization": "Bearer correct-token"}
-        )
+        response = self.client.get("/", headers={"Authorization": "Bearer correct-token"})
 
         self.assertEqual(response.status_code, 200)
 
@@ -87,9 +81,7 @@ class ApiAuthenticationTest(unittest.TestCase):
         api.app.config["API_TOKEN"] = "correct-token"
         encoded = base64.b64encode(b"roughcut:correct-token").decode("ascii")
 
-        response = self.client.get(
-            "/", headers={"Authorization": f"Basic {encoded}"}
-        )
+        response = self.client.get("/", headers={"Authorization": f"Basic {encoded}"})
 
         self.assertEqual(response.status_code, 200)
 
@@ -297,8 +289,7 @@ class ContainerSecurityConfigurationTest(unittest.TestCase):
 
         self.assertIsNotNone(volumes_match, "service volumes section is missing")
         mounts = {
-            line.strip().removeprefix("- ")
-            for line in volumes_match.group("mounts").splitlines()
+            line.strip().removeprefix("- ") for line in volumes_match.group("mounts").splitlines()
         }
         self.assertEqual(
             mounts,

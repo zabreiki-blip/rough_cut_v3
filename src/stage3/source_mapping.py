@@ -1,4 +1,5 @@
 """Fail-closed mapping from Stage 2 sequence sources to rendered viewings."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -62,14 +63,42 @@ _IDENTITY_ALIASES = {
     "ulinovsk": "ulyanovsk",
     "ulynovsk": "ulyanovsk",
 }
-_TRANSLITERATION = str.maketrans({
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l",
-    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
-    "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
-    "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e",
-    "ю": "yu", "я": "ya",
-})
+_TRANSLITERATION = str.maketrans(
+    {
+        "а": "a",
+        "б": "b",
+        "в": "v",
+        "г": "g",
+        "д": "d",
+        "е": "e",
+        "ж": "zh",
+        "з": "z",
+        "и": "i",
+        "й": "y",
+        "к": "k",
+        "л": "l",
+        "м": "m",
+        "н": "n",
+        "о": "o",
+        "п": "p",
+        "р": "r",
+        "с": "s",
+        "т": "t",
+        "у": "u",
+        "ф": "f",
+        "х": "h",
+        "ц": "ts",
+        "ч": "ch",
+        "ш": "sh",
+        "щ": "sch",
+        "ъ": "",
+        "ы": "y",
+        "ь": "",
+        "э": "e",
+        "ю": "yu",
+        "я": "ya",
+    }
+)
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
 
 
@@ -263,9 +292,7 @@ def map_catalog_to_timeline(
         )
         candidates: list[tuple[int, str, str, object]] = []
         for media_id, media in media_items:
-            score, method = _score_media(
-                _media_name(media), sequence_aliases, speaker_aliases
-            )
+            score, method = _score_media(_media_name(media), sequence_aliases, speaker_aliases)
             if score:
                 candidates.append((score, media_id, method, media))
         candidates.sort(key=lambda item: (-item[0], item[1]))

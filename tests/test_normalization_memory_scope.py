@@ -47,10 +47,32 @@ def _create_legacy_db(path: Path) -> None:
                 confirmations, corrections, confidence, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
-                (11, "Голос «Лили»", "голос «лили»", "voiceover", "llm", "candidate",
-                 1, 0, 0.7, "2026-07-21T12:27:22.391874+00:00", "2026-07-21T12:27:22.391874+00:00"),
-                (25, "ЗК.", "зк", "technical", "correction", "candidate",
-                 1, 0, 0.7, "2026-08-12T09:33:45.808622+00:00", "2026-08-12T09:33:45.808622+00:00"),
+                (
+                    11,
+                    "Голос «Лили»",
+                    "голос «лили»",
+                    "voiceover",
+                    "llm",
+                    "candidate",
+                    1,
+                    0,
+                    0.7,
+                    "2026-07-21T12:27:22.391874+00:00",
+                    "2026-07-21T12:27:22.391874+00:00",
+                ),
+                (
+                    25,
+                    "ЗК.",
+                    "зк",
+                    "technical",
+                    "correction",
+                    "candidate",
+                    1,
+                    0,
+                    0.7,
+                    "2026-08-12T09:33:45.808622+00:00",
+                    "2026-08-12T09:33:45.808622+00:00",
+                ),
             ],
         )
         conn.executemany(
@@ -149,15 +171,11 @@ def test_resolve_exact_and_suggest_are_scoped(tmp_path: Path) -> None:
 
 def test_candidate_to_active_learning_cycle_works_within_video_cue_scope(tmp_path: Path) -> None:
     with NormalizationMemory(tmp_path / "memory.sqlite3") as memory:
-        rule = memory.record_llm_confirmation(
-            "бюст", "technical", "hash-1", scope="video_cue"
-        )
+        rule = memory.record_llm_confirmation("бюст", "technical", "hash-1", scope="video_cue")
         assert rule["status"] == "candidate"
         assert rule["scope"] == "video_cue"
 
-        rule = memory.record_llm_confirmation(
-            "бюст", "technical", "hash-2", scope="video_cue"
-        )
+        rule = memory.record_llm_confirmation("бюст", "technical", "hash-2", scope="video_cue")
         assert rule["status"] == "active"
         assert rule["confirmations"] == 2
 

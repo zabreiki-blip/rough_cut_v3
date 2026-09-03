@@ -3,12 +3,8 @@ import re
 
 
 HOST = (Path(__file__).parents[1] / "cep" / "host.jsx").read_text(encoding="utf-8")
-PANEL = (Path(__file__).parents[1] / "cep" / "js" / "main.js").read_text(
-    encoding="utf-8"
-)
-HTML = (Path(__file__).parents[1] / "cep" / "index.html").read_text(
-    encoding="utf-8"
-)
+PANEL = (Path(__file__).parents[1] / "cep" / "js" / "main.js").read_text(encoding="utf-8")
+HTML = (Path(__file__).parents[1] / "cep" / "index.html").read_text(encoding="utf-8")
 
 
 def test_project_picker_loads_existing_backend_projects() -> None:
@@ -31,7 +27,7 @@ def test_whisper_job_progress_is_visible_and_polled_without_restarting_backend()
     assert 'id="whisperEta"' in HTML
     assert "function renderWhisperJob(job)" in PANEL
     assert "function etaFromProgress(elapsed, done, total)" in PANEL
-    assert 'job.transcription_processed_sec' in PANEL
+    assert "job.transcription_processed_sec" in PANEL
     assert '"Осталось: ≈ " + formatDuration(etaSeconds)' in PANEL
     assert '"/stage2/sync-jobs/status?project="' in PANEL
     assert "scheduleWhisperPoll(1000)" in PANEL
@@ -55,7 +51,7 @@ def test_premiere_panel_explains_safe_resume_after_an_interruption() -> None:
     assert 'currentWhisperJobStatus === "queued"' in PANEL
     assert 'currentWhisperJobStatus === "interrupted"' in PANEL
     assert "Сначала возобновите сопоставление СНХ в браузере" in PANEL
-    assert 'var changedTimeline = /^Inserted\\s+/i.test(hostError.message);' in PANEL
+    assert "var changedTimeline = /^Inserted\\s+/i.test(hostError.message);" in PANEL
     assert "повторный запуск проверит V/A и восстановит маркер" in PANEL
     assert 'id="resumeWhisper"' in HTML
     assert 'id="cancelWhisper"' in HTML
@@ -93,7 +89,7 @@ def test_sequence_roles_block_self_transcription_and_conform_into_sources() -> N
     assert "roughCutGuard: sequenceRoughCutSignals(sequence)" in HOST
     assert "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя экспортировать" in HOST
     assert "sourceRegistrationBlockReason(activeSource)" in PANEL
-    assert 'sequence_role: activeSource.roughCutGuard.isRoughCutTarget' in PANEL
+    assert "sequence_role: activeSource.roughCutGuard.isRoughCutTarget" in PANEL
     assert "function sourceIdentityMatchesSequence(source, sequence)" in PANEL
     assert '"/stage2/sync-sources?project="' in PANEL
     assert "registeredSourceGuards: sourceGuards" in PANEL
@@ -119,7 +115,7 @@ def test_source_registration_supports_shared_and_all_speaker_sequences() -> None
     html = (Path(__file__).parents[1] / "cep" / "index.html").read_text(encoding="utf-8")
     assert 'id="allSpeakers"' in html
     assert 'id="speakerName"' in html
-    assert 'speakers: speakerNames.slice(1)' in PANEL
+    assert "speakers: speakerNames.slice(1)" in PANEL
     assert 'all_speakers: byId("allSpeakers").checked' in PANEL
     assert "registeredSpeakers.concat(existing.speakers)" in PANEL
 
@@ -143,7 +139,7 @@ def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> 
     assert "verifySkippedInsertionAfterMove(" in HOST
     assert "findTrackItemByNodeId(" in HOST
     assert "reanchorConformMarker(" in HOST
-    assert "without a valid \" +" in HOST
+    assert 'without a valid " +' in HOST
     assert "source clips have no stable node IDs" in HOST
     marker_check = HOST.index("markerState = conformMarkerState(target, item);")
     placeholder_lookup = HOST.index(
@@ -195,7 +191,7 @@ def test_ripple_replace_requires_exact_placeholder_then_inserts() -> None:
     assert "shiftDownstreamItems(target, downstream, deltaSeconds)" in HOST
     assert "verifyDownstreamItems(target, downstream, deltaSeconds)" in HOST
     assert "found.clip.remove(0, 1)" in HOST
-    assert "mode: \"overwrite\"" in HOST
+    assert 'mode: "overwrite"' in HOST
     assert "target.setPlayerPosition(secondsToTicks(params.timelineSeconds))" in HOST
     assert "playerPositionForced: playerPositionForced" in HOST
     assert "alreadyConformed: true" in HOST

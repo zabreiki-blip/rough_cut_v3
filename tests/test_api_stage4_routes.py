@@ -96,9 +96,7 @@ def test_stage4_revisions_list_reports_internal_error(
 # ---------------------------------------------------------------------------
 
 
-def test_stage4_revision_import_rejects_path_outside_project(
-    client, tmp_path: Path
-) -> None:
+def test_stage4_revision_import_rejects_path_outside_project(client, tmp_path: Path) -> None:
     api._ensure_project("demo")
     outside = tmp_path / "outside.docx"
     outside.write_bytes(b"outside")
@@ -137,16 +135,25 @@ def test_stage4_revision_import_returns_400_when_no_baseline_exists(client) -> N
 
 def test_stage4_revision_import_returns_409_on_state_conflict(client) -> None:
     paths = api._ensure_project("demo")
-    atomic_write_json(paths["scenario_versions"] / "rev_0001.json", {
-        "revision_id": "rev_0001",
-    })
-    atomic_write_json(paths["work"] / "active_revision.json", {
-        "revision_id": "rev_0001",
-    })
-    atomic_write_json(paths["normalized"], {
-        "scenario_revision_id": "rev_0002",
-        "blocks": [],
-    })
+    atomic_write_json(
+        paths["scenario_versions"] / "rev_0001.json",
+        {
+            "revision_id": "rev_0001",
+        },
+    )
+    atomic_write_json(
+        paths["work"] / "active_revision.json",
+        {
+            "revision_id": "rev_0001",
+        },
+    )
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "scenario_revision_id": "rev_0002",
+            "blocks": [],
+        },
+    )
 
     response = client.post("/stage4/revisions/import", json={"project": "demo"})
 
@@ -160,12 +167,15 @@ def test_stage4_revision_import_succeeds_and_returns_new_revision(
     paths = api._ensure_project("demo")
     source_v1 = paths["input"] / "scenario.docx"
     source_v1.write_bytes(b"v1")
-    atomic_write_json(paths["normalized"], {
-        "source": str(source_v1),
-        "source_hash": hashlib.sha256(b"v1").hexdigest(),
-        "status": "confirmed",
-        "blocks": [_block("stable-a", "Первая")],
-    })
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": [_block("stable-a", "Первая")],
+        },
+    )
     source_v2 = paths["input"] / "v2.docx"
     source_v2.write_bytes(b"v2")
 
@@ -234,9 +244,7 @@ def test_stage4_diff_get_returns_404_when_missing(client) -> None:
 def test_stage4_revision_reconcile_rejects_invalid_id_format(client) -> None:
     api._ensure_project("demo")
 
-    response = client.post(
-        "/stage4/revisions/not-a-valid-id/reconcile", json={"project": "demo"}
-    )
+    response = client.post("/stage4/revisions/not-a-valid-id/reconcile", json={"project": "demo"})
 
     assert response.status_code == 400
     assert response.get_json()["ok"] is False
@@ -245,9 +253,7 @@ def test_stage4_revision_reconcile_rejects_invalid_id_format(client) -> None:
 def test_stage4_revision_reconcile_returns_400_when_revision_missing(client) -> None:
     api._ensure_project("demo")
 
-    response = client.post(
-        "/stage4/revisions/rev_0001/reconcile", json={"project": "demo"}
-    )
+    response = client.post("/stage4/revisions/rev_0001/reconcile", json={"project": "demo"})
 
     assert response.status_code == 400
     assert response.get_json()["ok"] is False
@@ -258,9 +264,7 @@ def test_stage4_revision_reconcile_blocked_by_active_job(client) -> None:
     with api._TTS_JOBS_LOCK:
         api._TTS_ACTIVE_PROJECTS.add("demo")
     try:
-        response = client.post(
-            "/stage4/revisions/rev_0001/reconcile", json={"project": "demo"}
-        )
+        response = client.post("/stage4/revisions/rev_0001/reconcile", json={"project": "demo"})
     finally:
         with api._TTS_JOBS_LOCK:
             api._TTS_ACTIVE_PROJECTS.discard("demo")
@@ -273,24 +277,28 @@ def test_stage4_revision_reconcile_restores_divergent_work_state(client) -> None
     paths = api._ensure_project("demo")
     source = paths["input"] / "v1.docx"
     source.write_bytes(b"v1")
-    atomic_write_json(paths["normalized"], {
-        "source": str(source),
-        "source_hash": hashlib.sha256(b"v1").hexdigest(),
-        "status": "confirmed",
-        "revision": 2,
-        "blocks": [_block("one", "Первая")],
-    })
-    ensure_baseline("demo", paths)
-    atomic_write_json(paths["normalized"], {
-        "scenario_revision_id": "",
-        "status": "draft",
-        "revision": 1,
-        "blocks": [_block("other", "Черновик")],
-    })
-
-    response = client.post(
-        "/stage4/revisions/rev_0001/reconcile", json={"project": "demo"}
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "revision": 2,
+            "blocks": [_block("one", "Первая")],
+        },
     )
+    ensure_baseline("demo", paths)
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "scenario_revision_id": "",
+            "status": "draft",
+            "revision": 1,
+            "blocks": [_block("other", "Черновик")],
+        },
+    )
+
+    response = client.post("/stage4/revisions/rev_0001/reconcile", json={"project": "demo"})
 
     assert response.status_code == 200
     payload = response.get_json()

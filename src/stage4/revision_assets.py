@@ -46,7 +46,8 @@ def _project_asset_path(project_paths: dict[str, Path], value: str) -> Path | No
 
 def prepared_from_normalized(normalized: dict[str, Any]) -> dict[str, Any]:
     blocks = [
-        block for block in normalized.get("blocks", [])
+        block
+        for block in normalized.get("blocks", [])
         if isinstance(block, dict) and block.get("type") == "voiceover"
     ]
     return {
@@ -84,7 +85,8 @@ def _with_block_uids(prepared: dict[str, Any], normalized: dict[str, Any]) -> di
         "parent_revision_id", result.get("parent_revision_id", "")
     )
     voiceovers = [
-        block for block in normalized.get("blocks", [])
+        block
+        for block in normalized.get("blocks", [])
         if isinstance(block, dict) and block.get("type") == "voiceover"
     ]
     items = []
@@ -131,15 +133,19 @@ def capture_legacy_voiceover_manifest(project_paths: dict[str, Path]) -> dict[st
         if not alias.is_file():
             continue
         audio_hash = hashlib.sha256(alias.read_bytes()).hexdigest()
-        destination = project_paths["voiceover_assets"] / _safe_uid(block_uid) / f"legacy-{audio_hash}.wav"
+        destination = (
+            project_paths["voiceover_assets"] / _safe_uid(block_uid) / f"legacy-{audio_hash}.wav"
+        )
         if not destination.is_file():
             _atomic_copy(alias, destination)
-        manifest_items.append({
-            "id": block_id,
-            "block_uid": block_uid,
-            "fingerprint": f"legacy-{audio_hash}",
-            "asset": destination.relative_to(project_paths["root"]).as_posix(),
-        })
+        manifest_items.append(
+            {
+                "id": block_id,
+                "block_uid": block_uid,
+                "fingerprint": f"legacy-{audio_hash}",
+                "asset": destination.relative_to(project_paths["root"]).as_posix(),
+            }
+        )
     manifest = {
         "schema_version": 1,
         "scenario_revision_id": prepared.get("scenario_revision_id") or "",
@@ -165,10 +171,7 @@ def snapshot_revision_assets(revision_id: str, project_paths: dict[str, Path]) -
         f"{revision_id}.source{Path(str(revision.get('source_file') or '')).suffix.lower()}"
     )
     source_snapshot = project_paths["scenario_versions"] / source_snapshot_name
-    if (
-        source_snapshot_name == expected_source_snapshot
-        and source_snapshot.is_file()
-    ):
+    if source_snapshot_name == expected_source_snapshot and source_snapshot.is_file():
         normalized["source"] = str(source_snapshot.resolve())
         atomic_write_json(project_paths["normalized"], normalized)
     voiceover_manifest = capture_legacy_voiceover_manifest(project_paths)
@@ -178,9 +181,7 @@ def snapshot_revision_assets(revision_id: str, project_paths: dict[str, Path]) -
     if project_paths["normalized"].is_file():
         _atomic_copy(project_paths["normalized"], normalized_snapshot)
         revision["normalized_snapshot"] = normalized_snapshot.name
-        revision["status"] = (
-            "confirmed" if normalized.get("status") == "confirmed" else "draft"
-        )
+        revision["status"] = "confirmed" if normalized.get("status") == "confirmed" else "draft"
         blocks = normalized.get("blocks")
         revision["block_count"] = len(blocks) if isinstance(blocks, list) else 0
     if project_paths["prepared"].is_file():
@@ -268,9 +269,9 @@ def create_revision_asset_snapshots(
 
     active = _read_json(project_paths["active_voiceover_manifest"])
     parent_id = str(normalized.get("parent_revision_id") or "")
-    parent_revision = _read_json(
-        project_paths["scenario_versions"] / f"{parent_id}.json"
-    ) if parent_id else {}
+    parent_revision = (
+        _read_json(project_paths["scenario_versions"] / f"{parent_id}.json") if parent_id else {}
+    )
     parent_snapshot = str(parent_revision.get("voiceover_manifest_snapshot") or "")
     if parent_snapshot:
         parent_manifest = _read_json(project_paths["scenario_versions"] / parent_snapshot)
@@ -301,11 +302,14 @@ def create_revision_asset_snapshots(
         item["block_uid"] = block_uid
         inherited.append(item)
     voiceover_snapshot = project_paths["scenario_versions"] / f"{revision_id}.voiceover.json"
-    atomic_write_json(voiceover_snapshot, {
-        "schema_version": 1,
-        "scenario_revision_id": revision_id,
-        "items": inherited,
-    })
+    atomic_write_json(
+        voiceover_snapshot,
+        {
+            "schema_version": 1,
+            "scenario_revision_id": revision_id,
+            "items": inherited,
+        },
+    )
     return prepared_snapshot.name, voiceover_snapshot.name
 
 
@@ -317,9 +321,9 @@ def save_tts_manifest(project_paths: dict[str, Path], result: dict[str, Any]) ->
         item = dict(raw)
         asset_path = Path(str(item.get("asset") or ""))
         try:
-            item["asset"] = asset_path.resolve().relative_to(
-                project_paths["root"].resolve()
-            ).as_posix()
+            item["asset"] = (
+                asset_path.resolve().relative_to(project_paths["root"].resolve()).as_posix()
+            )
         except (OSError, ValueError):
             continue
         items.append(item)

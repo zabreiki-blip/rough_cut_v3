@@ -79,6 +79,7 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage4/revisions/<revision_id>/activate": {"POST"},
         "/stage4/revisions/<revision_id>/reconcile": {"POST"},
         "/stage4/diffs/<diff_id>": {"GET"},
+        "/system/readiness": {"GET"},
     }
     actual: dict[str, set[str]] = defaultdict(set)
     for rule in api.app.url_map.iter_rules():
@@ -278,9 +279,7 @@ def _job_registry(job_label: str) -> api.ActiveJobRegistry:
     "job_label",
     ["нормализации", "сопоставления СНХ", "подготовки Stage 3"],
 )
-def test_stage4_activation_is_blocked_by_other_mutating_jobs(
-    client, job_label: str
-) -> None:
+def test_stage4_activation_is_blocked_by_other_mutating_jobs(client, job_label: str) -> None:
     registry = _job_registry(job_label)
     with registry.lock:
         registry.active_projects.add("demo")
@@ -361,9 +360,7 @@ def test_stage4_mismatched_work_state_is_reported_and_activation_is_blocked(
     )
 
     listed = client.get("/stage4/revisions?project=demo")
-    activated = client.post(
-        "/stage4/revisions/rev_0001/activate", json={"project": "demo"}
-    )
+    activated = client.post("/stage4/revisions/rev_0001/activate", json={"project": "demo"})
 
     integrity = listed.get_json()["result"]["integrity"]
     assert integrity["status"] == "active_work_mismatch"

@@ -12,9 +12,7 @@ PROJECT_NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9_-]{1,64}$")
 def normalize_project_name(name: str) -> str:
     project = (name or "").strip()
     if not PROJECT_NAME_RE.fullmatch(project):
-        raise ValueError(
-            "project may contain 1-64 Latin/Cyrillic letters, digits, '_' or '-'"
-        )
+        raise ValueError("project may contain 1-64 Latin/Cyrillic letters, digits, '_' or '-'")
     return project
 
 

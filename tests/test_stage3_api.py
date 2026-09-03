@@ -56,7 +56,10 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         _normalization_required=lambda _project: None,
         _confirmed_normalization=lambda _project: ({"revision": "norm-1"}, ""),
         _json_error=lambda message, status=400: (jsonify({"ok": False, "error": message}), status),
-        _internal_error=lambda _exc: (jsonify({"ok": False, "error": "internal server error"}), 500),
+        _internal_error=lambda _exc: (
+            jsonify({"ok": False, "error": "internal server error"}),
+            500,
+        ),
         register_job_registry=lambda label, lock, active_projects: None,
     )
     app.config["TEST_STAGE3_SERVICES"] = services
@@ -69,20 +72,29 @@ def test_prepare_uses_legacy_export_when_project_has_no_viewings(client) -> None
     services = app.config["TEST_STAGE3_SERVICES"]
     paths = services._ensure_project("BRIK")
     paths["work"].mkdir(parents=True, exist_ok=True)
-    (paths["work"] / "full_timeline.json").write_text(json.dumps({
-        "project": "BRIK",
-        "fps": 25,
-        "width": 1920,
-        "height": 1080,
-        "normalization_revision": "norm-1",
-        "segments": [{"id": "snh1", "type": "snh"}],
-    }), encoding="utf-8")
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [],
-    })
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "fps": 25,
+                "width": 1920,
+                "height": 1080,
+                "normalization_revision": "norm-1",
+                "segments": [{"id": "snh1", "type": "snh"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [],
+        },
+    )
 
     response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
 
@@ -96,21 +108,33 @@ def test_prepare_uses_legacy_export_when_project_has_no_viewings(client) -> None
 def test_prepare_rejects_timeline_from_another_scenario_revision(client) -> None:
     http, app, monkeypatch = client
     services = app.config["TEST_STAGE3_SERVICES"]
-    services._confirmed_normalization = lambda _project: ({
-        "revision": "norm-1",
-        "scenario_revision_id": "rev_0002",
-    }, "")
+    services._confirmed_normalization = lambda _project: (
+        {
+            "revision": "norm-1",
+            "scenario_revision_id": "rev_0002",
+        },
+        "",
+    )
     paths = services._ensure_project("BRIK")
     paths["work"].mkdir(parents=True, exist_ok=True)
-    (paths["work"] / "full_timeline.json").write_text(json.dumps({
-        "project": "BRIK",
-        "normalization_revision": "norm-1",
-        "scenario_revision_id": "rev_0001",
-        "segments": [],
-    }), encoding="utf-8")
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "sources": [],
-    })
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "normalization_revision": "norm-1",
+                "scenario_revision_id": "rev_0001",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "sources": [],
+        },
+    )
 
     response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
 
@@ -121,37 +145,60 @@ def test_prepare_rejects_timeline_from_another_scenario_revision(client) -> None
 def test_stage3_export_rejects_other_revision_and_accepts_legacy_identity(client) -> None:
     http, app, _monkeypatch = client
     services = app.config["TEST_STAGE3_SERVICES"]
-    services._confirmed_normalization = lambda _project: ({
-        "revision": "norm-1",
-        "scenario_revision_id": "rev_0002",
-    }, "")
+    services._confirmed_normalization = lambda _project: (
+        {
+            "revision": "norm-1",
+            "scenario_revision_id": "rev_0002",
+        },
+        "",
+    )
     paths = services._ensure_project("BRIK")
     paths["work"].mkdir(parents=True, exist_ok=True)
     (paths["work"] / "BRIK_nested_timeline.xml").write_text("<xml/>", encoding="utf-8")
     timeline_path = paths["work"] / "full_timeline.json"
-    timeline_path.write_text(json.dumps({
-        "normalization_revision": "norm-1",
-        "scenario_revision_id": "rev_0001",
-        "segments": [],
-    }), encoding="utf-8")
+    timeline_path.write_text(
+        json.dumps(
+            {
+                "normalization_revision": "norm-1",
+                "scenario_revision_id": "rev_0001",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert http.get("/stage3/export/xml?project=BRIK").status_code == 409
 
-    timeline_path.write_text(json.dumps({
-        "normalization_revision": "norm-1",
-        "segments": [],
-    }), encoding="utf-8")
+    timeline_path.write_text(
+        json.dumps(
+            {
+                "normalization_revision": "norm-1",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     assert http.get("/stage3/export/xml?project=BRIK").status_code == 200
 
-    timeline_path.write_text(json.dumps({
-        "normalization_revision": "norm-1",
-        "scenario_revision_id": "rev_0002",
-        "segments": [],
-    }), encoding="utf-8")
-    (paths["work"] / "stage3_source_mapping.json").write_text(json.dumps({
-        "normalization_revision": "norm-1",
-        "scenario_revision_id": "rev_0001",
-    }), encoding="utf-8")
+    timeline_path.write_text(
+        json.dumps(
+            {
+                "normalization_revision": "norm-1",
+                "scenario_revision_id": "rev_0002",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (paths["work"] / "stage3_source_mapping.json").write_text(
+        json.dumps(
+            {
+                "normalization_revision": "norm-1",
+                "scenario_revision_id": "rev_0001",
+            }
+        ),
+        encoding="utf-8",
+    )
     assert http.get("/stage3/export/xml?project=BRIK").status_code == 409
 
 
@@ -161,7 +208,12 @@ def test_scan_api_uses_project_review_directory_automatically(client) -> None:
 
     def fake_scan(directory, **kwargs):
         captured.update(directory=directory, **kwargs)
-        return {"directory": "/review-media/Брик", "relative_directory": "Брик", "recursive": True, "sources": []}
+        return {
+            "directory": "/review-media/Брик",
+            "relative_directory": "Брик",
+            "recursive": True,
+            "sources": [],
+        }
 
     monkeypatch.setattr(api_stage3_routes, "scan_media_directory", fake_scan)
     response = http.post(
@@ -210,20 +262,26 @@ def test_scan_registers_viewing_as_headless_whisper_source(client) -> None:
     http, app, monkeypatch = client
     services = app.config["TEST_STAGE3_SERVICES"]
 
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [{
-            "source_id": "media_123",
-            "fingerprint": "abc",
-            "name": "Курская.mp4",
-            "relative_path": "media/reviews/Курская.mp4",
-            "container_path": "/app/projects/BRIK/media/reviews/Курская.mp4",
-            "duration_sec": 123.5,
-            "fps": 25.0,
-        }],
-    })
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [
+                {
+                    "source_id": "media_123",
+                    "fingerprint": "abc",
+                    "name": "Курская.mp4",
+                    "relative_path": "media/reviews/Курская.mp4",
+                    "container_path": "/app/projects/BRIK/media/reviews/Курская.mp4",
+                    "duration_sec": 123.5,
+                    "fps": 25.0,
+                }
+            ],
+        },
+    )
 
     response = http.post("/stage3/media/scan", json={"project": "BRIK"})
 
@@ -242,25 +300,37 @@ def test_scan_pairs_same_stem_video_and_wav(client) -> None:
     http, app, monkeypatch = client
     services = app.config["TEST_STAGE3_SERVICES"]
     base = "/app/projects/BRIK/media/reviews/Курская"
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [
-            {
-                "source_id": "media_video", "fingerprint": "video-fp",
-                "name": "Курская.mp4", "relative_path": "media/reviews/Курская.mp4",
-                "container_path": f"{base}.mp4", "duration_sec": 123.5,
-                "fps": 25.0, "media_kind": "video",
-            },
-            {
-                "source_id": "media_audio", "fingerprint": "audio-fp",
-                "name": "Курская.wav", "relative_path": "media/reviews/Курская.wav",
-                "container_path": f"{base}.wav", "duration_sec": 123.5,
-                "fps": None, "media_kind": "audio",
-            },
-        ],
-    })
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [
+                {
+                    "source_id": "media_video",
+                    "fingerprint": "video-fp",
+                    "name": "Курская.mp4",
+                    "relative_path": "media/reviews/Курская.mp4",
+                    "container_path": f"{base}.mp4",
+                    "duration_sec": 123.5,
+                    "fps": 25.0,
+                    "media_kind": "video",
+                },
+                {
+                    "source_id": "media_audio",
+                    "fingerprint": "audio-fp",
+                    "name": "Курская.wav",
+                    "relative_path": "media/reviews/Курская.wav",
+                    "container_path": f"{base}.wav",
+                    "duration_sec": 123.5,
+                    "fps": None,
+                    "media_kind": "audio",
+                },
+            ],
+        },
+    )
 
     response = http.post("/stage3/media/scan", json={"project": "BRIK"})
 
@@ -280,25 +350,41 @@ def test_scan_binds_viewing_to_existing_normalized_premiere_source(client) -> No
     services = app.config["TEST_STAGE3_SERVICES"]
     paths = services._ensure_project("BRIK")
     source_store, _match_store = services._sync_stores(paths)
-    source_store.replace_all([services.SyncSource.from_dict({
-        "id": "ulynovsk_sinh",
-        "source_kind": "premiere_sequence",
-        "premiere_sequence": "ULINOVSK_sync",
-        "all_speakers": True,
-        "guide_audio": "work/sync_audio/ulynovsk_sinh.wav",
-        "duration_sec": 6060.96,
-    })])
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews", "recursive": False,
-        "sources": [{
-            "source_id": "media_new", "fingerprint": "video-fp",
-            "name": "УЛЬЯНОВСК СНХ.mp4",
-            "relative_path": "media/reviews/УЛЬЯНОВСК СНХ.mp4",
-            "container_path": "/app/projects/BRIK/media/reviews/УЛЬЯНОВСК СНХ.mp4",
-            "duration_sec": 6060.96, "fps": 25.0, "media_kind": "video",
-        }],
-    })
+    source_store.replace_all(
+        [
+            services.SyncSource.from_dict(
+                {
+                    "id": "ulynovsk_sinh",
+                    "source_kind": "premiere_sequence",
+                    "premiere_sequence": "ULINOVSK_sync",
+                    "all_speakers": True,
+                    "guide_audio": "work/sync_audio/ulynovsk_sinh.wav",
+                    "duration_sec": 6060.96,
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [
+                {
+                    "source_id": "media_new",
+                    "fingerprint": "video-fp",
+                    "name": "УЛЬЯНОВСК СНХ.mp4",
+                    "relative_path": "media/reviews/УЛЬЯНОВСК СНХ.mp4",
+                    "container_path": "/app/projects/BRIK/media/reviews/УЛЬЯНОВСК СНХ.mp4",
+                    "duration_sec": 6060.96,
+                    "fps": 25.0,
+                    "media_kind": "video",
+                }
+            ],
+        },
+    )
 
     response = http.post("/stage3/media/scan", json={"project": "BRIK"})
 
@@ -333,7 +419,10 @@ def test_timeline_catalog_keeps_standalone_audio_but_collapses_companion() -> No
     ("payload", "error"),
     [
         (None, "JSON object is required"),
-        ({"project": "BRIK", "directory": "/review-media", "recursive": "yes"}, "recursive must be a boolean"),
+        (
+            {"project": "BRIK", "directory": "/review-media", "recursive": "yes"},
+            "recursive must be a boolean",
+        ),
     ],
 )
 def test_scan_api_validates_payload(client, payload, error: str) -> None:
@@ -363,7 +452,9 @@ def test_scan_api_returns_catalog_validation_error(client) -> None:
     http, _app, monkeypatch = client
 
     def reject(*_args, **_kwargs):
-        raise api_stage3_routes.MediaCatalogError("directory resolves outside the configured media root")
+        raise api_stage3_routes.MediaCatalogError(
+            "directory resolves outside the configured media root"
+        )
 
     monkeypatch.setattr(api_stage3_routes, "scan_media_directory", reject)
     response = http.post(
@@ -390,12 +481,16 @@ def test_project_root_symlink_escape_is_rejected(client, tmp_path: Path) -> None
 def test_scan_background_job_reports_progress_and_result(client) -> None:
     http, _app, monkeypatch = client
     monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [],
-    })
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [],
+        },
+    )
 
     started = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
 
@@ -418,21 +513,30 @@ def test_prepare_background_job_returns_legacy_download_without_viewings(client)
     services = app.config["TEST_STAGE3_SERVICES"]
     paths = services._ensure_project("BRIK")
     paths["work"].mkdir(parents=True, exist_ok=True)
-    (paths["work"] / "full_timeline.json").write_text(json.dumps({
-        "project": "BRIK",
-        "fps": 25,
-        "width": 1920,
-        "height": 1080,
-        "normalization_revision": "norm-1",
-        "segments": [{"id": "snh1", "type": "snh"}],
-    }), encoding="utf-8")
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "fps": 25,
+                "width": 1920,
+                "height": 1080,
+                "normalization_revision": "norm-1",
+                "segments": [{"id": "snh1", "type": "snh"}],
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [],
-    })
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [],
+        },
+    )
 
     started = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"})
     job = http.get(started.get_json()["result"]["status_url"]).get_json()["result"]
@@ -446,12 +550,16 @@ def test_stage3_job_in_flight_guard_is_per_project(client) -> None:
     http, _app, monkeypatch = client
     _HoldingThread.instances.clear()
     monkeypatch.setattr(api_stage3_routes.threading, "Thread", _HoldingThread)
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [],
-    })
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [],
+        },
+    )
 
     first = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
     second = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"})
@@ -483,21 +591,23 @@ def test_latest_stage3_job_status_survives_route_registry_restart(client) -> Non
     http, app, monkeypatch = client
     services = app.config["TEST_STAGE3_SERVICES"]
     monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {
-        "directory": "/app/projects/BRIK/media/reviews",
-        "relative_directory": "media/reviews",
-        "recursive": False,
-        "sources": [],
-    })
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [],
+        },
+    )
     started = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"})
     completed_id = started.get_json()["result"]["job_id"]
 
     restarted_app = Flask(__name__)
     restarted_app.config.update(TESTING=True)
     api_stage3_routes.register_stage3_routes(restarted_app, services)
-    restored = restarted_app.test_client().get(
-        "/stage3/jobs/status?project=BRIK&kind=scan"
-    )
+    restored = restarted_app.test_client().get("/stage3/jobs/status?project=BRIK&kind=scan")
 
     assert restored.status_code == 200
     job = restored.get_json()["result"]

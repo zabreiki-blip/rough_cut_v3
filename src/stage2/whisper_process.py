@@ -1,4 +1,5 @@
 """Process-isolated Whisper execution with progress forwarding and a hard timeout."""
+
 from __future__ import annotations
 
 import atexit
@@ -59,8 +60,10 @@ if hasattr(os, "register_at_fork"):
 
 
 def _configured_timeout(value: float | None) -> float:
-    raw: float | str = value if value is not None else os.getenv(
-        "SYNC_WHISPER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)
+    raw: float | str = (
+        value
+        if value is not None
+        else os.getenv("SYNC_WHISPER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))
     )
     try:
         timeout = float(raw)
@@ -112,9 +115,7 @@ def _transcribe_worker(connection: Connection) -> None:
                 connection.send(("result", request_id, result))
             except BaseException as exc:
                 try:
-                    connection.send(
-                        ("error", request_id, type(exc).__name__, str(exc))
-                    )
+                    connection.send(("error", request_id, type(exc).__name__, str(exc)))
                 except (BrokenPipeError, EOFError, OSError):
                     pass
                 # A failed inference may leave a backend/model in an unknown state.
@@ -184,9 +185,7 @@ def _get_worker_locked(
     key: tuple[str, ...],
 ) -> _Worker:
     global _worker
-    if _worker is not None and (
-        _worker.key != key or not _worker.process.is_alive()
-    ):
+    if _worker is not None and (_worker.key != key or not _worker.process.is_alive()):
         _discard_worker_locked(_worker, graceful=_worker.process.is_alive())
     if _worker is None:
         _worker = _start_worker_locked(key)
@@ -291,9 +290,7 @@ def transcribe_audio_in_process(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _discard_worker_locked(worker)
-                raise WhisperTimeoutError(
-                    f"Whisper transcription exceeded {timeout:g} seconds"
-                )
+                raise WhisperTimeoutError(f"Whisper transcription exceeded {timeout:g} seconds")
             try:
                 response_ready = worker.connection.poll(min(0.25, remaining))
             except (EOFError, OSError):
@@ -307,17 +304,14 @@ def transcribe_audio_in_process(
                     exitcode = worker.process.exitcode
                     _discard_worker_locked(worker)
                     raise WhisperProcessError(
-                        "Whisper worker exited without a result "
-                        f"(exit code {exitcode})"
+                        f"Whisper worker exited without a result (exit code {exitcode})"
                     )
 
                 kind = message[0]
                 message_request_id = message[1]
                 if message_request_id != request_id:
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError(
-                        "Whisper worker returned an unexpected response"
-                    )
+                    raise WhisperProcessError("Whisper worker returned an unexpected response")
                 if kind == "progress":
                     if progress_callback is not None:
                         try:
@@ -343,6 +337,5 @@ def transcribe_audio_in_process(
                 exitcode = worker.process.exitcode
                 _discard_worker_locked(worker)
                 raise WhisperProcessError(
-                    "Whisper worker exited without a result "
-                    f"(exit code {exitcode})"
+                    f"Whisper worker exited without a result (exit code {exitcode})"
                 )

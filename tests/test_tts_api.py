@@ -41,7 +41,9 @@ class TtsCoordinationTests(unittest.TestCase):
         with (
             patch.object(api_module, "_normalization_required", return_value=None),
             patch.object(api_module, "_prepared_projection_required", return_value=None),
-            patch.object(api_module, "_confirmed_prepared_path", return_value=Path("prepared.json")),
+            patch.object(
+                api_module, "_confirmed_prepared_path", return_value=Path("prepared.json")
+            ),
             patch.object(api_module.threading, "Thread", _DormantThread),
         ):
             first = self.client.post("/stage1/tts-jobs/start", json=self._job_payload())
@@ -116,9 +118,7 @@ class TtsCoordinationTests(unittest.TestCase):
         )
         self.assertIsNotNone(updated)
 
-        status_path = (
-            Path(self.tmp.name) / "projects" / "demo" / "work" / "tts_job_status.json"
-        )
+        status_path = Path(self.tmp.name) / "projects" / "demo" / "work" / "tts_job_status.json"
         self.assertTrue(status_path.is_file())
 
         with api_module._TTS_JOBS_LOCK:
@@ -192,9 +192,7 @@ class TtsCoordinationTests(unittest.TestCase):
         with api_module._TTS_JOBS_LOCK:
             self.assertTrue(api_module._TTS_CANCEL_EVENTS[created["id"]].is_set())
 
-        status_path = (
-            Path(self.tmp.name) / "projects" / "demo" / "work" / "tts_job_status.json"
-        )
+        status_path = Path(self.tmp.name) / "projects" / "demo" / "work" / "tts_job_status.json"
         persisted = __import__("json").loads(status_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["id"], created["id"])
         self.assertEqual(persisted["status"], "cancelling")

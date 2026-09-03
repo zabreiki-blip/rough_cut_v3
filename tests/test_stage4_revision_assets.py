@@ -97,9 +97,7 @@ def _prepare_legacy_baseline(tmp_path: Path) -> tuple[dict[str, Path], Path, byt
     return paths, source, old_audio
 
 
-def _import_with_voiceover_insert(
-    tmp_path: Path, paths: dict[str, Path]
-) -> dict:
+def _import_with_voiceover_insert(tmp_path: Path, paths: dict[str, Path]) -> dict:
     source_v2 = paths["input"] / "scenario_v2.docx"
     source_v2.write_bytes(b"revision two")
 
@@ -174,10 +172,13 @@ def test_activating_old_revision_restores_prepared_and_audio_mapping(
     atomic_write_json(paths["active_voiceover_manifest"], active_manifest)
     (paths["speaker"] / "zk1.wav").write_bytes(new_audio)
     atomic_write_json(paths["timeline"], {"revision": "rev_0002", "segments": []})
-    atomic_write_json(paths["sync_matches"], {
-        "schema_version": 1,
-        "matches": [{"segment_id": "new-import-uid", "status": "confirmed"}],
-    })
+    atomic_write_json(
+        paths["sync_matches"],
+        {
+            "schema_version": 1,
+            "matches": [{"segment_id": "new-import-uid", "status": "confirmed"}],
+        },
+    )
 
     activate_revision("rev_0001", paths)
 
@@ -233,13 +234,16 @@ def test_baseline_accepts_scenario_from_friendly_inbox(tmp_path: Path) -> None:
     paths = ensure_project("demo", tmp_path / "projects")
     source = paths["inbox_scenarios"] / "Первая редакция.docx"
     source.write_bytes(b"friendly scenario")
-    atomic_write_json(paths["normalized"], {
-        "source": str(source),
-        "source_hash": hashlib.sha256(b"friendly scenario").hexdigest(),
-        "status": "confirmed",
-        "revision": 1,
-        "blocks": [_block("voice-friendly", "Текст")],
-    })
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source),
+            "source_hash": hashlib.sha256(b"friendly scenario").hexdigest(),
+            "status": "confirmed",
+            "revision": 1,
+            "blocks": [_block("voice-friendly", "Текст")],
+        },
+    )
 
     baseline = ensure_baseline("demo", paths)
 
@@ -260,18 +264,17 @@ def test_snapshot_syncs_manifest_metadata_and_uses_canonical_source(
 
     updated = snapshot_revision_assets("rev_0001", paths)
 
-    canonical = str(
-        (paths["scenario_versions"] / baseline["source_snapshot"]).resolve()
-    )
+    canonical = str((paths["scenario_versions"] / baseline["source_snapshot"]).resolve())
     assert updated["status"] == "draft"
     assert updated["block_count"] == 2
     assert _read_json(paths["normalized"])["source"] == canonical
-    assert _read_json(
-        paths["scenario_versions"] / updated["normalized_snapshot"]
-    )["source"] == canonical
-    assert _read_json(
-        paths["scenario_versions"] / updated["prepared_snapshot"]
-    )["source"] == canonical
+    assert (
+        _read_json(paths["scenario_versions"] / updated["normalized_snapshot"])["source"]
+        == canonical
+    )
+    assert (
+        _read_json(paths["scenario_versions"] / updated["prepared_snapshot"])["source"] == canonical
+    )
 
 
 def test_edited_voiceover_does_not_inherit_old_audio_before_resynthesis(
@@ -293,8 +296,11 @@ def test_edited_voiceover_does_not_inherit_old_audio_before_resynthesis(
         return value
 
     imported = import_revision(
-        "demo", paths, generate_normalization=fake_generate,
-        memory_path=tmp_path / "memory.sqlite3", input_path=source_v2,
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
     )
 
     manifest = _read_json(
@@ -312,22 +318,35 @@ def test_stale_tts_result_is_saved_to_its_revision_not_the_active_one(
     asset = paths["voiceover_assets"] / "old" / "fp.wav"
     _write_wav(asset, 404)
     atomic_write_json(paths["normalized"], {"scenario_revision_id": "rev_0002"})
-    atomic_write_json(paths["active_voiceover_manifest"], {
-        "schema_version": 1,
-        "scenario_revision_id": "rev_0002",
-        "items": [{"id": "zk1", "block_uid": "current", "asset": "current.wav"}],
-    })
-    atomic_write_json(paths["scenario_versions"] / "rev_0001.json", {
-        "revision_id": "rev_0001",
-    })
+    atomic_write_json(
+        paths["active_voiceover_manifest"],
+        {
+            "schema_version": 1,
+            "scenario_revision_id": "rev_0002",
+            "items": [{"id": "zk1", "block_uid": "current", "asset": "current.wav"}],
+        },
+    )
+    atomic_write_json(
+        paths["scenario_versions"] / "rev_0001.json",
+        {
+            "revision_id": "rev_0001",
+        },
+    )
 
-    save_tts_manifest(paths, {
-        "scenario_revision_id": "rev_0001",
-        "voiceover_assets": [{
-            "id": "zk1", "block_uid": "old", "fingerprint": "fp",
-            "asset": str(asset),
-        }],
-    })
+    save_tts_manifest(
+        paths,
+        {
+            "scenario_revision_id": "rev_0001",
+            "voiceover_assets": [
+                {
+                    "id": "zk1",
+                    "block_uid": "old",
+                    "fingerprint": "fp",
+                    "asset": str(asset),
+                }
+            ],
+        },
+    )
 
     assert _read_json(paths["active_voiceover_manifest"])["scenario_revision_id"] == "rev_0002"
     saved = _read_json(paths["scenario_versions"] / "rev_0001.voiceover.json")

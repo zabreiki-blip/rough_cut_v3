@@ -72,7 +72,8 @@ SYNC_LINE_RE = re.compile(
 )
 # SNH label line: "СНХ Имя Фамилия, Файл ..."
 SNH_LABEL_RE = re.compile(
-    r"^\s*СНХ\s+\S", flags=re.I,
+    r"^\s*СНХ\s+\S",
+    flags=re.I,
 )
 INTERVIEW_SPEAKER_LINE_RE = re.compile(
     r"^\s*(?:СНХ\s+)?"
@@ -120,7 +121,11 @@ def _is_technical(text: str) -> bool:
     if TECH_PREFIX_RE.match(stripped):
         return True
     # Very short ALL-CAPS lines are likely technical markers
-    if len(stripped) < 50 and stripped == stripped.upper() and _match_narrator_marker_line(stripped) is None:
+    if (
+        len(stripped) < 50
+        and stripped == stripped.upper()
+        and _match_narrator_marker_line(stripped) is None
+    ):
         return True
     return False
 
@@ -162,6 +167,7 @@ def _split_long_text(text: str, max_len: int = 300) -> Iterable[str]:
 
 
 # === Extraction strategies ===
+
 
 def _from_docx_formatting(input_path: Path) -> tuple[list[NarrationBlock], str]:
     """Primary strategy: use bold/formatting from .docx to identify voiceover.
@@ -214,12 +220,14 @@ def _from_docx_formatting(input_path: Path) -> tuple[list[NarrationBlock], str]:
         if not text or len(text) < 10:
             continue
 
-        blocks.append(NarrationBlock(
-            id="",
-            text_original=text,
-            text_for_tts=text,
-            notes="docx_formatting",
-        ))
+        blocks.append(
+            NarrationBlock(
+                id="",
+                text_original=text,
+                text_for_tts=text,
+                notes="docx_formatting",
+            )
+        )
 
     return blocks, "docx_formatting"
 
@@ -247,12 +255,14 @@ def _from_marked_docx(input_path: Path) -> list[NarrationBlock]:
         text = text.strip()
         if not text:
             continue
-        blocks.append(NarrationBlock(
-            id="",
-            text_original=text,
-            text_for_tts=text,
-            notes="manual_highlight",
-        ))
+        blocks.append(
+            NarrationBlock(
+                id="",
+                text_original=text,
+                text_for_tts=text,
+                notes="manual_highlight",
+            )
+        )
     return blocks
 
 
@@ -297,7 +307,11 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
         elif current_start is not None:
             if not stripped:
                 flush_current()
-            elif _is_speaker_or_snh(stripped) or _is_sync_or_interview(stripped) or _is_technical(stripped):
+            elif (
+                _is_speaker_or_snh(stripped)
+                or _is_sync_or_interview(stripped)
+                or _is_technical(stripped)
+            ):
                 flush_current()
             else:
                 current_lines.append(stripped)
@@ -322,6 +336,7 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
 
 
 # === Text cleanup ===
+
 
 def _strip_speaker_cues(text: str) -> str:
     if not text:
@@ -399,18 +414,21 @@ def _cleanup_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
         text_for_tts = _strip_technical_cues(text_for_tts)
         if not text_for_tts or len(text_for_tts) < 5:
             continue
-        cleaned_blocks.append(NarrationBlock(
-            id=block.id,
-            text_original=text_original or text_for_tts,
-            text_for_tts=text_for_tts,
-            pause_ms=block.pause_ms,
-            notes=block.notes,
-            source_spans=list(block.source_spans),
-        ))
+        cleaned_blocks.append(
+            NarrationBlock(
+                id=block.id,
+                text_original=text_original or text_for_tts,
+                text_for_tts=text_for_tts,
+                pause_ms=block.pause_ms,
+                notes=block.notes,
+                source_spans=list(block.source_spans),
+            )
+        )
     return cleaned_blocks
 
 
 # === LLM ===
+
 
 def _chunk_for_llm(scenario_text: str, max_chars: int = 6000) -> list[str]:
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", scenario_text) if p.strip()]
@@ -445,6 +463,7 @@ def _chunk_for_llm(scenario_text: str, max_chars: int = 6000) -> list[str]:
 
 # === Fallback ===
 
+
 def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
     marker_re = re.compile(r"^\s*(zk\d+)\s*[:\-–]\s*(.+?)\s*$", flags=re.I | re.M)
     marker_items = marker_re.findall(scenario_text)
@@ -452,11 +471,13 @@ def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
 
     if marker_items:
         for idx, (_, text) in enumerate(marker_items, start=1):
-            blocks.append(NarrationBlock(
-                id=f"zk{idx}",
-                text_original=text.strip(),
-                text_for_tts=text.strip(),
-            ))
+            blocks.append(
+                NarrationBlock(
+                    id=f"zk{idx}",
+                    text_original=text.strip(),
+                    text_for_tts=text.strip(),
+                )
+            )
         return blocks
 
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", scenario_text) if p.strip()]
@@ -472,16 +493,19 @@ def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
         if _is_sync_or_interview(paragraph):
             continue
         for piece in _split_long_text(paragraph):
-            blocks.append(NarrationBlock(
-                id=f"zk{idx}",
-                text_original=piece,
-                text_for_tts=piece,
-            ))
+            blocks.append(
+                NarrationBlock(
+                    id=f"zk{idx}",
+                    text_original=piece,
+                    text_for_tts=piece,
+                )
+            )
             idx += 1
     return blocks
 
 
 # === Numbering & merging ===
+
 
 def _renumber_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
     for idx, block in enumerate(blocks, start=1):
@@ -516,7 +540,9 @@ def _merge_adjacent_pair(
 ) -> NarrationBlock:
     return NarrationBlock(
         id="",
-        text_original=_join_block_text(left.text_original, right.text_original, separator=separator),
+        text_original=_join_block_text(
+            left.text_original, right.text_original, separator=separator
+        ),
         text_for_tts=_join_block_text(left.text_for_tts, right.text_for_tts, separator=separator),
         pause_ms=max(left.pause_ms, right.pause_ms),
         notes=_merge_block_notes(left.notes, right.notes),
@@ -696,9 +722,9 @@ def _llm_cache_fingerprint(chunk: str, *, identity: dict[str, Any]) -> str:
         "identity": identity,
     }
     return sha256(
-        json.dumps(
-            material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
@@ -733,9 +759,7 @@ def _deserialize_llm_blocks(payload: Any) -> list[NarrationBlock] | None:
     return blocks
 
 
-def _cached_llm_blocks(
-    cache: dict[str, Any], cache_key: str
-) -> list[NarrationBlock] | None:
+def _cached_llm_blocks(cache: dict[str, Any], cache_key: str) -> list[NarrationBlock] | None:
     entry = cache.get("entries", {}).get(cache_key)
     if not isinstance(entry, dict):
         return None
@@ -757,9 +781,9 @@ def _cache_llm_blocks(
         "blocks": serialized,
     }
     if len(entries) > _LLM_CACHE_MAX_ENTRIES:
-        oldest = sorted(
-            entries, key=lambda key: str(entries[key].get("created_at") or "")
-        )[: len(entries) - _LLM_CACHE_MAX_ENTRIES]
+        oldest = sorted(entries, key=lambda key: str(entries[key].get("created_at") or ""))[
+            : len(entries) - _LLM_CACHE_MAX_ENTRIES
+        ]
         for key in oldest:
             entries.pop(key, None)
     cache["version"] = _LLM_CACHE_VERSION
@@ -772,6 +796,7 @@ def _cache_llm_blocks(
 
 
 # === Main entry point ===
+
 
 def analyze_script(
     input_path: Path,
@@ -833,9 +858,7 @@ def analyze_script(
                 cache_path = _llm_cache_path(output_path)
                 cache = _load_llm_cache(cache_path)
                 identity = _llm_identity(settings)
-                cache_keys = [
-                    _llm_cache_fingerprint(chunk, identity=identity) for chunk in chunks
-                ]
+                cache_keys = [_llm_cache_fingerprint(chunk, identity=identity) for chunk in chunks]
 
                 chunk_results: list[list[NarrationBlock] | None] = [None] * len(chunks)
                 chunk_success = [False] * len(chunks)
@@ -860,13 +883,9 @@ def analyze_script(
                                 result_blocks = futures[idx].result()
                                 chunk_results[idx] = result_blocks
                                 chunk_success[idx] = True
-                                _cache_llm_blocks(
-                                    cache_path, cache, cache_keys[idx], result_blocks
-                                )
+                                _cache_llm_blocks(cache_path, cache, cache_keys[idx], result_blocks)
                             except Exception as exc:
-                                llm_errors.append(
-                                    f"chunk {idx + 1}: {type(exc).__name__}: {exc}"
-                                )
+                                llm_errors.append(f"chunk {idx + 1}: {type(exc).__name__}: {exc}")
                                 chunk_results[idx] = _fallback_blocks(chunks[idx])
 
                 for idx in range(len(chunks)):

@@ -25,10 +25,12 @@ class WhisperRunnerTest(unittest.TestCase):
     def test_flattens_and_sorts_word_timestamps(self) -> None:
         result = {
             "segments": [
-                {"words": [
-                    {"word": " второе", "start": 1.2, "end": 1.8},
-                    {"word": "первое", "start": 0.2, "end": 0.8},
-                ]},
+                {
+                    "words": [
+                        {"word": " второе", "start": 1.2, "end": 1.8},
+                        {"word": "первое", "start": 0.2, "end": 0.8},
+                    ]
+                },
             ],
         }
 
@@ -93,16 +95,18 @@ class WhisperRunnerTest(unittest.TestCase):
                 pass
 
             def transcribe(self, *_args, **_kwargs):
-                segments = iter([
-                    SimpleNamespace(
-                        end=5.0,
-                        words=[SimpleNamespace(word=" один", start=1.0, end=1.5)],
-                    ),
-                    SimpleNamespace(
-                        end=10.0,
-                        words=[SimpleNamespace(word="два", start=9.0, end=9.5)],
-                    ),
-                ])
+                segments = iter(
+                    [
+                        SimpleNamespace(
+                            end=5.0,
+                            words=[SimpleNamespace(word=" один", start=1.0, end=1.5)],
+                        ),
+                        SimpleNamespace(
+                            end=10.0,
+                            words=[SimpleNamespace(word="два", start=9.0, end=9.5)],
+                        ),
+                    ]
+                )
                 return segments, SimpleNamespace(
                     duration=10.0,
                     language="ru",
@@ -122,9 +126,7 @@ class WhisperRunnerTest(unittest.TestCase):
                 Path("audio.wav"),
                 "progress-test-model",
                 "ru",
-                lambda processed, duration, count: progress.append(
-                    (processed, duration, count)
-                ),
+                lambda processed, duration, count: progress.append((processed, duration, count)),
             )
 
         self.assertEqual(progress, [(0.0, 10.0, 0), (5.0, 10.0, 1), (10.0, 10.0, 2)])
@@ -140,12 +142,14 @@ class WhisperRunnerTest(unittest.TestCase):
 
             def transcribe(self, *args, **kwargs):
                 calls["transcribe"] = (args, kwargs)
-                return iter([
-                    SimpleNamespace(
-                        end=2.0,
-                        words=[SimpleNamespace(word="тест", start=1.0, end=2.0)],
-                    ),
-                ]), SimpleNamespace(
+                return iter(
+                    [
+                        SimpleNamespace(
+                            end=2.0,
+                            words=[SimpleNamespace(word="тест", start=1.0, end=2.0)],
+                        ),
+                    ]
+                ), SimpleNamespace(
                     duration=2.0,
                     language="ru",
                     language_probability=0.98,
@@ -212,12 +216,14 @@ class WhisperRunnerTest(unittest.TestCase):
 
             def transcribe(self, *args, **kwargs):
                 calls["transcribe"] = (args, kwargs)
-                return iter([
-                    SimpleNamespace(
-                        end=3.0,
-                        words=[SimpleNamespace(word="батч", start=2.0, end=3.0)],
-                    ),
-                ]), SimpleNamespace(
+                return iter(
+                    [
+                        SimpleNamespace(
+                            end=3.0,
+                            words=[SimpleNamespace(word="батч", start=2.0, end=3.0)],
+                        ),
+                    ]
+                ), SimpleNamespace(
                     duration=3.0,
                     language="ru",
                     language_probability=0.97,
@@ -281,12 +287,14 @@ class WhisperRunnerTest(unittest.TestCase):
 
             def transcribe(self, *_args, **kwargs):
                 calls["transcribe"] = kwargs
-                return iter([
-                    SimpleNamespace(
-                        end=1.0,
-                        words=[SimpleNamespace(word="тест", start=0.0, end=1.0)],
-                    ),
-                ]), SimpleNamespace(
+                return iter(
+                    [
+                        SimpleNamespace(
+                            end=1.0,
+                            words=[SimpleNamespace(word="тест", start=0.0, end=1.0)],
+                        ),
+                    ]
+                ), SimpleNamespace(
                     duration=1.0,
                     language="ru",
                     language_probability=0.99,
@@ -339,13 +347,17 @@ class WhisperRunnerTest(unittest.TestCase):
 
         self.assertEqual(result["duration_sec"], 10.0)
 
-    @patch("stage2.whisper_runner.available_backends", return_value=["faster-whisper", "mlx-whisper"])
+    @patch(
+        "stage2.whisper_runner.available_backends", return_value=["faster-whisper", "mlx-whisper"]
+    )
     def test_resolve_backend_accepts_explicit_cloud_audio(self, _available) -> None:
         self.assertEqual(resolve_backend("cloud-audio"), "cloud-audio")
         self.assertEqual(resolve_backend("cloud"), "cloud-audio")
         self.assertEqual(resolve_backend("openrouter"), "cloud-audio")
 
-    @patch("stage2.whisper_runner.available_backends", return_value=["faster-whisper", "mlx-whisper"])
+    @patch(
+        "stage2.whisper_runner.available_backends", return_value=["faster-whisper", "mlx-whisper"]
+    )
     def test_resolve_backend_auto_never_selects_cloud_audio(self, _available) -> None:
         # cloud-audio is paid and must be opted into explicitly; auto must
         # keep choosing a local backend even if cloud-audio were somehow

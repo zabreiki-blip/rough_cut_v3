@@ -4,6 +4,7 @@ The alignment artifacts deliberately live outside the normalized scenario.  A
 Whisper rerun or a manual correction can therefore replace ``sync_matches.json``
 without mutating the canonical Stage 1/2 scenario files.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -110,7 +111,9 @@ class SyncSource:
                 if item.strip()
             )
         elif isinstance(raw_speakers, (list, tuple)):
-            speakers = tuple(str(item or "").strip() for item in raw_speakers if str(item or "").strip())
+            speakers = tuple(
+                str(item or "").strip() for item in raw_speakers if str(item or "").strip()
+            )
         else:
             speakers = ()
         scope = str(value.get("speaker_scope") or "").strip().lower()
@@ -284,7 +287,9 @@ class SyncMatch:
                 None if value.get("source_in_sec") is None else _number(value.get("source_in_sec"))
             ),
             source_out_sec=(
-                None if value.get("source_out_sec") is None else _number(value.get("source_out_sec"))
+                None
+                if value.get("source_out_sec") is None
+                else _number(value.get("source_out_sec"))
             ),
             confidence=_number(value.get("confidence")),
             status=str(value.get("status") or "not_found"),  # type: ignore[arg-type]

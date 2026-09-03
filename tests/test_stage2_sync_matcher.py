@@ -43,9 +43,7 @@ def _source(
 
 def test_russian_normalization_handles_case_yo_punctuation_and_inflections() -> None:
     assert normalize_text("Ёлкой, ЁЛКАМИ!") == ["елк", "елк"]
-    assert normalize_text("энергетический вампир") == normalize_text(
-        "энергетическим вампиром"
-    )
+    assert normalize_text("энергетический вампир") == normalize_text("энергетическим вампиром")
 
 
 def test_transcript_tokens_are_built_once_per_matcher() -> None:
@@ -57,11 +55,13 @@ def test_transcript_tokens_are_built_once_per_matcher() -> None:
     ) as tokenize:
         matcher = SyncMatcher([_source("s1")], [index])
         for segment_id in ("one", "two"):
-            matcher.match(AlignmentRequest(
-                segment_id=segment_id,
-                text="точная цитата героя",
-                source_ids=("s1",),
-            ))
+            matcher.match(
+                AlignmentRequest(
+                    segment_id=segment_id,
+                    text="точная цитата героя",
+                    source_ids=("s1",),
+                )
+            )
 
     assert tokenize.call_count == 1
 
@@ -73,16 +73,20 @@ def test_teaser_and_full_quote_can_reuse_overlapping_source_range() -> None:
     )
     matcher = SyncMatcher([_source("s1")], [_index("s1", transcript, 120.0)])
 
-    teaser = matcher.match(AlignmentRequest(
-        segment_id="teaser-block",
-        text="это важное решение изменит жизнь всего города",
-        source_ids=("s1",),
-    ))
-    full = matcher.match(AlignmentRequest(
-        segment_id="full-block",
-        text=transcript,
-        source_ids=("s1",),
-    ))
+    teaser = matcher.match(
+        AlignmentRequest(
+            segment_id="teaser-block",
+            text="это важное решение изменит жизнь всего города",
+            source_ids=("s1",),
+        )
+    )
+    full = matcher.match(
+        AlignmentRequest(
+            segment_id="full-block",
+            text=transcript,
+            source_ids=("s1",),
+        )
+    )
 
     assert teaser.segment_id == "teaser-block"
     assert full.segment_id == "full-block"
@@ -274,11 +278,13 @@ def test_rendered_viewing_wins_over_duplicate_legacy_premiere_source() -> None:
         _index("viewing", phrase, 500.0),
     ]
 
-    result = SyncMatcher(sources, indexes).match(AlignmentRequest(
-        segment_id="reordered-snh",
-        text=phrase,
-        speaker="Бартон",
-    ))
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="reordered-snh",
+            text=phrase,
+            speaker="Бартон",
+        )
+    )
 
     assert result.source_id == "viewing"
     assert result.source_in_sec is not None and result.source_in_sec > 490
@@ -387,9 +393,7 @@ def test_differently_named_speaker_does_not_search_unrelated_interview() -> None
 def test_long_queries_bound_candidate_search_without_losing_rare_anchor() -> None:
     words = ["обычное"] * 1500 + ["уникальныйякорь"] + ["обычное"] * 1500
     index = _index("s1", " ".join(words), 0.0, step=0.01)
-    query = normalize_text(
-        " ".join(["обычное"] * 50 + ["уникальныйякорь"] + ["обычное"] * 50)
-    )
+    query = normalize_text(" ".join(["обычное"] * 50 + ["уникальныйякорь"] + ["обычное"] * 50))
     starts = _candidate_starts(query, _timed_tokens(index))
     assert len(starts) <= 240
     assert any(1445 <= start <= 1455 for start in starts)
@@ -453,12 +457,14 @@ def test_low_score_timecode_fallback_shares_bounded_start_budget() -> None:
         "_candidate_starts",
         side_effect=recording_candidate_starts,
     ):
-        matcher.match(AlignmentRequest(
-            segment_id="bounded-fallback",
-            text="совершенно иная короткая реплика",
-            approximate_timecode=500.0,
-            source_ids=("s1",),
-        ))
+        matcher.match(
+            AlignmentRequest(
+                segment_id="bounded-fallback",
+                text="совершенно иная короткая реплика",
+                approximate_timecode=500.0,
+                source_ids=("s1",),
+            )
+        )
 
     assert len(calls) == 2
     assert sum(len(starts) for _limit, starts in calls) <= 240

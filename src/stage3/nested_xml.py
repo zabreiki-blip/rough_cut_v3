@@ -5,6 +5,7 @@ The exporter does not talk to Premiere.  Every viewing file is wrapped in an
 sequences.  Replacing the media in an imported source sequence can therefore
 be done once without rebuilding the rough cut.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -54,10 +55,7 @@ class MediaSource:
             return cls(
                 id=str(raw.get("id") or raw.get("source_id") or source_id),
                 path=str(
-                    raw.get("path")
-                    or raw.get("media_path")
-                    or raw.get("container_path")
-                    or ""
+                    raw.get("path") or raw.get("media_path") or raw.get("container_path") or ""
                 ),
                 duration=_number(raw.get("duration", raw.get("duration_sec"))),
                 fps=_number(raw.get("fps"), 25.0),
@@ -81,9 +79,7 @@ class MediaSource:
                     getattr(value, "media_path", getattr(value, "container_path", "")),
                 )
             ),
-            duration=_number(
-                getattr(value, "duration", getattr(value, "duration_sec", 0.0))
-            ),
+            duration=_number(getattr(value, "duration", getattr(value, "duration_sec", 0.0))),
             fps=_number(getattr(value, "fps", 25.0), 25.0),
             width=_integer(getattr(value, "width", 1920), 1920),
             height=_integer(getattr(value, "height", 1080), 1080),
@@ -177,9 +173,7 @@ def _coerce_sources(
             if isinstance(item, Mapping):
                 source_id = str(item.get("source_id") or item.get("id") or "").strip()
             else:
-                source_id = str(
-                    getattr(item, "source_id", getattr(item, "id", ""))
-                ).strip()
+                source_id = str(getattr(item, "source_id", getattr(item, "id", ""))).strip()
             items.append((source_id, item))
     else:
         raise ValueError("catalog sources must be a mapping or list")
@@ -263,17 +257,13 @@ def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> Non
             continue
         matched_source = sources.get(segment.source_id)
         if matched_source is None:
-            raise ValueError(
-                f"segment {segment.id} references unknown source {segment.source_id}"
-            )
+            raise ValueError(f"segment {segment.id} references unknown source {segment.source_id}")
         tolerance = 1.0 / timeline.fps
         if segment.source_out_sec > matched_source.duration + tolerance:
             raise ValueError(f"segment {segment.id} source range exceeds media duration")
         range_duration = segment.source_out_sec - segment.source_in_sec
         if abs(range_duration - segment.duration_sec) > tolerance:
-            raise ValueError(
-                f"segment {segment.id} duration does not match its source range"
-            )
+            raise ValueError(f"segment {segment.id} duration does not match its source range")
 
 
 def _sequence_header(

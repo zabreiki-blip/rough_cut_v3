@@ -19,6 +19,7 @@ _env_file = os.getenv("MACOS_CONNECTOR_ENV_FILE", "").strip()
 if _env_file:
     try:
         from dotenv import load_dotenv
+
         load_dotenv(_env_file, override=False)
     except ImportError:
         pass

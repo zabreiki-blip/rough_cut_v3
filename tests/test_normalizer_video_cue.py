@@ -43,7 +43,9 @@ class VideoCueDetectionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             blocks = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )["blocks"]
             self.assertEqual(blocks[0]["type"], "voiceover")
@@ -70,7 +72,9 @@ class VideoCueDetectionTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("Мраморный бюст Марии\n", encoding="utf-8")
             block = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )["blocks"][0]
             self.assertEqual(block["type"], "technical")
@@ -81,7 +85,9 @@ class VideoCueDetectionTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("ЗАКАДР: Мраморный бюст Марии\n", encoding="utf-8")
             block = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )["blocks"][0]
             self.assertEqual(block["type"], "voiceover")

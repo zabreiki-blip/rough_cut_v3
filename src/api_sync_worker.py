@@ -138,9 +138,7 @@ def run_sync_job(
             audio_path = None
             try:
                 should_force = force_transcribe and selected_for_transcription
-                config = _transcription_config(
-                    backend=backend, model=model, language=language
-                )
+                config = _transcription_config(backend=backend, model=model, language=language)
                 audio_resolution_error = None
                 try:
                     audio_path = _resolve_sync_audio_path(source, paths)
@@ -174,31 +172,20 @@ def run_sync_job(
                     cached_index is not None
                     and audio_is_available
                     and audio_path is not None
-                    and not isinstance(
-                        cached_index.metadata.get(_TRANSCRIPTION_CACHE_KEY), dict
-                    )
+                    and not isinstance(cached_index.metadata.get(_TRANSCRIPTION_CACHE_KEY), dict)
                 ):
-                    cached_index.metadata[_TRANSCRIPTION_CACHE_KEY] = (
-                        _transcription_cache_metadata(
-                            audio_path,
-                            config,
-                            origin="legacy",
-                            audio_signature=audio_signature,
-                        )
+                    cached_index.metadata[_TRANSCRIPTION_CACHE_KEY] = _transcription_cache_metadata(
+                        audio_path,
+                        config,
+                        origin="legacy",
+                        audio_signature=audio_signature,
                     )
                     save_word_index(index_path, cached_index)
 
-                if (
-                    cached_index is not None
-                    and audio_is_available
-                    and audio_path is not None
-                ):
-                    cache_metadata = cached_index.metadata.get(
-                        _TRANSCRIPTION_CACHE_KEY
-                    )
+                if cached_index is not None and audio_is_available and audio_path is not None:
+                    cache_metadata = cached_index.metadata.get(_TRANSCRIPTION_CACHE_KEY)
                     stored_audio = (
-                        cache_metadata.get("audio")
-                        if isinstance(cache_metadata, dict) else None
+                        cache_metadata.get("audio") if isinstance(cache_metadata, dict) else None
                     )
                     if (
                         isinstance(stored_audio, dict)
@@ -230,8 +217,10 @@ def run_sync_job(
                     # they will be refreshed when selected by a later job.
                     index = cached_index
                     reused += 1
-                elif cached_index is not None and not should_force and (
-                    cache_matches_audio or not audio_is_available
+                elif (
+                    cached_index is not None
+                    and not should_force
+                    and (cache_matches_audio or not audio_is_available)
                 ):
                     # A completed transcript is an expensive durable artifact.
                     # Switching Small/Medium changes only future files; it must
@@ -273,9 +262,7 @@ def run_sync_job(
                             transcription_words=word_count,
                         )
 
-                    input_audio_signature = audio_signature or _audio_cache_signature(
-                        audio_path
-                    )
+                    input_audio_signature = audio_signature or _audio_cache_signature(audio_path)
                     transcription_started_at = time.monotonic()
                     result = transcribe_audio(
                         audio_path,
@@ -284,23 +271,16 @@ def run_sync_job(
                         language=language,
                         progress_callback=report_progress,
                         cancel_event=cancel_event,
-                        timeout_seconds=(
-                            app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS")
-                            or None
-                        ),
+                        timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
                     )
-                    transcription_wall_sec = (
-                        time.monotonic() - transcription_started_at
-                    )
+                    transcription_wall_sec = time.monotonic() - transcription_started_at
                     if _audio_cache_signature(audio_path) != input_audio_signature:
                         raise RuntimeError(
                             f"audio guide changed during transcription: {audio_path.name}"
                         )
                     result_backend_metadata = result.get("backend_metadata") or {}
                     asr_metrics["transcription_wall_sec_total"] += transcription_wall_sec
-                    asr_metrics["asr_backend_used"] = str(
-                        result.get("backend") or backend or ""
-                    )
+                    asr_metrics["asr_backend_used"] = str(result.get("backend") or backend or "")
                     asr_metrics["asr_cost_usd_total"] += float(
                         result_backend_metadata.get("cost_usd") or 0.0
                     )
@@ -314,12 +294,10 @@ def run_sync_job(
                         model=str(result.get("model") or model or ""),
                         language=str(result.get("language") or language),
                     )
-                    index.metadata[_TRANSCRIPTION_CACHE_KEY] = (
-                        _transcription_cache_metadata(
-                            audio_path,
-                            config,
-                            audio_signature=input_audio_signature,
-                        )
+                    index.metadata[_TRANSCRIPTION_CACHE_KEY] = _transcription_cache_metadata(
+                        audio_path,
+                        config,
+                        audio_signature=input_audio_signature,
                     )
                     save_word_index(index_path, index)
                     transcribed += 1
@@ -349,9 +327,7 @@ def run_sync_job(
 
         normalization = load_normalization(paths["normalized"])
         normalization_revision = normalization.get("revision")
-        scenario_revision_id = str(
-            normalization.get("scenario_revision_id") or ""
-        )
+        scenario_revision_id = str(normalization.get("scenario_revision_id") or "")
         blocks = [
             block
             for block in sorted(
@@ -362,31 +338,23 @@ def run_sync_job(
         ]
         units = _sync_alignment_units(blocks)
         indexed_source_ids = {item.source_id for item in indexes}
-        matching_sources = [
-            item for item in sources if item.id in indexed_source_ids
-        ]
+        matching_sources = [item for item in sources if item.id in indexed_source_ids]
         matcher = SyncMatcher(
             matching_sources,
             indexes,
             MatcherConfig(search_window_sec=search_window_sec),
         )
         settings = get_settings()
-        llm_review_enabled = (
-            bool(settings.openrouter_api_key)
-            and str(os.getenv("SYNC_LLM_REVIEW_ENABLED", "1")).strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        llm_review_enabled = bool(settings.openrouter_api_key) and str(
+            os.getenv("SYNC_LLM_REVIEW_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
         try:
-            llm_review_threshold = float(
-                os.getenv("SYNC_LLM_REVIEW_THRESHOLD", "0.80")
-            )
+            llm_review_threshold = float(os.getenv("SYNC_LLM_REVIEW_THRESHOLD", "0.80"))
         except ValueError:
             llm_review_threshold = 0.80
         llm_review_threshold = max(0.0, min(1.0, llm_review_threshold))
         try:
-            llm_review_limit = max(
-                0, int(os.getenv("SYNC_LLM_REVIEW_MAX_BLOCKS", "30"))
-            )
+            llm_review_limit = max(0, int(os.getenv("SYNC_LLM_REVIEW_MAX_BLOCKS", "30")))
         except ValueError:
             llm_review_limit = 30
         llm_reviewed = 0
@@ -398,24 +366,21 @@ def run_sync_job(
             if not checkpoint_state["dirty"]:
                 return
             with _SYNC_DATA_LOCK:
-                persisted = {
-                    item.segment_id: item for item in match_store.list()
-                }
+                persisted = {item.segment_id: item for item in match_store.list()}
                 # Manual edits made while matching was running are authoritative.
                 for persisted_id, persisted_match in persisted.items():
-                    persisted_revision = persisted_match.metadata.get(
-                        "normalization_revision"
-                    )
+                    persisted_revision = persisted_match.metadata.get("normalization_revision")
                     persisted_scenario_revision_id = str(
                         persisted_match.metadata.get("scenario_revision_id") or ""
                     )
-                    persisted_is_current = (
-                        persisted_revision in (None, "", normalization_revision)
-                        and (
-                            not persisted_scenario_revision_id
-                            or not scenario_revision_id
-                            or persisted_scenario_revision_id == scenario_revision_id
-                        )
+                    persisted_is_current = persisted_revision in (
+                        None,
+                        "",
+                        normalization_revision,
+                    ) and (
+                        not persisted_scenario_revision_id
+                        or not scenario_revision_id
+                        or persisted_scenario_revision_id == scenario_revision_id
                     )
                     if persisted_is_current and (
                         persisted_match.status == "confirmed"
@@ -426,6 +391,7 @@ def run_sync_job(
                         existing[persisted_id] = persisted_match
                 match_store.replace_all(list(existing.values()))
                 checkpoint_state["dirty"] = False
+
         current_ids = {
             str(unit.get("segment_id") or "").strip()
             for unit in units
@@ -462,10 +428,12 @@ def run_sync_job(
             ensure_not_cancelled()
             segment_id = str(unit.get("segment_id") or "").strip()
             if not segment_id:
-                segment_failures.append({
-                    "segment_id": "",
-                    "error": "sync/host block has no stable uid",
-                })
+                segment_failures.append(
+                    {
+                        "segment_id": "",
+                        "error": "sync/host block has no stable uid",
+                    }
+                )
                 continue
             _update_sync_job(
                 job_id,
@@ -473,12 +441,9 @@ def run_sync_job(
                 current_segment_id=segment_id,
             )
             prior = existing.get(segment_id)
-            prior_revision = (
-                prior.metadata.get("normalization_revision") if prior else None
-            )
+            prior_revision = prior.metadata.get("normalization_revision") if prior else None
             prior_scenario_revision_id = (
-                str(prior.metadata.get("scenario_revision_id") or "")
-                if prior else ""
+                str(prior.metadata.get("scenario_revision_id") or "") if prior else ""
             )
             prior_is_current = (
                 prior_revision in (None, "", normalization_revision)
@@ -492,8 +457,7 @@ def run_sync_job(
                 )
             )
             prior_matching_fingerprint = (
-                str(prior.metadata.get("matching_fingerprint") or "")
-                if prior else ""
+                str(prior.metadata.get("matching_fingerprint") or "") if prior else ""
             )
             if prior and not prior_is_current:
                 # Do not let a stale match contribute to progress/final summary
@@ -503,10 +467,7 @@ def run_sync_job(
                 prior
                 and prior_is_current
                 and (
-                    (
-                        prior.status == "confirmed"
-                        and not rematch_confirmed
-                    )
+                    (prior.status == "confirmed" and not rematch_confirmed)
                     or (
                         prior.status != "confirmed"
                         and prior_matching_fingerprint == matching_fingerprint
@@ -514,10 +475,7 @@ def run_sync_job(
                 )
             ):
                 processed += 1
-                current = [
-                    item for key, item in existing.items()
-                    if key in current_ids
-                ]
+                current = [item for key, item in existing.items() if key in current_ids]
                 _update_sync_job(
                     job_id,
                     persist=should_persist_progress(),
@@ -564,31 +522,31 @@ def run_sync_job(
                             )
                     except Exception as exc:
                         llm_reviewed += 1
-                        llm_review_failures.append({
-                            "segment_id": segment_id,
-                            "error": str(exc),
-                        })
+                        llm_review_failures.append(
+                            {
+                                "segment_id": segment_id,
+                                "error": str(exc),
+                            }
+                        )
                 match.metadata["normalization_revision"] = normalization_revision
                 match.metadata["scenario_revision_id"] = scenario_revision_id
                 match.metadata["matching_fingerprint"] = matching_fingerprint
-                match.metadata["parent_block_uid"] = str(
-                    unit.get("parent_block_uid") or segment_id
-                )
+                match.metadata["parent_block_uid"] = str(unit.get("parent_block_uid") or segment_id)
                 match.metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 match.metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
                 existing[segment_id] = match
                 checkpoint_state["dirty"] = True
             except Exception as exc:
-                segment_failures.append({
-                    "segment_id": segment_id,
-                    "error": str(exc),
-                })
+                segment_failures.append(
+                    {
+                        "segment_id": segment_id,
+                        "error": str(exc),
+                    }
+                )
             processed += 1
             if processed % 10 == 0:
                 checkpoint_matches()
-            current = [
-                item for key, item in existing.items() if key in current_ids
-            ]
+            current = [item for key, item in existing.items() if key in current_ids]
             _update_sync_job(
                 job_id,
                 persist=should_persist_progress(force=(processed % 10 == 0)),
@@ -600,9 +558,7 @@ def run_sync_job(
             )
 
         checkpoint_matches()
-        all_matches = [
-            item for key, item in existing.items() if key in current_ids
-        ]
+        all_matches = [item for key, item in existing.items() if key in current_ids]
         ensure_not_cancelled()
         summary = _sync_summary(all_matches)
         _update_sync_job(

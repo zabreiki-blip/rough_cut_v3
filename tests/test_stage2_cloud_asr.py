@@ -8,7 +8,6 @@ network access, no real ffmpeg/ffprobe binary required.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +98,9 @@ def test_parse_transcript_raises_on_unparseable_text() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _plan_chunks_for(duration_sec: float, *, chunk_minutes: float = 20.0, overlap_sec: float = 60.0):
+def _plan_chunks_for(
+    duration_sec: float, *, chunk_minutes: float = 20.0, overlap_sec: float = 60.0
+):
     adapter = CloudAudioAsrAdapter(
         api_key="test-key",
         chunk_minutes=chunk_minutes,
@@ -166,7 +167,12 @@ def test_stitch_chunk_drops_duplicate_in_overlap_zone() -> None:
 
 def test_stitch_chunk_no_boundary_just_renumbers() -> None:
     out, out_flags, next_number, label_map = _stitch_chunk(
-        [], [_seg("Первая часть", 0.0, 5.0, "ГОЛОС 1")], [True], part_start=0.0, boundary=None, next_speaker_number=1
+        [],
+        [_seg("Первая часть", 0.0, 5.0, "ГОЛОС 1")],
+        [True],
+        part_start=0.0,
+        boundary=None,
+        next_speaker_number=1,
     )
     assert len(out) == 1
     assert out[0].speaker == "ГОЛОС 1"
@@ -200,7 +206,9 @@ def test_reconcile_speakers_merges_same_person_by_name() -> None:
         "ГОЛОС 1": "мужской голос (Иван Сивопляс)",
         "ГОЛОС 3": "мужской голос, краевед (Иван Сивопляс)",
     }
-    merged, speakers, final_descriptions = _reconcile_speakers(segments, speaker_descriptions=descriptions)
+    merged, speakers, final_descriptions = _reconcile_speakers(
+        segments, speaker_descriptions=descriptions
+    )
     assert len(speakers) == 1
     assert merged[0].speaker == merged[1].speaker == speakers[0]
 
@@ -223,7 +231,9 @@ def test_reconcile_speakers_keeps_different_people_separate() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _model_response(text: str, *, cost: float | None = 0.0123, status_code: int = 200) -> httpx.Response:
+def _model_response(
+    text: str, *, cost: float | None = 0.0123, status_code: int = 200
+) -> httpx.Response:
     payload: dict[str, Any] = {
         "choices": [{"message": {"content": text}}],
     }
@@ -236,7 +246,9 @@ def _model_response(text: str, *, cost: float | None = 0.0123, status_code: int 
 def _no_real_ffmpeg_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Avoid touching disk/ffmpeg entirely: fixed duration + dummy mp3 bytes."""
 
-    async def fake_extract_chunk_mp3(self: CloudAudioAsrAdapter, media_path, start_sec, duration_sec) -> bytes:
+    async def fake_extract_chunk_mp3(
+        self: CloudAudioAsrAdapter, media_path, start_sec, duration_sec
+    ) -> bytes:
         return b"fake-mp3-bytes"
 
     monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda self, media_path: 60.0)
@@ -261,10 +273,7 @@ def test_transcribe_cloud_returns_expected_structure(monkeypatch: pytest.MonkeyP
     # transcript's last segment always has its end forced to the technical
     # chunk boundary (see transcribe_words), so has_explicit_end is checked
     # on the non-last segment.
-    text = (
-        "[00:01.0 — 00:02.0] ГОЛОС 1: Привет мир\n"
-        "[00:03.0 — 00:04.0] ГОЛОС 1: Вторая реплика"
-    )
+    text = "[00:01.0 — 00:02.0] ГОЛОС 1: Привет мир\n[00:03.0 — 00:04.0] ГОЛОС 1: Вторая реплика"
 
     def handler(request: httpx.Request) -> httpx.Response:
         return _model_response(text, cost=0.05)

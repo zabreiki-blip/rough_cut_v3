@@ -43,9 +43,9 @@ def _apply_tempo(wav_bytes: bytes, speed: float) -> bytes:
     if 0.5 <= speed <= 2.0:
         atempo = f"atempo={speed}"
     elif speed < 0.5:
-        atempo = f"atempo=0.5,atempo={round(speed/0.5, 4)}"
+        atempo = f"atempo=0.5,atempo={round(speed / 0.5, 4)}"
     else:
-        atempo = f"atempo=2.0,atempo={round(speed/2.0, 4)}"
+        atempo = f"atempo=2.0,atempo={round(speed / 2.0, 4)}"
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "in.wav"
         dst = Path(td) / "out.wav"
@@ -207,8 +207,14 @@ def _is_valid_wav(path: Path) -> bool:
 
 
 def _synthesis_fingerprint(
-    text: str, provider: str, voice: str, gender: str, speed: float,
-    model: str = "", sample_rate: int = 0, extra_rate: int = 0,
+    text: str,
+    provider: str,
+    voice: str,
+    gender: str,
+    speed: float,
+    model: str = "",
+    sample_rate: int = 0,
+    extra_rate: int = 0,
 ) -> str:
     payload = f"{text}\n{provider}\n{voice}\n{gender}\n{round(speed, 4)}\n{model}\n{sample_rate}\n{extra_rate}"
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -246,8 +252,7 @@ def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
             {
                 "role": "user",
                 "content": (
-                    "Прочитай вслух без добавлений и комментариев следующий текст:\n\n"
-                    + text
+                    "Прочитай вслух без добавлений и комментариев следующий текст:\n\n" + text
                 ),
             }
         ],
@@ -480,7 +485,9 @@ def _resolve_gender(gender: str | None, default_gender: str) -> str:
     return g
 
 
-def _pick_voice(settings, provider: str, voice_name: str | None, gender: str | None) -> tuple[str, str]:
+def _pick_voice(
+    settings, provider: str, voice_name: str | None, gender: str | None
+) -> tuple[str, str]:
     if voice_name and voice_name.strip():
         resolved_gender = _resolve_gender(gender, settings.tts_gender)
         return voice_name.strip(), resolved_gender
@@ -652,10 +659,7 @@ def _asset_uid(value: str) -> str:
 
 
 def _materialize_voiceover_alias(asset: Path, alias: Path, fingerprint: str) -> None:
-    if (
-        _is_valid_wav(alias)
-        and _read_meta_fingerprint(alias) == fingerprint
-    ):
+    if _is_valid_wav(alias) and _read_meta_fingerprint(alias) == fingerprint:
         return
     if asset != alias:
         _atomic_write_bytes(alias, asset.read_bytes(), validate_wav=True)
@@ -673,9 +677,7 @@ def _plan_tts_items(
     dry_run: bool,
     cancel_check: Callable[[], bool] | None,
 ) -> list[tuple[int, str, str, str, Path, Path, str, str]]:
-    fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(
-        provider, settings
-    )
+    fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(provider, settings)
     plan: list[tuple[int, str, str, str, Path, Path, str, str]] = []
 
     for index, (block_id, block_uid, text) in enumerate(prepared_items, start=1):
@@ -699,19 +701,14 @@ def _plan_tts_items(
         )
         if legacy_cache_hit and not asset_file.is_file():
             _atomic_write_bytes(asset_file, out_file.read_bytes(), validate_wav=True)
-        cache_hit = (
-            not dry_run
-            and _is_valid_wav(asset_file)
-        )
+        cache_hit = not dry_run and _is_valid_wav(asset_file)
         if cache_hit:
             action = "cache"
         elif dry_run:
             action = "dry_run"
         else:
             action = "synthesize"
-        plan.append((
-            index, block_id, block_uid, text, out_file, asset_file, fingerprint, action
-        ))
+        plan.append((index, block_id, block_uid, text, out_file, asset_file, fingerprint, action))
 
     return plan
 
@@ -825,9 +822,7 @@ def _publish_synthesized_item(
         )
     if final_error is not None or wav_bytes is None:
         if final_error is None:
-            final_error = RuntimeError(
-                f"TTS synthesis returned no audio for item {block_id}"
-            )
+            final_error = RuntimeError(f"TTS synthesis returned no audio for item {block_id}")
         _emit_item_progress(
             progress_callback,
             "item_failed",
@@ -949,13 +944,24 @@ def synthesize_tts(
                 _raise_if_cancelled(cancel_check)
                 if planned_item[7] == "synthesize":
                     (
-                        index, block_id, block_uid, text, out_file,
-                        asset_file, fingerprint, _action,
+                        index,
+                        block_id,
+                        block_uid,
+                        text,
+                        out_file,
+                        asset_file,
+                        fingerprint,
+                        _action,
                     ) = planned_item
                     _publish_synthesized_item(
                         (
-                            index, block_id, block_uid, text, out_file,
-                            asset_file, fingerprint,
+                            index,
+                            block_id,
+                            block_uid,
+                            text,
+                            out_file,
+                            asset_file,
+                            fingerprint,
                         ),
                         futures[index],
                         total_items,
@@ -1011,8 +1017,14 @@ def synthesize_tts(
                 "asset": str(asset_file),
             }
             for (
-                _index, block_id, block_uid, _text, _out_file,
-                asset_file, fingerprint, _action,
+                _index,
+                block_id,
+                block_uid,
+                _text,
+                _out_file,
+                asset_file,
+                fingerprint,
+                _action,
             ) in plan
             if asset_file.is_file()
         ],

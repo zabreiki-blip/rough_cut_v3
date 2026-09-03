@@ -60,7 +60,10 @@ class TimelineSegment:
         if kwargs["type"] not in {"zk", "snh", "host", "tech"}:
             raise ValueError(f"invalid timeline segment type: {kwargs['type']!r}")
         for key in (
-            "duration_sec", "start_sec", "source_in_sec", "source_out_sec",
+            "duration_sec",
+            "start_sec",
+            "source_in_sec",
+            "source_out_sec",
             "match_confidence",
         ):
             if key in kwargs:

@@ -13,20 +13,22 @@ from atomic_io import atomic_write_json
 DEFAULT_MEDIA_ROOT = Path("/review-media")
 CACHE_VERSION = 1
 CACHE_FILENAME = "stage3_ffprobe_cache.json"
-VIDEO_EXTENSIONS = frozenset({
-    ".3gp",
-    ".avi",
-    ".m2ts",
-    ".m4v",
-    ".mkv",
-    ".mov",
-    ".mp4",
-    ".mpeg",
-    ".mpg",
-    ".mts",
-    ".mxf",
-    ".webm",
-})
+VIDEO_EXTENSIONS = frozenset(
+    {
+        ".3gp",
+        ".avi",
+        ".m2ts",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".mts",
+        ".mxf",
+        ".webm",
+    }
+)
 AUDIO_EXTENSIONS = frozenset({".mp3", ".wav"})
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
@@ -142,12 +144,15 @@ def probe_media(
     streams = payload.get("streams") if isinstance(payload, dict) else []
     streams = streams if isinstance(streams, list) else []
     video = next(
-        (stream for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "video"),
+        (
+            stream
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("codec_type") == "video"
+        ),
         {},
     )
     has_audio = any(
-        isinstance(stream, dict) and stream.get("codec_type") == "audio"
-        for stream in streams
+        isinstance(stream, dict) and stream.get("codec_type") == "audio" for stream in streams
     )
     format_payload = payload.get("format") if isinstance(payload, dict) else {}
     format_payload = format_payload if isinstance(format_payload, dict) else {}
@@ -297,23 +302,25 @@ def scan_media_directory(
             "metadata": metadata,
         }
         next_entries[relative_path] = cache_entry
-        sources.append(MediaSource(
-            source_id=_source_id(relative_path),
-            fingerprint=_fingerprint(relative_path, stat.st_size, stat.st_mtime_ns),
-            name=safe_path.name,
-            relative_path=relative_path,
-            container_path=str(safe_path),
-            extension=extension,
-            size_bytes=stat.st_size,
-            mtime=stat.st_mtime,
-            mtime_ns=stat.st_mtime_ns,
-            duration_sec=float(metadata["duration_sec"] or 0),
-            fps=float(metadata["fps"]) if metadata["fps"] is not None else None,
-            width=int(metadata["width"]) if metadata["width"] is not None else None,
-            height=int(metadata["height"]) if metadata["height"] is not None else None,
-            media_kind=str(metadata["media_kind"]),
-            has_audio=bool(metadata["has_audio"]),
-        ))
+        sources.append(
+            MediaSource(
+                source_id=_source_id(relative_path),
+                fingerprint=_fingerprint(relative_path, stat.st_size, stat.st_mtime_ns),
+                name=safe_path.name,
+                relative_path=relative_path,
+                container_path=str(safe_path),
+                extension=extension,
+                size_bytes=stat.st_size,
+                mtime=stat.st_mtime,
+                mtime_ns=stat.st_mtime_ns,
+                duration_sec=float(metadata["duration_sec"] or 0),
+                fps=float(metadata["fps"]) if metadata["fps"] is not None else None,
+                width=int(metadata["width"]) if metadata["width"] is not None else None,
+                height=int(metadata["height"]) if metadata["height"] is not None else None,
+                media_kind=str(metadata["media_kind"]),
+                has_audio=bool(metadata["has_audio"]),
+            )
+        )
     if next_entries != cached_entries:
         atomic_write_json(cache_path, {"version": CACHE_VERSION, "entries": next_entries})
     return {

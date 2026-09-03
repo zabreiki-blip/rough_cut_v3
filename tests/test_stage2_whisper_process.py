@@ -52,9 +52,7 @@ def test_process_forwards_progress_and_returns_result() -> None:
             "unused.wav",
             timeout_seconds=2.0,
             _start_method="fork",
-            progress_callback=lambda done, total, words: progress.append(
-                (done, total, words)
-            ),
+            progress_callback=lambda done, total, words: progress.append((done, total, words)),
         )
 
     assert progress == [(5.0, 10.0, 42)]
@@ -69,9 +67,7 @@ def test_process_is_reused_for_matching_configuration() -> None:
         patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
         patch.dict("os.environ", {}, clear=True),
     ):
-        first = transcribe_audio_in_process(
-            "first.wav", timeout_seconds=2.0, _start_method="fork"
-        )
+        first = transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
         second = transcribe_audio_in_process(
             "second.wav", timeout_seconds=2.0, _start_method="fork"
         )
@@ -89,12 +85,8 @@ def test_process_restarts_when_inference_configuration_changes() -> None:
         patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
         patch.dict("os.environ", {}, clear=True),
     ):
-        first = transcribe_audio_in_process(
-            "first.wav", timeout_seconds=2.0, _start_method="fork"
-        )
-        with patch.dict(
-            "os.environ", {"SYNC_WHISPER_CPU_THREADS": "8"}, clear=False
-        ):
+        first = transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
+        with patch.dict("os.environ", {"SYNC_WHISPER_CPU_THREADS": "8"}, clear=False):
             second = transcribe_audio_in_process(
                 "second.wav", timeout_seconds=2.0, _start_method="fork"
             )
@@ -123,9 +115,7 @@ def test_worker_restarts_after_error() -> None:
 
     with patch("stage2.whisper_process.transcribe_audio", side_effect=fail_transcription):
         with pytest.raises(WhisperProcessError, match="RuntimeError: model failed") as exc:
-            transcribe_audio_in_process(
-                "unused.wav", timeout_seconds=2.0, _start_method="fork"
-            )
+            transcribe_audio_in_process("unused.wav", timeout_seconds=2.0, _start_method="fork")
     failed_worker_pid = int(str(exc.value).rsplit(" ", 1)[1])
 
     def succeed(_path, **_kwargs):
@@ -195,9 +185,7 @@ def test_worker_restarts_after_timeout() -> None:
                 "unused.wav",
                 timeout_seconds=0.1,
                 _start_method="fork",
-                progress_callback=lambda _done, _total, pid: timed_out_worker_pids.append(
-                    pid
-                ),
+                progress_callback=lambda _done, _total, pid: timed_out_worker_pids.append(pid),
             )
 
     def succeed(_path, **_kwargs):
@@ -212,9 +200,7 @@ def test_worker_restarts_after_timeout() -> None:
     assert result["worker_pid"] != timed_out_worker_pids[0]
 
 
-@pytest.mark.filterwarnings(
-    "ignore:This process.*multi-threaded.*:DeprecationWarning"
-)
+@pytest.mark.filterwarnings("ignore:This process.*multi-threaded.*:DeprecationWarning")
 def test_shutdown_does_not_wait_for_long_running_request() -> None:
     worker_started = threading.Event()
     errors = []

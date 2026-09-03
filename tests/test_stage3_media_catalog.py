@@ -14,16 +14,20 @@ def _probe_result(*, duration: str = "12.5", rate: str = "25/1"):
     return subprocess.CompletedProcess(
         args=[],
         returncode=0,
-        stdout=json.dumps({
-            "format": {"duration": duration},
-            "streams": [{
-                "codec_type": "video",
-                "avg_frame_rate": rate,
-                "r_frame_rate": rate,
-                "width": 1920,
-                "height": 1080,
-            }],
-        }),
+        stdout=json.dumps(
+            {
+                "format": {"duration": duration},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "avg_frame_rate": rate,
+                        "r_frame_rate": rate,
+                        "width": 1920,
+                        "height": 1080,
+                    }
+                ],
+            }
+        ),
         stderr="",
     )
 
@@ -100,9 +104,7 @@ def test_unchanged_file_uses_persistent_ffprobe_cache(tmp_path: Path) -> None:
 
     assert calls == 1
     assert second["sources"] == first["sources"]
-    cache = json.loads(
-        (root / "work" / "stage3_ffprobe_cache.json").read_text(encoding="utf-8")
-    )
+    cache = json.loads((root / "work" / "stage3_ffprobe_cache.json").read_text(encoding="utf-8"))
     assert cache["version"] == 1
     assert list(cache["entries"]) == ["project/clip.mp4"]
 
@@ -155,17 +157,13 @@ def test_deleted_file_is_pruned_from_ffprobe_cache(tmp_path: Path) -> None:
     video = folder / "clip.mp4"
     video.write_bytes(b"video")
 
-    scan_media_directory(
-        str(folder), media_root=root, run=lambda *_a, **_k: _probe_result()
-    )
+    scan_media_directory(str(folder), media_root=root, run=lambda *_a, **_k: _probe_result())
     video.unlink()
     result = scan_media_directory(
         str(folder), media_root=root, run=lambda *_a, **_k: _probe_result()
     )
 
-    cache = json.loads(
-        (root / "work" / "stage3_ffprobe_cache.json").read_text(encoding="utf-8")
-    )
+    cache = json.loads((root / "work" / "stage3_ffprobe_cache.json").read_text(encoding="utf-8"))
     assert result["sources"] == []
     assert cache["entries"] == {}
 
@@ -179,9 +177,7 @@ def test_corrupt_ffprobe_cache_is_rebuilt_atomically(tmp_path: Path) -> None:
     cache.parent.mkdir()
     cache.write_text("{not-json", encoding="utf-8")
 
-    scan_media_directory(
-        str(folder), media_root=root, run=lambda *_a, **_k: _probe_result()
-    )
+    scan_media_directory(str(folder), media_root=root, run=lambda *_a, **_k: _probe_result())
 
     rebuilt = json.loads(cache.read_text(encoding="utf-8"))
     assert rebuilt["version"] == 1
@@ -198,9 +194,7 @@ def test_cache_symlink_cannot_escape_media_root(tmp_path: Path) -> None:
     (root / "work").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(MediaCatalogError, match="cache resolves outside"):
-        scan_media_directory(
-            str(folder), media_root=root, run=lambda *_a, **_k: _probe_result()
-        )
+        scan_media_directory(str(folder), media_root=root, run=lambda *_a, **_k: _probe_result())
 
     assert list(outside.iterdir()) == []
 
@@ -238,16 +232,18 @@ def test_scan_accepts_audio_only_media(tmp_path: Path, extension: str) -> None:
 
     def fake_run(*_args, **_kwargs):
         return subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({
-                "format": {"duration": "42.25"},
-                "streams": [{"codec_type": "audio"}],
-            }), stderr="",
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "format": {"duration": "42.25"},
+                    "streams": [{"codec_type": "audio"}],
+                }
+            ),
+            stderr="",
         )
 
-    source = scan_media_directory(
-        str(folder), media_root=root, run=fake_run
-    )["sources"][0]
+    source = scan_media_directory(str(folder), media_root=root, run=fake_run)["sources"][0]
 
     assert source["name"] == audio.name
     assert source["duration_sec"] == 42.25

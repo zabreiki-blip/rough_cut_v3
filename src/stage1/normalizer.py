@@ -81,8 +81,20 @@ _BUILTIN_MARKERS = {
     "ведущая": BlockType.HOST.value,
 }
 _TECH_MARKERS = {
-    "видео", "лайф", "титр", "титры", "плашка", "графика", "карта", "фото",
-    "архив", "отбивка", "шапка", "склейка", "ремарка", "техническое",
+    "видео",
+    "лайф",
+    "титр",
+    "титры",
+    "плашка",
+    "графика",
+    "карта",
+    "фото",
+    "архив",
+    "отбивка",
+    "шапка",
+    "склейка",
+    "ремарка",
+    "техническое",
 }
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
@@ -95,15 +107,11 @@ _SYNC_METADATA = re.compile(
     r"[.\s–\-]*(.*)$",
     re.DOTALL,
 )
-_SYNC_LABEL_METADATA = re.compile(
-    r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*(.{2,160})$"
-)
+_SYNC_LABEL_METADATA = re.compile(r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*(.{2,160})$")
 _SYNC_NAME_ONLY_LABEL = re.compile(
     r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*$"
 )
-_SYNC_CONTINUATION_NOTE = re.compile(
-    r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE
-)
+_SYNC_CONTINUATION_NOTE = re.compile(r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE)
 _SYNC_FRAGMENT = re.compile(
     rf"(?P<start>{_TIMECODE_TOKEN})"
     rf"(?:\s*[-–—]\s*(?P<end>{_TIMECODE_TOKEN}))?"
@@ -148,15 +156,36 @@ _STRUCTURAL_HEADING = re.compile(
 # module constant so it can later be promoted into a learnable
 # NormalizationMemory rule instead of a hardcoded regex.
 _VIDEO_CUE_KEYWORDS = (
-    "планы", "план", "портреты", "портрет", "бюст", "камень", "интерьер",
-    "экстерьер", "детали", "деталь", "крупный план", "панорама", "проход",
-    "коптер", "дрон", "архив", "фотографии", "фотография", "фото",
-    "съёмка", "съемка", "кадры", "кадр", "виды", "вид",
+    "планы",
+    "план",
+    "портреты",
+    "портрет",
+    "бюст",
+    "камень",
+    "интерьер",
+    "экстерьер",
+    "детали",
+    "деталь",
+    "крупный план",
+    "панорама",
+    "проход",
+    "коптер",
+    "дрон",
+    "архив",
+    "фотографии",
+    "фотография",
+    "фото",
+    "съёмка",
+    "съемка",
+    "кадры",
+    "кадр",
+    "виды",
+    "вид",
 )
 _VIDEO_CUE_KEYWORD_RE = re.compile(
-    r"\b(?:" + "|".join(
-        re.escape(word) for word in sorted(_VIDEO_CUE_KEYWORDS, key=len, reverse=True)
-    ) + r")\b",
+    r"\b(?:"
+    + "|".join(re.escape(word) for word in sorted(_VIDEO_CUE_KEYWORDS, key=len, reverse=True))
+    + r")\b",
     re.IGNORECASE,
 )
 
@@ -198,11 +227,13 @@ def _video_cue_keyword_pattern(memory: NormalizationMemory | None) -> re.Pattern
     if keywords == set(_VIDEO_CUE_KEYWORDS):
         return _VIDEO_CUE_KEYWORD_RE
     return re.compile(
-        r"\b(?:" + "|".join(
-            re.escape(word) for word in sorted(keywords, key=len, reverse=True)
-        ) + r")\b",
+        r"\b(?:"
+        + "|".join(re.escape(word) for word in sorted(keywords, key=len, reverse=True))
+        + r")\b",
         re.IGNORECASE,
     )
+
+
 # Coarse heuristic for a Russian personal (finite) verb form: past tense
 # (-л/-ла/-ло/-ли, incl. reflexive -лся/-лась/-лись) and present/future
 # 3rd-person and plural endings. It is intentionally approximate: a false
@@ -234,10 +265,10 @@ _OPENROUTER_SYSTEM_PROMPT = "You normalize TV production scripts."
 _OPENROUTER_INSTRUCTIONS = (
     "Classify every scenario paragraph without deleting or merging any item. "
     "Allowed types: voiceover, sync, host, technical, other, unknown. "
-    "Return JSON {\"items\":[{\"uid\":...,\"type\":...,\"confidence\":0..1,"
-    "\"label_is_marker\":true|false,"
-    "\"text_for_tts\":...,\"speaker\":...,\"role\":...,"
-    "\"timecode_start\":...,\"timecode_end\":...,\"notes\":...}]}. "
+    'Return JSON {"items":[{"uid":...,"type":...,"confidence":0..1,'
+    '"label_is_marker":true|false,'
+    '"text_for_tts":...,"speaker":...,"role":...,'
+    '"timecode_start":...,"timecode_end":...,"notes":...}]}. '
     "Use unknown when unsure. Do not rewrite original content. "
     "An item with continuation_of_type=voiceover is an unlabelled paragraph "
     "continuing the preceding voiceover unless its text clearly starts a new "
@@ -370,9 +401,9 @@ def _generate_normalization_unlocked(
                 )
                 for payload in payloads
             ]
-            batch_results: list[
-                tuple[list[dict[str, Any]] | None, Exception | None]
-            ] = [(None, None) for _ in batches]
+            batch_results: list[tuple[list[dict[str, Any]] | None, Exception | None]] = [
+                (None, None) for _ in batches
+            ]
             pending: list[int] = []
             for index, (payload, cache_key) in enumerate(zip(payloads, cache_keys)):
                 cached = _llm_cached_results(cache, cache_key, payload)
@@ -388,10 +419,7 @@ def _generate_normalization_unlocked(
             # tests and custom integrations.
             if classifier is None and len(pending) > 1:
                 with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
-                    futures = {
-                        pool.submit(llm, payloads[index], hint): index
-                        for index in pending
-                    }
+                    futures = {pool.submit(llm, payloads[index], hint): index for index in pending}
                     for future in as_completed(futures):
                         index = futures[future]
                         try:
@@ -503,9 +531,7 @@ def save_normalization(
     expected_revision: int | None = None,
 ) -> dict[str, Any]:
     with _path_lock(path):
-        return _save_normalization_unlocked(
-            path, payload, expected_revision=expected_revision
-        )
+        return _save_normalization_unlocked(path, payload, expected_revision=expected_revision)
 
 
 def _save_normalization_unlocked(
@@ -517,14 +543,20 @@ def _save_normalization_unlocked(
     """Save user edits as a new draft revision, preserving source identity."""
     path = Path(path)
     current = NormalizedScenario.from_dict(read_json(path)) if path.exists() else None
-    if current is not None and expected_revision is not None and current.revision != expected_revision:
+    if (
+        current is not None
+        and expected_revision is not None
+        and current.revision != expected_revision
+    ):
         raise RevisionConflictError(
             f"Expected revision {expected_revision}, current revision is {current.revision}"
         )
     incoming = NormalizedScenario.from_dict(payload)
     if current is not None:
         if incoming.source_hash != current.source_hash or incoming.source != current.source:
-            raise SourceChangedError("Source and source_hash cannot be changed while editing a draft")
+            raise SourceChangedError(
+                "Source and source_hash cannot be changed while editing a draft"
+            )
         previous = {block.uid: block for block in current.blocks}
         for block in incoming.blocks:
             old = previous.get(block.uid)
@@ -544,8 +576,7 @@ def _save_normalization_unlocked(
                     block.label_confirmed = True
                     block.normalized_text = content
             if old is not None and (
-                block.type != old.type
-                or block.original_label != old.original_label
+                block.type != old.type or block.original_label != old.original_label
             ):
                 block.source = DecisionSource.MANUAL.value
                 block.confidence = 1.0
@@ -632,9 +663,7 @@ def _confirm_normalization_unlocked(
         len(scenario.blocks),
     )
     try:
-        _learn_from_confirmation(
-            scenario, resolved_memory_path, learning_candidates, decisions
-        )
+        _learn_from_confirmation(scenario, resolved_memory_path, learning_candidates, decisions)
     except Exception as exc:
         # Publishing the confirmed scenario is authoritative. A memory failure
         # must not roll it back or make downstream projections inconsistent.
@@ -661,7 +690,11 @@ def preview_learning_candidates(
 
 
 def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> list[str]:
-    value = scenario if isinstance(scenario, NormalizedScenario) else NormalizedScenario.from_dict(scenario)
+    value = (
+        scenario
+        if isinstance(scenario, NormalizedScenario)
+        else NormalizedScenario.from_dict(scenario)
+    )
     errors: list[str] = []
     try:
         _validate_structure(value)
@@ -700,7 +733,9 @@ def import_legacy_normalization(
     if not source.exists() and raw_text:
         source = Path(output_path).parent / "scenario_legacy_source.txt"
         _atomic_write_text(source, raw_text)
-    source_hash = _file_hash(source) if source.exists() else sha256(raw_text.encode("utf-8")).hexdigest()
+    source_hash = (
+        _file_hash(source) if source.exists() else sha256(raw_text.encode("utf-8")).hexdigest()
+    )
     blocks: list[NormalizedBlock] = []
     prepared_items = list(prepared.get("items", []))
     if raw_text.strip():
@@ -716,71 +751,110 @@ def import_legacy_normalization(
         for segment in legacy_timeline.segments:
             order = len(blocks) + 1
             if segment.type == "zk":
-                item = prepared_items[voiceover_index] if voiceover_index < len(prepared_items) else {}
+                item = (
+                    prepared_items[voiceover_index] if voiceover_index < len(prepared_items) else {}
+                )
                 voiceover_index += 1
                 original = str(item.get("text_original") or segment.text).strip()
-                blocks.append(NormalizedBlock(
-                    uid=f"legacy-{order}-{uuid4().hex[:8]}", order=order,
-                    original_text=original, normalized_text=original,
-                    text_for_tts=str(item.get("text_for_tts") or original).strip(),
-                    original_label=f"ЗК{voiceover_index}", label_confirmed=True,
-                    type=BlockType.VOICEOVER.value,
-                    source=DecisionSource.MANUAL.value, confidence=1.0,
-                    notes="imported_from_legacy",
-                ))
+                blocks.append(
+                    NormalizedBlock(
+                        uid=f"legacy-{order}-{uuid4().hex[:8]}",
+                        order=order,
+                        original_text=original,
+                        normalized_text=original,
+                        text_for_tts=str(item.get("text_for_tts") or original).strip(),
+                        original_label=f"ЗК{voiceover_index}",
+                        label_confirmed=True,
+                        type=BlockType.VOICEOVER.value,
+                        source=DecisionSource.MANUAL.value,
+                        confidence=1.0,
+                        notes="imported_from_legacy",
+                    )
+                )
             elif segment.type == "snh":
-                blocks.append(NormalizedBlock(
-                    uid=f"legacy-{order}-{uuid4().hex[:8]}", order=order,
-                    original_text=segment.text, normalized_text=segment.text,
-                    original_label="СНХ", label_confirmed=True, type=BlockType.SYNC.value,
-                    source=DecisionSource.MANUAL.value, confidence=1.0,
-                    speaker=segment.speaker, role=segment.role,
-                    timecode_start=segment.timecode, notes="imported_from_legacy",
-                ))
+                blocks.append(
+                    NormalizedBlock(
+                        uid=f"legacy-{order}-{uuid4().hex[:8]}",
+                        order=order,
+                        original_text=segment.text,
+                        normalized_text=segment.text,
+                        original_label="СНХ",
+                        label_confirmed=True,
+                        type=BlockType.SYNC.value,
+                        source=DecisionSource.MANUAL.value,
+                        confidence=1.0,
+                        speaker=segment.speaker,
+                        role=segment.role,
+                        timecode_start=segment.timecode,
+                        notes="imported_from_legacy",
+                    )
+                )
             else:
                 label, content = _split_label(segment.text)
                 marker_type = _BUILTIN_MARKERS.get(normalize_marker(label))
                 block_type = marker_type or BlockType.TECHNICAL.value
-                blocks.append(NormalizedBlock(
-                    uid=f"legacy-{order}-{uuid4().hex[:8]}", order=order,
-                    original_text=segment.text,
-                    normalized_text=content if marker_type and content else segment.text,
-                    original_label=label, label_confirmed=bool(label), type=block_type,
-                    source=DecisionSource.MANUAL.value, confidence=1.0,
-                    speaker=label if block_type == BlockType.HOST.value else "",
-                    notes="imported_from_legacy",
-                ))
+                blocks.append(
+                    NormalizedBlock(
+                        uid=f"legacy-{order}-{uuid4().hex[:8]}",
+                        order=order,
+                        original_text=segment.text,
+                        normalized_text=content if marker_type and content else segment.text,
+                        original_label=label,
+                        label_confirmed=bool(label),
+                        type=block_type,
+                        source=DecisionSource.MANUAL.value,
+                        confidence=1.0,
+                        speaker=label if block_type == BlockType.HOST.value else "",
+                        notes="imported_from_legacy",
+                    )
+                )
         for item in prepared_items[voiceover_index:]:
             order = len(blocks) + 1
             original = str(item.get("text_original", "")).strip()
-            blocks.append(NormalizedBlock(
-                uid=f"legacy-{order}-{uuid4().hex[:8]}", order=order,
-                original_text=original, normalized_text=original,
-                text_for_tts=str(item.get("text_for_tts", original)).strip(),
-                original_label=f"ЗК{voiceover_index + 1}", label_confirmed=True,
-                type=BlockType.VOICEOVER.value,
-                source=DecisionSource.MANUAL.value, confidence=1.0,
-                notes="imported_from_legacy_missing_in_raw",
-            ))
+            blocks.append(
+                NormalizedBlock(
+                    uid=f"legacy-{order}-{uuid4().hex[:8]}",
+                    order=order,
+                    original_text=original,
+                    normalized_text=original,
+                    text_for_tts=str(item.get("text_for_tts", original)).strip(),
+                    original_label=f"ЗК{voiceover_index + 1}",
+                    label_confirmed=True,
+                    type=BlockType.VOICEOVER.value,
+                    source=DecisionSource.MANUAL.value,
+                    confidence=1.0,
+                    notes="imported_from_legacy_missing_in_raw",
+                )
+            )
             voiceover_index += 1
     else:
         for item in prepared_items:
             order = len(blocks) + 1
             original = str(item.get("text_original", "")).strip()
-            blocks.append(NormalizedBlock(
-                uid=f"legacy-{order}-{uuid4().hex[:8]}", order=order,
-                original_text=original, normalized_text=original,
-                text_for_tts=str(item.get("text_for_tts", original)).strip(),
-                original_label=f"ЗК{order}", label_confirmed=True,
-                type=BlockType.VOICEOVER.value,
-                source=DecisionSource.MANUAL.value, confidence=1.0,
-                notes="imported_from_legacy",
-            ))
+            blocks.append(
+                NormalizedBlock(
+                    uid=f"legacy-{order}-{uuid4().hex[:8]}",
+                    order=order,
+                    original_text=original,
+                    normalized_text=original,
+                    text_for_tts=str(item.get("text_for_tts", original)).strip(),
+                    original_label=f"ЗК{order}",
+                    label_confirmed=True,
+                    type=BlockType.VOICEOVER.value,
+                    source=DecisionSource.MANUAL.value,
+                    confidence=1.0,
+                    notes="imported_from_legacy",
+                )
+            )
     now = _utcnow()
     _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
-        source=str(source), source_hash=source_hash, blocks=blocks,
-        status=NormalizationStatus.DRAFT.value, created_at=now, updated_at=now,
+        source=str(source),
+        source_hash=source_hash,
+        blocks=blocks,
+        status=NormalizationStatus.DRAFT.value,
+        created_at=now,
+        updated_at=now,
         warnings=["Imported legacy data requires confirmation"],
     )
     result = scenario.to_dict()
@@ -868,9 +942,7 @@ def _looks_like_sync_continuation(text: str) -> bool:
     return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё]|И(?:\s|$))", text.lstrip()))
 
 
-def _looks_like_video_cue(
-    text: str, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
-) -> bool:
+def _looks_like_video_cue(text: str, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE) -> bool:
     """Detect an unmarked "video cue": a shot-list remark describing footage
     to show on screen (e.g. "Мраморный бюст Марии"), not spoken narration.
 
@@ -925,7 +997,7 @@ def _starts_with_unambiguous_timecode(text: str) -> bool:
 
     # Two-component dot notation (for example 23.05) is ambiguous with a date.
     # Treat it as a timecode only when an explicit range removes that ambiguity.
-    remainder = stripped[match.end():]
+    remainder = stripped[match.end() :]
     return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", remainder))
 
 
@@ -967,8 +1039,7 @@ def _split_label(text: str) -> tuple[str, str]:
         content = speaker.group(2).strip()
         sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
         if (
-            _SYNC_LABEL_METADATA.match(candidate)
-            or _SYNC_NAME_ONLY_LABEL.match(candidate)
+            _SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate)
         ) and _TIMECODE.match(sync_content):
             return candidate, content
     # Some scripts put a timecode directly after the speaker credit, without a
@@ -979,10 +1050,7 @@ def _split_label(text: str) -> tuple[str, str]:
     )
     if timecoded_speaker:
         candidate = timecoded_speaker.group(1).strip()
-        if (
-            _SYNC_LABEL_METADATA.match(candidate)
-            or _SYNC_NAME_ONLY_LABEL.match(candidate)
-        ):
+        if _SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate):
             return candidate, timecoded_speaker.group(2).strip()
     generic = re.match(r"^\s*([^:\n]{1,60}?)\s*:\s*(.+)$", text, flags=re.DOTALL)
     if generic:
@@ -1026,7 +1094,9 @@ def _classify_by_rules(
             return
         if exact:
             rule = exact["rule"]
-            _apply_type(block, rule["target_type"], DecisionSource.MEMORY.value, float(rule["confidence"]))
+            _apply_type(
+                block, rule["target_type"], DecisionSource.MEMORY.value, float(rule["confidence"])
+            )
             block.memory_rule_id = int(rule["id"])
             return
         suggestion = memory.suggest(marker)
@@ -1040,36 +1110,23 @@ def _classify_by_rules(
     _label, content = _split_label(block.original_text)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
     if (
-        (
-            _SYNC_LABEL_METADATA.match(block.original_label)
-            or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
-        )
-        and _TIMECODE.match(sync_content)
-    ):
+        _SYNC_LABEL_METADATA.match(block.original_label)
+        or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
+    ) and _TIMECODE.match(sync_content):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif _starts_with_unambiguous_timecode(stripped) or re.match(
-        r"^\s*\((?:…|\.\.\.)\)", stripped
-    ):
+    elif _starts_with_unambiguous_timecode(stripped) or re.match(r"^\s*\((?:…|\.\.\.)\)", stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _EDITORIAL_TIMECODE_PREFIX.match(stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _STRUCTURAL_HEADING.match(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif (
-        _BARE_SPEAKER_PREFIX.match(stripped)
-        and block.original_label
-        and len(content) >= 40
-    ):
+    elif _BARE_SPEAKER_PREFIX.match(stripped) and block.original_label and len(content) >= 40:
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE) or (
         not block.original_label and _looks_like_video_cue(stripped, video_cue_re)
     ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif (
-        block.order == 1
-        and not block.original_label
-        and _looks_like_scenario_title(stripped)
-    ):
+    elif block.order == 1 and not block.original_label and _looks_like_scenario_title(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif stripped.startswith("(") and stripped.endswith(")"):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.8)
@@ -1099,7 +1156,7 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     if match:
         block.speaker = match.group(1).strip()
         block.role = match.group(2).strip()
-        fragment_source = block.normalized_text[match.start(3):].strip()
+        fragment_source = block.normalized_text[match.start(3) :].strip()
         has_sync_metadata = True
     else:
         label_match = _SYNC_LABEL_METADATA.match(block.original_label)
@@ -1140,11 +1197,13 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
         fragment_text = match.group("text").strip(" \t\r\n–—-")
         if not fragment_text:
             continue
-        fragments.append(SyncFragment(
-            text=fragment_text,
-            timecode_start=_canonicalize_timecode(match.group("start")),
-            timecode_end=_canonicalize_timecode(match.group("end") or ""),
-        ))
+        fragments.append(
+            SyncFragment(
+                text=fragment_text,
+                timecode_start=_canonicalize_timecode(match.group("start")),
+                timecode_end=_canonicalize_timecode(match.group("end") or ""),
+            )
+        )
     return fragments
 
 
@@ -1247,9 +1306,7 @@ def _classifier_identity(
     return {
         "kind": "custom",
         "module": getattr(classifier, "__module__", type(classifier).__module__),
-        "qualname": getattr(
-            classifier, "__qualname__", type(classifier).__qualname__
-        ),
+        "qualname": getattr(classifier, "__qualname__", type(classifier).__qualname__),
         "code_hash": code_hash,
     }
 
@@ -1265,9 +1322,7 @@ def _stable_code_identity(code: Any) -> dict[str, Any]:
             return {
                 "frozenset": sorted(
                     items,
-                    key=lambda item: json.dumps(
-                        item, ensure_ascii=False, sort_keys=True
-                    ),
+                    key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
                 )
             }
         if isinstance(value, (str, int, float, bool, type(None))):
@@ -1324,16 +1379,11 @@ def _llm_rules_signature(memory: NormalizationMemory) -> str:
         "confidence_threshold": _LLM_CONFIDENCE_THRESHOLD,
         "memory_rules": memory_rules,
     }
-    return sha256(
-        json.dumps(rules, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return sha256(json.dumps(rules, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _stable_llm_input(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {key: value for key, value in item.items() if key != "uid"}
-        for item in payload
-    ]
+    return [{key: value for key, value in item.items() if key != "uid"} for item in payload]
 
 
 def _llm_cache_fingerprint(
@@ -1352,9 +1402,9 @@ def _llm_cache_fingerprint(
         "rules_signature": rules_signature,
     }
     return sha256(
-        json.dumps(
-            material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
@@ -1396,9 +1446,7 @@ def _llm_cached_results(
     if not isinstance(entry, dict) or not isinstance(entry.get("results"), list):
         return None
     decisions = entry["results"]
-    if len(decisions) != len(payload) or not all(
-        isinstance(item, dict) for item in decisions
-    ):
+    if len(decisions) != len(payload) or not all(isinstance(item, dict) for item in decisions):
         return None
     restored: list[dict[str, Any]] = []
     for request, decision in zip(payload, decisions):
@@ -1481,20 +1529,24 @@ def _openrouter_classifier(
     except ImportError as exc:
         raise RuntimeError("requests is not installed") from exc
     prompt = _OPENROUTER_INSTRUCTIONS + (
-        f"Author hint: {hint or '(none)'}. "
-        f"Items: {json.dumps(blocks, ensure_ascii=False)}"
+        f"Author hint: {hint or '(none)'}. Items: {json.dumps(blocks, ensure_ascii=False)}"
     )
     json_body: dict[str, Any] = {
         "model": settings.openrouter_model,
-        "messages": [{"role": "system", "content": _OPENROUTER_SYSTEM_PROMPT},
-                     {"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": _OPENROUTER_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
     if llm_preset == "fast":
         json_body["provider"] = {"sort": "throughput"}
     request_kwargs = {
-        "headers": {"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
+        "headers": {
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+        },
         "json": json_body,
         "timeout": 120,
     }
@@ -1507,11 +1559,11 @@ def _openrouter_classifier(
         except requests.RequestException:
             if attempt == 2:
                 raise
-            time.sleep(2 ** attempt)
+            time.sleep(2**attempt)
             continue
         if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
             break
-        time.sleep(2 ** attempt)
+        time.sleep(2**attempt)
     assert response is not None
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
@@ -1522,7 +1574,7 @@ def _openrouter_classifier(
         start, end = content.find("{"), content.rfind("}")
         if start < 0 or end <= start:
             raise ValueError("OpenRouter response does not contain a JSON object")
-        content = content[start:end + 1]
+        content = content[start : end + 1]
     parsed = json.loads(content)
     items = parsed.get("items", [])
     if not isinstance(items, list):
@@ -1558,7 +1610,9 @@ def _prepared_projection(scenario: NormalizedScenario) -> dict[str, Any]:
     return {
         "source": scenario.source,
         "used_llm": any(block.source == DecisionSource.LLM.value for block in scenario.blocks),
-        "manual_markers_used": any(block.source == DecisionSource.MANUAL.value for block in scenario.blocks),
+        "manual_markers_used": any(
+            block.source == DecisionSource.MANUAL.value for block in scenario.blocks
+        ),
         "extraction_method": "normalization",
         "normalization_revision": scenario.revision,
         "scenario_revision_id": scenario.scenario_revision_id,
@@ -1580,9 +1634,12 @@ def _prepared_projection(scenario: NormalizedScenario) -> dict[str, Any]:
 def _raw_projection(scenario: NormalizedScenario) -> str:
     counters: dict[str, int] = {}
     prefixes = {
-        BlockType.VOICEOVER.value: "ЗК", BlockType.SYNC.value: "СНХ",
-        BlockType.HOST.value: "ВЕДУЩИЙ", BlockType.TECHNICAL.value: "ТЕХ",
-        BlockType.OTHER.value: "ПРОЧЕЕ", BlockType.UNKNOWN.value: "НЕИЗВЕСТНО",
+        BlockType.VOICEOVER.value: "ЗК",
+        BlockType.SYNC.value: "СНХ",
+        BlockType.HOST.value: "ВЕДУЩИЙ",
+        BlockType.TECHNICAL.value: "ТЕХ",
+        BlockType.OTHER.value: "ПРОЧЕЕ",
+        BlockType.UNKNOWN.value: "НЕИЗВЕСТНО",
     }
     lines: list[str] = []
     for block in scenario.blocks:
@@ -1628,28 +1685,28 @@ def _infer_learning_candidates(
         if memory.is_suppressed(block.original_label):
             continue
         matching = [r for r in rules if r["normalized_marker"] == normalized]
-        if any(
-            r["target_type"] == block.type and r["status"] == "active"
-            for r in matching
-        ):
+        if any(r["target_type"] == block.type and r["status"] == "active" for r in matching):
             continue
         candidate_id = sha256(
             f"correction-v1\n{normalized}\n{from_type}\n{block.type}".encode("utf-8")
         ).hexdigest()[:20]
-        item = candidates.setdefault(candidate_id, {
-            "id": candidate_id,
-            "marker": block.original_label,
-            "normalized_marker": normalized,
-            "from_type": from_type,
-            "target_type": block.type,
-            "reason": "manual_type_change",
-            "block_uids": [],
-            "orders": [],
-            "snippets": [],
-            "status": "new",
-            "confirmations": 0,
-            "required_confirmations": 2,
-        })
+        item = candidates.setdefault(
+            candidate_id,
+            {
+                "id": candidate_id,
+                "marker": block.original_label,
+                "normalized_marker": normalized,
+                "from_type": from_type,
+                "target_type": block.type,
+                "reason": "manual_type_change",
+                "block_uids": [],
+                "orders": [],
+                "snippets": [],
+                "status": "new",
+                "confirmations": 0,
+                "required_confirmations": 2,
+            },
+        )
         item["block_uids"].append(block.uid)
         item["orders"].append(block.order)
         item["snippets"].append(content[:160])
@@ -1697,10 +1754,15 @@ def _learn_from_confirmation(
             elif action == "never":
                 memory.suppress_marker(candidate["marker"])
         for block in scenario.blocks:
-            if not block.original_label or not block.label_confirmed or block.type in {
-                BlockType.UNKNOWN.value,
-                BlockType.OTHER.value,
-            }:
+            if (
+                not block.original_label
+                or not block.label_confirmed
+                or block.type
+                in {
+                    BlockType.UNKNOWN.value,
+                    BlockType.OTHER.value,
+                }
+            ):
                 continue
             if block.source == DecisionSource.MANUAL.value:
                 if block.memory_rule_id:

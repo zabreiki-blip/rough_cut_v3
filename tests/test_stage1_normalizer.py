@@ -98,29 +98,39 @@ class NormalizerTests(unittest.TestCase):
     def test_load_preserves_stage4_block_versioning_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "normalized.json"
-            path.write_text(json.dumps({
-                "source": "/tmp/scenario.docx",
-                "source_hash": "abc",
-                "blocks": [{
-                    "uid": "stable-block",
-                    "order": 1,
-                    "original_text": "Изменённый текст",
-                    "normalized_text": "Изменённый текст",
-                    "versioning": {
-                        "import_uid": "import-block",
-                        "parent_block_uid": "stable-block",
-                        "change_status": "edited",
-                    },
-                }],
-            }), encoding="utf-8")
+            path.write_text(
+                json.dumps(
+                    {
+                        "source": "/tmp/scenario.docx",
+                        "source_hash": "abc",
+                        "blocks": [
+                            {
+                                "uid": "stable-block",
+                                "order": 1,
+                                "original_text": "Изменённый текст",
+                                "normalized_text": "Изменённый текст",
+                                "versioning": {
+                                    "import_uid": "import-block",
+                                    "parent_block_uid": "stable-block",
+                                    "change_status": "edited",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             loaded = load_normalization(path)
 
-            self.assertEqual(loaded["blocks"][0]["versioning"], {
-                "import_uid": "import-block",
-                "parent_block_uid": "stable-block",
-                "change_status": "edited",
-            })
+            self.assertEqual(
+                loaded["blocks"][0]["versioning"],
+                {
+                    "import_uid": "import-block",
+                    "parent_block_uid": "stable-block",
+                    "change_status": "edited",
+                },
+            )
 
     def test_docx_soft_line_break_stays_inside_voiceover_block(self) -> None:
         from docx import Document
@@ -156,7 +166,9 @@ class NormalizerTests(unittest.TestCase):
             document.save(source)
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )
 
@@ -176,10 +188,14 @@ class NormalizerTests(unittest.TestCase):
             source.write_text("ДИКТОР: Первый абзац\nПродолжение закадра\n", encoding="utf-8")
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )
-            self.assertEqual([block["type"] for block in result["blocks"]], ["voiceover", "voiceover"])
+            self.assertEqual(
+                [block["type"] for block in result["blocks"]], ["voiceover", "voiceover"]
+            )
             self.assertEqual(result["blocks"][1]["continuation_of_type"], "voiceover")
             self.assertEqual(result["blocks"][1]["text_for_tts"], "Продолжение закадра")
 
@@ -275,7 +291,9 @@ class NormalizerTests(unittest.TestCase):
                 memory.record_manual("Голос автора", "voiceover")
             source = root / "scenario.txt"
             source.write_text("ГОЛОС АВТОРА: Текст\n", encoding="utf-8")
-            result = generate_normalization(source, root / "out.json", memory_path=db, use_llm=False)
+            result = generate_normalization(
+                source, root / "out.json", memory_path=db, use_llm=False
+            )
             self.assertEqual(result["blocks"][0]["type"], "voiceover")
             self.assertEqual(result["blocks"][0]["source"], "memory")
 
@@ -311,11 +329,17 @@ class NormalizerTests(unittest.TestCase):
                 )
                 self.assertEqual(len(candidates), 1)
                 confirm_normalization(
-                    normalized, root / f"prepared-{index}.json", root / f"raw-{index}.txt",
-                    memory_path=db, expected_revision=saved["revision"],
-                    learning_decisions=[{
-                        "candidate_id": candidates[0]["id"], "action": "remember",
-                    }],
+                    normalized,
+                    root / f"prepared-{index}.json",
+                    root / f"raw-{index}.txt",
+                    memory_path=db,
+                    expected_revision=saved["revision"],
+                    learning_decisions=[
+                        {
+                            "candidate_id": candidates[0]["id"],
+                            "action": "remember",
+                        }
+                    ],
                 )
 
             with NormalizationMemory(db) as memory:
@@ -344,11 +368,17 @@ class NormalizerTests(unittest.TestCase):
                 normalized, memory_path=db, expected_revision=saved["revision"]
             )
             confirm_normalization(
-                normalized, root / "never-prepared.json", root / "never-raw.txt",
-                memory_path=db, expected_revision=saved["revision"],
-                learning_decisions=[{
-                    "candidate_id": candidates[0]["id"], "action": "never",
-                }],
+                normalized,
+                root / "never-prepared.json",
+                root / "never-raw.txt",
+                memory_path=db,
+                expected_revision=saved["revision"],
+                learning_decisions=[
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "action": "never",
+                    }
+                ],
             )
             second_path, second = corrected_draft(2)
             self.assertEqual(
@@ -377,10 +407,15 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["role"], "эксперт")
             self.assertEqual(block["timecode_start"], "01.02.03")
             self.assertEqual(block["normalized_text"], "Ответ героя")
-            self.assertEqual(block["sync_fragments"], [{
-                "text": "Ответ героя",
-                "timecode_start": "01.02.03",
-            }])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Ответ героя",
+                        "timecode_start": "01.02.03",
+                    }
+                ],
+            )
 
     def test_sync_speaker_block_can_contain_multiple_timecoded_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -404,23 +439,26 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["role"], "ИСТОРИК")
             self.assertEqual(block["timecode_start"], "01:22:29")
             self.assertEqual(block["timecode_end"], "")
-            self.assertEqual(block["sync_fragments"], [
-                {
-                    "text": (
-                        "Шодэ приехал к нам из Одессы, где его семья жила с середины "
-                        "19-ого века. Образование он получил во Франции художественное."
-                    ),
-                    "timecode_start": "01:22:29",
-                },
-                {
-                    "text": "Был он человеком очень восприимчивым к разным стилям.",
-                    "timecode_start": "01:23:36",
-                },
-                {
-                    "text": "Он строил особняки многофасадные.",
-                    "timecode_start": "01:24:11",
-                },
-            ])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": (
+                            "Шодэ приехал к нам из Одессы, где его семья жила с середины "
+                            "19-ого века. Образование он получил во Франции художественное."
+                        ),
+                        "timecode_start": "01:22:29",
+                    },
+                    {
+                        "text": "Был он человеком очень восприимчивым к разным стилям.",
+                        "timecode_start": "01:23:36",
+                    },
+                    {
+                        "text": "Он строил особняки многофасадные.",
+                        "timecode_start": "01:24:11",
+                    },
+                ],
+            )
 
     def test_sync_fragments_survive_docx_soft_line_breaks(self) -> None:
         from docx import Document
@@ -430,9 +468,7 @@ class NormalizerTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "scenario.docx"
             document = Document()
-            paragraph = document.add_paragraph(
-                "ИРИНА КОТОВА, ИСТОРИК: 01:22:29. Первый фрагмент"
-            )
+            paragraph = document.add_paragraph("ИРИНА КОТОВА, ИСТОРИК: 01:22:29. Первый фрагмент")
             paragraph.add_run().add_break(WD_BREAK.LINE)
             paragraph.add_run("01:23:36. Второй фрагмент")
             paragraph.add_run().add_break(WD_BREAK.LINE)
@@ -482,8 +518,12 @@ class NormalizerTests(unittest.TestCase):
             )["blocks"]
 
             self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
-            self.assertEqual([block["speaker"] for block in blocks], ["ЕЛЕНА САДОВНИК", "ИРИНА КОТОВА"])
-            self.assertEqual([block["timecode_start"] for block in blocks], ["00:31:16", "01:25:03"])
+            self.assertEqual(
+                [block["speaker"] for block in blocks], ["ЕЛЕНА САДОВНИК", "ИРИНА КОТОВА"]
+            )
+            self.assertEqual(
+                [block["timecode_start"] for block in blocks], ["00:31:16", "01:25:03"]
+            )
 
     def test_known_voiceover_marker_precedes_generic_dash_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -688,10 +728,15 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["type"], "sync")
             self.assertEqual(block["speaker"], "Шпагин")
             self.assertEqual(block["timecode_start"], "18:35")
-            self.assertEqual(block["sync_fragments"], [{
-                "text": "Это решение изменило дальнейшую работу.",
-                "timecode_start": "18:35",
-            }])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Это решение изменило дальнейшую работу.",
+                        "timecode_start": "18:35",
+                    }
+                ],
+            )
 
     def test_prose_with_em_dash_is_not_split_into_a_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -855,9 +900,14 @@ class NormalizerTests(unittest.TestCase):
                 source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
             )["blocks"]
 
-            self.assertEqual([block["type"] for block in blocks], [
-                "voiceover", "technical", "technical",
-            ])
+            self.assertEqual(
+                [block["type"] for block in blocks],
+                [
+                    "voiceover",
+                    "technical",
+                    "technical",
+                ],
+            )
 
     def test_plural_titles_marker_is_technical(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -887,11 +937,16 @@ class NormalizerTests(unittest.TestCase):
 
             self.assertEqual(block["timecode_start"], "01:02:03")
             self.assertEqual(block["timecode_end"], "01:02:08")
-            self.assertEqual(block["sync_fragments"], [{
-                "text": "Ответ героя",
-                "timecode_start": "01:02:03",
-                "timecode_end": "01:02:08",
-            }])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Ответ героя",
+                        "timecode_start": "01:02:03",
+                        "timecode_end": "01:02:08",
+                    }
+                ],
+            )
 
     def test_llm_classifies_only_unresolved_without_drops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -901,13 +956,19 @@ class NormalizerTests(unittest.TestCase):
 
             def classifier(items, _hint):
                 self.assertEqual(len(items), 1)
-                return [{
-                    "uid": items[0]["uid"], "type": "voiceover", "confidence": .8,
-                    "label_is_marker": True,
-                }]
+                return [
+                    {
+                        "uid": items[0]["uid"],
+                        "type": "voiceover",
+                        "confidence": 0.8,
+                        "label_is_marker": True,
+                    }
+                ]
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 classifier=classifier,
             )
             self.assertEqual(len(result["blocks"]), 2)
@@ -921,13 +982,19 @@ class NormalizerTests(unittest.TestCase):
             source.write_text("Москва: сегодня прошёл форум\n", encoding="utf-8")
 
             def classifier(items, _hint):
-                return [{
-                    "uid": items[0]["uid"], "type": "voiceover", "confidence": .9,
-                    "label_is_marker": False,
-                }]
+                return [
+                    {
+                        "uid": items[0]["uid"],
+                        "type": "voiceover",
+                        "confidence": 0.9,
+                        "label_is_marker": False,
+                    }
+                ]
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 classifier=classifier,
             )
 
@@ -995,10 +1062,12 @@ class NormalizerTests(unittest.TestCase):
             source.write_text("Авторский блок\n", encoding="utf-8")
 
             def classifier(items, _hint):
-                return [{"uid": items[0]["uid"], "type": "voiceover", "confidence": .1}]
+                return [{"uid": items[0]["uid"], "type": "voiceover", "confidence": 0.1}]
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 classifier=classifier,
             )
             self.assertEqual(result["blocks"][0]["type"], "unknown")
@@ -1013,10 +1082,7 @@ class NormalizerTests(unittest.TestCase):
 
             def classifier(items, _hint):
                 calls.append(len(items))
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.7}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.7} for item in items]
 
             result = generate_normalization(
                 source,
@@ -1041,10 +1107,7 @@ class NormalizerTests(unittest.TestCase):
             def classifier(items, _hint):
                 self.assertTrue(items)
                 self.assertNotIn("normalized_text", items[0])
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             with patch.object(
                 normalizer_module, "_openrouter_classifier", side_effect=classifier
@@ -1079,8 +1142,7 @@ class NormalizerTests(unittest.TestCase):
                         self.failed = True
                         raise RuntimeError("provider interrupted")
                     return [
-                        {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                        for item in items
+                        {"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items
                     ]
 
             classifier = FlakyClassifier()
@@ -1135,24 +1197,15 @@ class NormalizerTests(unittest.TestCase):
             def classifier(items, _hint):
                 nonlocal calls
                 calls += 1
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             source.write_text("Авторский абзац", encoding="utf-8")
-            generate_normalization(
-                source, output, memory_path=memory_path, classifier=classifier
-            )
-            generate_normalization(
-                source, output, memory_path=memory_path, classifier=classifier
-            )
+            generate_normalization(source, output, memory_path=memory_path, classifier=classifier)
+            generate_normalization(source, output, memory_path=memory_path, classifier=classifier)
             self.assertEqual(calls, 1)
 
             source.write_text("Изменённый авторский абзац", encoding="utf-8")
-            generate_normalization(
-                source, output, memory_path=memory_path, classifier=classifier
-            )
+            generate_normalization(source, output, memory_path=memory_path, classifier=classifier)
             self.assertEqual(calls, 2)
 
             generate_normalization(
@@ -1191,10 +1244,7 @@ class NormalizerTests(unittest.TestCase):
                 )
 
             def classifier(items, _hint):
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             with (
                 patch.object(normalizer_module, "get_settings", side_effect=settings),
@@ -1243,10 +1293,17 @@ class NormalizerTests(unittest.TestCase):
             )
             self.assertEqual(len(candidates), 1)
             confirmed = confirm_normalization(
-                normalized, prepared, raw, memory_path=db, expected_revision=2,
-                learning_decisions=[{
-                    "candidate_id": candidates[0]["id"], "action": "remember",
-                }],
+                normalized,
+                prepared,
+                raw,
+                memory_path=db,
+                expected_revision=2,
+                learning_decisions=[
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "action": "remember",
+                    }
+                ],
             )
             self.assertEqual(confirmed["status"], "confirmed")
             self.assertTrue(is_normalization_confirmed(normalized))
@@ -1284,7 +1341,9 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(reset["hint"], "")
             self.assertEqual(reset["blocks"], [])
             with self.assertRaises(RevisionConflictError):
-                reset_normalization(normalized, expected_revision=saved["revision"], source_root=root)
+                reset_normalization(
+                    normalized, expected_revision=saved["revision"], source_root=root
+                )
 
     def test_unknown_blocks_prevent_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1292,10 +1351,14 @@ class NormalizerTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("Непонятный абзац\n", encoding="utf-8")
             normalized = root / "normalized.json"
-            generate_normalization(source, normalized, memory_path=root / "db.sqlite3", use_llm=False)
+            generate_normalization(
+                source, normalized, memory_path=root / "db.sqlite3", use_llm=False
+            )
             with self.assertRaises(NormalizationValidationError):
                 confirm_normalization(
-                    normalized, root / "prepared.json", root / "raw.txt",
+                    normalized,
+                    root / "prepared.json",
+                    root / "raw.txt",
                     memory_path=root / "db.sqlite3",
                 )
             self.assertFalse((root / "prepared.json").exists())
@@ -1326,10 +1389,17 @@ class NormalizerTests(unittest.TestCase):
             with patch("stage1.normalizer._atomic_write_text", side_effect=fail_raw):
                 with self.assertRaises(OSError):
                     confirm_normalization(
-                        normalized, prepared, raw, memory_path=db, expected_revision=2,
-                        learning_decisions=[{
-                            "candidate_id": candidates[0]["id"], "action": "remember",
-                        }],
+                        normalized,
+                        prepared,
+                        raw,
+                        memory_path=db,
+                        expected_revision=2,
+                        learning_decisions=[
+                            {
+                                "candidate_id": candidates[0]["id"],
+                                "action": "remember",
+                            }
+                        ],
                     )
 
             with NormalizationMemory(db) as memory:
@@ -1341,10 +1411,15 @@ class NormalizerTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("source", encoding="utf-8")
             prepared = root / "prepared.json"
-            prepared.write_text(json.dumps({
-                "source": str(source),
-                "items": [{"text_original": "Закадр", "text_for_tts": "Закадр"}],
-            }), encoding="utf-8")
+            prepared.write_text(
+                json.dumps(
+                    {
+                        "source": str(source),
+                        "items": [{"text_original": "Закадр", "text_for_tts": "Закадр"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             raw = root / "raw.txt"
             raw.write_text(
                 "ЗК1: Закадр\n\n"
@@ -1353,7 +1428,9 @@ class NormalizerTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = import_legacy_normalization(prepared, raw, root / "normalized.json", source_path=source)
+            result = import_legacy_normalization(
+                prepared, raw, root / "normalized.json", source_path=source
+            )
 
             self.assertEqual(
                 [block["type"] for block in result["blocks"]],
@@ -1366,10 +1443,15 @@ class NormalizerTests(unittest.TestCase):
             prepared = root / "prepared.json"
             raw = root / "raw.txt"
             normalized = root / "normalized.json"
-            prepared.write_text(json.dumps({
-                "source": str(root / "missing.docx"),
-                "items": [{"text_original": "Текст", "text_for_tts": "Текст"}],
-            }), encoding="utf-8")
+            prepared.write_text(
+                json.dumps(
+                    {
+                        "source": str(root / "missing.docx"),
+                        "items": [{"text_original": "Текст", "text_for_tts": "Текст"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             raw.write_text("ЗК1: Текст\n", encoding="utf-8")
             imported = import_legacy_normalization(prepared, raw, normalized)
 
@@ -1468,9 +1550,7 @@ class LlmPresetTests(unittest.TestCase):
                 [{"uid": "u1", "original_text": "text"}], "hint", llm_preset="fast"
             )
 
-        self.assertEqual(
-            post.call_args.kwargs["json"]["provider"], {"sort": "throughput"}
-        )
+        self.assertEqual(post.call_args.kwargs["json"]["provider"], {"sort": "throughput"})
 
     def test_openrouter_classifier_standard_preset_omits_provider_sort(self) -> None:
         settings = SimpleNamespace(
@@ -1531,10 +1611,7 @@ class LlmPresetTests(unittest.TestCase):
                 )
 
             def classifier(items, _hint, llm_preset="standard"):
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             with (
                 patch.object(normalizer_module, "get_settings", side_effect=settings),
@@ -1552,14 +1629,10 @@ class LlmPresetTests(unittest.TestCase):
                 )
                 self.assertEqual(mocked.call_count, 1)
 
-                generate_normalization(
-                    source, output, memory_path=memory_path, llm_preset="fast"
-                )
+                generate_normalization(source, output, memory_path=memory_path, llm_preset="fast")
                 self.assertEqual(mocked.call_count, 2)
 
-                generate_normalization(
-                    source, output, memory_path=memory_path, llm_preset="fast"
-                )
+                generate_normalization(source, output, memory_path=memory_path, llm_preset="fast")
                 self.assertEqual(mocked.call_count, 2)
 
 

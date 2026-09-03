@@ -31,9 +31,7 @@ class TtsErrorClassificationTests(unittest.TestCase):
             exc.status_code = status  # type: ignore[attr-defined]
             self.assertFalse(_is_retryable_tts_error("gemini", exc), status)
 
-        self.assertTrue(
-            _is_retryable_tts_error("openrouter", TimeoutError("request timed out"))
-        )
+        self.assertTrue(_is_retryable_tts_error("openrouter", TimeoutError("request timed out")))
         self.assertFalse(
             _is_retryable_tts_error("gemini", RuntimeError("response blocked by safety policy"))
         )

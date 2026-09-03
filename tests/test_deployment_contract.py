@@ -5,21 +5,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_apple_silicon_profile_uses_native_mlx() -> None:
-    requirements = (ROOT / "requirements-macos-apple-silicon.txt").read_text(
-        encoding="utf-8"
-    )
-    setup = (ROOT / "scripts/setup-macos-apple-silicon").read_text(
-        encoding="utf-8"
-    )
+    requirements = (ROOT / "requirements-macos-apple-silicon.txt").read_text(encoding="utf-8")
+    setup = (ROOT / "scripts/setup-macos-apple-silicon").read_text(encoding="utf-8")
     runner = (ROOT / "scripts/run-native-macos").read_text(encoding="utf-8")
 
     assert "mlx-whisper==0.4.3" in requirements
     assert '"$(uname -m)" != "arm64"' in setup
-    assert 'PYTHON_ARCH' in setup
+    assert "PYTHON_ARCH" in setup
     assert 'resolve_backend("auto") == "mlx-whisper"' in setup
     assert ".venv-macos-arm64" in setup
     assert "gunicorn" in runner
-    assert "source \"${ROOT_DIR}/.env\"" not in runner
+    assert 'source "${ROOT_DIR}/.env"' not in runner
     assert "api:app" in runner
 
 

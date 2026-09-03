@@ -300,12 +300,8 @@ def test_extract_text_dispatches_docx_and_doc_handlers(
     doc_path = tmp_path / "scenario.doc"
     doc_path.write_bytes(b"")
 
-    monkeypatch.setattr(
-        stage1_io_utils, "extract_text_from_docx", lambda p: f"docx:{p.name}"
-    )
-    monkeypatch.setattr(
-        stage1_io_utils, "extract_text_from_doc", lambda p: f"doc:{p.name}"
-    )
+    monkeypatch.setattr(stage1_io_utils, "extract_text_from_docx", lambda p: f"docx:{p.name}")
+    monkeypatch.setattr(stage1_io_utils, "extract_text_from_doc", lambda p: f"doc:{p.name}")
 
     assert extract_text(docx_path) == "docx:scenario.docx"
     assert extract_text(doc_path) == "doc:scenario.doc"

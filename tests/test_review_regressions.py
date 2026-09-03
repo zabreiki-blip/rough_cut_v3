@@ -1,4 +1,5 @@
 """Regression tests for issues found in REVIEW_REPORT.md 2026-06-09."""
+
 from __future__ import annotations
 
 import json
@@ -84,9 +85,7 @@ class ManualMarkersRawTextTest(unittest.TestCase):
         self.assertRegex(raw, r"ЗК\d+: Без дублирования маркера\.")
 
     def test_merged_manual_blocks_keep_one_canonical_timeline_segment(self) -> None:
-        blocks, raw = self._analyze(
-            "VO: Короткий первый блок.\n\nVO: Короткий второй блок.\n"
-        )
+        blocks, raw = self._analyze("VO: Короткий первый блок.\n\nVO: Короткий второй блок.\n")
 
         self.assertEqual(len(blocks), 1)
         self.assertIn("ЗК1: Короткий первый блок. Короткий второй блок.", raw)
@@ -134,21 +133,25 @@ class DotTimecodeSnhTest(unittest.TestCase):
         texts = [it["text_for_tts"] for it in items]
         for text in texts:
             self.assertNotIn(
-                "ГАЛИНА СТЕПАНОВА", text,
+                "ГАЛИНА СТЕПАНОВА",
+                text,
                 f"SNH speaker name must not appear in ZK blocks: {text!r}",
             )
             self.assertNotIn(
-                "00.42.51", text,
+                "00.42.51",
+                text,
                 f"Timecode must not appear in ZK blocks: {text!r}",
             )
 
     def test_is_sync_or_interview_dot_timecode(self) -> None:
         from stage1.analyzer import _is_sync_or_interview
+
         line = "ГАЛИНА СТЕПАНОВА, Генеральный директор: 00.42.51. Текст."
         self.assertTrue(_is_sync_or_interview(line))
 
     def test_is_sync_or_interview_colon_timecode_unchanged(self) -> None:
         from stage1.analyzer import _is_sync_or_interview
+
         line = "ИВАН ПЕТРОВ, эксперт: 00:42:51 Текст с двоеточием."
         self.assertTrue(_is_sync_or_interview(line))
 

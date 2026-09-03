@@ -132,7 +132,30 @@ _DESCRIPTION_STOPWORDS = frozenset({"голос", "голоса", "и", "а", "�
 # «Елена» и «Елены»/«Елене» считались одним и тем же именем.
 _NAME_CASE_SUFFIXES = tuple(
     sorted(
-        {"ого", "его", "ому", "ему", "ыми", "ими", "ах", "ях", "ой", "ей", "ем", "им", "ом", "ам", "ям", "у", "ю", "е", "ы", "и", "а", "я"},
+        {
+            "ого",
+            "его",
+            "ому",
+            "ему",
+            "ыми",
+            "ими",
+            "ах",
+            "ях",
+            "ой",
+            "ей",
+            "ем",
+            "им",
+            "ом",
+            "ам",
+            "ям",
+            "у",
+            "ю",
+            "е",
+            "ы",
+            "и",
+            "а",
+            "я",
+        },
         key=len,
         reverse=True,
     )
@@ -183,8 +206,12 @@ def _build_prompt(legend: dict[str, str] | None, *, next_number: int) -> str:
     """
     prompt = _BASE_PROMPT_RU + _LEGEND_REQUEST_RU
     if legend:
-        legend_lines = "\n".join(f"{label} — {description}" for label, description in legend.items())
-        prompt += _LEGEND_REUSE_RU_TEMPLATE.format(legend_lines=legend_lines, next_number=next_number)
+        legend_lines = "\n".join(
+            f"{label} — {description}" for label, description in legend.items()
+        )
+        prompt += _LEGEND_REUSE_RU_TEMPLATE.format(
+            legend_lines=legend_lines, next_number=next_number
+        )
     return prompt
 
 
@@ -248,7 +275,9 @@ _END_OVERSHOOT_TOLERANCE_SEC = 2.0
 # ниже по конвейеру пустая строка превращалась в фиктивный сегмент с текстом
 # "ГОЛОС 4:" вместо того, чтобы быть тихо отброшенной (см. проверку
 # `if not content.strip()` в parse_transcript).
-_SPEAKER_RE = re.compile(r"^\s*([^\n:\-\u2013\u2014]{1,40}?)\s*[:\-\u2013\u2014]\s*(.*)$", re.DOTALL)
+_SPEAKER_RE = re.compile(
+    r"^\s*([^\n:\-\u2013\u2014]{1,40}?)\s*[:\-\u2013\u2014]\s*(.*)$", re.DOTALL
+)
 _FENCE_RE = re.compile(r"^```\w*$")
 
 # Заголовок секции легенды голосов (см. _LEGEND_REQUEST_RU) и её строки вида
@@ -273,7 +302,9 @@ def _parse_timecode(a: str, b: str, c: str | None, frac: str | None = None) -> f
     return float(hours * 3600 + minutes * 60 + seconds) + fraction
 
 
-def _resolve_end(start: float, own_end: float | None, next_start: float | None) -> tuple[float, bool]:
+def _resolve_end(
+    start: float, own_end: float | None, next_start: float | None
+) -> tuple[float, bool]:
     """Определяет конец реплики и признак того, что это НАСТОЯЩАЯ граница,
     указанная моделью (новый формат `[начало — конец]`), а не приближение по
     началу следующей реплики (старая логика).
@@ -348,11 +379,18 @@ def _parse_transcript_with_own_end(
             if prefix:
                 if entries:
                     prev_start, prev_speaker, prev_text, prev_own_end = entries[-1]
-                    entries[-1] = (prev_start, prev_speaker, f"{prev_text} {prefix}".strip(), prev_own_end)
+                    entries[-1] = (
+                        prev_start,
+                        prev_speaker,
+                        f"{prev_text} {prefix}".strip(),
+                        prev_own_end,
+                    )
                 # иначе — преамбула до первой распознанной реплики (например,
                 # «Расшифровка:») молча отбрасывается, как и раньше.
             for i, match in enumerate(timecodes):
-                start = _parse_timecode(match.group("a1"), match.group("a2"), match.group("a3"), match.group("a4"))
+                start = _parse_timecode(
+                    match.group("a1"), match.group("a2"), match.group("a3"), match.group("a4")
+                )
                 start += offset_sec
                 own_end: float | None = None
                 if match.group("b1") is not None:
@@ -671,11 +709,15 @@ def _reconcile_speakers(
         group = group_of[label]
         if group not in group_order:
             group_order.append(group)
-    ranked_groups = sorted(group_order, key=lambda group: duration_by_group.get(group, 0.0), reverse=True)
+    ranked_groups = sorted(
+        group_order, key=lambda group: duration_by_group.get(group, 0.0), reverse=True
+    )
     final_label_of_group = {group: f"ГОЛОС {i + 1}" for i, group in enumerate(ranked_groups)}
 
     renamed_segments = [
-        replace(seg, speaker=final_label_of_group[group_of[seg.speaker]]) if seg.speaker is not None else seg
+        replace(seg, speaker=final_label_of_group[group_of[seg.speaker]])
+        if seg.speaker is not None
+        else seg
         for seg in segments
     ]
 
@@ -750,7 +792,11 @@ def _stitch_chunk(
                 is_duplicate = True
                 used_prev.add(best_idx)
                 matched_speaker = prev_overlap[best_idx].speaker
-                if seg.speaker is not None and seg.speaker not in label_map and matched_speaker is not None:
+                if (
+                    seg.speaker is not None
+                    and seg.speaker not in label_map
+                    and matched_speaker is not None
+                ):
                     label_map[seg.speaker] = matched_speaker
 
         if seg.speaker is not None:
@@ -780,7 +826,9 @@ def _resolve_api_key() -> str | None:
     return value or None
 
 
-def _probe_duration(media_path: Path, *, ffprobe: str = "ffprobe", timeout_sec: float = _PROBE_TIMEOUT_SEC) -> float:
+def _probe_duration(
+    media_path: Path, *, ffprobe: str = "ffprobe", timeout_sec: float = _PROBE_TIMEOUT_SEC
+) -> float:
     """Определяет длительность медиафайла в секундах через `ffprobe`
     (замена `engine.media.probe.probe_media` донора): список аргументов без
     `shell=True` и с конечным таймаутом, тот же стиль вызова subprocess, что
@@ -802,7 +850,9 @@ def _probe_duration(media_path: Path, *, ffprobe: str = "ffprobe", timeout_sec: 
             f"Не найден исполняемый файл {ffprobe!r}. Установите ffmpeg/ffprobe и добавьте в PATH."
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise CloudAudioAsrError(f"ffprobe не ответил при определении длительности {media_path}") from exc
+        raise CloudAudioAsrError(
+            f"ffprobe не ответил при определении длительности {media_path}"
+        ) from exc
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()[-500:]
@@ -813,7 +863,9 @@ def _probe_duration(media_path: Path, *, ffprobe: str = "ffprobe", timeout_sec: 
     try:
         return float(result.stdout.decode("utf-8", errors="replace").strip())
     except ValueError as exc:
-        raise CloudAudioAsrError(f"Не удалось разобрать длительность {media_path} из вывода ffprobe") from exc
+        raise CloudAudioAsrError(
+            f"Не удалось разобрать длительность {media_path} из вывода ffprobe"
+        ) from exc
 
 
 class CloudAudioAsrAdapter:
@@ -847,7 +899,9 @@ class CloudAudioAsrAdapter:
         self.model = model
         self.language = language
         resolved_base_url = (
-            base_url if base_url else os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            base_url
+            if base_url
+            else os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         )
         self._base_url = resolved_base_url.rstrip("/")
         self._api_key = api_key if api_key is not None else _resolve_api_key()
@@ -920,9 +974,13 @@ class CloudAudioAsrAdapter:
         except CloudAudioAsrError:
             raise
         except Exception as exc:
-            raise CloudAudioAsrError(f"Не удалось определить длительность {media_path}: {exc}") from exc
+            raise CloudAudioAsrError(
+                f"Не удалось определить длительность {media_path}: {exc}"
+            ) from exc
 
-    async def _extract_chunk_mp3(self, media_path: Path, start_sec: float, duration_sec: float) -> bytes:
+    async def _extract_chunk_mp3(
+        self, media_path: Path, start_sec: float, duration_sec: float
+    ) -> bytes:
         """Вырезает и перекодирует фрагмент аудио в mp3 моно 16 кГц через ffmpeg."""
         args = [
             self._ffmpeg,
@@ -1034,7 +1092,11 @@ class CloudAudioAsrAdapter:
                     raise CloudAudioAsrError(
                         f"Ошибка сети при запросе к облачной ASR-модели после {attempt} попыток: {exc}"
                     ) from exc
-                logger.warning("Облачный ASR: сетевая ошибка (попытка %d/%d), повтор", attempt, self._max_retries)
+                logger.warning(
+                    "Облачный ASR: сетевая ошибка (попытка %d/%d), повтор",
+                    attempt,
+                    self._max_retries,
+                )
                 await self._sleep_backoff(attempt)
                 continue
 
@@ -1064,13 +1126,13 @@ class CloudAudioAsrAdapter:
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise CloudAudioAsrError(f"Некорректная структура ответа облачной ASR-модели: {data}") from exc
+            raise CloudAudioAsrError(
+                f"Некорректная структура ответа облачной ASR-модели: {data}"
+            ) from exc
 
         if isinstance(content, list):
             # Некоторые провайдеры возвращают content частями (list of parts).
-            content = "".join(
-                part.get("text", "") for part in content if isinstance(part, dict)
-            )
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
 
         usage = data.get("usage") or {}
         cost = self._extract_cost(usage)
@@ -1119,7 +1181,9 @@ class CloudAudioAsrAdapter:
                 if cancel is not None and cancel.is_set():
                     raise asyncio.CancelledError("Распознавание отменено пользователем")
 
-                mp3_bytes = await self._extract_chunk_mp3(audio_path, part_start, part_end - part_start)
+                mp3_bytes = await self._extract_chunk_mp3(
+                    audio_path, part_start, part_end - part_start
+                )
                 audio_b64 = base64.b64encode(mp3_bytes).decode("ascii")
 
                 prompt = _build_prompt(

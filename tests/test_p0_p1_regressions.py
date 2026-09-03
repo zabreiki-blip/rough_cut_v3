@@ -1,4 +1,5 @@
 """Regression tests for P0/P1 bugs from audit report 2026-06-09."""
+
 from __future__ import annotations
 
 import json
@@ -36,9 +37,7 @@ def _patch_say_available() -> unittest.mock._patch:
     preflight path (and stay meaningful) on any platform, e.g. Linux CI, without
     depending on the actual `say` binary being present.
     """
-    return unittest.mock.patch(
-        "stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"
-    )
+    return unittest.mock.patch("stage1.gemini_tts.shutil.which", return_value="/usr/bin/say")
 
 
 def _make_wav_bytes(duration_ms: int = 1000) -> bytes:
@@ -103,10 +102,14 @@ class AtomicTtsPublicationTest(unittest.TestCase):
             old_bytes = _make_wav_bytes(500)
             wav.write_bytes(old_bytes)
 
-            with _patch_say_available(), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
-            ), unittest.mock.patch(
-                "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+            with (
+                _patch_say_available(),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
+                ),
+                unittest.mock.patch(
+                    "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+                ),
             ):
                 with self.assertRaisesRegex(OSError, "publish failed"):
                     synthesize_tts(
@@ -123,10 +126,14 @@ class AtomicTtsPublicationTest(unittest.TestCase):
             old_bytes = _make_wav_bytes(500)
             wav.write_bytes(old_bytes)
 
-            with _patch_say_available(), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
-            ), unittest.mock.patch(
-                "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+            with (
+                _patch_say_available(),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes", return_value=_make_wav_bytes(1000)
+                ),
+                unittest.mock.patch(
+                    "stage1.gemini_tts.os.replace", side_effect=OSError("publish failed")
+                ),
             ):
                 with self.assertRaisesRegex(OSError, "publish failed"):
                     synthesize_phrase(
@@ -187,13 +194,13 @@ class TtsCancellationTest(unittest.TestCase):
                 cancelled = True
                 return _make_wav_bytes(1000)
 
-            with unittest.mock.patch(
-                "stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"
-            ), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes", side_effect=synthesize_once
-            ) as synthesize, unittest.mock.patch(
-                "stage1.gemini_tts.time.sleep"
-            ) as sleep:
+            with (
+                unittest.mock.patch("stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes", side_effect=synthesize_once
+                ) as synthesize,
+                unittest.mock.patch("stage1.gemini_tts.time.sleep") as sleep,
+            ):
                 with self.assertRaises(TtsCancelledError):
                     synthesize_tts(
                         prepared,
@@ -264,6 +271,7 @@ class StaleWavRegenerationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         import io, wave as _wave
+
         buf = io.BytesIO()
         with _wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
@@ -290,13 +298,20 @@ class StaleWavRegenerationTest(unittest.TestCase):
             original_mtime = wav.stat().st_mtime_ns
 
             prepared = self._prepared(speaker_dir, "Тест")
-            with _patch_say_available(), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes",
-                return_value=self._FAKE_WAV_BYTES,
-            ) as mock_synth:
+            with (
+                _patch_say_available(),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes",
+                    return_value=self._FAKE_WAV_BYTES,
+                ) as mock_synth,
+            ):
                 result = synthesize_tts(
-                    prepared, speaker_dir,
-                    provider="macos", voice_name="Yuri", gender="male", speed=1.0,
+                    prepared,
+                    speaker_dir,
+                    provider="macos",
+                    voice_name="Yuri",
+                    gender="male",
+                    speed=1.0,
                 )
 
             mock_synth.assert_not_called()
@@ -312,13 +327,20 @@ class StaleWavRegenerationTest(unittest.TestCase):
             # No meta file — fingerprint unknown
 
             prepared = self._prepared(speaker_dir, "Текст")
-            with _patch_say_available(), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes",
-                return_value=self._FAKE_WAV_BYTES,
-            ) as mock_synth:
+            with (
+                _patch_say_available(),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes",
+                    return_value=self._FAKE_WAV_BYTES,
+                ) as mock_synth,
+            ):
                 result = synthesize_tts(
-                    prepared, speaker_dir,
-                    provider="macos", voice_name="Yuri", gender="male", speed=1.0,
+                    prepared,
+                    speaker_dir,
+                    provider="macos",
+                    voice_name="Yuri",
+                    gender="male",
+                    speed=1.0,
                 )
 
             mock_synth.assert_called_once()
@@ -333,13 +355,20 @@ class StaleWavRegenerationTest(unittest.TestCase):
             _write_meta_fingerprint(wav, old_fp)
 
             prepared = self._prepared(speaker_dir, "Новый текст")
-            with _patch_say_available(), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes",
-                return_value=self._FAKE_WAV_BYTES,
-            ) as mock_synth:
+            with (
+                _patch_say_available(),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes",
+                    return_value=self._FAKE_WAV_BYTES,
+                ) as mock_synth,
+            ):
                 result = synthesize_tts(
-                    prepared, speaker_dir,
-                    provider="macos", voice_name="Yuri", gender="male", speed=1.0,
+                    prepared,
+                    speaker_dir,
+                    provider="macos",
+                    voice_name="Yuri",
+                    gender="male",
+                    speed=1.0,
                 )
 
             mock_synth.assert_called_once()
@@ -351,16 +380,25 @@ class StaleWavRegenerationTest(unittest.TestCase):
             wav = speaker_dir / "zk1.wav"
 
             prepared = self._prepared(speaker_dir, "Текст")
-            with _patch_say_available(), unittest.mock.patch(
-                "stage1.gemini_tts._synthesize_wav_bytes",
-                return_value=self._FAKE_WAV_BYTES,
+            with (
+                _patch_say_available(),
+                unittest.mock.patch(
+                    "stage1.gemini_tts._synthesize_wav_bytes",
+                    return_value=self._FAKE_WAV_BYTES,
+                ),
             ):
                 synthesize_tts(
-                    prepared, speaker_dir,
-                    provider="macos", voice_name="Yuri", gender="male", speed=1.0,
+                    prepared,
+                    speaker_dir,
+                    provider="macos",
+                    voice_name="Yuri",
+                    gender="male",
+                    speed=1.0,
                 )
 
-            expected_fp = _synthesis_fingerprint("Текст", "macos", "Yuri", "male", 1.0, "", 24000, 175)
+            expected_fp = _synthesis_fingerprint(
+                "Текст", "macos", "Yuri", "male", 1.0, "", 24000, 175
+            )
             self.assertEqual(_read_meta_fingerprint(wav), expected_fp)
 
     def test_fingerprint_differs_by_provider_voice_speed(self) -> None:

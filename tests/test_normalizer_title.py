@@ -20,7 +20,9 @@ class ScenarioTitleDetectionTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text(f"{text}\nПланы окрестностей – коптер\n", encoding="utf-8")
             blocks = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )["blocks"]
             return blocks[0]
@@ -40,12 +42,13 @@ class ScenarioTitleDetectionTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "scenario.txt"
             source.write_text(
-                "ЗАКАДР: Первый абзац закадрового текста.\n"
-                "ВНИМАНИЕ ОПАСНОСТЬ ОБВАЛА КРЫШИ\n",
+                "ЗАКАДР: Первый абзац закадрового текста.\nВНИМАНИЕ ОПАСНОСТЬ ОБВАЛА КРЫШИ\n",
                 encoding="utf-8",
             )
             blocks = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )["blocks"]
             self.assertEqual(blocks[0]["type"], "voiceover")
@@ -87,7 +90,9 @@ class ScenarioTitleDetectionTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("ЗАКАДР: БЕЛАРУСЬ. САРЬЯ. ХРАМ\n", encoding="utf-8")
             block = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )["blocks"][0]
             self.assertEqual(block["type"], "voiceover")

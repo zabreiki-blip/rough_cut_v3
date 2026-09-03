@@ -15,12 +15,7 @@ from stage1.gemini_tts import TtsCancelledError, synthesize_tts
 def _prepared(path: Path, *item_ids: str) -> Path:
     path.write_text(
         json.dumps(
-            {
-                "items": [
-                    {"id": item_id, "text_for_tts": f"text {item_id}"}
-                    for item_id in item_ids
-                ]
-            }
+            {"items": [{"id": item_id, "text_for_tts": f"text {item_id}"} for item_id in item_ids]}
         ),
         encoding="utf-8",
     )
@@ -57,20 +52,41 @@ def test_dry_run_progress_schema_and_order(tmp_path: Path) -> None:
     assert events == [
         {"event": "started", "total": 2, "completed": 0, "generated": 0, "skipped": 0},
         {
-            "event": "item_started", "id": "zk1", "index": 1, "total": 2,
-            "completed": 0, "generated": 0, "skipped": 0,
+            "event": "item_started",
+            "id": "zk1",
+            "index": 1,
+            "total": 2,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
         },
         {
-            "event": "item_generated", "id": "zk1", "index": 1, "total": 2,
-            "completed": 1, "generated": 1, "skipped": 0, "attempts": 1,
+            "event": "item_generated",
+            "id": "zk1",
+            "index": 1,
+            "total": 2,
+            "completed": 1,
+            "generated": 1,
+            "skipped": 0,
+            "attempts": 1,
         },
         {
-            "event": "item_started", "id": "zk2", "index": 2, "total": 2,
-            "completed": 1, "generated": 1, "skipped": 0,
+            "event": "item_started",
+            "id": "zk2",
+            "index": 2,
+            "total": 2,
+            "completed": 1,
+            "generated": 1,
+            "skipped": 0,
         },
         {
-            "event": "item_skipped", "id": "zk2", "index": 2, "total": 2,
-            "completed": 2, "generated": 1, "skipped": 1,
+            "event": "item_skipped",
+            "id": "zk2",
+            "index": 2,
+            "total": 2,
+            "completed": 2,
+            "generated": 1,
+            "skipped": 1,
         },
         {"event": "completed", "total": 2, "completed": 2, "generated": 1, "skipped": 1},
     ]
@@ -78,18 +94,15 @@ def test_dry_run_progress_schema_and_order(tmp_path: Path) -> None:
 
 def test_cache_hit_progress_schema_and_order(tmp_path: Path) -> None:
     prepared = _prepared(tmp_path / "prepared.json", "zk1")
-    which_patch, synthesize_patch = _real_tts_patches(
-        lambda *_args, **_kwargs: _wav_bytes()
-    )
+    which_patch, synthesize_patch = _real_tts_patches(lambda *_args, **_kwargs: _wav_bytes())
     with which_patch, synthesize_patch:
-        synthesize_tts(
-            prepared, tmp_path, provider="macos", voice_name="Yuri", gender="male"
-        )
+        synthesize_tts(prepared, tmp_path, provider="macos", voice_name="Yuri", gender="male")
 
     events: list[dict] = []
-    with patch("stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"), patch(
-        "stage1.gemini_tts._synthesize_wav_bytes"
-    ) as synthesize:
+    with (
+        patch("stage1.gemini_tts.shutil.which", return_value="/usr/bin/say"),
+        patch("stage1.gemini_tts._synthesize_wav_bytes") as synthesize,
+    ):
         result = synthesize_tts(
             prepared,
             tmp_path,
@@ -105,12 +118,22 @@ def test_cache_hit_progress_schema_and_order(tmp_path: Path) -> None:
     assert events == [
         {"event": "started", "total": 1, "completed": 0, "generated": 0, "skipped": 0},
         {
-            "event": "item_started", "id": "zk1", "index": 1, "total": 1,
-            "completed": 0, "generated": 0, "skipped": 0,
+            "event": "item_started",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
         },
         {
-            "event": "item_skipped", "id": "zk1", "index": 1, "total": 1,
-            "completed": 1, "generated": 0, "skipped": 1,
+            "event": "item_skipped",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 1,
+            "generated": 0,
+            "skipped": 1,
         },
         {"event": "completed", "total": 1, "completed": 1, "generated": 0, "skipped": 1},
     ]
@@ -118,9 +141,7 @@ def test_cache_hit_progress_schema_and_order(tmp_path: Path) -> None:
 
 def test_mixed_pending_and_cache_progress_is_monotonic(tmp_path: Path) -> None:
     cached_prepared = _prepared(tmp_path / "cached.json", "zk2")
-    which_patch, synthesize_patch = _real_tts_patches(
-        lambda *_args, **_kwargs: _wav_bytes()
-    )
+    which_patch, synthesize_patch = _real_tts_patches(lambda *_args, **_kwargs: _wav_bytes())
     with which_patch, synthesize_patch:
         synthesize_tts(
             cached_prepared,
@@ -132,9 +153,7 @@ def test_mixed_pending_and_cache_progress_is_monotonic(tmp_path: Path) -> None:
 
     prepared = _prepared(tmp_path / "prepared.json", "zk1", "zk2")
     events: list[dict] = []
-    which_patch, synthesize_patch = _real_tts_patches(
-        lambda *_args, **_kwargs: _wav_bytes()
-    )
+    which_patch, synthesize_patch = _real_tts_patches(lambda *_args, **_kwargs: _wav_bytes())
     with which_patch, synthesize_patch:
         synthesize_tts(
             prepared,
@@ -188,17 +207,34 @@ def test_retry_then_success_progress_schema_and_order(tmp_path: Path) -> None:
     assert events == [
         {"event": "started", "total": 1, "completed": 0, "generated": 0, "skipped": 0},
         {
-            "event": "item_started", "id": "zk1", "index": 1, "total": 1,
-            "completed": 0, "generated": 0, "skipped": 0,
+            "event": "item_started",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
         },
         {
-            "event": "item_retrying", "id": "zk1", "index": 1, "total": 1,
-            "completed": 0, "generated": 0, "skipped": 0, "attempts": 1,
+            "event": "item_retrying",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
+            "attempts": 1,
             "error": "request timed out",
         },
         {
-            "event": "item_generated", "id": "zk1", "index": 1, "total": 1,
-            "completed": 1, "generated": 1, "skipped": 0, "attempts": 2,
+            "event": "item_generated",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 1,
+            "generated": 1,
+            "skipped": 0,
+            "attempts": 2,
         },
         {"event": "completed", "total": 1, "completed": 1, "generated": 1, "skipped": 0},
     ]
@@ -227,12 +263,23 @@ def test_terminal_failure_progress_schema_and_order(tmp_path: Path) -> None:
     assert events == [
         {"event": "started", "total": 1, "completed": 0, "generated": 0, "skipped": 0},
         {
-            "event": "item_started", "id": "zk1", "index": 1, "total": 1,
-            "completed": 0, "generated": 0, "skipped": 0,
+            "event": "item_started",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
         },
         {
-            "event": "item_failed", "id": "zk1", "index": 1, "total": 1,
-            "completed": 0, "generated": 0, "skipped": 0, "attempts": 1,
+            "event": "item_failed",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
+            "attempts": 1,
             "error": "permanent failure",
         },
     ]
@@ -271,8 +318,13 @@ def test_cancellation_progress_schema_and_order(tmp_path: Path) -> None:
     assert events == [
         {"event": "started", "total": 1, "completed": 0, "generated": 0, "skipped": 0},
         {
-            "event": "item_started", "id": "zk1", "index": 1, "total": 1,
-            "completed": 0, "generated": 0, "skipped": 0,
+            "event": "item_started",
+            "id": "zk1",
+            "index": 1,
+            "total": 1,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
         },
     ]
 
@@ -291,9 +343,7 @@ def test_cancellation_drops_queued_provider_requests(tmp_path: Path) -> None:
 
     which_patch, synthesize_patch = _real_tts_patches(synthesize)
     try:
-        with which_patch, synthesize_patch, patch.dict(
-            "os.environ", {"TTS_MAX_WORKERS": "1"}
-        ):
+        with which_patch, synthesize_patch, patch.dict("os.environ", {"TTS_MAX_WORKERS": "1"}):
             with pytest.raises(TtsCancelledError, match="cancelled"):
                 synthesize_tts(
                     prepared,
@@ -328,9 +378,7 @@ def test_parallel_completion_still_publishes_progress_in_scenario_order(
         return _wav_bytes()
 
     which_patch, synthesize_patch = _real_tts_patches(synthesize)
-    with which_patch, synthesize_patch, patch.dict(
-        "os.environ", {"TTS_MAX_WORKERS": "2"}
-    ):
+    with which_patch, synthesize_patch, patch.dict("os.environ", {"TTS_MAX_WORKERS": "2"}):
         synthesize_tts(
             prepared,
             tmp_path,
@@ -344,20 +392,42 @@ def test_parallel_completion_still_publishes_progress_in_scenario_order(
     assert events == [
         {"event": "started", "total": 2, "completed": 0, "generated": 0, "skipped": 0},
         {
-            "event": "item_started", "id": "zk1", "index": 1, "total": 2,
-            "completed": 0, "generated": 0, "skipped": 0,
+            "event": "item_started",
+            "id": "zk1",
+            "index": 1,
+            "total": 2,
+            "completed": 0,
+            "generated": 0,
+            "skipped": 0,
         },
         {
-            "event": "item_generated", "id": "zk1", "index": 1, "total": 2,
-            "completed": 1, "generated": 1, "skipped": 0, "attempts": 1,
+            "event": "item_generated",
+            "id": "zk1",
+            "index": 1,
+            "total": 2,
+            "completed": 1,
+            "generated": 1,
+            "skipped": 0,
+            "attempts": 1,
         },
         {
-            "event": "item_started", "id": "zk2", "index": 2, "total": 2,
-            "completed": 1, "generated": 1, "skipped": 0,
+            "event": "item_started",
+            "id": "zk2",
+            "index": 2,
+            "total": 2,
+            "completed": 1,
+            "generated": 1,
+            "skipped": 0,
         },
         {
-            "event": "item_generated", "id": "zk2", "index": 2, "total": 2,
-            "completed": 2, "generated": 2, "skipped": 0, "attempts": 1,
+            "event": "item_generated",
+            "id": "zk2",
+            "index": 2,
+            "total": 2,
+            "completed": 2,
+            "generated": 2,
+            "skipped": 0,
+            "attempts": 1,
         },
         {"event": "completed", "total": 2, "completed": 2, "generated": 2, "skipped": 0},
     ]

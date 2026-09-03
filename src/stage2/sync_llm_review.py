@@ -3,6 +3,7 @@
 The model never searches audio and never supplies timestamps.  It may only
 choose one of the ranges already produced from the Whisper word index.
 """
+
 from __future__ import annotations
 
 import json

@@ -21,9 +21,7 @@ class MacosVoicePolicyTests(unittest.TestCase):
             patch.dict("os.environ", {"MACOS_CONNECTOR_TOKEN": "token"}),
             patch.object(macos_connector, "shutil_which", return_value="/usr/bin/tool"),
             patch.object(macos_connector, "_available_voices", return_value=frozenset({"Yuri"})),
-            patch.object(
-                macos_connector, "_run_say_and_convert", return_value=fake_wav
-            ) as run,
+            patch.object(macos_connector, "_run_say_and_convert", return_value=fake_wav) as run,
         ):
             response = macos_connector.app.test_client().post(
                 "/synthesize",

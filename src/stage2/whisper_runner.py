@@ -111,9 +111,7 @@ def resolve_backend(requested: str | None = None) -> str:
             # name never touches the network or reveals key presence.
             return value
         if value not in installed:
-            raise WhisperUnavailableError(
-                f"Whisper backend '{value}' is not installed"
-            )
+            raise WhisperUnavailableError(f"Whisper backend '{value}' is not installed")
         return value
 
     # Auto-selection only ever considers local backends: cloud-audio is paid
@@ -166,11 +164,13 @@ def _clean_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if not text or not isfinite(start) or not isfinite(end) or start < 0 or end < start:
             continue
-        cleaned.append({
-            "word": text,
-            "start": round(start, 3),
-            "end": round(end, 3),
-        })
+        cleaned.append(
+            {
+                "word": text,
+                "start": round(start, 3),
+                "end": round(end, 3),
+            }
+        )
     cleaned.sort(key=lambda item: (item["start"], item["end"]))
     return cleaned
 
@@ -221,8 +221,7 @@ def _transcribe_faster(
     device = os.getenv("SYNC_WHISPER_DEVICE", "auto").strip() or "auto"
     default_compute_type = "int8" if device.lower() == "cpu" else "default"
     compute_type = (
-        os.getenv("SYNC_WHISPER_COMPUTE_TYPE", default_compute_type).strip()
-        or default_compute_type
+        os.getenv("SYNC_WHISPER_COMPUTE_TYPE", default_compute_type).strip() or default_compute_type
     )
     default_beam_size = 1 if device.lower() == "cpu" else 5
     beam_size = _env_int(
@@ -246,11 +245,7 @@ def _transcribe_faster(
     # Backend model instances are not guaranteed to be thread-safe.
     raw_words: list[dict[str, Any]] = []
     with model_lock:
-        transcriber = (
-            BatchedInferencePipeline(whisper_model)
-            if batch_size > 0
-            else whisper_model
-        )
+        transcriber = BatchedInferencePipeline(whisper_model) if batch_size > 0 else whisper_model
         transcribe_kwargs: dict[str, Any] = {
             "language": language,
             "word_timestamps": True,
@@ -268,11 +263,13 @@ def _transcribe_faster(
         _emit_progress(progress_callback, 0.0, duration_sec, 0)
         for segment in segments:
             for word in segment.words or []:
-                raw_words.append({
-                    "word": word.word,
-                    "start": word.start,
-                    "end": word.end,
-                })
+                raw_words.append(
+                    {
+                        "word": word.word,
+                        "start": word.start,
+                        "end": word.end,
+                    }
+                )
             _emit_progress(
                 progress_callback,
                 float(getattr(segment, "end", 0.0) or 0.0),
@@ -335,9 +332,7 @@ def _transcribe_cloud(
         # local-backend progress contract also does not require a live word
         # count, so 0 is reported until the final word list is ready below.
         duration = float(progress.duration_sec or 0.0)
-        processed = float(
-            progress.processed_sec if progress.processed_sec is not None else 0.0
-        )
+        processed = float(progress.processed_sec if progress.processed_sec is not None else 0.0)
         _emit_progress(progress_callback, processed, duration, 0)
 
     try:
@@ -351,9 +346,7 @@ def _transcribe_cloud(
         # CloudAudioAsrError messages (see cloud_asr.py) are already
         # Russian-language, project-styled, and never include the API key
         # itself (only its presence/absence) — safe to surface as-is.
-        raise WhisperTranscriptionError(
-            f"Облачное распознавание речи не удалось: {exc}"
-        ) from exc
+        raise WhisperTranscriptionError(f"Облачное распознавание речи не удалось: {exc}") from exc
 
     segments = result.get("segments") or []
     timestamps, _interpolated = segment_words_interpolated(segments)
@@ -420,9 +413,7 @@ def transcribe_audio(
             f"{selected} returned no usable word timestamps for {path.name}"
         )
 
-    completed_duration = float(
-        backend_meta.get("duration_sec") or words[-1]["end"]
-    )
+    completed_duration = float(backend_meta.get("duration_sec") or words[-1]["end"])
     _emit_progress(
         progress_callback,
         completed_duration,

@@ -15,16 +15,16 @@ def persist_tts_job(services: Any, job: dict) -> None:
 
 
 def load_persisted_tts_job(services: Any, project: str) -> dict | None:
-    payload = services._read_json_safe(
-        services._project_paths(project)["tts_job_status"]
-    )
+    payload = services._read_json_safe(services._project_paths(project)["tts_job_status"])
     if not isinstance(payload, dict):
         return None
     if payload.get("project") != project or not str(payload.get("id") or "").strip():
         return None
     restored = dict(payload)
     if str(restored.get("status") or "").lower() in {
-        "queued", "running", "cancelling",
+        "queued",
+        "running",
+        "cancelling",
     }:
         restored["status"] = "interrupted"
         restored["event"] = "interrupted"
@@ -36,7 +36,8 @@ def load_persisted_tts_job(services: Any, project: str) -> dict | None:
 def trim_tts_jobs_locked(services: Any) -> None:
     now = services.datetime.now(services.UTC)
     terminal_ids = [
-        job_id for job_id, job in services._TTS_JOBS.items()
+        job_id
+        for job_id, job in services._TTS_JOBS.items()
         if job.get("status") in {"completed", "failed", "cancelled"}
     ]
     for job_id in terminal_ids:
@@ -50,7 +51,8 @@ def trim_tts_jobs_locked(services: Any) -> None:
         if expired:
             services._TTS_JOBS.pop(job_id, None)
     terminal_ids = [
-        job_id for job_id, job in services._TTS_JOBS.items()
+        job_id
+        for job_id, job in services._TTS_JOBS.items()
         if job.get("status") in {"completed", "failed", "cancelled"}
     ]
     ordered_ids = sorted(
@@ -235,8 +237,7 @@ def run_tts_job(
         current_id = str(progress.get("id") or "").strip()
         error_text = str(progress.get("error") or "").strip()
         msg = (
-            f"{event}: {done}/{total} ({current_id})"
-            if current_id else f"{event}: {done}/{total}"
+            f"{event}: {done}/{total} ({current_id})" if current_id else f"{event}: {done}/{total}"
         )
         existing = services._get_tts_job(job_id) or {}
         retry_count = int(existing.get("retry_count") or 0)
@@ -365,9 +366,7 @@ def create_normalization_job(
                 for job_id, item in services._NORMALIZATION_JOBS.items()
                 if item.get("status") in {"completed", "failed", "cancelled"}
             ),
-            key=lambda pair: (
-                pair[1].get("finished_at") or pair[1].get("created_at") or ""
-            ),
+            key=lambda pair: pair[1].get("finished_at") or pair[1].get("created_at") or "",
         )
         drop_count = max(
             0,
@@ -422,18 +421,18 @@ def release_normalization_project(services: Any, project: str) -> None:
 
 
 def load_persisted_normalization_job(services: Any, project: str) -> dict | None:
-    payload = services._read_json_safe(
-        services._project_paths(project)["normalization_job_status"]
-    )
+    payload = services._read_json_safe(services._project_paths(project)["normalization_job_status"])
     if not isinstance(payload, dict) or payload.get("project") != project:
         return None
     restored = dict(payload)
     if restored.get("status") in {"queued", "running"}:
-        restored.update({
-            "status": "interrupted",
-            "message": "Interrupted; normalization can be restarted",
-            "finished_at": services._utc_now_iso(),
-        })
+        restored.update(
+            {
+                "status": "interrupted",
+                "message": "Interrupted; normalization can be restarted",
+                "finished_at": services._utc_now_iso(),
+            }
+        )
     return restored
 
 

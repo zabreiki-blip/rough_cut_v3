@@ -79,12 +79,15 @@ def test_resolve_path_rejects_paths_outside_project_root(tmp_path: Path) -> None
     fallback = allowed / "work/default.json"
 
     assert resolve_path("", fallback, root_dir=root, allowed_root=allowed) == fallback
-    assert resolve_path(
-        "projects/demo/input/scenario.txt",
-        fallback,
-        root_dir=root,
-        allowed_root=allowed,
-    ) == allowed / "input/scenario.txt"
+    assert (
+        resolve_path(
+            "projects/demo/input/scenario.txt",
+            fallback,
+            root_dir=root,
+            allowed_root=allowed,
+        )
+        == allowed / "input/scenario.txt"
+    )
     with pytest.raises(ValueError):
         resolve_path(
             "projects/other/input/scenario.txt",

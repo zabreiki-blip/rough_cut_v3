@@ -18,6 +18,7 @@ import uuid
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -222,7 +223,10 @@ def _cep_cors_enabled() -> bool:
     if configured is not None:
         return bool(configured)
     return os.getenv("ROUGH_CUT_CEP_CORS", "").strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -258,9 +262,7 @@ def require_api_authentication():
     # Keep the challenge for direct browser navigation only.
     header = request.headers.get("Authorization", "").strip()
     if not _cep_cors_origin() and not header.lower().startswith("bearer "):
-        response.headers["WWW-Authenticate"] = (
-            'Basic realm="Rough Cut", charset="UTF-8"'
-        )
+        response.headers["WWW-Authenticate"] = 'Basic realm="Rough Cut", charset="UTF-8"'
     return response
 
 
@@ -270,12 +272,8 @@ def add_cep_cors_headers(response):
     if not origin:
         return response
     response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Authorization, Content-Type, X-API-Token"
-    )
-    response.headers["Access-Control-Allow-Methods"] = (
-        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    )
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-API-Token"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     response.headers["Access-Control-Max-Age"] = "600"
     response.headers.add("Vary", "Origin")
     return response
@@ -331,12 +329,16 @@ def _normalization_source_is_current(document: dict, project_root: Path) -> bool
     """Best-effort source hash check, compatible with old normalization drafts."""
     source_meta = document.get("source")
     source_dict = source_meta if isinstance(source_meta, dict) else {}
-    expected_hash = str(
-        document.get("source_sha256")
-        or document.get("source_hash")
-        or source_dict.get("sha256")
-        or ""
-    ).strip().lower()
+    expected_hash = (
+        str(
+            document.get("source_sha256")
+            or document.get("source_hash")
+            or source_dict.get("sha256")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     source_value = (
         document.get("source_path")
         or source_dict.get("path")
@@ -346,7 +348,9 @@ def _normalization_source_is_current(document: dict, project_root: Path) -> bool
     if not expected_hash or not source_value:
         return True
     try:
-        source_path = _abs_path(str(source_value), project_root / "input" / "scenario.docx", project_root)
+        source_path = _abs_path(
+            str(source_value), project_root / "input" / "scenario.docx", project_root
+        )
         if not source_path.is_file():
             return False
         stat = source_path.stat()
@@ -389,13 +393,15 @@ def _normalization_required(project: str):
     document, reason = _confirmed_normalization(project)
     if document is not None:
         return None
-    return jsonify({
-        "ok": False,
-        "error": "normalization_confirmation_required",
-        "message": "Сначала подтвердите актуальную нормализацию сценария",
-        "reason": reason,
-        "project": project,
-    }), 409
+    return jsonify(
+        {
+            "ok": False,
+            "error": "normalization_confirmation_required",
+            "message": "Сначала подтвердите актуальную нормализацию сценария",
+            "reason": reason,
+            "project": project,
+        }
+    ), 409
 
 
 def _prepared_projection_required(project: str):
@@ -407,19 +413,19 @@ def _prepared_projection_required(project: str):
         and str(prepared.get("source") or "") == str(confirmed.get("source") or "")
     ):
         return None
-    return jsonify({
-        "ok": False,
-        "error": "normalization_projection_stale",
-        "message": "Подтверждённая проекция для озвучки устарела; подтвердите сценарий повторно",
-        "reason": reason if confirmed is None else "prepared_changed",
-        "project": project,
-    }), 409
+    return jsonify(
+        {
+            "ok": False,
+            "error": "normalization_projection_stale",
+            "message": "Подтверждённая проекция для озвучки устарела; подтвердите сценарий повторно",
+            "reason": reason if confirmed is None else "prepared_changed",
+            "project": project,
+        }
+    ), 409
 
 
 def _confirmed_prepared_path(payload: dict, paths: dict[str, Path]) -> Path:
-    prepared_path = _abs_path(
-        payload.get("prepared_path", ""), paths["prepared"], paths["root"]
-    )
+    prepared_path = _abs_path(payload.get("prepared_path", ""), paths["prepared"], paths["root"])
     if prepared_path.resolve() != paths["prepared"].resolve():
         raise ValueError("prepared_path must reference confirmed scenario_prepared.json")
     return prepared_path
@@ -496,8 +502,7 @@ def _build_status(project: str) -> dict:
         "timeline_ready": bool(
             paths["timeline"].is_file()
             and confirmed_normalization
-            and timeline.get("normalization_revision")
-            == confirmed_normalization.get("revision")
+            and timeline.get("normalization_revision") == confirmed_normalization.get("revision")
         ),
     }
 
@@ -647,12 +652,14 @@ def _normalization_exception(exc: Exception):
     if isinstance(exc, SourceChangedError):
         return _json_error(str(exc) or "normalization source changed", 409)
     if isinstance(exc, NormalizationValidationError):
-        return jsonify({
-            "ok": False,
-            "error": "normalization_validation_failed",
-            "message": str(exc),
-            "errors": list(getattr(exc, "errors", []) or []),
-        }), 422
+        return jsonify(
+            {
+                "ok": False,
+                "error": "normalization_validation_failed",
+                "message": str(exc),
+                "errors": list(getattr(exc, "errors", []) or []),
+            }
+        ), 422
     if isinstance(exc, FileNotFoundError):
         return _json_error(str(exc), 404)
     if isinstance(exc, KeyError):
@@ -664,10 +671,7 @@ def _normalization_exception(exc: Exception):
 
 def _normalization_payload_for_save(payload: dict, normalized_path: Path) -> dict:
     current = load_normalization(normalized_path)
-    editable = {
-        key: value for key, value in payload.items()
-        if key in {"blocks", "hint"}
-    }
+    editable = {key: value for key, value in payload.items() if key in {"blocks", "hint"}}
     # The UI normally sends only blocks; retaining metadata prevents accidental
     # loss of source hashes and other server-owned document fields.
     current.update(editable)
@@ -793,6 +797,7 @@ _expose_registered_views(
 
 # ── Stage 2 ────────────────────────────────────────────────────────────────────
 
+
 def _sync_source_id(raw: object) -> str:
     source_id = str(raw or "").strip()
     if not SYNC_SOURCE_ID_RE.fullmatch(source_id):
@@ -812,9 +817,7 @@ def _source_api_dict(source: SyncSource) -> dict:
 
 def _match_api_dict(match: SyncMatch) -> dict:
     result = match.to_dict()
-    result["block_uid"] = str(
-        match.metadata.get("parent_block_uid") or match.segment_id
-    )
+    result["block_uid"] = str(match.metadata.get("parent_block_uid") or match.segment_id)
     return result
 
 
@@ -893,11 +896,15 @@ def _transcription_config(
     """Return lightweight cache inputs without importing a Whisper backend."""
 
     configured_backend = (
-        str(backend).strip() if backend is not None else ""
-    ) or os.getenv("SYNC_WHISPER_BACKEND", "auto").strip() or "auto"
+        (str(backend).strip() if backend is not None else "")
+        or os.getenv("SYNC_WHISPER_BACKEND", "auto").strip()
+        or "auto"
+    )
     configured_model = (
-        str(model).strip() if model is not None else ""
-    ) or os.getenv("SYNC_WHISPER_MODEL", "").strip() or "<backend-default>"
+        (str(model).strip() if model is not None else "")
+        or os.getenv("SYNC_WHISPER_MODEL", "").strip()
+        or "<backend-default>"
+    )
     return {
         "backend": configured_backend.lower(),
         "model": configured_model,
@@ -907,8 +914,7 @@ def _transcription_config(
         "batch_size": os.getenv("SYNC_WHISPER_BATCH_SIZE", "0").strip() or "0",
         "device": os.getenv("SYNC_WHISPER_DEVICE", "auto").strip().lower() or "auto",
         "compute_type": (
-            os.getenv("SYNC_WHISPER_COMPUTE_TYPE", "default").strip().lower()
-            or "default"
+            os.getenv("SYNC_WHISPER_COMPUTE_TYPE", "default").strip().lower() or "default"
         ),
         "runtime_platform": f"{platform.system()}-{platform.machine()}",
         "faster_whisper_version": _installed_version("faster-whisper"),
@@ -918,9 +924,9 @@ def _transcription_config(
 
 
 def _transcription_config_fingerprint(config: dict[str, str]) -> str:
-    payload = json.dumps(
-        config, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    payload = json.dumps(config, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -970,10 +976,9 @@ def _word_index_audio_matches(
     if not isinstance(stored, dict):
         return False
     if stored.get("sample_sha256"):
-        return (
-            stored.get("size") == current_signature.get("size")
-            and stored.get("sample_sha256") == current_signature.get("sample_sha256")
-        )
+        return stored.get("size") == current_signature.get("size") and stored.get(
+            "sample_sha256"
+        ) == current_signature.get("sample_sha256")
     # Backward-compatible first read. The caller upgrades this metadata after
     # a successful size/mtime comparison without retranscribing the source.
     return stored == _audio_stat_signature(audio_path)
@@ -1027,9 +1032,7 @@ def _cleanup_stale_uploads(directory: Path, *, max_age_seconds: int = 24 * 60 * 
 
 def _sync_quote(block: dict) -> str:
     """Remove a scenario speaker/role/timecode prefix before fuzzy matching."""
-    text = str(
-        block.get("normalized_text") or block.get("original_text") or ""
-    ).strip()
+    text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
     if not text:
         return ""
 
@@ -1054,9 +1057,9 @@ def _sync_quote(block: dict) -> str:
     speaker = str(block.get("speaker") or "").strip()
     role = str(block.get("role") or "").strip()
     if speaker and text.casefold().startswith(speaker.casefold()):
-        remainder = text[len(speaker):].lstrip(" \t,")
+        remainder = text[len(speaker) :].lstrip(" \t,")
         if role and remainder.casefold().startswith(role.casefold()):
-            remainder = remainder[len(role):]
+            remainder = remainder[len(role) :]
         quote = remainder.lstrip(" \t\r\n:;,.…—–-")
         if quote:
             return quote
@@ -1082,23 +1085,27 @@ def _sync_alignment_units(blocks: list[dict]) -> list[dict[str, object]]:
         fragments = (
             normalized_sync_fragments(block)
             if block_type == "sync" and isinstance(raw_fragments, list) and raw_fragments
-            else [{
-                "text": _sync_quote(block),
-                "timecode_start": str(block.get("timecode_start") or "").strip(),
-                "timecode_end": str(block.get("timecode_end") or "").strip(),
-            }]
+            else [
+                {
+                    "text": _sync_quote(block),
+                    "timecode_start": str(block.get("timecode_start") or "").strip(),
+                    "timecode_end": str(block.get("timecode_end") or "").strip(),
+                }
+            ]
         )
         for index, fragment in enumerate(fragments):
-            units.append({
-                "segment_id": sync_fragment_id(parent_uid, index, len(fragments)),
-                "parent_block_uid": parent_uid,
-                "fragment_index": index,
-                "fragment_count": len(fragments),
-                "text": fragment["text"],
-                "timecode_start": fragment["timecode_start"],
-                "speaker": speaker,
-                "block": block,
-            })
+            units.append(
+                {
+                    "segment_id": sync_fragment_id(parent_uid, index, len(fragments)),
+                    "parent_block_uid": parent_uid,
+                    "fragment_index": index,
+                    "fragment_count": len(fragments),
+                    "text": fragment["text"],
+                    "timecode_start": fragment["timecode_start"],
+                    "speaker": speaker,
+                    "block": block,
+                }
+            )
     return units
 
 
@@ -1129,23 +1136,20 @@ def _sync_job_with_live_summary(job: dict) -> dict:
     try:
         matches = SyncMatchStore(_project_paths(project)["sync_matches"]).list()
     except ValueError as exc:
-        app.logger.warning(
-            "Could not refresh sync summary project=%s error=%s", project, exc
-        )
+        app.logger.warning("Could not refresh sync summary project=%s error=%s", project, exc)
         return snapshot
     confirmed, _reason = _confirmed_normalization(project)
     if confirmed is not None:
         normalization_revision = confirmed.get("revision")
         scenario_revision_id = str(confirmed.get("scenario_revision_id") or "")
         matches = [
-            item for item in matches
-            if item.metadata.get("normalization_revision")
-            in (None, "", normalization_revision)
+            item
+            for item in matches
+            if item.metadata.get("normalization_revision") in (None, "", normalization_revision)
             and (
                 not str(item.metadata.get("scenario_revision_id") or "")
                 or not scenario_revision_id
-                or str(item.metadata.get("scenario_revision_id") or "")
-                == scenario_revision_id
+                or str(item.metadata.get("scenario_revision_id") or "") == scenario_revision_id
             )
         ]
     snapshot.update(_sync_summary(matches))
@@ -1211,22 +1215,26 @@ def _semantic_review_candidates(match: SyncMatch) -> list[SemanticCandidate]:
         and match.source_out_sec is not None
         and match.source_out_sec > match.source_in_sec
     ):
-        candidates.append(SemanticCandidate(
-            source_id=match.source_id,
-            source_in_sec=match.source_in_sec,
-            source_out_sec=match.source_out_sec,
-            confidence=match.confidence,
-            matched_text=match.matched_text,
-        ))
+        candidates.append(
+            SemanticCandidate(
+                source_id=match.source_id,
+                source_in_sec=match.source_in_sec,
+                source_out_sec=match.source_out_sec,
+                confidence=match.confidence,
+                matched_text=match.matched_text,
+            )
+        )
     for alternative in match.alternatives:
         if alternative.source_id and alternative.source_out_sec > alternative.source_in_sec:
-            candidates.append(SemanticCandidate(
-                source_id=alternative.source_id,
-                source_in_sec=alternative.source_in_sec,
-                source_out_sec=alternative.source_out_sec,
-                confidence=alternative.confidence,
-                matched_text=alternative.matched_text,
-            ))
+            candidates.append(
+                SemanticCandidate(
+                    source_id=alternative.source_id,
+                    source_in_sec=alternative.source_in_sec,
+                    source_out_sec=alternative.source_out_sec,
+                    confidence=alternative.confidence,
+                    matched_text=alternative.matched_text,
+                )
+            )
     return candidates
 
 
@@ -1296,7 +1304,9 @@ def _load_persisted_sync_job(project: str) -> dict | None:
         return None
     restored = dict(payload)
     if str(restored.get("status") or "").lower() in {
-        "queued", "running", "cancelling",
+        "queued",
+        "running",
+        "cancelling",
     }:
         # There is no live worker for a job loaded only from disk. Present it
         # as an interrupted checkpoint instead of leaving every client polling
@@ -1314,19 +1324,12 @@ def _trim_sync_jobs_locked() -> None:
     now = datetime.now(UTC)
     terminal_statuses = {"completed", "failed", "cancelled", "interrupted"}
     terminal_ids = [
-        job_id for job_id, job in _SYNC_JOBS.items()
-        if job.get("status") in terminal_statuses
+        job_id for job_id, job in _SYNC_JOBS.items() if job.get("status") in terminal_statuses
     ]
     for job_id in terminal_ids:
-        stamp = (
-            _SYNC_JOBS[job_id].get("finished_at")
-            or _SYNC_JOBS[job_id].get("created_at")
-            or ""
-        )
+        stamp = _SYNC_JOBS[job_id].get("finished_at") or _SYNC_JOBS[job_id].get("created_at") or ""
         try:
-            expired = (
-                now - datetime.fromisoformat(stamp)
-            ).total_seconds() > _SYNC_JOBS_TTL_SECONDS
+            expired = (now - datetime.fromisoformat(stamp)).total_seconds() > _SYNC_JOBS_TTL_SECONDS
         except (TypeError, ValueError):
             expired = False
         if expired:
@@ -1334,15 +1337,12 @@ def _trim_sync_jobs_locked() -> None:
             _SYNC_CANCEL_EVENTS.pop(job_id, None)
 
     terminal_ids = [
-        job_id for job_id, job in _SYNC_JOBS.items()
-        if job.get("status") in terminal_statuses
+        job_id for job_id, job in _SYNC_JOBS.items() if job.get("status") in terminal_statuses
     ]
     ordered_ids = sorted(
         terminal_ids,
         key=lambda job_id: (
-            _SYNC_JOBS[job_id].get("finished_at")
-            or _SYNC_JOBS[job_id].get("created_at")
-            or "",
+            _SYNC_JOBS[job_id].get("finished_at") or _SYNC_JOBS[job_id].get("created_at") or "",
             job_id,
         ),
     )

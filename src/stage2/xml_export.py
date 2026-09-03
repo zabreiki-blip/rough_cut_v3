@@ -54,13 +54,9 @@ def _validate_placeholder_identities(timeline: FullTimeline) -> None:
         if seg.type not in {"snh", "host"} or not seg.placeholder_path:
             continue
         if not seg.block_uid or not re.fullmatch(r"[A-Za-z0-9._:-]+", seg.block_uid):
-            raise ValueError(
-                f"{seg.id} has no valid canonical block_uid for XML export"
-            )
+            raise ValueError(f"{seg.id} has no valid canonical block_uid for XML export")
         if seg.block_uid in seen:
-            raise ValueError(
-                f"duplicate placeholder block_uid in XML export: {seg.block_uid}"
-            )
+            raise ValueError(f"duplicate placeholder block_uid in XML export: {seg.block_uid}")
         seen.add(seg.block_uid)
 
 
@@ -87,8 +83,9 @@ def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
     _sub(audio, "channelcount", str(channels))
 
 
-def _video_file_el(parent: ET.Element, seg: TimelineSegment, fps: int,
-                   width: int, height: int) -> None:
+def _video_file_el(
+    parent: ET.Element, seg: TimelineSegment, fps: int, width: int, height: int
+) -> None:
     file_el = ET.SubElement(parent, "file")
     file_el.set("id", f"file-{seg.id}")
     _sub(file_el, "name", Path(seg.placeholder_path).name)

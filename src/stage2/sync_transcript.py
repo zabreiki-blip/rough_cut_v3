@@ -1,4 +1,5 @@
 """Provider-neutral ingestion for word-timestamp transcription output."""
+
 from __future__ import annotations
 
 import json

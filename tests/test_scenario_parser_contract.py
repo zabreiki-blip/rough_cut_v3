@@ -99,9 +99,7 @@ def test_date_is_not_a_timecode_but_explicit_timecode_is_canonical_sync(
 
     date_analysis = _analyze_legacy(tmp_path / "date", date_text)
     timecode_analysis = _analyze_legacy(tmp_path / "timecode", timecoded_text)
-    canonical = _normalize_canonical(
-        tmp_path / "canonical", f"{date_text}\n{timecoded_text}"
-    )
+    canonical = _normalize_canonical(tmp_path / "canonical", f"{date_text}\n{timecoded_text}")
 
     assert [item["text_original"] for item in date_analysis["items"]] == [date_text]
     assert timecode_analysis["items"] == []
@@ -181,8 +179,7 @@ def test_multiline_boundaries_are_preserved_at_each_abstraction_level(
 
     assert len(legacy_analysis["items"]) == 1
     assert legacy_analysis["items"][0]["text_original"] == (
-        "Первая строка закадрового текста.\n"
-        "Вторая строка продолжает тот же закадровый текст."
+        "Первая строка закадрового текста.\nВторая строка продолжает тот же закадровый текст."
     )
     assert [block["type"] for block in canonical["blocks"]] == [
         "voiceover",
@@ -193,8 +190,7 @@ def test_multiline_boundaries_are_preserved_at_each_abstraction_level(
     assert [(segment.type, segment.text) for segment in legacy_timeline.segments] == [
         (
             "zk",
-            "Первая строка закадрового текста. "
-            "Вторая строка продолжает тот же закадровый текст.",
+            "Первая строка закадрового текста. Вторая строка продолжает тот же закадровый текст.",
         ),
         ("snh", "Первая строка ответа. продолжение ответа героя."),
     ]
@@ -203,10 +199,7 @@ def test_multiline_boundaries_are_preserved_at_each_abstraction_level(
 def test_legacy_import_is_a_projection_of_the_legacy_timeline_parser(
     tmp_path: Path,
 ) -> None:
-    raw_text = (
-        "ЗК7: Текст диктора.\n"
-        "СНХ ИВАН ИВАНОВ, эксперт, 00:01:02 Ответ героя.\n"
-    )
+    raw_text = "ЗК7: Текст диктора.\nСНХ ИВАН ИВАНОВ, эксперт, 00:01:02 Ответ героя.\n"
     raw_path = tmp_path / "scenario_raw.txt"
     raw_path.write_text(raw_text, encoding="utf-8")
     prepared_path = tmp_path / "scenario_prepared.json"

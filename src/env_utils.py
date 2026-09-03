@@ -37,11 +37,7 @@ def env_int_strict(
     try:
         value = int(str(raw).strip())
     except ValueError as exc:
-        raise ValueError(
-            f"{name} must be an integer greater than or equal to {minimum}"
-        ) from exc
+        raise ValueError(f"{name} must be an integer greater than or equal to {minimum}") from exc
     if value < minimum:
-        raise ValueError(
-            f"{name} must be an integer greater than or equal to {minimum}"
-        )
+        raise ValueError(f"{name} must be an integer greater than or equal to {minimum}")
     return value

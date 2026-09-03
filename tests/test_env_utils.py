@@ -11,13 +11,16 @@ from env_utils import env_int, env_int_strict
 )
 def test_env_int_defaults_and_clamps(raw: str | None, expected: int) -> None:
     environ = {} if raw is None else {"SETTING": raw}
-    assert env_int(
-        "SETTING",
-        10,
-        minimum=1,
-        maximum=20,
-        environ=environ,
-    ) == expected
+    assert (
+        env_int(
+            "SETTING",
+            10,
+            minimum=1,
+            maximum=20,
+            environ=environ,
+        )
+        == expected
+    )
 
 
 def test_env_int_strict_distinguishes_missing_and_invalid_values() -> None:

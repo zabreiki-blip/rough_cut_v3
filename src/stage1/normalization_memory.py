@@ -11,9 +11,7 @@ from typing import Any, Iterator
 from .normalization_models import VALID_BLOCK_TYPES
 
 
-DEFAULT_MEMORY_PATH = (
-    Path(__file__).resolve().parents[2] / "data" / "normalization_memory.sqlite3"
-)
+DEFAULT_MEMORY_PATH = Path(__file__).resolve().parents[2] / "data" / "normalization_memory.sqlite3"
 
 VALID_ALIAS_SCOPES = {"marker", "video_cue"}
 
@@ -138,7 +136,9 @@ class NormalizationMemory:
             )
             self._conn.execute("DROP TABLE aliases")
             self._conn.execute("ALTER TABLE aliases_new RENAME TO aliases")
-            self._conn.execute("CREATE INDEX IF NOT EXISTS aliases_marker_idx ON aliases(normalized_marker)")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS aliases_marker_idx ON aliases(normalized_marker)"
+            )
             after_count = self._conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
             if after_count != before_count:
                 raise RuntimeError(
@@ -174,7 +174,9 @@ class NormalizationMemory:
         return [dict(row) for row in self._conn.execute(sql, tuple(params))]
 
     def get_rule(self, rule_id: int) -> dict[str, Any] | None:
-        return self._row(self._conn.execute("SELECT * FROM aliases WHERE id = ?", (rule_id,)).fetchone())
+        return self._row(
+            self._conn.execute("SELECT * FROM aliases WHERE id = ?", (rule_id,)).fetchone()
+        )
 
     def create_rule(
         self,
@@ -213,8 +215,18 @@ class NormalizationMemory:
                      END,
                      confidence=MAX(aliases.confidence, excluded.confidence),
                      updated_at=excluded.updated_at""",
-                (marker.strip(), normalized, target_type, source, rule_status,
-                 confirmations, confidence, now, now, scope),
+                (
+                    marker.strip(),
+                    normalized,
+                    target_type,
+                    source,
+                    rule_status,
+                    confirmations,
+                    confidence,
+                    now,
+                    now,
+                    scope,
+                ),
             )
             self._reconcile_conflicts(normalized, scope)
         row = self._conn.execute(
@@ -262,9 +274,7 @@ class NormalizationMemory:
     def record_manual(
         self, marker: str, target_type: str, *, scope: str = "marker"
     ) -> dict[str, Any]:
-        return self.create_rule(
-            marker, target_type, source="manual", status="active", scope=scope
-        )
+        return self.create_rule(marker, target_type, source="manual", status="active", scope=scope)
 
     def record_llm_confirmation(
         self, marker: str, target_type: str, source_hash: str, *, scope: str = "marker"
@@ -286,9 +296,7 @@ class NormalizationMemory:
         _validate_scope(scope)
         if source not in {"llm", "correction"}:
             raise ValueError("Candidate source must be llm or correction")
-        rule = self.create_rule(
-            marker, target_type, source=source, status="candidate", scope=scope
-        )
+        rule = self.create_rule(marker, target_type, source=source, status="candidate", scope=scope)
         now = _utcnow()
         with self.transaction():
             inserted = self._conn.execute(
@@ -350,11 +358,14 @@ class NormalizationMemory:
     def resolve_exact(self, marker: str, *, scope: str = "marker") -> dict[str, Any] | None:
         _validate_scope(scope)
         normalized = normalize_marker(marker)
-        rows = [dict(row) for row in self._conn.execute(
-            """SELECT * FROM aliases WHERE normalized_marker=? AND scope=? AND status IN ('active', 'conflict')
+        rows = [
+            dict(row)
+            for row in self._conn.execute(
+                """SELECT * FROM aliases WHERE normalized_marker=? AND scope=? AND status IN ('active', 'conflict')
                ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END, confidence DESC, id""",
-            (normalized, scope),
-        )]
+                (normalized, scope),
+            )
+        ]
         if not rows:
             return None
         manual = [row for row in rows if row["source"] == "manual"]
@@ -390,11 +401,13 @@ class NormalizationMemory:
         return {"score": round(best[0], 3), "rule": best[1]}
 
     def _reconcile_conflicts(self, normalized_marker: str, scope: str = "marker") -> None:
-        rows = list(self._conn.execute(
-            """SELECT id, target_type, source, status, confirmations
+        rows = list(
+            self._conn.execute(
+                """SELECT id, target_type, source, status, confirmations
                FROM aliases WHERE normalized_marker=? AND scope=? AND status != 'disabled'""",
-            (normalized_marker, scope),
-        ))
+                (normalized_marker, scope),
+            )
+        )
         manual_types = {row["target_type"] for row in rows if row["source"] == "manual"}
         if len(manual_types) > 1:
             self._conn.execute(
@@ -420,7 +433,9 @@ class NormalizationMemory:
                 (manual_target, now, normalized_marker, scope),
             )
             return
-        active_types = {row["target_type"] for row in rows if row["status"] in {"active", "conflict"}}
+        active_types = {
+            row["target_type"] for row in rows if row["status"] in {"active", "conflict"}
+        }
         if len(active_types) > 1:
             self._conn.execute(
                 "UPDATE aliases SET status='conflict', updated_at=? WHERE normalized_marker=? AND scope=? AND status!='disabled'",
