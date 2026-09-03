@@ -839,6 +839,196 @@ function testMarkerAwareConformResume() {
   assert.match(rejectedWrite.error, /did not persist the exact completion marker/);
 }
 
+function testMarkerNameIndexCaching() {
+  const context = {
+    $: {_roughCutTestMode: true},
+    app: {},
+    console,
+    Date,
+    JSON,
+    Math,
+    decodeURIComponent,
+    encodeURIComponent,
+    isFinite,
+    File: function File() {},
+    Folder: function Folder() {},
+    Time: function Time() { this.ticks = "0"; },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    fs.readFileSync(path.join(root, "cep", "host.jsx"), "utf8"),
+    context,
+    {filename: "host.jsx"},
+  );
+  const hooks = context.$._roughCutStage2Test;
+
+  // --- (a) + (c): a large marker collection scanned by many item lookups
+  // against the same target must return results identical to a naive scan,
+  // while not re-walking the whole collection for every lookup.
+  const N = 40;
+  const markerList = [];
+  for (let i = 0; i < N; i++) {
+    markerList.push({
+      name: "RC_SYNC seg-" + i,
+      comments: "",
+      start: {seconds: i * 10},
+      end: {seconds: i * 10 + 5},
+    });
+  }
+  let nextCalls = 0;
+  let firstCalls = 0;
+  const target = {
+    markers: {
+      getFirstMarker() {
+        firstCalls += 1;
+        return markerList[0] || null;
+      },
+      getNextMarker(current) {
+        nextCalls += 1;
+        const index = markerList.indexOf(current);
+        return index >= 0 ? markerList[index + 1] || null : null;
+      },
+      createMarker(start) {
+        const created = {
+          name: "",
+          comments: "",
+          start: {seconds: start},
+          end: {seconds: start},
+        };
+        markerList.push(created);
+        return created;
+      },
+      deleteMarker(value) {
+        const index = markerList.indexOf(value);
+        if (index < 0) return false;
+        markerList.splice(index, 1);
+        return true;
+      },
+    },
+  };
+
+  function naiveMatches(name) {
+    return markerList.filter((marker) => marker.name === name);
+  }
+
+  // Marker objects cross the vm-context boundary; compare by reference
+  // identity and length rather than assert.deepStrictEqual, which also
+  // requires the containing Array's prototype to match across realms.
+  function assertSameMarkers(actual, expected) {
+    assert.strictEqual(actual.length, expected.length);
+    for (let i = 0; i < expected.length; i++) {
+      assert.strictEqual(actual[i], expected[i]);
+    }
+  }
+
+  for (let i = 0; i < N; i += 7) {
+    const name = "RC_SYNC seg-" + i;
+    assertSameMarkers(hooks.exactMarkersNamed(target, name), naiveMatches(name));
+  }
+  assert.strictEqual(hooks.exactMarkersNamed(target, "RC_SYNC absent").length, 0);
+
+  nextCalls = 0;
+  firstCalls = 0;
+  const M = 30;
+  for (let i = 0; i < M; i++) {
+    hooks.exactMarkersNamed(target, "RC_SYNC seg-" + (i % N));
+  }
+  assert.ok(
+    nextCalls <= N,
+    "expected a single collection scan (<= " + N +
+      " getNextMarker calls) across " + M + " item lookups against the " +
+      "same target, got " + nextCalls,
+  );
+  assert.ok(
+    firstCalls <= 1,
+    "expected a single getFirstMarker call across " + M +
+      " item lookups, got " + firstCalls,
+  );
+
+  // (b) upsertConformMarker's own createMarker call must be visible to the
+  // very next lookup against the same target.
+  const newItem = {
+    segmentId: "seg-new",
+    speaker: "S",
+    text: "text",
+    sourceSequenceName: "src",
+    sourceInSeconds: 0,
+    sourceOutSeconds: 5,
+    timelineSeconds: 900,
+  };
+  const write = hooks.upsertConformMarker(target, newItem);
+  assert.strictEqual(write.ok, true);
+  const afterCreate = hooks.exactMarkersNamed(target, "RC_SYNC seg-new");
+  assertSameMarkers(afterCreate, naiveMatches("RC_SYNC seg-new"));
+  assert.strictEqual(afterCreate.length, 1);
+  assert.strictEqual(afterCreate[0], write.marker);
+
+  // --- (b): reanchorConformMarker's delete-then-recreate fallback must
+  // also be visible to the very next lookup, and must not keep returning
+  // the deleted marker instance from a stale cached index.
+  function fallbackMarker() {
+    return Object.assign({
+      name: "RC_SYNC seg-b",
+      comments: "orig",
+      start: {seconds: 12},
+      end: {seconds: 17},
+    }, {});
+  }
+  const fixedStart = 12;
+  const fixedEnd = 17;
+  const fixedMarker = fallbackMarker();
+  Object.defineProperties(fixedMarker, {
+    start: {get() { return {seconds: fixedStart}; }, set() {}, configurable: true},
+    end: {get() { return {seconds: fixedEnd}; }, set() {}, configurable: true},
+  });
+  const markerList2 = [fixedMarker];
+  const target2 = {
+    markers: {
+      getFirstMarker() { return markerList2[0] || null; },
+      getNextMarker(current) {
+        const index = markerList2.indexOf(current);
+        return index >= 0 ? markerList2[index + 1] || null : null;
+      },
+      createMarker(start) {
+        const created = {name: "", comments: "", start, end: start};
+        markerList2.push(created);
+        return created;
+      },
+      deleteMarker(value) {
+        const index = markerList2.indexOf(value);
+        if (index < 0) return false;
+        markerList2.splice(index, 1);
+        return true;
+      },
+    },
+  };
+  const itemB = {
+    segmentId: "seg-b",
+    sourceInSeconds: 0,
+    sourceOutSeconds: 5,
+    timelineSeconds: 12,
+  };
+
+  // Warm the index cache before the mutation so a missing invalidation
+  // would reproduce as a stale-marker bug below.
+  const beforeReanchor = hooks.exactMarkersNamed(target2, "RC_SYNC seg-b");
+  assert.strictEqual(beforeReanchor.length, 1);
+  assert.strictEqual(beforeReanchor[0], fixedMarker);
+
+  const reanchored = hooks.reanchorConformMarker(target2, fixedMarker, itemB, 21.5);
+  assert.strictEqual(reanchored.report.recreated, true);
+
+  const afterReanchor = hooks.exactMarkersNamed(target2, "RC_SYNC seg-b");
+  assert.strictEqual(
+    afterReanchor.length,
+    1,
+    "index must reflect delete+recreate, not a stale cached entry",
+  );
+  assert.strictEqual(afterReanchor[0], reanchored.marker);
+  assert.notStrictEqual(afterReanchor[0], fixedMarker);
+  assert.strictEqual(markerList2.indexOf(fixedMarker), -1);
+}
+
 function testWhisperPollingAndEta() {
   class Element {
     constructor() {
@@ -1090,4 +1280,5 @@ testPlaceholderSelection();
 testCyrillicProjectNames();
 testSequenceRoleGuards();
 testMarkerAwareConformResume();
+testMarkerNameIndexCaching();
 testWhisperPollingAndEta();

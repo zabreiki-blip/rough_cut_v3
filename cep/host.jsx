@@ -13,6 +13,16 @@
     var TICKS_PER_SECOND = 254016000000;
     var roughCutSignalCache = [];
     var ROUGH_CUT_SIGNAL_CACHE_LIMIT = 64;
+    // Marker-name index for a single sequence's marker collection, built by
+    // one full getFirstMarker/getNextMarker scan and reused across the many
+    // exactMarkersNamed() lookups a single conform pass performs against the
+    // same target. Any code path that creates, deletes, or renames a marker
+    // MUST call invalidateMarkerIndexCache() immediately afterwards so the
+    // next lookup rebuilds from a fresh scan instead of serving stale data.
+    // The index is valid only within a single call from the panel; it is reset
+    // on entry to each public operation because external marker edits between
+    // calls are not tracked.
+    var markerIndexCache = null;
 
     function fail(message, details) {
         return stringify({
@@ -2443,15 +2453,20 @@
             asString(marker.comments);
     }
 
-    function exactMarkersNamed(target, markerName) {
+    function invalidateMarkerIndexCache() {
+        markerIndexCache = null;
+    }
+
+    function buildMarkerIndex(target) {
         var markers;
-        var matches = [];
+        var byName = {};
         var current;
         var next;
         var currentKey;
         var nextKey;
         var visited = 0;
         var maxMarkers = 10000;
+        var key;
         try {
             markers = target.markers;
         } catch (markerAccessError) {
@@ -2473,9 +2488,11 @@
                     " entries; conform cancelled."
                 );
             }
-            if (asString(current.name) === markerName) {
-                matches.push(current);
+            key = "n:" + asString(current.name);
+            if (!Object.prototype.hasOwnProperty.call(byName, key)) {
+                byName[key] = [];
             }
+            byName[key].push(current);
             currentKey = markerPositionKey(current);
             next = markers.getNextMarker(current);
             if (next) {
@@ -2489,7 +2506,20 @@
             }
             current = next;
         }
-        return matches;
+        return { target: target, byName: byName };
+    }
+
+    function exactMarkersNamed(target, markerName) {
+        var key = "n:" + markerName;
+        var bucket;
+        if (!markerIndexCache || markerIndexCache.target !== target) {
+            markerIndexCache = buildMarkerIndex(target);
+        }
+        if (!Object.prototype.hasOwnProperty.call(markerIndexCache.byName, key)) {
+            return [];
+        }
+        bucket = markerIndexCache.byName[key];
+        return bucket.slice();
     }
 
     function conformMarkerState(target, item) {
@@ -2851,11 +2881,13 @@
                     );
                 }
                 temporary = markers.createMarker(expectedStart);
+                invalidateMarkerIndexCache();
                 if (!temporary) {
                     throw new Error("createMarker returned no marker");
                 }
                 temporary.name = "RC_SYNC_REANCHOR_TMP " +
                     asString(item.segmentId);
+                invalidateMarkerIndexCache();
                 temporary.comments = preservedComments;
                 temporary.end = expectedEnd;
                 if (!markerTimingMatches(
@@ -2865,6 +2897,7 @@
                     )) {
                     try { markers.deleteMarker(temporary); }
                     catch (ignoreTemporaryDelete) { /* временный элемент уже удалён */ }
+                    invalidateMarkerIndexCache();
                     temporary = null;
                     throw new Error(
                         "temporary marker timing did not verify"
@@ -2872,16 +2905,19 @@
                 }
                 try {
                     deleteResult = markers.deleteMarker(marker);
+                    invalidateMarkerIndexCache();
                     if (deleteResult === false) {
                         throw new Error("deleteMarker returned false");
                     }
                 } catch (oldMarkerDeleteError) {
                     try { markers.deleteMarker(temporary); }
                     catch (ignoreTemporaryCleanup) { /* очистка временных данных не критична */ }
+                    invalidateMarkerIndexCache();
                     temporary = null;
                     throw oldMarkerDeleteError;
                 }
                 temporary.name = preservedName;
+                invalidateMarkerIndexCache();
                 temporary.comments = preservedComments;
                 marker = temporary;
                 exactMatches = exactMarkersNamed(target, preservedName);
@@ -2953,8 +2989,10 @@
                 marker = matches[0];
             } else {
                 marker = markers.createMarker(markerStart);
+                invalidateMarkerIndexCache();
             }
             marker.name = markerName;
+            invalidateMarkerIndexCache();
             marker.comments = markerComments;
             try {
                 if (markerStart > secondsOf(marker.end)) {
@@ -3039,6 +3077,7 @@
 
     $._roughCutStage2 = {
         ping: function () {
+            invalidateMarkerIndexCache();
             if (!app.project) {
                 return fail("No Premiere project is open.");
             }
@@ -3050,6 +3089,7 @@
         },
 
         listProjects: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var root;
             var entries;
@@ -3086,6 +3126,7 @@
         },
 
         inspectActiveSequence: function () {
+            invalidateMarkerIndexCache();
             try {
                 if (!app.project || !app.project.activeSequence) {
                     return fail("Open a sequence and make it active in Premiere.");
@@ -3097,6 +3138,7 @@
         },
 
         inspectActiveSequenceLayout: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var sequence;
             var fromSeconds;
@@ -3122,6 +3164,7 @@
         },
 
         resolveSequence: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             try {
                 return success({ sequence: sequenceMetadata(resolveSequence(parsePayload(encodedPayload))) });
             } catch (error) {
@@ -3130,6 +3173,7 @@
         },
 
         insertSequenceRange: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var source;
             var target;
@@ -3228,6 +3272,7 @@
         },
 
         conformSequenceRanges: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var items;
             var target;
@@ -3277,6 +3322,7 @@
         },
 
         exportActiveSequenceAudio: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var sequence;
             var outputFile;
@@ -3364,6 +3410,7 @@
         },
 
         fileInfo: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var file;
             var modified;
@@ -3394,6 +3441,7 @@
             placeholderAnywhere: placeholderAnywhere,
             preparedGapForInsertion: preparedGapForInsertion,
             conformMarkerState: conformMarkerState,
+            exactMarkersNamed: exactMarkersNamed,
             verifyConformMarkerInsertion: verifyConformMarkerInsertion,
             uniqueSourcePairAnywhere: uniqueSourcePairAnywhere,
             staleSourcePairForRepair: staleSourcePairForRepair,
