@@ -1,23 +1,34 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import logging
 import os
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
-from .config import get_settings
+from .config import Settings, get_settings
 from .io_utils import (
     extract_marked_blocks_from_docx,
     extract_paragraphs_from_docx,
     extract_text,
+    read_json,
     write_json,
 )
 from .models import NarrationBlock
+from .openrouter_client import SYSTEM_PROMPT as _OPENROUTER_SYSTEM_PROMPT
 from .openrouter_client import analyze_with_openrouter
 
 logger = logging.getLogger(__name__)
+
+# --- LLM analysis cache (per scenario chunk) ---
+# Increment when the cached payload shape or the classifier contract changes
+# so stale entries are transparently invalidated instead of misapplied.
+_LLM_CACHE_VERSION = 1
+_LLM_CACHE_MAX_ENTRIES = 2000
 
 # --- Regex patterns ---
 
@@ -641,6 +652,125 @@ def _merge_blocks_to_limit(blocks: list[NarrationBlock], max_blocks: int) -> lis
     return merged
 
 
+def _llm_cache_path(output_path: Path) -> Path:
+    parent = Path(output_path).parent
+    work_dir = parent if parent.name == "work" else parent / "work"
+    return work_dir / "analysis_llm_cache.json"
+
+
+def _load_llm_cache(path: Path) -> dict[str, Any]:
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"version": _LLM_CACHE_VERSION, "entries": {}}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _LLM_CACHE_VERSION
+        or not isinstance(payload.get("entries"), dict)
+    ):
+        return {"version": _LLM_CACHE_VERSION, "entries": {}}
+    return payload
+
+
+def _llm_identity(settings: Settings) -> dict[str, Any]:
+    """Fingerprint of the LLM configuration used for a chunk analysis call.
+
+    Any change to the model/provider/prompt must invalidate previously
+    cached results, so every field ``analyze_with_openrouter`` relies on is
+    represented here explicitly.
+    """
+    return {
+        "kind": "openrouter",
+        "model": settings.openrouter_model,
+        "base_url": settings.openrouter_base_url,
+        "temperature": 0.2,
+        "response_format": "json_object",
+        "system_prompt": _OPENROUTER_SYSTEM_PROMPT,
+    }
+
+
+def _llm_cache_fingerprint(chunk: str, *, identity: dict[str, Any]) -> str:
+    material = {
+        "version": _LLM_CACHE_VERSION,
+        "chunk": chunk,
+        "identity": identity,
+    }
+    return sha256(
+        json.dumps(
+            material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _serialize_llm_blocks(blocks: list[NarrationBlock]) -> list[dict[str, Any]] | None:
+    try:
+        payload = [block.to_dict() for block in blocks]
+        json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return payload
+
+
+def _deserialize_llm_blocks(payload: Any) -> list[NarrationBlock] | None:
+    if not isinstance(payload, list):
+        return None
+    blocks: list[NarrationBlock] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            return None
+        try:
+            blocks.append(
+                NarrationBlock(
+                    id=str(item.get("id", "")),
+                    text_original=str(item.get("text_original", "")),
+                    text_for_tts=str(item.get("text_for_tts", "")),
+                    pause_ms=int(item.get("pause_ms", 300)),
+                    notes=str(item.get("notes", "")),
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+    return blocks
+
+
+def _cached_llm_blocks(
+    cache: dict[str, Any], cache_key: str
+) -> list[NarrationBlock] | None:
+    entry = cache.get("entries", {}).get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    return _deserialize_llm_blocks(entry.get("blocks"))
+
+
+def _cache_llm_blocks(
+    path: Path,
+    cache: dict[str, Any],
+    cache_key: str,
+    blocks: list[NarrationBlock],
+) -> bool:
+    serialized = _serialize_llm_blocks(blocks)
+    if serialized is None:
+        return False
+    entries = cache.setdefault("entries", {})
+    entries[cache_key] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "blocks": serialized,
+    }
+    if len(entries) > _LLM_CACHE_MAX_ENTRIES:
+        oldest = sorted(
+            entries, key=lambda key: str(entries[key].get("created_at") or "")
+        )[: len(entries) - _LLM_CACHE_MAX_ENTRIES]
+        for key in oldest:
+            entries.pop(key, None)
+    cache["version"] = _LLM_CACHE_VERSION
+    try:
+        write_json(path, cache)
+    except (OSError, TypeError, ValueError):
+        entries.pop(cache_key, None)
+        return False
+    return True
+
+
 # === Main entry point ===
 
 def analyze_script(
@@ -699,19 +829,50 @@ def analyze_script(
                 except ValueError:
                     configured_workers = 4
                 max_workers = max(1, min(4, configured_workers))
-                with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as pool:
-                    futures = [
-                        pool.submit(analyze_with_openrouter, settings, chunk)
-                        for chunk in chunks
-                    ]
-                    # Consume in source order so output and error reporting stay stable.
-                    for idx, (chunk, future) in enumerate(zip(chunks, futures), start=1):
-                        try:
-                            llm_blocks.extend(future.result())
-                            llm_success_chunks += 1
-                        except Exception as exc:
-                            llm_errors.append(f"chunk {idx}: {type(exc).__name__}: {exc}")
-                            llm_blocks.extend(_fallback_blocks(chunk))
+
+                cache_path = _llm_cache_path(output_path)
+                cache = _load_llm_cache(cache_path)
+                identity = _llm_identity(settings)
+                cache_keys = [
+                    _llm_cache_fingerprint(chunk, identity=identity) for chunk in chunks
+                ]
+
+                chunk_results: list[list[NarrationBlock] | None] = [None] * len(chunks)
+                chunk_success = [False] * len(chunks)
+                pending: list[int] = []
+                for idx, (chunk, cache_key) in enumerate(zip(chunks, cache_keys)):
+                    cached = _cached_llm_blocks(cache, cache_key)
+                    if cached is None:
+                        pending.append(idx)
+                    else:
+                        chunk_results[idx] = cached
+                        chunk_success[idx] = True
+
+                if pending:
+                    with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
+                        futures = {
+                            idx: pool.submit(analyze_with_openrouter, settings, chunks[idx])
+                            for idx in pending
+                        }
+                        # Consume in source order so output and error reporting stay stable.
+                        for idx in pending:
+                            try:
+                                result_blocks = futures[idx].result()
+                                chunk_results[idx] = result_blocks
+                                chunk_success[idx] = True
+                                _cache_llm_blocks(
+                                    cache_path, cache, cache_keys[idx], result_blocks
+                                )
+                            except Exception as exc:
+                                llm_errors.append(
+                                    f"chunk {idx + 1}: {type(exc).__name__}: {exc}"
+                                )
+                                chunk_results[idx] = _fallback_blocks(chunks[idx])
+
+                for idx in range(len(chunks)):
+                    llm_blocks.extend(chunk_results[idx] or [])
+                    if chunk_success[idx]:
+                        llm_success_chunks += 1
 
                 blocks = llm_blocks if llm_blocks else _fallback_blocks(scenario_text)
                 used_llm = llm_success_chunks > 0
