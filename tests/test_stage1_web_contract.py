@@ -1,10 +1,16 @@
 from pathlib import Path
 
+ROOT = Path(__file__).parents[1]
 
-STAGE1_JS = (Path(__file__).parents[1] / "src" / "static" / "stage1.js").read_text(encoding="utf-8")
-PROJECT_HTML = (Path(__file__).parents[1] / "src" / "templates" / "project.html").read_text(
-    encoding="utf-8"
+# `stage1.js` is a thin ES-module entry point; the actual logic lives in
+# `src/static/stage1/*.js`. Concatenate the entry point with every module so
+# contract checks below can keep searching a single "STAGE1_JS" haystack
+# regardless of which file a given piece of code now lives in.
+_STAGE1_SOURCES = [ROOT / "src" / "static" / "stage1.js"] + sorted(
+    (ROOT / "src" / "static" / "stage1").glob("*.js")
 )
+STAGE1_JS = "\n".join(path.read_text(encoding="utf-8") for path in _STAGE1_SOURCES)
+PROJECT_HTML = (ROOT / "src" / "templates" / "project.html").read_text(encoding="utf-8")
 
 
 def test_restored_tts_job_rehydrates_every_resume_control() -> None:
@@ -43,7 +49,7 @@ def test_stage3_headless_media_scan_contract() -> None:
     assert "stage3PollTimer = window.setTimeout" in STAGE1_JS
     assert "stage3JobRunning" in STAGE1_JS
     assert (
-        'async function exportTimelineXml() {\n    return startStage3Job("prepare");' in STAGE1_JS
+        'async function exportTimelineXml() {\n  return startStage3Job("prepare");' in STAGE1_JS
     )
     assert "function exportTimelineXml()" in STAGE1_JS
     assert "ids.btn_export_xml.href" not in STAGE1_JS
@@ -84,7 +90,7 @@ def test_tts_and_stage3_progress_show_elapsed_and_eta() -> None:
     assert "function renderEtaCells(elapsedEl, etaEl, startedAtMs, fraction, status)" in STAGE1_JS
     assert "fraction >= 0.05 && fraction < 1" in STAGE1_JS
     assert "renderEtaCells(ids.live_job_elapsed, ids.live_job_eta" in STAGE1_JS
-    assert "renderEtaCells(\n      ids.stage3_job_elapsed, ids.stage3_job_eta," in STAGE1_JS
+    assert "renderEtaCells(\n    ids.stage3_job_elapsed, ids.stage3_job_eta," in STAGE1_JS
     assert "ttsJobClientStartedAt" in STAGE1_JS
     assert "stage3JobClientStartedAt" in STAGE1_JS
 
@@ -94,7 +100,9 @@ def test_headless_whisper_model_and_source_scope_controls() -> None:
     assert '<option value="small" selected>Small — быстро</option>' in PROJECT_HTML
     assert '<option value="medium">Medium — точнее</option>' in PROJECT_HTML
     assert 'model: ids.sync_whisper_model?.value || "small"' in STAGE1_JS
-    assert 'source_scope: stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
+    # `stage3MediaCount` moved from a module-level `let` to a shared `appState`
+    # property so the sync/stage3 modules can read and mutate it across files.
+    assert 'source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
 
 
 def test_normalization_offers_safe_openrouter_speed_presets() -> None:
@@ -105,7 +113,8 @@ def test_normalization_offers_safe_openrouter_speed_presets() -> None:
 
 
 def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
-    assert "if (normalizationDirty)" in STAGE1_JS
+    # `normalizationDirty` likewise moved onto the shared `appState` object.
+    assert "if (appState.normalizationDirty)" in STAGE1_JS
     assert "await saveNormalization();" in STAGE1_JS
     assert "let selectedDiffRequest = 0;" in STAGE1_JS
     assert "if (requestId !== selectedDiffRequest) return;" in STAGE1_JS
@@ -166,3 +175,12 @@ def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None
     assert '"бесплатно"' in STAGE1_JS
     assert '"точные"' in STAGE1_JS
     assert '"интерполированные"' in STAGE1_JS
+
+
+def test_stage1_entry_point_is_loaded_as_module_without_native_confirm() -> None:
+    # Regression guard for the U7 ES-module split: the template must load the
+    # thin entry point as `type="module"` (so its `import` statements work),
+    # and no module may reintroduce the blocking native `window.confirm(`.
+    assert '<script type="module" src="' in PROJECT_HTML
+    assert "stage1.js" in PROJECT_HTML
+    assert "window.confirm(" not in STAGE1_JS

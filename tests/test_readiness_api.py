@@ -141,18 +141,20 @@ def test_readiness_requires_auth_like_other_protected_routes(
 
 
 def test_readiness_ui_contract_in_template_and_script() -> None:
-    stage1_js = (Path(__file__).parents[1] / "src" / "static" / "stage1.js").read_text(
+    root = Path(__file__).parents[1]
+    # `stage1.js` is a thin ES-module entry point (see U7); the readiness DOM
+    # references live in `state.js` and the fetch call lives in `readiness.js`.
+    state_js = (root / "src" / "static" / "stage1" / "state.js").read_text(encoding="utf-8")
+    readiness_js = (root / "src" / "static" / "stage1" / "readiness.js").read_text(
         encoding="utf-8"
     )
-    project_html = (Path(__file__).parents[1] / "src" / "templates" / "project.html").read_text(
-        encoding="utf-8"
-    )
+    project_html = (root / "src" / "templates" / "project.html").read_text(encoding="utf-8")
 
     assert 'id="readiness_panel"' in project_html
     assert 'id="readiness_summary_badge"' in project_html
     assert 'id="readiness_list"' in project_html
 
-    assert 'readiness_panel: el("readiness_panel")' in stage1_js
-    assert 'readiness_summary_badge: el("readiness_summary_badge")' in stage1_js
-    assert 'readiness_list: el("readiness_list")' in stage1_js
-    assert '"/system/readiness"' in stage1_js
+    assert 'readiness_panel: el("readiness_panel")' in state_js
+    assert 'readiness_summary_badge: el("readiness_summary_badge")' in state_js
+    assert 'readiness_list: el("readiness_list")' in state_js
+    assert '"/system/readiness"' in readiness_js

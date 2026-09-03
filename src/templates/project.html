@@ -682,6 +682,6 @@
     window.__STAGE1_DEFAULTS__ = {{ defaults | tojson }};
     window.__STAGE1_STATUS__ = {{ status | tojson }};
   </script>
-  <script src="{{ url_for('static', filename='stage1.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='stage1.js') }}"></script>
 </body>
 </html>
