@@ -5,6 +5,9 @@
 
   const el = (id) => document.getElementById(id);
   const ids = {
+    readiness_panel: el("readiness_panel"),
+    readiness_summary_badge: el("readiness_summary_badge"),
+    readiness_list: el("readiness_list"),
     input_path: el("input_path"),
     prepared_path: el("prepared_path"),
     raw_output_path: el("raw_output_path"),
@@ -40,6 +43,8 @@
     live_current: el("live_current"),
     live_retries: el("live_retries"),
     live_done: el("live_done"),
+    live_job_elapsed: el("live_job_elapsed"),
+    live_job_eta: el("live_job_eta"),
     live_error: el("live_error"),
     speaker_items: el("speaker_items"),
     speaker_hint: el("speaker_hint"),
@@ -109,6 +114,11 @@
     learning_rule_list: el("learning_rule_list"),
     btn_cancel_learning: el("btn_cancel_learning"),
     btn_confirm_with_learning: el("btn_confirm_with_learning"),
+    confirm_dialog: el("confirm_dialog"),
+    confirm_dialog_title: el("confirm_dialog_title"),
+    confirm_dialog_message: el("confirm_dialog_message"),
+    btn_confirm_dialog_cancel: el("btn_confirm_dialog_cancel"),
+    btn_confirm_dialog_accept: el("btn_confirm_dialog_accept"),
     voiceover_lock: el("voiceover_lock"),
     assembly_lock: el("assembly_lock"),
     assembly_gate_message: el("assembly_gate_message"),
@@ -123,6 +133,8 @@
     stage3_job_message: el("stage3_job_message"),
     stage3_job_numbers: el("stage3_job_numbers"),
     stage3_progress_bar: el("stage3_progress_bar"),
+    stage3_job_elapsed: el("stage3_job_elapsed"),
+    stage3_job_eta: el("stage3_job_eta"),
     versioning_status: el("versioning_status"),
     btn_import_revision: el("btn_import_revision"),
     inbox_scenario_select: el("inbox_scenario_select"),
@@ -168,6 +180,8 @@
   let syncPollTimer = null;
   let currentTtsJobId = "";
   let currentTtsJobStatus = "";
+  let ttsJobClientStartedAt = null;
+  let lastTtsEtaJobId = null;
   let ttsPollTimer = null;
   let ttsPollFailures = 0;
   let syncPollFailures = 0;
@@ -178,6 +192,7 @@
   let stage3JobRunning = false;
   let currentStage3JobId = "";
   let currentStage3JobKind = "";
+  let stage3JobClientStartedAt = null;
   let stage3PollTimer = null;
   let stage3PollFailures = 0;
   let timelineReady = Boolean(initialStatus.timeline_ready);
@@ -253,6 +268,15 @@
     ids.live_done.textContent = `${live.done || 0}/${live.total || 0}`;
     ids.live_error.textContent = live.error ? `${live.error}` : "\u2014";
     ids.live_error.classList.toggle("has-error", Boolean(live.error));
+    if (currentTtsJobId !== lastTtsEtaJobId) {
+      lastTtsEtaJobId = currentTtsJobId;
+      ttsJobClientStartedAt = null;
+    }
+    if (["queued", "running", "cancelling"].includes(live.status) && !ttsJobClientStartedAt) {
+      ttsJobClientStartedAt = Date.now();
+    }
+    const ttsFraction = live.total > 0 ? Math.max(0, Math.min(1, (live.done || 0) / live.total)) : 0;
+    renderEtaCells(ids.live_job_elapsed, ids.live_job_eta, ttsJobClientStartedAt, ttsFraction, live.status);
   }
 
   function setLive(patch) {
@@ -467,6 +491,10 @@
     if (doc.revision == null) doc.revision = 0;
     doc.warnings = Array.isArray(doc.warnings) ? doc.warnings : [];
     return doc;
+  }
+
+  function hasUnsavedChanges() {
+    return Boolean(normalizationDirty);
   }
 
   function markNormalizationDirty() {
@@ -919,6 +947,58 @@
     const response = await fetch(`/stage1/status?project=${encodeURIComponent(project)}`);
     const data = await response.json();
     applyStatus(data.result || {});
+  }
+
+  function readinessStatusLabel(status) {
+    const map = { ok: "всё готово", warn: "есть предупреждения", error: "есть проблемы" };
+    return map[status] || status || "—";
+  }
+
+  function renderReadiness(data) {
+    if (!ids.readiness_panel || !ids.readiness_list) return;
+    const checks = Array.isArray(data.checks) ? data.checks : [];
+    ids.readiness_list.innerHTML = "";
+    checks.forEach((check) => {
+      const item = document.createElement("li");
+      item.className = "readiness-item";
+      item.dataset.state = check.status || "warn";
+
+      const head = document.createElement("div");
+      head.className = "readiness-item-head";
+      const title = document.createElement("span");
+      title.className = "readiness-item-label";
+      title.textContent = check.label || check.id || "";
+      const badge = document.createElement("span");
+      badge.className = "status-badge";
+      badge.dataset.state = check.status || "warn";
+      badge.textContent = readinessStatusLabel(check.status);
+      head.appendChild(title);
+      head.appendChild(badge);
+      item.appendChild(head);
+
+      const detailText = [check.detail, check.hint].filter(Boolean).join(" ");
+      if (detailText) {
+        const detail = document.createElement("p");
+        detail.className = "readiness-item-detail";
+        detail.textContent = detailText;
+        item.appendChild(detail);
+      }
+      ids.readiness_list.appendChild(item);
+    });
+
+    const overall = data.overall || "ok";
+    if (ids.readiness_summary_badge) {
+      ids.readiness_summary_badge.dataset.state = overall;
+      ids.readiness_summary_badge.textContent = readinessStatusLabel(overall);
+    }
+    ids.readiness_panel.dataset.state = overall;
+    if (overall !== "ok") ids.readiness_panel.open = true;
+  }
+
+  async function loadReadiness() {
+    const response = await fetch("/system/readiness");
+    const data = await response.json();
+    renderReadiness(data);
   }
 
   async function doAnalyze() {
@@ -2295,6 +2375,25 @@
       : `${minutes}:${String(rest).padStart(2, "0")}`;
   }
 
+  function computeEtaSeconds(startedAtMs, fraction) {
+    if (!Number.isFinite(startedAtMs)) return { elapsedSec: 0, etaSec: 0 };
+    const elapsedSec = Math.max(0, (Date.now() - startedAtMs) / 1000);
+    const etaSec = elapsedSec > 0 && fraction >= 0.05 && fraction < 1
+      ? elapsedSec * (1 - fraction) / fraction
+      : 0;
+    return { elapsedSec, etaSec };
+  }
+
+  function renderEtaCells(elapsedEl, etaEl, startedAtMs, fraction, status) {
+    const { elapsedSec, etaSec } = computeEtaSeconds(startedAtMs, fraction);
+    if (elapsedEl) elapsedEl.textContent = elapsedSec > 0 ? formatMediaDuration(elapsedSec) : "—";
+    if (etaEl) {
+      etaEl.textContent = status === "completed" ? "готово"
+        : (fraction < 0.05 ? "рассчитывается"
+          : (etaSec > 0 ? `≈ ${formatMediaDuration(etaSec)}` : "рассчитывается"));
+    }
+  }
+
   function formatMediaSize(value) {
     const bytes = Number(value);
     if (!Number.isFinite(bytes) || bytes < 0) return "—";
@@ -2396,9 +2495,16 @@
     const job = stage3JobPayload(value);
     const status = String(job.status || "queued").toLowerCase();
     const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
-    currentStage3JobId = String(job.id || job.job_id || currentStage3JobId || "");
+    const stage3JobId = String(job.id || job.job_id || currentStage3JobId || "");
+    if (stage3JobId && stage3JobId !== currentStage3JobId) {
+      stage3JobClientStartedAt = null;
+    }
+    currentStage3JobId = stage3JobId;
     currentStage3JobKind = String(job.kind || currentStage3JobKind || "");
     stage3JobRunning = ["queued", "running"].includes(status);
+    if (stage3JobRunning && !stage3JobClientStartedAt) {
+      stage3JobClientStartedAt = Date.now();
+    }
     ids.stage3_media_status.dataset.state = status;
     ids.stage3_media_status.textContent = status === "completed"
       ? (currentStage3JobKind === "prepare" ? "XML готов" : "готово")
@@ -2411,6 +2517,10 @@
     if (ids.stage3_job_numbers) ids.stage3_job_numbers.textContent = `${Math.round(progress)}%`;
     if (ids.stage3_progress_bar) ids.stage3_progress_bar.style.width = `${progress}%`;
     if (job.error) ids.stage3_media_message.textContent = job.error;
+    renderEtaCells(
+      ids.stage3_job_elapsed, ids.stage3_job_eta,
+      stage3JobClientStartedAt, Math.max(0, Math.min(1, progress / 100)), status,
+    );
     updateActionAvailability();
     return job;
   }
@@ -3346,8 +3456,15 @@
   applyStatus(initialStatus);
   renderLive();
   appendLog(`UI ready. project=${project}`);
+  loadReadiness().catch((err) => appendLog(`Readiness init: ${err.message || err}`, "warn"));
   Promise.all([loadNormalization(true), loadMemory(true)]).catch((err) => appendLog(`Normalization init: ${err.message}`, "warn"));
   loadRevisionsScreen(true);
   restoreTtsJob().catch((err) => appendLog(`TTS status init: ${err.message || err}`, "warn"));
   loadSyncWorkspace(true).catch((err) => appendLog(`Stage 2 sync init: ${err.message || err}`, "warn"));
+
+  window.addEventListener("beforeunload", (event) => {
+    if (!hasUnsavedChanges()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
 })();

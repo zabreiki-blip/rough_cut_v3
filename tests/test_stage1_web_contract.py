@@ -1,12 +1,10 @@
 from pathlib import Path
 
 
-STAGE1_JS = (
-    Path(__file__).parents[1] / "src" / "static" / "stage1.js"
-).read_text(encoding="utf-8")
-PROJECT_HTML = (
-    Path(__file__).parents[1] / "src" / "templates" / "project.html"
-).read_text(encoding="utf-8")
+STAGE1_JS = (Path(__file__).parents[1] / "src" / "static" / "stage1.js").read_text(encoding="utf-8")
+PROJECT_HTML = (Path(__file__).parents[1] / "src" / "templates" / "project.html").read_text(
+    encoding="utf-8"
+)
 
 
 def test_restored_tts_job_rehydrates_every_resume_control() -> None:
@@ -44,7 +42,9 @@ def test_stage3_headless_media_scan_contract() -> None:
     assert "/stage3/jobs/status?project=" in STAGE1_JS
     assert "stage3PollTimer = window.setTimeout" in STAGE1_JS
     assert "stage3JobRunning" in STAGE1_JS
-    assert 'async function exportTimelineXml() {\n    return startStage3Job("prepare");' in STAGE1_JS
+    assert (
+        'async function exportTimelineXml() {\n    return startStage3Job("prepare");' in STAGE1_JS
+    )
     assert "function exportTimelineXml()" in STAGE1_JS
     assert "ids.btn_export_xml.href" not in STAGE1_JS
     assert "stage3MediaScanAttempted" in STAGE1_JS
@@ -69,6 +69,24 @@ def test_whisper_progress_shows_current_viewing_elapsed_and_eta() -> None:
     assert "job.transcription_source_started_at" in STAGE1_JS
     assert "overallEtaSec" in STAGE1_JS
     assert "stage3SourceMapping.find" in STAGE1_JS
+
+
+def test_tts_and_stage3_progress_show_elapsed_and_eta() -> None:
+    for element_id in (
+        "live_job_elapsed",
+        "live_job_eta",
+        "stage3_job_elapsed",
+        "stage3_job_eta",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+    assert "рассчитывается" in PROJECT_HTML
+    assert "function computeEtaSeconds(startedAtMs, fraction)" in STAGE1_JS
+    assert "function renderEtaCells(elapsedEl, etaEl, startedAtMs, fraction, status)" in STAGE1_JS
+    assert "fraction >= 0.05 && fraction < 1" in STAGE1_JS
+    assert "renderEtaCells(ids.live_job_elapsed, ids.live_job_eta" in STAGE1_JS
+    assert "renderEtaCells(\n      ids.stage3_job_elapsed, ids.stage3_job_eta," in STAGE1_JS
+    assert "ttsJobClientStartedAt" in STAGE1_JS
+    assert "stage3JobClientStartedAt" in STAGE1_JS
 
 
 def test_headless_whisper_model_and_source_scope_controls() -> None:
@@ -97,16 +115,38 @@ def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
 
 def test_asr_engine_selector_defaults_to_local_and_is_wired_to_request() -> None:
     assert 'id="sync_asr_engine"' in PROJECT_HTML
-    assert (
-        '<option value="local" selected>Локально (бесплатно, медленно)</option>'
-        in PROJECT_HTML
-    )
-    assert (
-        '<option value="cloud">Облако (быстро, ~2¢/час, платно)</option>'
-        in PROJECT_HTML
-    )
+    assert '<option value="local" selected>Локально (бесплатно, медленно)</option>' in PROJECT_HTML
+    assert '<option value="cloud">Облако (быстро, ~2¢/час, платно)</option>' in PROJECT_HTML
     assert 'sync_asr_engine: el("sync_asr_engine")' in STAGE1_JS
     assert 'asr_engine: ids.sync_asr_engine?.value || "local"' in STAGE1_JS
+
+
+def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
+    assert "window.confirm(" not in STAGE1_JS
+    # Bare `confirm(` must not appear at all: the only surviving call sites are
+    # `confirmDialog(` and `function confirmDialog(`, neither of which matches
+    # the literal substring `confirm(` (both are followed by `Dialog`).
+    assert "confirm(" not in STAGE1_JS
+
+    assert 'id="confirm_dialog"' in PROJECT_HTML
+    assert 'role="dialog"' in PROJECT_HTML
+    assert 'aria-modal="true"' in PROJECT_HTML
+    assert 'aria-labelledby="confirm_dialog_title"' in PROJECT_HTML
+    assert 'id="confirm_dialog_title"' in PROJECT_HTML
+    assert 'id="confirm_dialog_message"' in PROJECT_HTML
+    assert 'id="btn_confirm_dialog_cancel"' in PROJECT_HTML
+    assert 'id="btn_confirm_dialog_accept"' in PROJECT_HTML
+
+    assert "function confirmDialog(" in STAGE1_JS
+    assert "dialog.showModal();" in STAGE1_JS
+    assert "onCancel = (event) => { event.preventDefault(); finish(false); };" in STAGE1_JS
+    assert (
+        "onBackdropClick = (event) => { if (event.target === dialog) finish(false); };" in STAGE1_JS
+    )
+    assert 'acceptBtn.classList.toggle("danger", Boolean(danger));' in STAGE1_JS
+    assert "if (acceptBtn.disabled) return;" in STAGE1_JS
+    assert "acceptBtn.disabled = true;" in STAGE1_JS
+    assert STAGE1_JS.count("await confirmDialog({") == 5
 
 
 def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None:
