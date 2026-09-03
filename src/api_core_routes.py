@@ -4,8 +4,190 @@ import json
 from pathlib import Path
 import shutil
 from types import ModuleType
+from typing import Any
 
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
+
+from stage2.cloud_asr import CloudAudioAsrAdapter
+from stage2.whisper_runner import available_backends
+
+_READINESS_SEVERITY_ORDER = {"error": 0, "warn": 1, "ok": 2}
+
+
+def _readiness_item(
+    *, item_id: str, label: str, status: str, detail: str, hint: str = ""
+) -> dict[str, str]:
+    return {"id": item_id, "label": label, "status": status, "detail": detail, "hint": hint}
+
+
+def _check_ffmpeg() -> dict[str, str]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    if ffmpeg_path and ffprobe_path:
+        return _readiness_item(
+            item_id="ffmpeg",
+            label="FFmpeg / FFprobe",
+            status="ok",
+            detail="ffmpeg и ffprobe найдены в PATH.",
+        )
+    missing = [
+        name for name, path in (("ffmpeg", ffmpeg_path), ("ffprobe", ffprobe_path)) if not path
+    ]
+    return _readiness_item(
+        item_id="ffmpeg",
+        label="FFmpeg / FFprobe",
+        status="error",
+        detail=f"Не найдено: {', '.join(missing)}.",
+        hint="Установите: brew install ffmpeg",
+    )
+
+
+def _check_whisper_backend() -> dict[str, str]:
+    local_backends = available_backends()
+    # Переиспользуем CloudAudioAsrAdapter.is_available() (stage2/cloud_asr.py) —
+    # не дублируем чтение SYNC_CLOUD_ASR_API_KEY/OPENROUTER_API_KEY/
+    # OPENROUTER_BASE_URL здесь. Читается только признак доступности,
+    # значение ключа наружу никогда не попадает.
+    cloud_available = CloudAudioAsrAdapter().is_available()
+    if local_backends and cloud_available:
+        return _readiness_item(
+            item_id="whisper_backend",
+            label="Whisper-бэкенд (Stage 2)",
+            status="ok",
+            detail=(
+                f"Локальный бэкенд установлен: {', '.join(local_backends)} "
+                "(используется по умолчанию); также настроен облачный ASR (cloud-audio)."
+            ),
+        )
+    if local_backends:
+        return _readiness_item(
+            item_id="whisper_backend",
+            label="Whisper-бэкенд (Stage 2)",
+            status="ok",
+            detail=f"Установлен локальный бэкенд: {', '.join(local_backends)}.",
+        )
+    if cloud_available:
+        return _readiness_item(
+            item_id="whisper_backend",
+            label="Whisper-бэкенд (Stage 2)",
+            status="ok",
+            detail=(
+                "Локальный бэкенд не установлен, но настроен облачный ASR (cloud-audio); "
+                "задайте SYNC_WHISPER_BACKEND=cloud, чтобы использовать его."
+            ),
+        )
+    return _readiness_item(
+        item_id="whisper_backend",
+        label="Whisper-бэкенд (Stage 2)",
+        status="warn",
+        detail=(
+            "Нет ни локального бэкенда (faster-whisper/mlx-whisper), "
+            "ни настроенного облачного ASR; синхронизация Stage 2 недоступна."
+        ),
+        hint=(
+            "Установите локальный бэкенд: pip install -r requirements-whisper.txt "
+            "(на Apple Silicon — requirements-macos-apple-silicon.txt); "
+            "или настройте облачный ASR: задайте SYNC_CLOUD_ASR_API_KEY "
+            "(либо OPENROUTER_API_KEY) и SYNC_WHISPER_BACKEND=cloud."
+        ),
+    )
+
+
+def _check_tts_provider(settings: Any) -> dict[str, str]:
+    provider = str(getattr(settings, "tts_provider", "") or "")
+    label = "TTS-провайдер"
+    if provider == "macos":
+        say_path = shutil.which("say")
+        afconvert_path = shutil.which("afconvert")
+        if say_path and afconvert_path:
+            return _readiness_item(
+                item_id="tts_provider",
+                label=label,
+                status="ok",
+                detail="Провайдер macos: команды say и afconvert найдены.",
+            )
+        missing = [
+            name for name, path in (("say", say_path), ("afconvert", afconvert_path)) if not path
+        ]
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="error",
+            detail=f"Провайдер macos: не найдено {', '.join(missing)}.",
+            hint="Доступно только на macOS со стандартными системными утилитами.",
+        )
+    if provider == "gemini":
+        if settings.gemini_api_key:
+            return _readiness_item(
+                item_id="tts_provider",
+                label=label,
+                status="ok",
+                detail="Провайдер gemini: ключ задан.",
+            )
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="warn",
+            detail="Провайдер gemini: GEMINI_API_KEY не задан.",
+            hint="Задайте GEMINI_API_KEY в .env или переключите TTS_PROVIDER.",
+        )
+    if provider == "openrouter":
+        if settings.openrouter_api_key:
+            return _readiness_item(
+                item_id="tts_provider",
+                label=label,
+                status="ok",
+                detail="Провайдер openrouter: ключ задан.",
+            )
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="warn",
+            detail="Провайдер openrouter: OPENROUTER_API_KEY не задан.",
+            hint="Задайте OPENROUTER_API_KEY в .env или переключите TTS_PROVIDER.",
+        )
+    return _readiness_item(
+        item_id="tts_provider",
+        label=label,
+        status="warn",
+        detail=f"Неизвестный провайдер: {provider!r}.",
+        hint="TTS_PROVIDER должен быть gemini, openrouter или macos.",
+    )
+
+
+def _check_api_key(*, item_id: str, label: str, has_key: bool, hint: str) -> dict[str, str]:
+    if has_key:
+        return _readiness_item(item_id=item_id, label=label, status="ok", detail="Ключ задан.")
+    return _readiness_item(
+        item_id=item_id, label=label, status="warn", detail="Ключ не задан.", hint=hint
+    )
+
+
+def _build_readiness(settings: Any) -> dict[str, Any]:
+    # Ключи и их значения никогда не возвращаются клиенту — только факт наличия.
+    checks: list[dict[str, str]] = [
+        _check_ffmpeg(),
+        _check_whisper_backend(),
+        _check_tts_provider(settings),
+        _check_api_key(
+            item_id="openrouter_key",
+            label="OPENROUTER_API_KEY",
+            has_key=bool(settings.openrouter_api_key),
+            hint="Нужен для LLM-анализа сценария и OpenRouter TTS.",
+        ),
+        _check_api_key(
+            item_id="gemini_key",
+            label="GEMINI_API_KEY",
+            has_key=bool(settings.gemini_api_key),
+            hint="Нужен для Gemini TTS.",
+        ),
+    ]
+    overall = min(
+        (check["status"] for check in checks),
+        key=lambda status: _READINESS_SEVERITY_ORDER.get(status, 1),
+        default="ok",
+    )
+    return {"ok": True, "overall": overall, "checks": checks}
 
 
 def _active_revision_input_path(paths: dict[str, Path], input_files: list[str]) -> str:
@@ -87,9 +269,7 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
         active_input = _active_revision_input_path(paths, input_files)
         defaults = {
             "project": project,
-            "input_path": (
-                active_input or f"projects/{project}/input/scenario.docx"
-            ),
+            "input_path": (active_input or f"projects/{project}/input/scenario.docx"),
             "output_path": f"projects/{project}/work/scenario_prepared.json",
             "raw_output_path": f"projects/{project}/work/scenario_raw.txt",
             "prepared_path": f"projects/{project}/work/scenario_prepared.json",
@@ -102,11 +282,18 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
 
     @app.get("/health")
     def health():
-        return jsonify({
-            "ok": True,
-            "status": "healthy",
-            "configuration_warnings": list(services._CONFIG_WARNINGS),
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "status": "healthy",
+                "configuration_warnings": list(services._CONFIG_WARNINGS),
+            }
+        )
+
+    @app.get("/system/readiness")
+    def system_readiness():
+        settings = services.get_settings()
+        return jsonify(_build_readiness(settings))
 
     @app.get("/stage1/status")
     def stage1_status():
