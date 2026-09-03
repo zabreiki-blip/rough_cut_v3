@@ -27,12 +27,11 @@ def _scenario_revision_matches(stored: object, current: object) -> bool:
 
 
 def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
-    return (
-        timeline.get("normalization_revision") == normalization.get("revision")
-        and _scenario_revision_matches(
-            timeline.get("scenario_revision_id"),
-            normalization.get("scenario_revision_id"),
-        )
+    return timeline.get("normalization_revision") == normalization.get(
+        "revision"
+    ) and _scenario_revision_matches(
+        timeline.get("scenario_revision_id"),
+        normalization.get("scenario_revision_id"),
     )
 
 
@@ -108,8 +107,7 @@ def _placeholder_unmapped_sources(data: dict, mapped_source_ids: set[str]) -> tu
             segment.get("type") in {"snh", "host"}
             and str(segment.get("match_status") or "") in _MATCHED_STATUSES
             and source_id
-            and float(segment.get("source_out_sec") or 0)
-            > float(segment.get("source_in_sec") or 0)
+            and float(segment.get("source_out_sec") or 0) > float(segment.get("source_in_sec") or 0)
         )
         if not matched or source_id in mapped_source_ids:
             continue
@@ -126,17 +124,19 @@ def _placeholder_unmapped_sources(data: dict, mapped_source_ids: set[str]) -> tu
 def _mapping_summary(mapping) -> list[dict]:
     result = []
     for source_id, detail in mapping.details.items():
-        result.append({
-            "source_id": source_id,
-            "status": detail.get("status", "unmapped"),
-            "reason": detail.get("reason", ""),
-            "media_name": detail.get("media_name", ""),
-            "media_source_id": detail.get("media_source_id", ""),
-            "max_source_out_sec": detail.get("max_source_out_sec", 0.0),
-            "sequence_aliases": detail.get("sequence_aliases", []),
-            "speaker_aliases": detail.get("speaker_aliases", []),
-            "media_kind": detail.get("media_kind", "video"),
-        })
+        result.append(
+            {
+                "source_id": source_id,
+                "status": detail.get("status", "unmapped"),
+                "reason": detail.get("reason", ""),
+                "media_name": detail.get("media_name", ""),
+                "media_source_id": detail.get("media_source_id", ""),
+                "max_source_out_sec": detail.get("max_source_out_sec", 0.0),
+                "sequence_aliases": detail.get("sequence_aliases", []),
+                "speaker_aliases": detail.get("speaker_aliases", []),
+                "media_kind": detail.get("media_kind", "video"),
+            }
+        )
     return result
 
 
@@ -144,7 +144,12 @@ def _media_kind(item: dict) -> str:
     explicit = str(item.get("media_kind") or "").strip().lower()
     if explicit in {"audio", "video"}:
         return explicit
-    return "audio" if Path(str(item.get("name") or item.get("relative_path") or "")).suffix.lower() in {".mp3", ".wav"} else "video"
+    return (
+        "audio"
+        if Path(str(item.get("name") or item.get("relative_path") or "")).suffix.lower()
+        in {".mp3", ".wav"}
+        else "video"
+    )
 
 
 def _timeline_catalog(catalog: dict) -> dict:
@@ -236,7 +241,10 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
         audios = sorted(
             (item for item in items if _media_kind(item) == "audio"),
             key=lambda candidate: (
-                Path(str(candidate.get("name") or candidate.get("relative_path") or "")).suffix.lower() != ".wav",
+                Path(
+                    str(candidate.get("name") or candidate.get("relative_path") or "")
+                ).suffix.lower()
+                != ".wav",
                 str(candidate.get("relative_path") or "").casefold(),
             ),
         )
@@ -256,7 +264,8 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
             source
             for source in existing
             if media_identity
-            and media_identity in {
+            and media_identity
+            in {
                 normalize_source_identity(source.premiere_sequence),
                 normalize_source_identity(source.proxy_sequence_name),
                 normalize_source_identity(source.speaker),
@@ -266,11 +275,7 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
         # keep the same bound source on every subsequent scan. The catalog ID
         # is file-derived and must not replace a stable Stage 2 source ID.
         bound_source = next(
-            (
-                source
-                for source in identity_matches
-                if source.source_kind != "review_media"
-            ),
+            (source for source in identity_matches if source.source_kind != "review_media"),
             identity_matches[0] if identity_matches else None,
         )
         if bound_source is None:
@@ -287,51 +292,386 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
         )
         speaker = " ".join(speaker.replace("_", " ").split()) or Path(name).stem
         source_payload = bound_source.to_dict() if bound_source is not None else {}
-        source_payload.update({
-            "id": bound_source.id if bound_source is not None else source_id,
-            "source_kind": "review_media",
-            "premiere_sequence": (
-                bound_source.premiere_sequence if bound_source is not None
-                else Path(name).stem
-            ),
-            "proxy_sequence_name": (
-                bound_source.proxy_sequence_name if bound_source is not None
-                else f"RC_SRC_{Path(name).stem}"
-            ),
-            "speaker": bound_source.speaker if bound_source is not None else speaker,
-            "all_speakers": bound_source.all_speakers if bound_source is not None else False,
-            "fps": item.get("fps") or 25.0,
-            "duration_sec": item.get("duration_sec") or 0.0,
-            # faster-whisper/PyAV can decode the audio stream directly from the
-            # project-local viewing; no Premiere guide export is required.
-            "guide_audio": (
-                bound_source.guide_audio
-                if bound_source is not None and bound_source.guide_audio
-                else guide_audio
-            ),
-            "media_path": relative_path,
-            "media_fingerprint": (
-                bound_source.media_fingerprint
-                if bound_source is not None and bound_source.guide_audio
-                else audio.get("fingerprint") or ""
-            ),
-            "metadata": {
-                **(bound_source.metadata if bound_source is not None else {}),
-                "managed_by": "stage3_media_scan",
-                "media_name": name,
-                "audio_guide_name": audio.get("name") or Path(guide_audio).name,
-                "has_companion_video": visual is not None,
-            },
-        })
+        source_payload.update(
+            {
+                "id": bound_source.id if bound_source is not None else source_id,
+                "source_kind": "review_media",
+                "premiere_sequence": (
+                    bound_source.premiere_sequence if bound_source is not None else Path(name).stem
+                ),
+                "proxy_sequence_name": (
+                    bound_source.proxy_sequence_name
+                    if bound_source is not None
+                    else f"RC_SRC_{Path(name).stem}"
+                ),
+                "speaker": bound_source.speaker if bound_source is not None else speaker,
+                "all_speakers": bound_source.all_speakers if bound_source is not None else False,
+                "fps": item.get("fps") or 25.0,
+                "duration_sec": item.get("duration_sec") or 0.0,
+                # faster-whisper/PyAV can decode the audio stream directly from the
+                # project-local viewing; no Premiere guide export is required.
+                "guide_audio": (
+                    bound_source.guide_audio
+                    if bound_source is not None and bound_source.guide_audio
+                    else guide_audio
+                ),
+                "media_path": relative_path,
+                "media_fingerprint": (
+                    bound_source.media_fingerprint
+                    if bound_source is not None and bound_source.guide_audio
+                    else audio.get("fingerprint") or ""
+                ),
+                "metadata": {
+                    **(bound_source.metadata if bound_source is not None else {}),
+                    "managed_by": "stage3_media_scan",
+                    "media_name": name,
+                    "audio_guide_name": audio.get("name") or Path(guide_audio).name,
+                    "has_companion_video": visual is not None,
+                },
+            }
+        )
         registered.append(services.SyncSource.from_dict(source_payload))
     registered_ids = {source.id for source in registered}
     preserved = [
-        source for source in existing
+        source
+        for source in existing
         if source.id not in registered_ids and source.source_kind != "review_media"
     ]
     with services._SYNC_DATA_LOCK:
         source_store.replace_all(sorted(preserved + registered, key=lambda item: item.id))
     return registered
+
+
+def _project_transition(project: str, services: ModuleType):
+    factory = getattr(services, "_project_transition_lock", None)
+    return factory(project) if callable(factory) else nullcontext()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _scan_project_media(
+    project: str, paths: dict, services: ModuleType, *, recursive: bool = False
+) -> dict:
+    project_root = paths["root"].resolve()
+    projects_root = Path(getattr(services, "PROJECTS_DIR", project_root.parent)).resolve()
+    try:
+        project_root.relative_to(projects_root)
+    except ValueError as exc:
+        raise MediaCatalogError("project directory resolves outside the projects root") from exc
+    inbox_reviews = paths.get("inbox_reviews", project_root / "ЗАГРУЗИТЬ" / "Просмотровки")
+    legacy_reviews = paths.get("media_reviews", project_root / "media" / "reviews")
+    inbox_path = Path(inbox_reviews)
+    has_inbox_media = inbox_path.is_dir() and any(
+        item.is_file() and item.suffix.lower() in MEDIA_EXTENSIONS for item in inbox_path.iterdir()
+    )
+    review_directory = inbox_reviews if has_inbox_media else legacy_reviews
+    return scan_media_directory(
+        str(review_directory),
+        recursive=recursive,
+        media_root=project_root,
+    )
+
+
+def _perform_scan(
+    project: str, services: ModuleType, *, recursive: bool = False, progress=None
+) -> dict:
+    paths = services._ensure_project(project)
+    if progress:
+        progress(10, "Сканирование папки просмотровок")
+    catalog = _scan_project_media(project, paths, services, recursive=recursive)
+    if progress:
+        progress(70, "Регистрация источников Whisper")
+    registered = _register_review_sources(catalog, paths, services)
+    catalog["registered_sources"] = len(registered)
+    work_dir = paths.get("work")
+    timeline_path = Path(work_dir) / "full_timeline.json" if work_dir else None
+    if timeline_path is not None and timeline_path.is_file():
+        if progress:
+            progress(85, "Сопоставление просмотровок с таймлайном")
+        timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+        confirmed, _reason = services._confirmed_normalization(project)
+        if confirmed and _timeline_is_current(timeline_data, confirmed):
+            source_store, _match_store = services._sync_stores(paths)
+            mapping = map_catalog_to_timeline(
+                timeline_data,
+                {"sources": [source.to_dict() for source in source_store.list()]},
+                _timeline_catalog(catalog),
+            )
+            _annotate_media_kinds(mapping, catalog)
+            catalog["mapping"] = _mapping_summary(mapping)
+    return {"project": project, **catalog}
+
+
+def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> dict:
+    paths = services._ensure_project(project)
+    timeline_path = paths["work"] / "full_timeline.json"
+    if not timeline_path.is_file():
+        raise Stage3OperationError("full_timeline.json not found — run Build Timeline first", 404)
+    if progress:
+        progress(10, "Проверка собранного таймлайна")
+    timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+    confirmed, _reason = services._confirmed_normalization(project)
+    if not confirmed or not _timeline_is_current(timeline_data, confirmed):
+        raise Stage3OperationError(
+            "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
+            409,
+        )
+    if progress:
+        progress(25, "Проверка доступных просмотровок")
+    catalog = _scan_project_media(project, paths, services)
+    logical_catalog = _timeline_catalog(catalog)
+    if not logical_catalog.get("sources"):
+        return {
+            "project": project,
+            "format": "legacy",
+            "filename": f"{project}_timeline.xml",
+            "download_url": f"/stage2/export/xml?project={project}",
+            "media_count": 0,
+            "audio_count": 0,
+            "mapped_source_ids": [],
+            "unmapped_source_ids": [],
+            "placeholder_segments": sum(
+                1
+                for segment in timeline_data.get("segments", [])
+                if isinstance(segment, dict) and segment.get("type") in {"snh", "host"}
+            ),
+            "source_mapping": [],
+        }
+    if progress:
+        progress(50, "Подготовка заменяемых subsequence")
+    _attach_audio_placeholder_cards(
+        logical_catalog,
+        paths=paths,
+        services=services,
+        width=int(timeline_data.get("width") or 1920),
+        height=int(timeline_data.get("height") or 1080),
+    )
+    source_store, _match_store = services._sync_stores(paths)
+    sync_sources = [source.to_dict() for source in source_store.list()]
+    host_catalog = _host_catalog(logical_catalog, project=project, project_root=paths["root"])
+    mapping = map_catalog_to_timeline(timeline_data, {"sources": sync_sources}, host_catalog)
+    _annotate_media_kinds(mapping, host_catalog)
+    mapped_timeline_source_ids = set(mapping.catalog)
+    export_timeline, placeholder_count = _placeholder_unmapped_sources(
+        _host_timeline_paths(timeline_data, project=project, project_root=paths["root"]),
+        mapped_timeline_source_ids,
+    )
+    export_catalog: dict[str, object] = {
+        str(source["source_id"]): source
+        for source in host_catalog.get("sources", [])
+        if isinstance(source, dict) and source.get("source_id")
+    }
+    export_catalog.update(mapping.catalog)
+    if progress:
+        progress(80, "Генерация nested XML")
+    xml_text = build_nested_xml(export_timeline, export_catalog)
+    filename = f"{project}_nested_timeline.xml"
+    atomic_write_text(paths["work"] / filename, xml_text)
+    mapping_payload = mapping.to_dict()
+    mapping_payload["normalization_revision"] = timeline_data.get("normalization_revision")
+    mapping_payload["scenario_revision_id"] = str(timeline_data.get("scenario_revision_id") or "")
+    atomic_write_json(paths["work"] / "stage3_source_mapping.json", mapping_payload)
+    mapped = [
+        source_id
+        for source_id, detail in mapping.details.items()
+        if detail.get("status") == "mapped"
+    ]
+    return {
+        "project": project,
+        "format": "nested",
+        "filename": filename,
+        "download_url": f"/stage3/export/xml?project={project}",
+        "media_count": len(host_catalog.get("sources", [])),
+        "audio_count": sum(
+            1
+            for item in catalog.get("sources", [])
+            if isinstance(item, dict) and _media_kind(item) == "audio"
+        ),
+        "mapped_source_ids": mapped,
+        "unmapped_source_ids": list(mapping.unmapped_source_ids),
+        "placeholder_segments": placeholder_count,
+        "source_mapping": _mapping_summary(mapping),
+    }
+
+
+def _job_status_path(project: str, services: ModuleType) -> Path:
+    return services._ensure_project(project)["work"] / "stage3_job_status.json"
+
+
+def _persist_job(job: dict, services: ModuleType) -> None:
+    atomic_write_json(_job_status_path(str(job["project"]), services), job)
+
+
+def _update_job(job_id: str, jobs: dict, jobs_lock, services: ModuleType, **updates) -> dict | None:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            return None
+        job.update(updates)
+        snapshot = dict(job)
+    _persist_job(snapshot, services)
+    return snapshot
+
+
+def _create_job(project: str, kind: str, jobs: dict, jobs_lock, services: ModuleType) -> dict:
+    job_id = uuid.uuid4().hex
+    job = {
+        "id": job_id,
+        "project": project,
+        "kind": kind,
+        "status": "queued",
+        "progress": 0,
+        "message": "Задача поставлена в очередь",
+        "result": None,
+        "error": "",
+        "created_at": _now_iso(),
+        "started_at": None,
+        "finished_at": None,
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+    _persist_job(job, services)
+    return dict(job)
+
+
+def _run_job(
+    job_id: str,
+    project: str,
+    kind: str,
+    recursive: bool,
+    jobs: dict,
+    jobs_lock,
+    active_projects: set[str],
+    services: ModuleType,
+) -> None:
+    def progress(value: int, message: str) -> None:
+        _update_job(job_id, jobs, jobs_lock, services, progress=value, message=message)
+
+    _update_job(
+        job_id,
+        jobs,
+        jobs_lock,
+        services,
+        status="running",
+        started_at=_now_iso(),
+        message="Запуск Stage 3",
+    )
+    try:
+        result = (
+            _perform_scan(project, services, recursive=recursive, progress=progress)
+            if kind == "scan"
+            else _perform_prepare(project, services, progress=progress)
+        )
+        _update_job(
+            job_id,
+            jobs,
+            jobs_lock,
+            services,
+            status="completed",
+            progress=100,
+            message=("Просмотровки обновлены" if kind == "scan" else "XML готов"),
+            result=result,
+            finished_at=_now_iso(),
+        )
+    except Stage3OperationError as exc:
+        _update_job(
+            job_id,
+            jobs,
+            jobs_lock,
+            services,
+            status="failed",
+            error=str(exc),
+            error_status=exc.status_code,
+            message=str(exc),
+            finished_at=_now_iso(),
+        )
+    except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        _update_job(
+            job_id,
+            jobs,
+            jobs_lock,
+            services,
+            status="failed",
+            error=str(exc),
+            error_status=400,
+            message=str(exc),
+            finished_at=_now_iso(),
+        )
+    except Exception:
+        _update_job(
+            job_id,
+            jobs,
+            jobs_lock,
+            services,
+            status="failed",
+            error="internal server error",
+            error_status=500,
+            message="Внутренняя ошибка Stage 3",
+            finished_at=_now_iso(),
+        )
+    finally:
+        with jobs_lock:
+            active_projects.discard(project)
+
+
+def _start_job(
+    kind: str,
+    jobs: dict,
+    jobs_lock,
+    active_projects: set[str],
+    services: ModuleType,
+):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return services._json_error("JSON object is required", 400)
+    try:
+        project = services._resolve_project_name(payload.get("project"))
+        services._ensure_project(project)
+        recursive = payload.get("recursive", False)
+        if not isinstance(recursive, bool):
+            raise MediaCatalogError("recursive must be a boolean")
+    except (MediaCatalogError, ValueError) as exc:
+        return services._json_error(str(exc), 400)
+    if kind == "prepare":
+        gate = services._normalization_required(project)
+        if gate:
+            return gate
+    with _project_transition(project, services):
+        has_active_mutation = getattr(services, "_project_has_active_mutation", None)
+        if callable(has_active_mutation) and has_active_mutation(project):
+            return services._json_error(
+                f"another mutating job is active for project {project}", 409
+            )
+        with jobs_lock:
+            if project in active_projects:
+                return services._json_error(f"stage3 job already active for project {project}", 409)
+            active_projects.add(project)
+    try:
+        job = _create_job(project, kind, jobs, jobs_lock, services)
+        worker = threading.Thread(
+            target=_run_job,
+            args=(job["id"], project, kind, recursive, jobs, jobs_lock, active_projects, services),
+            daemon=True,
+        )
+        worker.start()
+    except Exception:
+        with jobs_lock:
+            active_projects.discard(project)
+        raise
+    return jsonify(
+        {
+            "ok": True,
+            "result": {
+                "project": project,
+                "job_id": job["id"],
+                "kind": kind,
+                "status": "queued",
+                "status_url": f"/stage3/jobs/{job['id']}",
+            },
+        }
+    )
 
 
 def register_stage3_routes(app: Flask, services: ModuleType) -> None:
@@ -342,324 +682,13 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
     # can atomically coordinate with Stage 3 jobs as well.
     services.register_job_registry("подготовки Stage 3", jobs_lock, active_projects)
 
-    def project_transition(project: str):
-        factory = getattr(services, "_project_transition_lock", None)
-        return factory(project) if callable(factory) else nullcontext()
-
-    def now_iso() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def scan_project_media(project: str, paths: dict, *, recursive: bool = False) -> dict:
-        project_root = paths["root"].resolve()
-        projects_root = Path(
-            getattr(services, "PROJECTS_DIR", project_root.parent)
-        ).resolve()
-        try:
-            project_root.relative_to(projects_root)
-        except ValueError as exc:
-            raise MediaCatalogError(
-                "project directory resolves outside the projects root"
-            ) from exc
-        inbox_reviews = paths.get("inbox_reviews", project_root / "ЗАГРУЗИТЬ" / "Просмотровки")
-        legacy_reviews = paths.get("media_reviews", project_root / "media" / "reviews")
-        inbox_path = Path(inbox_reviews)
-        has_inbox_media = inbox_path.is_dir() and any(
-            item.is_file() and item.suffix.lower() in MEDIA_EXTENSIONS
-            for item in inbox_path.iterdir()
-        )
-        review_directory = inbox_reviews if has_inbox_media else legacy_reviews
-        return scan_media_directory(
-            str(review_directory),
-            recursive=recursive,
-            media_root=project_root,
-        )
-
-    def perform_scan(project: str, *, recursive: bool = False, progress=None) -> dict:
-        paths = services._ensure_project(project)
-        if progress:
-            progress(10, "Сканирование папки просмотровок")
-        catalog = scan_project_media(project, paths, recursive=recursive)
-        if progress:
-            progress(70, "Регистрация источников Whisper")
-        registered = _register_review_sources(catalog, paths, services)
-        catalog["registered_sources"] = len(registered)
-        work_dir = paths.get("work")
-        timeline_path = Path(work_dir) / "full_timeline.json" if work_dir else None
-        if timeline_path is not None and timeline_path.is_file():
-            if progress:
-                progress(85, "Сопоставление просмотровок с таймлайном")
-            timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
-            confirmed, _reason = services._confirmed_normalization(project)
-            if confirmed and _timeline_is_current(timeline_data, confirmed):
-                source_store, _match_store = services._sync_stores(paths)
-                mapping = map_catalog_to_timeline(
-                    timeline_data,
-                    {"sources": [source.to_dict() for source in source_store.list()]},
-                    _timeline_catalog(catalog),
-                )
-                _annotate_media_kinds(mapping, catalog)
-                catalog["mapping"] = _mapping_summary(mapping)
-        return {"project": project, **catalog}
-
-    def perform_prepare(project: str, *, progress=None) -> dict:
-        paths = services._ensure_project(project)
-        timeline_path = paths["work"] / "full_timeline.json"
-        if not timeline_path.is_file():
-            raise Stage3OperationError(
-                "full_timeline.json not found — run Build Timeline first", 404
-            )
-        if progress:
-            progress(10, "Проверка собранного таймлайна")
-        timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
-        confirmed, _reason = services._confirmed_normalization(project)
-        if (
-            not confirmed
-            or not _timeline_is_current(timeline_data, confirmed)
-        ):
-            raise Stage3OperationError(
-                "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
-                409,
-            )
-        if progress:
-            progress(25, "Проверка доступных просмотровок")
-        catalog = scan_project_media(project, paths)
-        logical_catalog = _timeline_catalog(catalog)
-        if not logical_catalog.get("sources"):
-            return {
-                "project": project,
-                "format": "legacy",
-                "filename": f"{project}_timeline.xml",
-                "download_url": f"/stage2/export/xml?project={project}",
-                "media_count": 0,
-                "audio_count": 0,
-                "mapped_source_ids": [],
-                "unmapped_source_ids": [],
-                "placeholder_segments": sum(
-                    1
-                    for segment in timeline_data.get("segments", [])
-                    if isinstance(segment, dict)
-                    and segment.get("type") in {"snh", "host"}
-                ),
-                "source_mapping": [],
-            }
-        if progress:
-            progress(50, "Подготовка заменяемых subsequence")
-        _attach_audio_placeholder_cards(
-            logical_catalog,
-            paths=paths,
-            services=services,
-            width=int(timeline_data.get("width") or 1920),
-            height=int(timeline_data.get("height") or 1080),
-        )
-        source_store, _match_store = services._sync_stores(paths)
-        sync_sources = [source.to_dict() for source in source_store.list()]
-        host_catalog = _host_catalog(
-            logical_catalog, project=project, project_root=paths["root"]
-        )
-        mapping = map_catalog_to_timeline(
-            timeline_data, {"sources": sync_sources}, host_catalog
-        )
-        _annotate_media_kinds(mapping, host_catalog)
-        mapped_timeline_source_ids = set(mapping.catalog)
-        export_timeline, placeholder_count = _placeholder_unmapped_sources(
-            _host_timeline_paths(
-                timeline_data, project=project, project_root=paths["root"]
-            ),
-            mapped_timeline_source_ids,
-        )
-        export_catalog: dict[str, object] = {
-            str(source["source_id"]): source
-            for source in host_catalog.get("sources", [])
-            if isinstance(source, dict) and source.get("source_id")
-        }
-        export_catalog.update(mapping.catalog)
-        if progress:
-            progress(80, "Генерация nested XML")
-        xml_text = build_nested_xml(export_timeline, export_catalog)
-        filename = f"{project}_nested_timeline.xml"
-        atomic_write_text(paths["work"] / filename, xml_text)
-        mapping_payload = mapping.to_dict()
-        mapping_payload["normalization_revision"] = timeline_data.get(
-            "normalization_revision"
-        )
-        mapping_payload["scenario_revision_id"] = str(
-            timeline_data.get("scenario_revision_id") or ""
-        )
-        atomic_write_json(
-            paths["work"] / "stage3_source_mapping.json", mapping_payload
-        )
-        mapped = [
-            source_id
-            for source_id, detail in mapping.details.items()
-            if detail.get("status") == "mapped"
-        ]
-        return {
-            "project": project,
-            "format": "nested",
-            "filename": filename,
-            "download_url": f"/stage3/export/xml?project={project}",
-            "media_count": len(host_catalog.get("sources", [])),
-            "audio_count": sum(
-                1 for item in catalog.get("sources", [])
-                if isinstance(item, dict) and _media_kind(item) == "audio"
-            ),
-            "mapped_source_ids": mapped,
-            "unmapped_source_ids": list(mapping.unmapped_source_ids),
-            "placeholder_segments": placeholder_count,
-            "source_mapping": _mapping_summary(mapping),
-        }
-
-    def job_status_path(project: str) -> Path:
-        return services._ensure_project(project)["work"] / "stage3_job_status.json"
-
-    def persist_job(job: dict) -> None:
-        atomic_write_json(job_status_path(str(job["project"])), job)
-
-    def update_job(job_id: str, **updates) -> dict | None:
-        with jobs_lock:
-            job = jobs.get(job_id)
-            if job is None:
-                return None
-            job.update(updates)
-            snapshot = dict(job)
-        persist_job(snapshot)
-        return snapshot
-
-    def create_job(project: str, kind: str) -> dict:
-        job_id = uuid.uuid4().hex
-        job = {
-            "id": job_id,
-            "project": project,
-            "kind": kind,
-            "status": "queued",
-            "progress": 0,
-            "message": "Задача поставлена в очередь",
-            "result": None,
-            "error": "",
-            "created_at": now_iso(),
-            "started_at": None,
-            "finished_at": None,
-        }
-        with jobs_lock:
-            jobs[job_id] = job
-        persist_job(job)
-        return dict(job)
-
-    def run_job(job_id: str, project: str, kind: str, recursive: bool) -> None:
-        def progress(value: int, message: str) -> None:
-            update_job(job_id, progress=value, message=message)
-
-        update_job(
-            job_id,
-            status="running",
-            started_at=now_iso(),
-            message="Запуск Stage 3",
-        )
-        try:
-            result = (
-                perform_scan(project, recursive=recursive, progress=progress)
-                if kind == "scan"
-                else perform_prepare(project, progress=progress)
-            )
-            update_job(
-                job_id,
-                status="completed",
-                progress=100,
-                message=("Просмотровки обновлены" if kind == "scan" else "XML готов"),
-                result=result,
-                finished_at=now_iso(),
-            )
-        except Stage3OperationError as exc:
-            update_job(
-                job_id,
-                status="failed",
-                error=str(exc),
-                error_status=exc.status_code,
-                message=str(exc),
-                finished_at=now_iso(),
-            )
-        except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            update_job(
-                job_id,
-                status="failed",
-                error=str(exc),
-                error_status=400,
-                message=str(exc),
-                finished_at=now_iso(),
-            )
-        except Exception:
-            update_job(
-                job_id,
-                status="failed",
-                error="internal server error",
-                error_status=500,
-                message="Внутренняя ошибка Stage 3",
-                finished_at=now_iso(),
-            )
-        finally:
-            with jobs_lock:
-                active_projects.discard(project)
-
-    def start_job(kind: str):
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return services._json_error("JSON object is required", 400)
-        try:
-            project = services._resolve_project_name(payload.get("project"))
-            services._ensure_project(project)
-            recursive = payload.get("recursive", False)
-            if not isinstance(recursive, bool):
-                raise MediaCatalogError("recursive must be a boolean")
-        except (MediaCatalogError, ValueError) as exc:
-            return services._json_error(str(exc), 400)
-        if kind == "prepare":
-            gate = services._normalization_required(project)
-            if gate:
-                return gate
-        with project_transition(project):
-            has_active_mutation = getattr(
-                services, "_project_has_active_mutation", None
-            )
-            if callable(has_active_mutation) and has_active_mutation(project):
-                return services._json_error(
-                    f"another mutating job is active for project {project}", 409
-                )
-            with jobs_lock:
-                if project in active_projects:
-                    return services._json_error(
-                        f"stage3 job already active for project {project}", 409
-                    )
-                active_projects.add(project)
-        try:
-            job = create_job(project, kind)
-            worker = threading.Thread(
-                target=run_job,
-                args=(job["id"], project, kind, recursive),
-                daemon=True,
-            )
-            worker.start()
-        except Exception:
-            with jobs_lock:
-                active_projects.discard(project)
-            raise
-        return jsonify({
-            "ok": True,
-            "result": {
-                "project": project,
-                "job_id": job["id"],
-                "kind": kind,
-                "status": "queued",
-                "status_url": f"/stage3/jobs/{job['id']}",
-            },
-        })
-
     @app.post("/stage3/jobs/scan/start")
     def stage3_scan_job_start():
-        return start_job("scan")
+        return _start_job("scan", jobs, jobs_lock, active_projects, services)
 
     @app.post("/stage3/jobs/prepare/start")
     def stage3_prepare_job_start():
-        return start_job("prepare")
+        return _start_job("prepare", jobs, jobs_lock, active_projects, services)
 
     @app.get("/stage3/jobs/<job_id>")
     def stage3_job_status(job_id: str):
@@ -680,13 +709,14 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error("kind must be 'scan' or 'prepare'", 400)
         with jobs_lock:
             candidates = [
-                dict(job) for job in jobs.values()
+                dict(job)
+                for job in jobs.values()
                 if job.get("project") == project and (not kind or job.get("kind") == kind)
             ]
         if candidates:
             latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
             return jsonify({"ok": True, "result": latest})
-        path = job_status_path(project)
+        path = _job_status_path(project, services)
         try:
             restored = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -694,12 +724,14 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         if kind and restored.get("kind") != kind:
             return services._json_error("job not found", 404)
         if restored.get("status") in {"queued", "running"}:
-            restored.update({
-                "status": "interrupted",
-                "message": "Stage 3 был прерван перезапуском сервера",
-                "finished_at": now_iso(),
-            })
-            persist_job(restored)
+            restored.update(
+                {
+                    "status": "interrupted",
+                    "message": "Stage 3 был прерван перезапуском сервера",
+                    "finished_at": _now_iso(),
+                }
+            )
+            _persist_job(restored, services)
         return jsonify({"ok": True, "result": restored})
 
     @app.post("/stage3/media/scan")
@@ -712,10 +744,8 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             recursive = payload.get("recursive", False)
             if not isinstance(recursive, bool):
                 raise MediaCatalogError("recursive must be a boolean")
-            with project_transition(project):
-                has_active_mutation = getattr(
-                    services, "_project_has_active_mutation", None
-                )
+            with _project_transition(project, services):
+                has_active_mutation = getattr(services, "_project_has_active_mutation", None)
                 if callable(has_active_mutation) and has_active_mutation(project):
                     return services._json_error(
                         f"another mutating job is active for project {project}", 409
@@ -727,7 +757,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                         )
                     active_projects.add(project)
             try:
-                result = perform_scan(project, recursive=recursive)
+                result = _perform_scan(project, services, recursive=recursive)
             finally:
                 with jobs_lock:
                     active_projects.discard(project)
@@ -747,8 +777,8 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             gate = services._normalization_required(project)
             if gate:
                 return gate
-            with project_transition(project):
-                result = perform_prepare(project)
+            with _project_transition(project, services):
+                result = _perform_prepare(project, services)
         except Stage3OperationError as exc:
             return services._json_error(str(exc), exc.status_code)
         except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -766,9 +796,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error(str(exc), 400)
         filename = f"{project}_nested_timeline.xml"
         if not (paths["work"] / filename).is_file():
-            return services._json_error(
-                "nested timeline not found — prepare Stage 3 first", 404
-            )
+            return services._json_error("nested timeline not found — prepare Stage 3 first", 404)
         timeline_path = paths["work"] / "full_timeline.json"
         try:
             timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
@@ -791,14 +819,11 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             # Legacy Stage 3 exports did not always persist mapping metadata.
             mapping_data = {}
         except (OSError, json.JSONDecodeError) as exc:
-            return services._json_error(
-                f"invalid stage3_source_mapping.json: {exc}", 500
-            )
+            return services._json_error(f"invalid stage3_source_mapping.json: {exc}", 500)
         mapping_normalization_revision = mapping_data.get("normalization_revision")
         if (
             mapping_normalization_revision not in (None, "")
-            and mapping_normalization_revision
-            != timeline_data.get("normalization_revision")
+            and mapping_normalization_revision != timeline_data.get("normalization_revision")
         ) or not _scenario_revision_matches(
             mapping_data.get("scenario_revision_id"),
             timeline_data.get("scenario_revision_id"),
