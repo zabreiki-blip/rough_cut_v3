@@ -168,6 +168,21 @@ _PERSONAL_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 _VIDEO_CUE_MAX_WORDS = 12
+# An unmarked, all-caps first paragraph of a scenario is almost always the
+# film/scenario title (e.g. "БЕЛАРУСЬ. САРЬЯ. ХРАМ ВО ИМЯ ЛЮБВИ ИГНАТИЯ
+# ЛОПАТИНСКОГО"), not spoken narration. It must never reach TTS or the
+# interview search, so it belongs in "technical" like production credits.
+# At least one Cyrillic/Latin letter is required so punctuation-only text
+# does not match; the personal-verb check (shared with _looks_like_video_cue)
+# keeps an all-caps opening line of narration from being misclassified.
+_SCENARIO_TITLE_RE = re.compile(r"^[^а-яa-z]*[А-ЯЁA-Z][^а-яa-z]*$")
+# A real scenario title is a short phrase (e.g. the 8-word/55-char example
+# above); generous caps well above that keep long all-caps narration or
+# a single very long run of caps (no spaces at all) from being mistaken
+# for a title. Both bounds are needed: a single run-on "word" with no
+# spaces would otherwise pass a word-count-only check.
+_SCENARIO_TITLE_MAX_WORDS = 20
+_SCENARIO_TITLE_MAX_CHARS = 120
 _LLM_CONFIDENCE_THRESHOLD = 0.65
 _LLM_CACHE_VERSION = 1
 _LLM_CACHE_MAX_ENTRIES = 2000
@@ -823,6 +838,22 @@ def _looks_like_video_cue(text: str) -> bool:
     return True
 
 
+def _looks_like_scenario_title(text: str) -> bool:
+    """Detect an unmarked scenario/film title paragraph: fully upper-case
+    text (dots, dashes, spaces and quotes allowed) with no personal (finite)
+    verb form. Intended to be applied only to the first block of a scenario;
+    callers are responsible for that position check.
+    """
+    stripped = text.strip()
+    if not stripped or not _SCENARIO_TITLE_RE.match(stripped):
+        return False
+    if len(stripped) > _SCENARIO_TITLE_MAX_CHARS:
+        return False
+    if len(stripped.split()) > _SCENARIO_TITLE_MAX_WORDS:
+        return False
+    return not _PERSONAL_VERB_RE.search(stripped)
+
+
 def _starts_with_unambiguous_timecode(text: str) -> bool:
     """Recognize a bare timecode without mistaking a prose-leading date for one."""
     stripped = text.lstrip()
@@ -976,6 +1007,12 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
         not block.original_label and _looks_like_video_cue(stripped)
     ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif (
+        block.order == 1
+        and not block.original_label
+        and _looks_like_scenario_title(stripped)
+    ):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif stripped.startswith("(") and stripped.endswith(")"):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.8)
 
