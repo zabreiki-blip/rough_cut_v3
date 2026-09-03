@@ -159,6 +159,50 @@ _VIDEO_CUE_KEYWORD_RE = re.compile(
     ) + r")\b",
     re.IGNORECASE,
 )
+
+
+def _seed_video_cue_rules(memory: NormalizationMemory) -> None:
+    """Seed the built-in video-cue lexicon into scope='video_cue' memory
+    rules. Idempotent: ``record_manual``'s upsert never regresses a rule a
+    user already disabled and is a no-op once a keyword is already active,
+    so calling this once per normalization run never creates duplicates or
+    overrides manual edits.
+    """
+    for keyword in _VIDEO_CUE_KEYWORDS:
+        memory.record_manual(keyword, BlockType.TECHNICAL.value, scope="video_cue")
+
+
+def _video_cue_keyword_pattern(memory: NormalizationMemory | None) -> re.Pattern[str]:
+    """Build the effective video-cue keyword regex for a normalization run:
+    the built-in seed plus any active learned keywords, minus anything a
+    user disabled. Meant to be computed once per run (not per block) and
+    passed down explicitly, since it requires a memory query.
+
+    Falls back to the built-in-only pattern when memory is unavailable or
+    the lookup fails, so normalization never breaks on a memory error.
+    """
+    if memory is None:
+        return _VIDEO_CUE_KEYWORD_RE
+    try:
+        _seed_video_cue_rules(memory)
+        rules = memory.list_rules(scope="video_cue")
+    except Exception:
+        logger.warning(
+            "Failed to load learned video-cue keywords; using the built-in seed only",
+            exc_info=True,
+        )
+        return _VIDEO_CUE_KEYWORD_RE
+    active = {str(rule["marker"]).strip() for rule in rules if rule["status"] == "active"}
+    disabled = {str(rule["marker"]).strip() for rule in rules if rule["status"] == "disabled"}
+    keywords = ((set(_VIDEO_CUE_KEYWORDS) | active) - disabled) - {""}
+    if keywords == set(_VIDEO_CUE_KEYWORDS):
+        return _VIDEO_CUE_KEYWORD_RE
+    return re.compile(
+        r"\b(?:" + "|".join(
+            re.escape(word) for word in sorted(keywords, key=len, reverse=True)
+        ) + r")\b",
+        re.IGNORECASE,
+    )
 # Coarse heuristic for a Russian personal (finite) verb form: past tense
 # (-л/-ла/-ло/-ли, incl. reflexive -лся/-лась/-лись) and present/future
 # 3rd-person and plural endings. It is intentionally approximate: a false
@@ -263,6 +307,9 @@ def _generate_normalization_unlocked(
     blocks: list[NormalizedBlock] = []
 
     with NormalizationMemory(memory_path or DEFAULT_MEMORY_PATH) as memory:
+        # Computed once per run (not per block): building it requires a
+        # memory query, and the seed keyword list rarely changes mid-run.
+        video_cue_re = _video_cue_keyword_pattern(memory)
         for order, original in enumerate(paragraphs, start=1):
             label, content = _split_label(original)
             block = NormalizedBlock(
@@ -273,7 +320,7 @@ def _generate_normalization_unlocked(
                 text_for_tts="",
                 original_label=label,
             )
-            _classify_by_rules(block, memory)
+            _classify_by_rules(block, memory, video_cue_re)
             if block.type != BlockType.UNKNOWN.value and block.original_label:
                 block.label_confirmed = True
                 if content:
@@ -295,7 +342,7 @@ def _generate_normalization_unlocked(
                 block.text_for_tts = block.normalized_text
             blocks.append(block)
 
-        _annotate_continuation_context(blocks)
+        _annotate_continuation_context(blocks, video_cue_re)
         unresolved = [block for block in blocks if block.type == BlockType.UNKNOWN.value]
         if unresolved and use_llm:
             if classifier is not None:
@@ -754,7 +801,9 @@ def _snapshot_proposals(blocks: list[NormalizedBlock]) -> None:
         block.proposed_memory_rule_id = block.memory_rule_id
 
 
-def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
+def _annotate_continuation_context(
+    blocks: list[NormalizedBlock], video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
+) -> None:
     previous: NormalizedBlock | None = None
     previous_sync: NormalizedBlock | None = None
     for block in blocks:
@@ -787,7 +836,7 @@ def _annotate_continuation_context(blocks: list[NormalizedBlock]) -> None:
             # A footage/shot-list remark must not inherit voiceover just
             # because it follows one without its own marker (see
             # _looks_like_video_cue).
-            and not _looks_like_video_cue(block.original_text)
+            and not _looks_like_video_cue(block.original_text, video_cue_re)
         ):
             block.continuation_of_type = BlockType.VOICEOVER.value
             if not block.suggested_type:
@@ -819,7 +868,9 @@ def _looks_like_sync_continuation(text: str) -> bool:
     return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё]|И(?:\s|$))", text.lstrip()))
 
 
-def _looks_like_video_cue(text: str) -> bool:
+def _looks_like_video_cue(
+    text: str, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
+) -> bool:
     """Detect an unmarked "video cue": a shot-list remark describing footage
     to show on screen (e.g. "Мраморный бюст Марии"), not spoken narration.
 
@@ -827,9 +878,12 @@ def _looks_like_video_cue(text: str) -> bool:
     phrase naming what to show, containing no personal (finite) verb form.
     The verb/length check is the primary signal; the keyword lexicon only
     narrows it to paragraphs that plausibly describe footage at all.
+    ``video_cue_re`` defaults to the built-in seed pattern but callers with
+    a :class:`NormalizationMemory` should pass the pattern produced by
+    :func:`_video_cue_keyword_pattern`, computed once per normalization run.
     """
     stripped = text.strip()
-    if not stripped or not _VIDEO_CUE_KEYWORD_RE.search(stripped):
+    if not stripped or not video_cue_re.search(stripped):
         return False
     if _PERSONAL_VERB_RE.search(stripped):
         return False
@@ -947,7 +1001,11 @@ def _split_label(text: str) -> tuple[str, str]:
     return "", text.strip()
 
 
-def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> None:
+def _classify_by_rules(
+    block: NormalizedBlock,
+    memory: NormalizationMemory,
+    video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+) -> None:
     marker = normalize_marker(block.original_label)
     if marker:
         exact = memory.resolve_exact(marker)
@@ -1004,7 +1062,7 @@ def _classify_by_rules(block: NormalizedBlock, memory: NormalizationMemory) -> N
     ):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE) or (
-        not block.original_label and _looks_like_video_cue(stripped)
+        not block.original_label and _looks_like_video_cue(stripped, video_cue_re)
     ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
     elif (
@@ -1231,8 +1289,15 @@ def _stable_code_identity(code: Any) -> dict[str, Any]:
 
 
 def _llm_rules_signature(memory: NormalizationMemory) -> str:
+    # ``list_rules()`` with no scope filter returns every alias scope (both
+    # 'marker' and 'video_cue'), so learned/disabled video-cue keywords are
+    # already part of this signature. The scope is included explicitly below
+    # so a marker-scope rule and a video_cue-scope rule that happen to share
+    # the same normalized marker/type/status/source are not indistinguishable
+    # in the hashed representation.
     memory_rules = [
         {
+            "scope": str(rule.get("scope") or ""),
             "normalized_marker": str(rule.get("normalized_marker") or ""),
             "target_type": str(rule.get("target_type") or ""),
             "status": str(rule.get("status") or ""),
@@ -1242,6 +1307,7 @@ def _llm_rules_signature(memory: NormalizationMemory) -> str:
     ]
     memory_rules.sort(
         key=lambda item: (
+            item["scope"],
             item["normalized_marker"],
             item["target_type"],
             item["status"],

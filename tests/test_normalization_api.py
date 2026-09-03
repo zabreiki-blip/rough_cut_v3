@@ -404,7 +404,7 @@ class NormalizationApiTest(unittest.TestCase):
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
         with NormalizationMemory(self.memory) as memory:
-            self.assertEqual(memory.list_rules(), [])
+            self.assertEqual(memory.list_rules(scope="marker"), [])
 
     def test_confirm_rejects_forged_learning_candidate(self) -> None:
         source = self.projects / "demo" / "input" / "scenario.txt"
@@ -434,7 +434,7 @@ class NormalizationApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400, response.get_json())
         with NormalizationMemory(self.memory) as memory:
-            self.assertEqual(memory.list_rules(), [])
+            self.assertEqual(memory.list_rules(scope="marker"), [])
 
 
 if __name__ == "__main__":
