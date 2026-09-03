@@ -59,9 +59,9 @@ if hasattr(os, "register_at_fork"):
 
 
 def _configured_timeout(value: float | None) -> float:
-    raw = value
-    if raw is None:
-        raw = os.getenv("SYNC_WHISPER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))
+    raw: float | str = value if value is not None else os.getenv(
+        "SYNC_WHISPER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)
+    )
     try:
         timeout = float(raw)
     except (TypeError, ValueError) as exc:
@@ -163,7 +163,9 @@ def _start_worker_locked(
 ) -> _Worker:
     context = multiprocessing.get_context(key[-1])
     parent_connection, child_connection = context.Pipe(duplex=True)
-    process = context.Process(
+    # typeshed's get_context(str) return type is BaseContext, which omits the
+    # Process attribute that all concrete context subclasses actually provide.
+    process = context.Process(  # type: ignore[attr-defined]
         target=_transcribe_worker,
         args=(child_connection,),
         daemon=True,

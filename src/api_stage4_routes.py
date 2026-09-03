@@ -16,23 +16,10 @@ from stage4.versioning import (
 
 
 def _active_project_job(services: ModuleType, project: str) -> str:
-    registries = [
-        ("озвучки", services._TTS_JOBS_LOCK, services._TTS_ACTIVE_PROJECTS),
-        (
-            "нормализации",
-            services._NORMALIZATION_JOBS_LOCK,
-            services._NORMALIZATION_ACTIVE_PROJECTS,
-        ),
-        ("сопоставления СНХ", services._SYNC_JOBS_LOCK, services._SYNC_ACTIVE_PROJECTS),
-    ]
-    stage3_lock = getattr(services, "_STAGE3_JOBS_LOCK", None)
-    stage3_active = getattr(services, "_STAGE3_ACTIVE_PROJECTS", None)
-    if stage3_lock is not None and stage3_active is not None:
-        registries.append(("подготовки Stage 3", stage3_lock, stage3_active))
-    for label, lock, active_projects in registries:
-        with lock:
-            if project in active_projects:
-                return label
+    for registry in services.iter_job_registries():
+        with registry.lock:
+            if project in registry.active_projects:
+                return registry.label
     return ""
 
 

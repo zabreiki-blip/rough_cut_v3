@@ -103,6 +103,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
             )
             if not input_path.is_file():
                 raise FileNotFoundError(f"Input file not found: {input_path}")
+            llm_preset = services.normalize_llm_preset(payload.get("llm_preset"))
         except ValueError as exc:
             return services._json_error(str(exc), 400)
         except FileNotFoundError as exc:
@@ -117,6 +118,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
             input_path=input_path,
             use_llm=bool(payload.get("use_llm", True)),
             hint=str(payload.get("hint") or payload.get("author_hint") or ""),
+            llm_preset=llm_preset,
         )
         worker = services.threading.Thread(
             target=services._run_normalization_job,
@@ -127,6 +129,7 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
                 "output_path": paths["normalized"],
                 "use_llm": job["use_llm"],
                 "hint": job["hint"],
+                "llm_preset": job["llm_preset"],
             },
             daemon=True,
             name=f"normalization-{project}-{job['id'][:8]}",
@@ -180,12 +183,14 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
             input_path = services._abs_path(
                 str(payload.get("input_path") or ""), default_input, paths["root"]
             )
+            llm_preset = services.normalize_llm_preset(payload.get("llm_preset"))
             result = services.generate_normalization(
                 input_path,
                 paths["normalized"],
                 memory_path=services.NORMALIZATION_MEMORY_PATH,
                 use_llm=bool(payload.get("use_llm", True)),
                 hint=str(payload.get("hint") or payload.get("author_hint") or ""),
+                llm_preset=llm_preset,
             )
         except Exception as exc:
             return services._normalization_exception(exc)

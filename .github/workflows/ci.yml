@@ -42,8 +42,8 @@ jobs:
       - name: Ruff correctness checks
         run: ruff check src tests
 
-      - name: Mypy type check (non-blocking, gradual rollout)
-        run: mypy src || true
+      - name: Mypy type check (baseline clean, type regressions block CI)
+        run: mypy src
 
       - name: Install JS dev dependencies
         run: npm ci

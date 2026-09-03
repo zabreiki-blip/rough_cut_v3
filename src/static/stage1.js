@@ -17,6 +17,7 @@
     phrase_file_name: el("phrase_file_name"),
     phrase_player: el("phrase_player"),
     use_llm: el("use_llm"),
+    normalization_llm_preset: el("normalization_llm_preset"),
     dry_run: el("dry_run"),
     btn_analyze: el("btn_analyze"),
     btn_tts: el("btn_tts"),
@@ -75,6 +76,12 @@
     sync_review_list: el("sync_review_list"),
     sync_timecode_mode: el("sync_timecode_mode"),
     sync_whisper_model: el("sync_whisper_model"),
+    sync_asr_engine: el("sync_asr_engine"),
+    sync_job_metrics: el("sync_job_metrics"),
+    sync_metric_backend: el("sync_metric_backend"),
+    sync_metric_wall_time: el("sync_metric_wall_time"),
+    sync_metric_cost: el("sync_metric_cost"),
+    sync_metric_precision: el("sync_metric_precision"),
     normalization_input_path: el("normalization_input_path"),
     normalization_hint: el("normalization_hint"),
     normalization_use_llm: el("normalization_use_llm"),
@@ -300,6 +307,7 @@
     }
     if (ids.btn_sync_cancel) ids.btn_sync_cancel.hidden = !syncJobRunning;
     if (ids.sync_whisper_model) ids.sync_whisper_model.disabled = syncJobRunning;
+    if (ids.sync_asr_engine) ids.sync_asr_engine.disabled = syncJobRunning;
     if (ids.btn_tts_cancel) {
       ids.btn_tts_cancel.hidden = !["queued", "running", "cancelling"].includes(currentTtsJobStatus);
     }
@@ -647,6 +655,7 @@
     const started = await requestJSON("/stage1/normalization-jobs/start", "POST", {
       project, input_path: inputPath, hint: ids.normalization_hint.value.trim(),
       use_llm: ids.normalization_use_llm.checked,
+      llm_preset: ids.normalization_llm_preset?.value || "standard",
     });
     const jobId = String(started.id || "").trim();
     if (!jobId) throw new Error("Сервер не вернул ID задачи нормализации");
@@ -3009,6 +3018,38 @@
             ? `≈ ${formatMediaDuration(currentEtaSec)} текущая`
             : "рассчитывается"));
     }
+    renderSyncJobMetrics(job);
+  }
+
+  function renderSyncJobMetrics(job) {
+    if (!ids.sync_job_metrics) return;
+    const backend = String(job.asr_backend_used || "");
+    const engine = String(job.asr_engine || "");
+    const wallSec = Number(job.transcription_wall_sec_total || 0);
+    const costUsd = Number(job.asr_cost_usd_total || 0);
+    const precision = String(job.asr_timestamp_precision || "");
+    const hasMetrics = Boolean(backend) || wallSec > 0;
+    ids.sync_job_metrics.hidden = !hasMetrics;
+    if (!hasMetrics) return;
+    if (ids.sync_metric_backend) {
+      const engineLabel = engine === "cloud" ? "облако"
+        : engine === "local" ? "локально"
+        : "";
+      ids.sync_metric_backend.textContent = engineLabel
+        ? (backend ? `${engineLabel} (${backend})` : engineLabel)
+        : (backend || "—");
+    }
+    if (ids.sync_metric_wall_time) {
+      ids.sync_metric_wall_time.textContent = wallSec > 0 ? formatMediaDuration(wallSec) : "—";
+    }
+    if (ids.sync_metric_cost) {
+      ids.sync_metric_cost.textContent = costUsd > 0 ? `$${costUsd.toFixed(4)}` : "бесплатно";
+    }
+    if (ids.sync_metric_precision) {
+      ids.sync_metric_precision.textContent = precision === "interpolated"
+        ? "интерполированные"
+        : (precision === "word" ? "точные" : "—");
+    }
   }
 
   function finishSyncJob() {
@@ -3088,6 +3129,7 @@
         project,
         timecode_mode: ids.sync_timecode_mode?.value || "relative",
         model: ids.sync_whisper_model?.value || "small",
+        asr_engine: ids.sync_asr_engine?.value || "local",
         source_scope: stage3MediaCount > 0 ? "review_media" : "all",
       },
     );

@@ -99,7 +99,7 @@ class MediaSource:
         )
 
 
-def _number(value: object, default: float = 0.0) -> float:
+def _number(value: Any, default: float = 0.0) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -107,7 +107,7 @@ def _number(value: object, default: float = 0.0) -> float:
     return result
 
 
-def _integer(value: object, default: int) -> int:
+def _integer(value: Any, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -168,8 +168,9 @@ def _coerce_sources(
     value: Mapping[str, object] | Sequence[object],
 ) -> dict[str, MediaSource]:
     raw: object = value.get("sources", value) if isinstance(value, Mapping) else value
+    items: list[tuple[object, object]]
     if isinstance(raw, Mapping):
-        items = raw.items()
+        items = list(raw.items())
     elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
         items = []
         for item in raw:
@@ -260,13 +261,13 @@ def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> Non
             raise ValueError(f"matched segment {segment.id} has no valid source range")
         if not matched:
             continue
-        source = sources.get(segment.source_id)
-        if source is None:
+        matched_source = sources.get(segment.source_id)
+        if matched_source is None:
             raise ValueError(
                 f"segment {segment.id} references unknown source {segment.source_id}"
             )
         tolerance = 1.0 / timeline.fps
-        if segment.source_out_sec > source.duration + tolerance:
+        if segment.source_out_sec > matched_source.duration + tolerance:
             raise ValueError(f"segment {segment.id} source range exceeds media duration")
         range_duration = segment.source_out_sec - segment.source_in_sec
         if abs(range_duration - segment.duration_sec) > tolerance:
@@ -618,13 +619,12 @@ def build_nested_xml(
         if segment.type == "tech" or segment.duration_sec <= 0:
             continue
         entry = sequence_by_source.get(segment.source_id)
-        is_nested = (
+        is_nested = entry is not None and (
             segment.type in {"snh", "host"}
             and segment.match_status in _MATCHED_STATUSES
-            and entry is not None
             and segment.source_out_sec > segment.source_in_sec
         )
-        if is_nested:
+        if is_nested and entry is not None:
             source, sequence_id, _, sequence_name = entry
             clip_number += 1
             _nested_clip(

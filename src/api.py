@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import hmac
 import hashlib
@@ -62,6 +63,7 @@ from stage1.normalizer import (
     generate_normalization,
     import_legacy_normalization,
     load_normalization,
+    normalize_llm_preset,
     preview_learning_candidates,
     reset_normalization,
     save_normalization,
@@ -102,6 +104,44 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = ROOT_DIR / "projects"
 NORMALIZATION_MEMORY_PATH = ROOT_DIR / "data" / "normalization_memory.sqlite3"
 SYNC_SOURCE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,96}$")
+
+
+@dataclass(frozen=True)
+class ActiveJobRegistry:
+    """A named lock + in-progress-project set guarding project mutations.
+
+    Route modules register their own job registries here explicitly instead of
+    reaching into ``api``'s (or another module's) globals at runtime, so the
+    active-mutation contract is statically visible and cannot silently depend
+    on blueprint registration order.
+    """
+
+    label: str
+    lock: threading.Lock | threading.RLock
+    active_projects: set[str]
+
+
+_JOB_REGISTRIES: dict[str, ActiveJobRegistry] = {}
+
+
+def register_job_registry(
+    label: str, lock: threading.Lock | threading.RLock, active_projects: set[str]
+) -> None:
+    """Register (or replace) the job registry published under ``label``.
+
+    Re-registering an already-known label replaces its entry in place instead
+    of appending a duplicate, so priority order among registries is preserved.
+    """
+
+    _JOB_REGISTRIES[label] = ActiveJobRegistry(label, lock, active_projects)
+
+
+def iter_job_registries() -> tuple[ActiveJobRegistry, ...]:
+    """Return all registered job registries in registration order."""
+
+    return tuple(_JOB_REGISTRIES.values())
+
+
 _TTS_RUNTIME = JobRegistry()
 _TTS_JOBS = _TTS_RUNTIME.jobs
 _TTS_JOBS_LOCK = _TTS_RUNTIME.lock
@@ -129,6 +169,13 @@ _NORMALIZATION_JOBS_MAX = 50
 _PROJECT_TRANSITION_LOCKS: dict[str, threading.RLock] = {}
 _PROJECT_TRANSITION_LOCKS_GUARD = threading.Lock()
 
+# Priority order matters: the first matching registry's label is reported to
+# callers (e.g. ``api_stage4_routes._active_project_job``). Stage 3 registers
+# itself later, via ``register_stage3_routes``, so it is appended last.
+register_job_registry("озвучки", _TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS)
+register_job_registry("нормализации", _NORMALIZATION_JOBS_LOCK, _NORMALIZATION_ACTIVE_PROJECTS)
+register_job_registry("сопоставления СНХ", _SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS)
+
 
 class AudioUploadTooLargeError(ValueError):
     """Raised after the actual uploaded stream exceeds its byte limit."""
@@ -146,20 +193,9 @@ def _project_transition_lock(project: str) -> threading.RLock:
 
 
 def _project_has_active_mutation(project: str) -> bool:
-    registries = (
-        (_TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS),
-        (_SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS),
-        (_NORMALIZATION_JOBS_LOCK, _NORMALIZATION_ACTIVE_PROJECTS),
-    )
-    for lock, active_projects in registries:
-        with lock:
-            if project in active_projects:
-                return True
-    stage3_lock = globals().get("_STAGE3_JOBS_LOCK")
-    stage3_active = globals().get("_STAGE3_ACTIVE_PROJECTS")
-    if stage3_lock is not None and stage3_active is not None:
-        with stage3_lock:
-            if project in stage3_active:
+    for registry in iter_job_registries():
+        with registry.lock:
+            if project in registry.active_projects:
                 return True
     return False
 
@@ -648,6 +684,7 @@ def _create_normalization_job(
     input_path: Path,
     use_llm: bool,
     hint: str,
+    llm_preset: str,
 ) -> dict:
     return stage1_jobs.create_normalization_job(
         _stage1_job_services(),
@@ -655,6 +692,7 @@ def _create_normalization_job(
         input_path=input_path,
         use_llm=use_llm,
         hint=hint,
+        llm_preset=llm_preset,
     )
 
 
@@ -702,6 +740,7 @@ def _run_normalization_job(
     output_path: Path,
     use_llm: bool,
     hint: str,
+    llm_preset: str,
 ) -> None:
     stage1_jobs.run_normalization_job(
         _stage1_job_services(),
@@ -711,6 +750,7 @@ def _run_normalization_job(
         output_path=output_path,
         use_llm=use_llm,
         hint=hint,
+        llm_preset=llm_preset,
     )
 
 
@@ -1314,8 +1354,9 @@ def _trim_sync_jobs_locked() -> None:
 
 def _create_sync_job(project: str) -> dict:
     now = _utc_now_iso()
+    job_id = uuid.uuid4().hex
     job = {
-        "id": uuid.uuid4().hex,
+        "id": job_id,
         "project": project,
         "status": "queued",
         "message": "Queued",
@@ -1343,14 +1384,19 @@ def _create_sync_job(project: str) -> dict:
         "transcription_timeout_seconds": 0.0,
         "whisper_model": "",
         "source_scope": "all",
+        "asr_engine": "local",
+        "asr_backend_used": "",
+        "asr_cost_usd_total": 0.0,
+        "asr_timestamp_precision": "",
+        "transcription_wall_sec_total": 0.0,
         "created_at": now,
         "started_at": "",
         "finished_at": "",
         "error": "",
     }
     with _SYNC_JOBS_LOCK:
-        _SYNC_JOBS[job["id"]] = job
-        _SYNC_CANCEL_EVENTS[job["id"]] = threading.Event()
+        _SYNC_JOBS[job_id] = job
+        _SYNC_CANCEL_EVENTS[job_id] = threading.Event()
         _trim_sync_jobs_locked()
         snapshot = dict(job)
     _persist_sync_job(snapshot)
@@ -1396,6 +1442,7 @@ def _run_sync_job(
     job_id: str,
     project: str,
     backend: str | None,
+    asr_engine: str = "local",
     model: str | None,
     language: str,
     timecode_mode: str,
@@ -1410,6 +1457,7 @@ def _run_sync_job(
         job_id=job_id,
         project=project,
         backend=backend,
+        asr_engine=asr_engine,
         model=model,
         language=language,
         timecode_mode=timecode_mode,

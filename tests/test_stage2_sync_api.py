@@ -1769,3 +1769,162 @@ def test_model_config_change_reuses_completed_same_audio_index(sync_api) -> None
     assert job["reused_indexes"] == 1
     assert job["source_failures"] == []
     assert found["source_id"] == "vasilieva_01"
+
+
+def test_sync_job_start_rejects_unknown_asr_engine_with_clear_error(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+
+    response = client.post(
+        "/stage2/sync-jobs/start",
+        json={"project": "demo", "asr_engine": "turbo"},
+    )
+
+    assert response.status_code == 400
+    assert "asr_engine" in response.get_json()["error"]
+
+
+def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+
+    captured_backend: dict[str, object] = {}
+
+    def fake_transcribe(path, backend=None, **_kwargs):
+        captured_backend["backend"] = backend
+        return {
+            "backend": "cloud-audio",
+            "model": "cloud-model",
+            "language": "ru",
+            "words": [
+                {"word": "маленькая", "start": 10.0, "end": 10.2},
+                {"word": "женщина", "start": 10.2, "end": 10.4},
+                {"word": "покоряла", "start": 10.4, "end": 10.6},
+                {"word": "великих", "start": 10.6, "end": 10.8},
+                {"word": "людей", "start": 10.8, "end": 11.0},
+            ],
+        }
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["asr_engine"] == "cloud"
+    assert captured_backend["backend"] == "cloud-audio"
+
+
+def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backend(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+
+    captured_backend: dict[str, object] = {}
+
+    def fake_transcribe(path, backend=None, **_kwargs):
+        captured_backend["backend"] = backend
+        return {
+            "backend": "faster-whisper",
+            "model": "small",
+            "language": "ru",
+            "words": [
+                {"word": "маленькая", "start": 10.0, "end": 10.2},
+                {"word": "женщина", "start": 10.2, "end": 10.4},
+                {"word": "покоряла", "start": 10.4, "end": 10.6},
+                {"word": "великих", "start": 10.6, "end": 10.8},
+                {"word": "людей", "start": 10.8, "end": 11.0},
+            ],
+        }
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        # No asr_engine in the payload: must default to "local" and never
+        # implicitly switch to the paid cloud-audio backend.
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["asr_engine"] == "local"
+    assert captured_backend["backend"] is None
+    assert captured_backend["backend"] != "cloud-audio"
+
+
+def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={
+            "project": "demo",
+            "audio": (BytesIO(_wav_bytes()), "guide.wav"),
+        },
+        content_type="multipart/form-data",
+    ).status_code == 200
+
+    def fake_transcribe(path, **_kwargs):
+        return {
+            "backend": "cloud-audio",
+            "model": "cloud-model",
+            "language": "ru",
+            "backend_metadata": {
+                "cost_usd": 0.02,
+                "timestamp_precision": "interpolated",
+            },
+            "words": [
+                {"word": "маленькая", "start": 10.0, "end": 10.2},
+                {"word": "женщина", "start": 10.2, "end": 10.4},
+                {"word": "покоряла", "start": 10.4, "end": 10.6},
+                {"word": "великих", "start": 10.6, "end": 10.8},
+                {"word": "людей", "start": 10.8, "end": 11.0},
+            ],
+        }
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["asr_backend_used"] == "cloud-audio"
+    assert job["asr_cost_usd_total"] == pytest.approx(0.02)
+    assert job["asr_timestamp_precision"] == "interpolated"
+    assert job["transcription_wall_sec_total"] >= 0.0

@@ -5,10 +5,14 @@ import json
 import os
 from pathlib import Path
 from types import ModuleType
+from typing import TYPE_CHECKING, Any
 import uuid
 import wave
 
 from flask import Flask, Response, jsonify, request, send_from_directory
+
+if TYPE_CHECKING:
+    from stage2.sync_models import SyncMatch
 
 
 def _scenario_revision_matches(stored: object, current: object) -> bool:
@@ -335,6 +339,11 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
         language = str(payload.get("language") or "ru").strip()
         if not language:
             return services._json_error("language must not be empty", 400)
+        asr_engine = str(payload.get("asr_engine") or "local").strip().lower()
+        if asr_engine not in {"local", "cloud"}:
+            return services._json_error(
+                "asr_engine должен быть 'local' или 'cloud'", 400
+            )
         try:
             sources = services.SyncSourceStore(paths["sync_sources"]).list()
         except ValueError as exc:
@@ -372,6 +381,16 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
         if not services._reserve_sync_project(project):
             return services._json_error(f"sync job already active for project {project}", 409)
 
+        backend = (
+            str(payload.get("backend")).strip()
+            if payload.get("backend") is not None
+            else None
+        )
+        if asr_engine == "cloud" and not backend:
+            # "cloud" is the UI-facing engine choice; "backend" stays available
+            # for explicit low-level overrides (tests/tooling) and wins when set.
+            backend = "cloud-audio"
+
         try:
             job = services._create_sync_job(project)
             worker = services.threading.Thread(
@@ -379,11 +398,8 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
                 kwargs={
                     "job_id": job["id"],
                     "project": project,
-                    "backend": (
-                        str(payload.get("backend")).strip()
-                        if payload.get("backend") is not None
-                        else None
-                    ),
+                    "backend": backend,
+                    "asr_engine": asr_engine,
                     "model": (
                         str(payload.get("model")).strip()
                         if payload.get("model") is not None
@@ -552,7 +568,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             scenario_revision_id = str(
                 confirmed.get("scenario_revision_id") or ""
             )
-            saved: list[services.SyncMatch] = []
+            saved: list[SyncMatch] = []
             with services._SYNC_DATA_LOCK:
                 stored_by_id = {
                     item.segment_id: item for item in match_store.list()
@@ -578,7 +594,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
                     values.pop("block_uid", None)
                     values["segment_id"] = segment_id
                     current = stored_by_id.get(segment_id)
-                    merged = current.to_dict() if current else {
+                    merged: dict[str, Any] = current.to_dict() if current else {
                         "segment_id": segment_id,
                         "query_text": "",
                     }
@@ -712,7 +728,7 @@ def register_stage2_routes(app: Flask, services: ModuleType) -> None:
             normalization_revision = normalization.get("revision")
             scenario_revision_id = normalization.get("scenario_revision_id")
             stale_match_ids: list[str] = []
-            current_matches: list[services.SyncMatch] = []
+            current_matches: list[SyncMatch] = []
             for match in stored_matches:
                 match_revision = match.metadata.get("normalization_revision")
                 if match_revision not in (None, "", normalization_revision):

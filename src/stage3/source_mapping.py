@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, SupportsFloat
 import unicodedata
 
 from stage2.models import FullTimeline
@@ -136,10 +136,13 @@ def _media_name(media: object) -> str:
 
 
 def _media_duration(media: object) -> float:
-    try:
-        return float(_field(media, "duration", "duration_sec", default=0.0))
-    except (TypeError, ValueError):
-        return 0.0
+    value = _field(media, "duration", "duration_sec", default=0.0)
+    if isinstance(value, (int, float, str, SupportsFloat)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
 
 
 def _source_aliases(source: object, timeline_aliases: set[str]) -> tuple[set[str], set[str]]:

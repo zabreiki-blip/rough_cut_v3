@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable
+from typing import Any, Callable
 
 from env_utils import env_int
 
@@ -430,7 +430,7 @@ def _is_retryable_tts_error(provider: str, exc: Exception) -> bool:
     if any(marker in msg for marker in permanent_markers):
         return False
 
-    transient_markers = (
+    transient_markers: tuple[str, ...] = (
         "429",
         "resource exhausted",
         "resource_exhausted",
@@ -513,7 +513,7 @@ def _normalize_provider(raw: str | None, default_provider: str) -> str:
 
 def _build_tts_client(provider: str, settings):
     client = None
-    types = None
+    types: Any = None
     if provider == "gemini":
         try:
             from google import genai

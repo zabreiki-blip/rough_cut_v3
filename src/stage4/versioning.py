@@ -204,7 +204,7 @@ def _revision_number(revision_id: str) -> int:
 
 
 def _find_source(project_paths: dict[str, Path], source_hash: str) -> Path:
-    candidates = []
+    candidates: list[Path] = []
     for directory in (
         project_paths["input"],
         project_paths.get("inbox_scenarios", project_paths["input"]),
@@ -704,7 +704,8 @@ def _activation_matches(
         for match in raw_matches:
             if not isinstance(match, dict):
                 raise ValueError("invalid sync match")
-            metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+            raw_metadata = match.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
             parent_uid = str(
                 metadata.get("parent_block_uid") or match.get("segment_id") or ""
             ).split("::fragment:", 1)[0]

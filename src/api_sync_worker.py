@@ -1,5 +1,24 @@
 from __future__ import annotations
 
+from typing import TypedDict
+
+
+class _AsrMetrics(TypedDict):
+    """Per-key typed job-status fields for ASR usage metrics.
+
+    A plain ``dict[str, object]`` forces every value to the ``object``
+    type, which breaks ``+=`` on the numeric fields under mypy (see
+    api_sync_worker.py history). A ``TypedDict`` keeps each key's own
+    declared type (``str``/``float``) without changing the dict's shape,
+    so it still unpacks into ``_update_sync_job(**asr_metrics)`` exactly
+    as before.
+    """
+
+    asr_backend_used: str
+    asr_cost_usd_total: float
+    asr_timestamp_precision: str
+    transcription_wall_sec_total: float
+
 
 def run_sync_job(
     services,
@@ -7,6 +26,7 @@ def run_sync_job(
     job_id: str,
     project: str,
     backend: str | None,
+    asr_engine: str = "local",
     model: str | None,
     language: str,
     timecode_mode: str,
@@ -60,6 +80,12 @@ def run_sync_job(
     cancel_event = _sync_cancel_event(job_id)
     progress_persist_lock = threading.Lock()
     last_progress_persist_at = 0.0
+    asr_metrics: _AsrMetrics = {
+        "asr_backend_used": "",
+        "asr_cost_usd_total": 0.0,
+        "asr_timestamp_precision": "",
+        "transcription_wall_sec_total": 0.0,
+    }
 
     def should_persist_progress(*, force: bool = False) -> bool:
         nonlocal last_progress_persist_at
@@ -86,6 +112,7 @@ def run_sync_job(
             started_at=_utc_now_iso(),
             whisper_model=str(model or os.getenv("SYNC_WHISPER_MODEL") or ""),
             source_scope=source_scope,
+            asr_engine=asr_engine,
         )
         all_sources = source_store.list()
         # ``source_ids`` scopes forced transcription, not the matching pool.
@@ -249,6 +276,7 @@ def run_sync_job(
                     input_audio_signature = audio_signature or _audio_cache_signature(
                         audio_path
                     )
+                    transcription_started_at = time.monotonic()
                     result = transcribe_audio(
                         audio_path,
                         backend=backend,
@@ -261,10 +289,25 @@ def run_sync_job(
                             or None
                         ),
                     )
+                    transcription_wall_sec = (
+                        time.monotonic() - transcription_started_at
+                    )
                     if _audio_cache_signature(audio_path) != input_audio_signature:
                         raise RuntimeError(
                             f"audio guide changed during transcription: {audio_path.name}"
                         )
+                    result_backend_metadata = result.get("backend_metadata") or {}
+                    asr_metrics["transcription_wall_sec_total"] += transcription_wall_sec
+                    asr_metrics["asr_backend_used"] = str(
+                        result.get("backend") or backend or ""
+                    )
+                    asr_metrics["asr_cost_usd_total"] += float(
+                        result_backend_metadata.get("cost_usd") or 0.0
+                    )
+                    asr_metrics["asr_timestamp_precision"] = str(
+                        result_backend_metadata.get("timestamp_precision") or "word"
+                    )
+                    _update_sync_job(job_id, persist=False, **asr_metrics)
                     index = ingest_word_index(
                         result,
                         source.id,
@@ -572,6 +615,7 @@ def run_sync_job(
             segment_failures=segment_failures,
             llm_reviewed=llm_reviewed,
             llm_review_failures=llm_review_failures,
+            **asr_metrics,
             **summary,
         )
     except _JobCancelled:

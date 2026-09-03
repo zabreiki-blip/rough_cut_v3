@@ -6,11 +6,14 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from stage2.cloud_asr import CloudAudioAsrError
 from stage2.whisper_runner import (
     _MODEL_CACHE,
     _cached_model,
+    WhisperTranscriptionError,
     WhisperUnavailableError,
     _default_model,
+    _transcribe_cloud,
     _transcribe_faster,
     _words_from_mapping,
     resolve_backend,
@@ -335,6 +338,98 @@ class WhisperRunnerTest(unittest.TestCase):
                 )
 
         self.assertEqual(result["duration_sec"], 10.0)
+
+    @patch("stage2.whisper_runner.available_backends", return_value=["faster-whisper", "mlx-whisper"])
+    def test_resolve_backend_accepts_explicit_cloud_audio(self, _available) -> None:
+        self.assertEqual(resolve_backend("cloud-audio"), "cloud-audio")
+        self.assertEqual(resolve_backend("cloud"), "cloud-audio")
+        self.assertEqual(resolve_backend("openrouter"), "cloud-audio")
+
+    @patch("stage2.whisper_runner.available_backends", return_value=["faster-whisper", "mlx-whisper"])
+    def test_resolve_backend_auto_never_selects_cloud_audio(self, _available) -> None:
+        # cloud-audio is paid and must be opted into explicitly; auto must
+        # keep choosing a local backend even if cloud-audio were somehow
+        # reported as "available".
+        self.assertIn(resolve_backend("auto"), ("faster-whisper", "mlx-whisper"))
+        self.assertEqual(resolve_backend(None), resolve_backend("auto"))
+
+    def test_transcribe_cloud_interpolates_words_and_preserves_metadata(self) -> None:
+        cloud_result = {
+            "segments": [
+                {
+                    "text": "раз два три четыре",
+                    "start": 0.0,
+                    "end": 4.0,
+                    "speaker": "ГОЛОС 1",
+                    "has_explicit_end": True,
+                },
+            ],
+            "speakers": ["ГОЛОС 1"],
+            "language": "ru",
+            "model": "google/gemini-3.7-flash",
+            "backend": "cloud-audio",
+            "duration_sec": 4.0,
+            "cost_usd": 0.0123,
+        }
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with patch(
+                "stage2.whisper_runner.transcribe_cloud",
+                return_value=cloud_result,
+            ):
+                result = transcribe_audio(
+                    audio_path,
+                    backend="cloud-audio",
+                    model="google/gemini-3.7-flash",
+                )
+
+        self.assertEqual(result["backend"], "cloud-audio")
+        self.assertEqual(result["word_count"], 4)
+        words = result["words"]
+        self.assertEqual([w["word"] for w in words], ["раз", "два", "три", "четыре"])
+        # Words must strictly increase in time and stay inside the segment.
+        starts = [w["start"] for w in words]
+        self.assertEqual(starts, sorted(starts))
+        self.assertEqual(len(set(starts)), len(starts))
+        self.assertGreaterEqual(words[0]["start"], 0.0)
+        self.assertLessEqual(words[-1]["end"], 4.0)
+        for earlier, later in zip(words, words[1:]):
+            self.assertLessEqual(earlier["end"], later["start"])
+
+        self.assertEqual(result["segments"], cloud_result["segments"])
+        meta = result["backend_metadata"]
+        self.assertEqual(meta["speakers"], ["ГОЛОС 1"])
+        self.assertEqual(meta["cost_usd"], 0.0123)
+        self.assertEqual(meta["timestamp_precision"], "interpolated")
+        self.assertNotIn("segments", meta)
+
+    def test_transcribe_cloud_missing_api_key_raises_clear_error(self) -> None:
+        with (
+            TemporaryDirectory() as directory,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with self.assertRaises(WhisperTranscriptionError) as ctx:
+                _transcribe_cloud(audio_path, "google/gemini-3.7-flash", "ru", None)
+
+        message = str(ctx.exception)
+        self.assertIn("Облачное распознавание", message)
+        self.assertNotIn("Bearer", message)
+
+    def test_transcribe_cloud_wraps_provider_errors(self) -> None:
+        with (
+            TemporaryDirectory() as directory,
+            patch(
+                "stage2.whisper_runner.transcribe_cloud",
+                side_effect=CloudAudioAsrError("сбой сети"),
+            ),
+        ):
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with self.assertRaises(WhisperTranscriptionError):
+                _transcribe_cloud(audio_path, "google/gemini-3.7-flash", "ru", None)
 
     def test_faster_whisper_rejects_invalid_integer_settings(self) -> None:
         fake_module = SimpleNamespace(

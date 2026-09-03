@@ -339,6 +339,7 @@ def create_normalization_job(
     input_path: Path,
     use_llm: bool,
     hint: str,
+    llm_preset: str,
 ) -> dict:
     now = services._utc_now_iso()
     job = {
@@ -349,6 +350,7 @@ def create_normalization_job(
         "input_path": str(input_path),
         "use_llm": bool(use_llm),
         "hint": hint,
+        "llm_preset": llm_preset,
         "created_at": now,
         "started_at": "",
         "finished_at": "",
@@ -444,6 +446,7 @@ def run_normalization_job(
     output_path: Path,
     use_llm: bool,
     hint: str,
+    llm_preset: str,
 ) -> None:
     services._update_normalization_job(
         job_id,
@@ -458,6 +461,7 @@ def run_normalization_job(
             memory_path=services.NORMALIZATION_MEMORY_PATH,
             use_llm=use_llm,
             hint=hint,
+            llm_preset=llm_preset,
         )
         services._update_normalization_job(
             job_id,

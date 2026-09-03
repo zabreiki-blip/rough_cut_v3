@@ -4,6 +4,7 @@ import re
 import logging
 import wave
 from pathlib import Path
+from typing import Any
 
 from .models import FullTimeline, TimelineSegment
 
@@ -323,7 +324,7 @@ def parse_normalized_timeline(
     matches = sync_matches or {}
     sources = sync_sources or {}
 
-    def field(item: object | None, name: str, default: object = "") -> object:
+    def field(item: object | None, name: str, default: Any = "") -> Any:
         if item is None:
             return default
         if isinstance(item, dict):

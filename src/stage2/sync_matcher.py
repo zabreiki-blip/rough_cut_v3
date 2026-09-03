@@ -10,6 +10,7 @@ from typing import Iterable
 
 from .sync_models import (
     AlignmentRequest,
+    MatchStatus,
     SyncAlternative,
     SyncMatch,
     SyncSource,
@@ -423,7 +424,7 @@ def _search_one(
     coarse_lengths, length_step = _length_samples(min_length, max_length, len(query))
     candidates: list[_Candidate] = []
     latest_start = len(tokens) - min_length
-    eligible_starts = range(latest_start + 1)
+    eligible_starts: Iterable[int] = range(latest_start + 1)
     if exclude_word_time_range is not None:
         excluded_lower, excluded_upper = exclude_word_time_range
         eligible_starts = [
@@ -720,8 +721,8 @@ class SyncMatcher:
             and not ambiguous
             and best.strategy != "fallback_full"
         )
-        status = "auto_matched" if auto else "needs_review"
-        alternatives: list[SyncAlternative] = []
+        status: MatchStatus = "auto_matched" if auto else "needs_review"
+        alternatives = []
         for item in candidates[1 : 1 + self.config.max_alternatives]:
             item_in, item_out = _padded_range(
                 item, self.sources[item.source_id], self.config

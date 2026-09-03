@@ -28,8 +28,6 @@ python_version = "3.11"
 mypy_path = "src"
 ignore_missing_imports = true
 warn_unused_ignores = false
-# Gradual rollout (AUDIT_REVIEW_2026-08-15.md P3): mypy currently reports
-# ~44 pre-existing errors across the codebase. The CI step runs
-# non-blocking until those are triaged and fixed file by file; do not
-# flip it to blocking until `mypy src` is clean or explicit per-module
-# ignores are in place.
+# Type checking baseline is clean (mypy src passes with no issues).
+# CI step is blocking: any type regressions must be fixed or explicitly
+# ignored per-module before merging.

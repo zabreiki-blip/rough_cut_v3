@@ -57,6 +57,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         _confirmed_normalization=lambda _project: ({"revision": "norm-1"}, ""),
         _json_error=lambda message, status=400: (jsonify({"ok": False, "error": message}), status),
         _internal_error=lambda _exc: (jsonify({"ok": False, "error": "internal server error"}), 500),
+        register_job_registry=lambda label, lock, active_projects: None,
     )
     app.config["TEST_STAGE3_SERVICES"] = services
     api_stage3_routes.register_stage3_routes(app, services)

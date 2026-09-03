@@ -99,7 +99,7 @@ def placeholder_asset_path(
 
 
 @lru_cache(maxsize=16)
-def _get_font(size: int) -> ImageFont.ImageFont:
+def _get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for name in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",

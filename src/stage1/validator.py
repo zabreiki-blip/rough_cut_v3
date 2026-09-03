@@ -51,10 +51,10 @@ def _read_pcm_stats(
             samples = [x - 128 for x in unpacked]
         elif sample_width == 2:
             fmt = f"<{len(raw) // 2}h"
-            samples = struct.unpack(fmt, raw)
+            samples = list(struct.unpack(fmt, raw))
         else:
             fmt = f"<{len(raw) // 4}i"
-            samples = struct.unpack(fmt, raw)
+            samples = list(struct.unpack(fmt, raw))
 
         if n_channels > 1:
             samples = samples[::n_channels]

@@ -338,10 +338,9 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
     jobs: dict[str, dict] = {}
     jobs_lock = threading.RLock()
     active_projects: set[str] = set()
-    # Expose the registry through the API facade so scenario-version transitions
+    # Publish the registry through the API facade so scenario-version transitions
     # can atomically coordinate with Stage 3 jobs as well.
-    services._STAGE3_JOBS_LOCK = jobs_lock
-    services._STAGE3_ACTIVE_PROJECTS = active_projects
+    services.register_job_registry("подготовки Stage 3", jobs_lock, active_projects)
 
     def project_transition(project: str):
         factory = getattr(services, "_project_transition_lock", None)
@@ -468,7 +467,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             ),
             mapped_timeline_source_ids,
         )
-        export_catalog = {
+        export_catalog: dict[str, object] = {
             str(source["source_id"]): source
             for source in host_catalog.get("sources", [])
             if isinstance(source, dict) and source.get("source_id")
@@ -527,8 +526,9 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         return snapshot
 
     def create_job(project: str, kind: str) -> dict:
+        job_id = uuid.uuid4().hex
         job = {
-            "id": uuid.uuid4().hex,
+            "id": job_id,
             "project": project,
             "kind": kind,
             "status": "queued",
@@ -541,7 +541,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             "finished_at": None,
         }
         with jobs_lock:
-            jobs[job["id"]] = job
+            jobs[job_id] = job
         persist_job(job)
         return dict(job)
 

@@ -79,6 +79,13 @@ def test_headless_whisper_model_and_source_scope_controls() -> None:
     assert 'source_scope: stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
 
 
+def test_normalization_offers_safe_openrouter_speed_presets() -> None:
+    assert 'id="normalization_llm_preset"' in PROJECT_HTML
+    assert '<option value="fast" selected>Быстро</option>' in PROJECT_HTML
+    assert '<option value="standard">Стандарт</option>' in PROJECT_HTML
+    assert 'llm_preset: ids.normalization_llm_preset?.value || "standard"' in STAGE1_JS
+
+
 def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     assert "if (normalizationDirty)" in STAGE1_JS
     assert "await saveNormalization();" in STAGE1_JS
@@ -86,3 +93,36 @@ def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     assert "if (requestId !== selectedDiffRequest) return;" in STAGE1_JS
     assert "Активная редакция не определена" in STAGE1_JS
     assert "use_llm: Boolean(ids.normalization_use_llm?.checked)" in STAGE1_JS
+
+
+def test_asr_engine_selector_defaults_to_local_and_is_wired_to_request() -> None:
+    assert 'id="sync_asr_engine"' in PROJECT_HTML
+    assert (
+        '<option value="local" selected>Локально (бесплатно, медленно)</option>'
+        in PROJECT_HTML
+    )
+    assert (
+        '<option value="cloud">Облако (быстро, ~2¢/час, платно)</option>'
+        in PROJECT_HTML
+    )
+    assert 'sync_asr_engine: el("sync_asr_engine")' in STAGE1_JS
+    assert 'asr_engine: ids.sync_asr_engine?.value || "local"' in STAGE1_JS
+
+
+def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None:
+    assert 'id="sync_job_metrics"' in PROJECT_HTML
+    for element_id in (
+        "sync_metric_backend",
+        "sync_metric_wall_time",
+        "sync_metric_cost",
+        "sync_metric_precision",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+    assert "function renderSyncJobMetrics(job)" in STAGE1_JS
+    assert "job.asr_backend_used" in STAGE1_JS
+    assert "job.transcription_wall_sec_total" in STAGE1_JS
+    assert "job.asr_cost_usd_total" in STAGE1_JS
+    assert "job.asr_timestamp_precision" in STAGE1_JS
+    assert '"бесплатно"' in STAGE1_JS
+    assert '"точные"' in STAGE1_JS
+    assert '"интерполированные"' in STAGE1_JS

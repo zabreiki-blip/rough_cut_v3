@@ -34,6 +34,15 @@ logger = logging.getLogger(__name__)
 
 
 LLMClassifier = Callable[[list[dict[str, Any]], str], list[dict[str, Any]]]
+LLM_PRESETS = {"standard", "fast"}
+
+
+def normalize_llm_preset(value: str | None) -> str:
+    """Return a supported, request-local OpenRouter routing preset."""
+    preset = str(value or "standard").strip().lower()
+    if preset not in LLM_PRESETS:
+        raise ValueError("llm_preset must be 'standard' or 'fast'")
+    return preset
 
 
 class NormalizationError(RuntimeError):
@@ -160,7 +169,9 @@ def generate_normalization(
     use_llm: bool = True,
     hint: str = "",
     classifier: LLMClassifier | None = None,
+    llm_preset: str = "standard",
 ) -> dict[str, Any]:
+    llm_preset = normalize_llm_preset(llm_preset)
     with _path_lock(output_path):
         return _generate_normalization_unlocked(
             input_path,
@@ -169,6 +180,7 @@ def generate_normalization(
             use_llm=use_llm,
             hint=hint,
             classifier=classifier,
+            llm_preset=llm_preset,
         )
 
 
@@ -180,6 +192,7 @@ def _generate_normalization_unlocked(
     use_llm: bool = True,
     hint: str = "",
     classifier: LLMClassifier | None = None,
+    llm_preset: str = "standard",
 ) -> dict[str, Any]:
     """Create and persist a complete, ordered normalization draft."""
     input_path = Path(input_path)
@@ -243,7 +256,16 @@ def _generate_normalization_unlocked(
         _annotate_continuation_context(blocks)
         unresolved = [block for block in blocks if block.type == BlockType.UNKNOWN.value]
         if unresolved and use_llm:
-            llm = classifier or _openrouter_classifier
+            if classifier is not None:
+                llm = classifier
+            elif llm_preset == "standard":
+                # Keep the legacy call shape: integrations and tests may patch
+                # this classifier with a two-argument callable.
+                llm = _openrouter_classifier
+            else:
+                llm = lambda batch, author_hint: _openrouter_classifier(
+                    batch, author_hint, llm_preset=llm_preset
+                )
             batches = _llm_batches(unresolved)
             payloads = [[_llm_input(block) for block in batch] for batch in batches]
             cache_path = _llm_cache_path(Path(output_path))
@@ -254,6 +276,7 @@ def _generate_normalization_unlocked(
                     payload,
                     hint=hint,
                     classifier=classifier,
+                    llm_preset=llm_preset,
                     rules_signature=rules_signature,
                 )
                 for payload in payloads
@@ -293,6 +316,7 @@ def _generate_normalization_unlocked(
                                 results,
                             )
                         except Exception as exc:
+                            logger.exception("LLM batch %d classification failed", index)
                             batch_results[index] = (None, exc)
             else:
                 for index in pending:
@@ -307,11 +331,12 @@ def _generate_normalization_unlocked(
                             results,
                         )
                     except Exception as exc:
+                        logger.exception("LLM batch %d classification failed", index)
                         batch_results[index] = (None, exc)
 
-            for batch, (results, error) in zip(batches, batch_results):
+            for batch, (batch_result, error) in zip(batches, batch_results):
                 if error is None:
-                    _apply_llm_results(batch, results or [])
+                    _apply_llm_results(batch, batch_result or [])
                     continue
                 message = f"LLM classification failed: {type(error).__name__}: {error}"
                 for block in batch:
@@ -340,10 +365,10 @@ def _generate_normalization_unlocked(
             old = candidates.popleft()
             block.uid = old.uid
             block.versioning = dict(old.versioning)
-    payload = scenario.to_dict()
-    _atomic_write_json(Path(output_path), payload)
+    scenario_payload = scenario.to_dict()
+    _atomic_write_json(Path(output_path), scenario_payload)
     logger.info("Normalization draft written source=%s blocks=%d", input_path, len(blocks))
-    return payload
+    return scenario_payload
 
 
 def load_normalization(path: Path) -> dict[str, Any]:
@@ -1041,12 +1066,16 @@ def _load_llm_cache(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _classifier_identity(classifier: LLMClassifier | None) -> dict[str, Any]:
+def _classifier_identity(
+    classifier: LLMClassifier | None, *, llm_preset: str = "standard"
+) -> dict[str, Any]:
     if classifier is None:
         settings = get_settings()
         return {
             "kind": "openrouter",
             "model": settings.openrouter_model,
+            "llm_preset": llm_preset,
+            "provider": {"sort": "throughput"} if llm_preset == "fast" else {},
             "base_url": settings.openrouter_base_url,
             "temperature": 0.1,
             "response_format": "json_object",
@@ -1158,12 +1187,13 @@ def _llm_cache_fingerprint(
     hint: str,
     classifier: LLMClassifier | None,
     rules_signature: str,
+    llm_preset: str = "standard",
 ) -> str:
     material = {
         "version": _LLM_CACHE_VERSION,
         "input": _stable_llm_input(payload),
         "hint": hint.strip(),
-        "classifier": _classifier_identity(classifier),
+        "classifier": _classifier_identity(classifier, llm_preset=llm_preset),
         "rules_signature": rules_signature,
     }
     return sha256(
@@ -1284,7 +1314,10 @@ def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
     }
 
 
-def _openrouter_classifier(blocks: list[dict[str, Any]], hint: str) -> list[dict[str, Any]]:
+def _openrouter_classifier(
+    blocks: list[dict[str, Any]], hint: str, *, llm_preset: str = "standard"
+) -> list[dict[str, Any]]:
+    llm_preset = normalize_llm_preset(llm_preset)
     settings = get_settings()
     if not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
@@ -1296,15 +1329,18 @@ def _openrouter_classifier(blocks: list[dict[str, Any]], hint: str) -> list[dict
         f"Author hint: {hint or '(none)'}. "
         f"Items: {json.dumps(blocks, ensure_ascii=False)}"
     )
+    json_body: dict[str, Any] = {
+        "model": settings.openrouter_model,
+        "messages": [{"role": "system", "content": _OPENROUTER_SYSTEM_PROMPT},
+                     {"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    if llm_preset == "fast":
+        json_body["provider"] = {"sort": "throughput"}
     request_kwargs = {
         "headers": {"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
-        "json": {
-            "model": settings.openrouter_model,
-            "messages": [{"role": "system", "content": _OPENROUTER_SYSTEM_PROMPT},
-                         {"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"},
-        },
+        "json": json_body,
         "timeout": 120,
     }
     response = None

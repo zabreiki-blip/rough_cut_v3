@@ -178,6 +178,13 @@
           <span class="toggle-slider"></span>
           <span>Распознавать нестандартные обозначения с LLM</span>
         </label>
+        <label class="field">
+          <span>Режим OpenRouter</span>
+          <select id="normalization_llm_preset">
+            <option value="fast" selected>Быстро</option>
+            <option value="standard">Стандарт</option>
+          </select>
+        </label>
       </div>
 
       <div id="normalization_summary" class="normalization-summary" aria-live="polite">
@@ -518,6 +525,13 @@
             </div>
             <div class="sync-source-actions">
               <label class="sync-timecode-mode">
+                <span>Движок распознавания</span>
+                <select id="sync_asr_engine">
+                  <option value="local" selected>Локально (бесплатно, медленно)</option>
+                  <option value="cloud">Облако (быстро, ~2¢/час, платно)</option>
+                </select>
+              </label>
+              <label class="sync-timecode-mode">
                 <span>Модель Whisper</span>
                 <select id="sync_whisper_model">
                   <option value="small" selected>Small — быстро</option>
@@ -539,7 +553,7 @@
               </button>
             </div>
           </div>
-          <p class="section-copy">Small рекомендуется для первого прохода. Medium точнее, но примерно вдвое медленнее. Готовые индексы Whisper и найденные диапазоны сохраняются.</p>
+          <p class="section-copy">Small рекомендуется для первого прохода. Medium точнее, но примерно вдвое медленнее. Готовые индексы Whisper и найденные диапазоны сохраняются. Облачный режим распознавания платный и отправляет аудио во внешний сервис.</p>
 
           <div id="sync_job_progress" class="sync-job-progress" hidden aria-live="polite">
             <div class="sync-progress-copy">
@@ -555,6 +569,13 @@
               <span>Прошло: <strong id="sync_job_elapsed">—</strong></span>
               <span>Осталось примерно: <strong id="sync_job_eta">рассчитывается</strong></span>
             </div>
+          </div>
+
+          <div id="sync_job_metrics" class="sync-progress-meta" hidden aria-live="polite">
+            <span>Движок: <strong id="sync_metric_backend">—</strong></span>
+            <span>Время распознавания: <strong id="sync_metric_wall_time">—</strong></span>
+            <span>Стоимость: <strong id="sync_metric_cost">—</strong></span>
+            <span>Таймкоды: <strong id="sync_metric_precision">—</strong></span>
           </div>
 
           <div class="sync-stats" aria-label="Статус сопоставления СНХ">

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -266,32 +267,82 @@ def test_stage4_activation_is_blocked_while_project_tts_is_running(client) -> No
     assert "озвучки" in response.get_json()["error"]
 
 
+def _job_registry(job_label: str) -> api.ActiveJobRegistry:
+    for registry in api.iter_job_registries():
+        if registry.label == job_label:
+            return registry
+    raise AssertionError(f"no job registry registered under label {job_label!r}")
+
+
 @pytest.mark.parametrize(
-    ("lock_name", "active_name", "job_label"),
-    [
-        ("_NORMALIZATION_JOBS_LOCK", "_NORMALIZATION_ACTIVE_PROJECTS", "нормализации"),
-        ("_SYNC_JOBS_LOCK", "_SYNC_ACTIVE_PROJECTS", "сопоставления СНХ"),
-        ("_STAGE3_JOBS_LOCK", "_STAGE3_ACTIVE_PROJECTS", "подготовки Stage 3"),
-    ],
+    "job_label",
+    ["нормализации", "сопоставления СНХ", "подготовки Stage 3"],
 )
 def test_stage4_activation_is_blocked_by_other_mutating_jobs(
-    client, lock_name: str, active_name: str, job_label: str
+    client, job_label: str
 ) -> None:
-    lock = getattr(api, lock_name)
-    active = getattr(api, active_name)
-    with lock:
-        active.add("demo")
+    registry = _job_registry(job_label)
+    with registry.lock:
+        registry.active_projects.add("demo")
     try:
         response = client.post(
             "/stage4/revisions/rev_0001/activate",
             json={"project": "demo"},
         )
     finally:
-        with lock:
-            active.discard("demo")
+        with registry.lock:
+            registry.active_projects.discard("demo")
 
     assert response.status_code == 409
     assert job_label in response.get_json()["error"]
+
+
+def test_job_registries_are_visible_from_api_and_stage4_routes_in_priority_order(
+    client,
+) -> None:
+    # api.py and api_stage4_routes.py must observe the exact same registry
+    # objects (and priority order) after Stage 3 routes have registered
+    # themselves during api.py's module-level setup.
+    import api_stage4_routes
+
+    labels = [registry.label for registry in api.iter_job_registries()]
+    assert labels == ["озвучки", "нормализации", "сопоставления СНХ", "подготовки Stage 3"]
+
+    # api_stage4_routes._active_project_job reads registries off the passed-in
+    # ``services`` module (here, ``api``) rather than any private module state
+    # of its own, so this exercises the same cross-module visibility.
+    registry = _job_registry("подготовки Stage 3")
+    with registry.lock:
+        registry.active_projects.add("demo")
+    try:
+        assert api_stage4_routes._active_project_job(api, "demo") == "подготовки Stage 3"
+    finally:
+        with registry.lock:
+            registry.active_projects.discard("demo")
+
+
+def test_register_job_registry_replaces_existing_label_without_duplicating() -> None:
+    original_labels = [registry.label for registry in api.iter_job_registries()]
+
+    replacement_lock = threading.RLock()
+    replacement_active: set[str] = set()
+    api.register_job_registry("нормализации", replacement_lock, replacement_active)
+    try:
+        labels = [registry.label for registry in api.iter_job_registries()]
+        assert labels == original_labels
+        assert labels.count("нормализации") == 1
+
+        registry = _job_registry("нормализации")
+        assert registry.lock is replacement_lock
+        assert registry.active_projects is replacement_active
+    finally:
+        api.register_job_registry(
+            "нормализации",
+            api._NORMALIZATION_JOBS_LOCK,
+            api._NORMALIZATION_ACTIVE_PROJECTS,
+        )
+
+    assert _job_registry("нормализации").lock is api._NORMALIZATION_JOBS_LOCK
 
 
 def test_stage4_mismatched_work_state_is_reported_and_activation_is_blocked(

@@ -68,6 +68,40 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["project"], "Монтаж_01")
 
+    def test_normalization_job_accepts_fast_preset_and_rejects_unknown_preset(self) -> None:
+        source = self._source()
+        with patch.object(api.threading.Thread, "start"):
+            response = self.client.post(
+                "/stage1/normalization-jobs/start",
+                json={"project": "demo", "input_path": str(source), "llm_preset": "fast"},
+            )
+        self.assertEqual(response.status_code, 202, response.get_json())
+        self.assertEqual(response.get_json()["result"]["llm_preset"], "fast")
+        api._release_normalization_project("demo")
+
+        rejected = self.client.post(
+            "/stage1/normalization-jobs/start",
+            json={"project": "demo", "input_path": str(source), "llm_preset": "anything"},
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("llm_preset", rejected.get_json()["error"])
+
+    def test_normalization_generate_endpoint_rejects_unknown_llm_preset(self) -> None:
+        source = self._source()
+
+        rejected = self.client.post(
+            "/stage1/normalization/generate",
+            json={
+                "project": "demo",
+                "input_path": str(source),
+                "use_llm": False,
+                "llm_preset": "turbo",
+            },
+        )
+
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("llm_preset", rejected.get_json()["error"])
+
     def test_project_name_rejects_path_syntax(self) -> None:
         for project in ("../demo", "demo/test", "demo.test", "имя проекта"):
             with self.subTest(project=project):

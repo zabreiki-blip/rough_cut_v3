@@ -100,6 +100,21 @@ def _segment_words(segments: Any) -> tuple[list[WordTimestamp], bool]:
     return result, interpolated
 
 
+def segment_words_interpolated(segments: Any) -> tuple[list[WordTimestamp], bool]:
+    """Public wrapper around :func:`_segment_words` for callers outside this
+    module (see ``stage2.whisper_runner._transcribe_cloud``) that need to turn
+    reply-level ``{"text", "start", "end"}`` segments — with no per-word
+    timestamps of their own, such as the cloud ASR backend's output — into
+    per-word timestamps by linear interpolation over each segment's span.
+
+    Returns the same ``(words, interpolated)`` pair as :func:`_segment_words`;
+    ``interpolated`` is ``True`` whenever a segment contributed more than one
+    token, i.e. whenever the returned timestamps are approximations rather
+    than genuine per-word timing from the source.
+    """
+    return _segment_words(segments)
+
+
 def ingest_word_index(
     payload: Any,
     source_id: str | None = None,

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 from atomic_io import atomic_write_json as _atomic_write_json
 
@@ -62,7 +62,7 @@ class SyncSourceStore:
         )
         return source
 
-    def replace_all(self, sources: list[SyncSource]) -> None:
+    def replace_all(self, sources: List[SyncSource]) -> None:  # List not list: class method .list() shadows builtin
         if len({item.id for item in sources}) != len(sources):
             raise ValueError("duplicate sync source id")
         _atomic_write_json(
@@ -106,7 +106,7 @@ class SyncMatchStore:
         )
         return match
 
-    def replace_all(self, matches: list[SyncMatch]) -> None:
+    def replace_all(self, matches: List[SyncMatch]) -> None:  # List not list: class method .list() shadows builtin
         if len({item.segment_id for item in matches}) != len(matches):
             raise ValueError("duplicate segment_id in sync matches")
         _atomic_write_json(

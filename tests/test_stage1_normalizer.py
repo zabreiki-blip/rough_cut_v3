@@ -1432,5 +1432,136 @@ class NormalizerTests(unittest.TestCase):
             )
 
 
+class LlmPresetTests(unittest.TestCase):
+    def test_normalize_llm_preset_accepts_known_values_and_defaults(self) -> None:
+        self.assertEqual(normalizer_module.normalize_llm_preset(None), "standard")
+        self.assertEqual(normalizer_module.normalize_llm_preset(""), "standard")
+        self.assertEqual(normalizer_module.normalize_llm_preset("standard"), "standard")
+        self.assertEqual(normalizer_module.normalize_llm_preset("Fast"), "fast")
+        self.assertEqual(normalizer_module.normalize_llm_preset(" fast "), "fast")
+
+    def test_normalize_llm_preset_rejects_unsupported_value(self) -> None:
+        with self.assertRaises(ValueError):
+            normalizer_module.normalize_llm_preset("turbo")
+
+    def test_openrouter_classifier_fast_preset_requests_throughput_sort(self) -> None:
+        settings = SimpleNamespace(
+            openrouter_api_key="test-key",
+            openrouter_model="model-x",
+            openrouter_base_url="https://example.invalid/api/v1",
+        )
+
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"items": []}'}}]}
+
+        with (
+            patch.object(normalizer_module, "get_settings", return_value=settings),
+            patch("requests.post", return_value=_Response()) as post,
+        ):
+            normalizer_module._openrouter_classifier(
+                [{"uid": "u1", "original_text": "text"}], "hint", llm_preset="fast"
+            )
+
+        self.assertEqual(
+            post.call_args.kwargs["json"]["provider"], {"sort": "throughput"}
+        )
+
+    def test_openrouter_classifier_standard_preset_omits_provider_sort(self) -> None:
+        settings = SimpleNamespace(
+            openrouter_api_key="test-key",
+            openrouter_model="model-x",
+            openrouter_base_url="https://example.invalid/api/v1",
+        )
+
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"items": []}'}}]}
+
+        with (
+            patch.object(normalizer_module, "get_settings", return_value=settings),
+            patch("requests.post", return_value=_Response()) as post,
+        ):
+            normalizer_module._openrouter_classifier(
+                [{"uid": "u1", "original_text": "text"}], "hint", llm_preset="standard"
+            )
+
+        self.assertNotIn("provider", post.call_args.kwargs["json"])
+
+    def test_llm_cache_fingerprint_differs_between_fast_and_standard_presets(self) -> None:
+        payload = [{"uid": "u1", "original_text": "text"}]
+        fingerprint_standard = normalizer_module._llm_cache_fingerprint(
+            payload,
+            hint="",
+            classifier=None,
+            rules_signature="sig",
+            llm_preset="standard",
+        )
+        fingerprint_fast = normalizer_module._llm_cache_fingerprint(
+            payload,
+            hint="",
+            classifier=None,
+            rules_signature="sig",
+            llm_preset="fast",
+        )
+        self.assertNotEqual(fingerprint_standard, fingerprint_fast)
+
+    def test_generate_normalization_does_not_reuse_cache_across_presets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            output = root / "normalized.json"
+            memory_path = root / "memory.sqlite3"
+            source.write_text("Авторский абзац", encoding="utf-8")
+
+            def settings():
+                return SimpleNamespace(
+                    openrouter_model="model-a",
+                    openrouter_base_url="https://example.invalid/api/v1",
+                )
+
+            def classifier(items, _hint, llm_preset="standard"):
+                return [
+                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
+                    for item in items
+                ]
+
+            with (
+                patch.object(normalizer_module, "get_settings", side_effect=settings),
+                patch.object(
+                    normalizer_module,
+                    "_openrouter_classifier",
+                    side_effect=classifier,
+                ) as mocked,
+            ):
+                generate_normalization(
+                    source, output, memory_path=memory_path, llm_preset="standard"
+                )
+                generate_normalization(
+                    source, output, memory_path=memory_path, llm_preset="standard"
+                )
+                self.assertEqual(mocked.call_count, 1)
+
+                generate_normalization(
+                    source, output, memory_path=memory_path, llm_preset="fast"
+                )
+                self.assertEqual(mocked.call_count, 2)
+
+                generate_normalization(
+                    source, output, memory_path=memory_path, llm_preset="fast"
+                )
+                self.assertEqual(mocked.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
