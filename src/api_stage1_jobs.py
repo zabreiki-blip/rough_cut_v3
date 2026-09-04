@@ -141,6 +141,7 @@ def update_tts_job(
     job_id: str,
     *,
     persist: bool = True,
+    increments: dict[str, int | float] | None = None,
     **updates: Any,
 ) -> dict | None:
     snapshot = services.update_job(
@@ -148,6 +149,7 @@ def update_tts_job(
         services._TTS_JOBS,
         job_id,
         updates,
+        increments=increments,
     )
     if snapshot is None:
         return None
@@ -212,18 +214,6 @@ def run_tts_job(
                 services._TTS_CANCEL_EVENTS.pop(job_id, None)
             return
         acquired = services._TTS_SEMAPHORE.acquire(timeout=0.25)
-    services._update_tts_job(
-        job_id,
-        status="running",
-        event="started",
-        message="Started",
-        started_at=services._utc_now_iso(),
-        provider=(provider or "").strip().lower(),
-        dry_run=bool(dry_run),
-        attempts=0,
-        retry_count=0,
-        last_error="",
-    )
 
     def progress_callback(progress: dict) -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -240,9 +230,6 @@ def run_tts_job(
             f"{event}: {done}/{total} ({current_id})" if current_id else f"{event}: {done}/{total}"
         )
         existing = services._get_tts_job(job_id) or {}
-        retry_count = int(existing.get("retry_count") or 0)
-        if event == "item_retrying":
-            retry_count += 1
         services._update_tts_job(
             job_id,
             persist=should_persist_progress(event),
@@ -255,11 +242,23 @@ def run_tts_job(
             skipped=skipped,
             current_id=current_id,
             attempts=attempts,
-            retry_count=retry_count,
             last_error=error_text or str(existing.get("last_error") or ""),
+            increments={"retry_count": 1} if event == "item_retrying" else None,
         )
 
     try:
+        services._update_tts_job(
+            job_id,
+            status="running",
+            event="started",
+            message="Started",
+            started_at=services._utc_now_iso(),
+            provider=(provider or "").strip().lower(),
+            dry_run=bool(dry_run),
+            attempts=0,
+            retry_count=0,
+            last_error="",
+        )
         result = services.synthesize_tts(
             prepared_path=prepared_path,
             speaker_dir=speaker_dir,
@@ -305,6 +304,11 @@ def run_tts_job(
             finished_at=services._utc_now_iso(),
         )
     except Exception as exc:
+        services.app.logger.exception(
+            "TTS job failed project=%s job=%s",
+            project,
+            job_id,
+        )
         services._update_tts_job(
             job_id,
             status="failed",

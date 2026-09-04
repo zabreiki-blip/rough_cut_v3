@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from stage1.normalization_memory import NormalizationMemory, normalize_marker
 from stage1.normalizer import (
     _VIDEO_CUE_KEYWORDS,
     _llm_rules_signature,
     generate_normalization,
+    invalidate_video_cue_seed_cache,
 )
 
 
@@ -116,6 +118,106 @@ class VideoCueMemoryTests(unittest.TestCase):
                 {normalize_marker(keyword) for keyword in _VIDEO_CUE_KEYWORDS}
             )
             self.assertEqual(len(rules), expected_marker_count)
+
+    def test_seeding_writes_only_once_per_database_across_normalization_calls(self) -> None:
+        # _seed_video_cue_rules() re-upserts the whole built-in lexicon on
+        # every generate_normalization() call, even though the rows already
+        # exist after the first run. That is wasted sqlite writes (and lock
+        # contention) per document. Guard against a regression of the fix:
+        # a second call against the *same* database must not write again,
+        # while a *different* database must still be seeded on first use.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("Мраморный бюст Марии\n", encoding="utf-8")
+            memory_path_a = root / "a.sqlite3"
+            memory_path_b = root / "b.sqlite3"
+
+            original_record_manual = NormalizationMemory.record_manual
+            video_cue_calls: list[str] = []
+
+            def counting_record_manual(self, marker, target_type, *, scope="marker"):
+                if scope == "video_cue":
+                    video_cue_calls.append(str(self.path))
+                return original_record_manual(self, marker, target_type, scope=scope)
+
+            with mock.patch.object(NormalizationMemory, "record_manual", counting_record_manual):
+                generate_normalization(
+                    source, root / "out1.json", memory_path=memory_path_a, use_llm=False
+                )
+                self.assertEqual(len(video_cue_calls), len(_VIDEO_CUE_KEYWORDS))
+
+                # Same database again: already seeded, so no repeat writes.
+                generate_normalization(
+                    source, root / "out2.json", memory_path=memory_path_a, use_llm=False
+                )
+                self.assertEqual(len(video_cue_calls), len(_VIDEO_CUE_KEYWORDS))
+
+                # A brand-new database must still be seeded on first use.
+                generate_normalization(
+                    source, root / "out3.json", memory_path=memory_path_b, use_llm=False
+                )
+                self.assertEqual(len(video_cue_calls), 2 * len(_VIDEO_CUE_KEYWORDS))
+
+    def test_invalidating_seed_cache_reseeds_a_deleted_video_cue_rule(self) -> None:
+        # A user-deleted scope='video_cue' rule must come back on the next
+        # generate_normalization() call once the seed cache has been
+        # invalidated for its database -- regressing this would make the
+        # deleted rule's reappearance depend on a process restart (see
+        # invalidate_video_cue_seed_cache()'s docstring) instead of being
+        # deterministic from the caller's point of view.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("Мраморный бюст Марии\n", encoding="utf-8")
+            memory_path = root / "memory.sqlite3"
+
+            original_record_manual = NormalizationMemory.record_manual
+            video_cue_calls: list[str] = []
+
+            def counting_record_manual(self, marker, target_type, *, scope="marker"):
+                if scope == "video_cue":
+                    video_cue_calls.append(marker)
+                return original_record_manual(self, marker, target_type, scope=scope)
+
+            with mock.patch.object(NormalizationMemory, "record_manual", counting_record_manual):
+                generate_normalization(
+                    source, root / "out1.json", memory_path=memory_path, use_llm=False
+                )
+                self.assertEqual(len(video_cue_calls), len(_VIDEO_CUE_KEYWORDS))
+
+                with NormalizationMemory(memory_path) as memory:
+                    rules = memory.list_rules(scope="video_cue")
+                    deleted = next(rule for rule in rules if rule["marker"] == "бюст")
+                    self.assertTrue(memory.delete_rule(deleted["id"]))
+                    self.assertIsNone(memory.get_rule(deleted["id"]))
+
+                # Without invalidating the cache, the second normalization
+                # call against the *same* database is a no-op seeding-wise
+                # (see test_seeding_writes_only_once_per_database_across_normalization_calls),
+                # so the deleted rule would stay gone.
+                generate_normalization(
+                    source, root / "out2.json", memory_path=memory_path, use_llm=False
+                )
+                self.assertEqual(len(video_cue_calls), len(_VIDEO_CUE_KEYWORDS))
+                with NormalizationMemory(memory_path) as memory:
+                    self.assertNotIn(
+                        "бюст", [rule["marker"] for rule in memory.list_rules(scope="video_cue")]
+                    )
+
+                invalidate_video_cue_seed_cache(memory_path)
+
+                generate_normalization(
+                    source, root / "out3.json", memory_path=memory_path, use_llm=False
+                )
+                self.assertEqual(len(video_cue_calls), 2 * len(_VIDEO_CUE_KEYWORDS))
+                with NormalizationMemory(memory_path) as memory:
+                    restored = next(
+                        rule
+                        for rule in memory.list_rules(scope="video_cue")
+                        if rule["marker"] == "бюст"
+                    )
+                self.assertEqual(restored["status"], "active")
 
     def test_video_cue_rule_change_invalidates_llm_cache_signature(self) -> None:
         # The LLM result cache is keyed by _llm_rules_signature(); if it did

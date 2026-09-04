@@ -588,6 +588,11 @@ def run_sync_job(
             finished_at=_utc_now_iso(),
         )
     except Exception as exc:
+        app.logger.exception(
+            "Sync job failed project=%s job=%s",
+            project,
+            job_id,
+        )
         try:
             checkpoint_matches()
         except Exception:

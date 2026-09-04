@@ -36,6 +36,24 @@ def test_registry_reserves_projects_atomically() -> None:
     assert registry.reserve("demo")
 
 
+def test_registry_increments_field_atomically_under_concurrency() -> None:
+    registry = JobRegistry()
+    registry.jobs["job-1"] = {"retry_count": 0}
+    iterations = 200
+
+    def bump() -> None:
+        for _ in range(iterations):
+            registry.update("job-1", {}, increments={"retry_count": 1})
+
+    threads = [threading.Thread(target=bump) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert registry.jobs["job-1"]["retry_count"] == 8 * iterations
+
+
 def test_api_job_facade_honors_reassigned_legacy_state(monkeypatch) -> None:
     jobs: dict[str, dict] = {}
     lock = threading.Lock()

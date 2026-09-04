@@ -8,7 +8,9 @@ network access, no real ffmpeg/ffprobe binary required.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,12 @@ from stage2.cloud_asr import (
     parse_transcript,
     transcribe_cloud,
 )
+
+# Captured at import time, BEFORE the autouse `_no_real_ffmpeg_ffprobe`
+# fixture (below) monkeypatches `CloudAudioAsrAdapter._extract_chunk_mp3` for
+# every test — needed by tests that exercise the *real* ffmpeg-subprocess
+# logic (e.g. the ffmpeg-hang timeout test) despite the autouse stub.
+_REAL_EXTRACT_CHUNK_MP3 = CloudAudioAsrAdapter._extract_chunk_mp3
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +235,29 @@ def test_reconcile_speakers_keeps_different_people_separate() -> None:
     assert len(speakers) == 2
 
 
+def test_reconcile_speakers_does_not_merge_anonymous_same_sex_different_voices() -> None:
+    """Два РАЗНЫХ анонимных голоса одного пола с типовыми описаниями («пол,
+    роль, манера речи», без личных имён) не должны склеиваться в одного
+    говорящего только из-за совпадения слова «мужской»/«женский»: пол сам по
+    себе — не признак различия людей одного пола, а обозначения пола не
+    должны входить в значимые слова меры Жаккара (см. _DESCRIPTION_STOPWORDS).
+    Before the fix: {"мужской", "уверенный", "тон"} vs
+    {"мужской", "доброжелательный", "тон"} give Jaccard 2/4 = 0.5 (>= порога)
+    and were incorrectly merged.
+    """
+    segments = [
+        _seg("A", 0.0, 5.0, "ГОЛОС 1"),
+        _seg("B", 100.0, 105.0, "ГОЛОС 2"),
+    ]
+    descriptions = {
+        "ГОЛОС 1": "Мужской голос, уверенный тон",
+        "ГОЛОС 2": "Мужской голос, доброжелательный тон",
+    }
+    merged, speakers, _ = _reconcile_speakers(segments, speaker_descriptions=descriptions)
+    assert len(speakers) == 2
+    assert merged[0].speaker != merged[1].speaker
+
+
 # ---------------------------------------------------------------------------
 # transcribe_cloud (mocked httpx + mocked ffmpeg/ffprobe)
 # ---------------------------------------------------------------------------
@@ -366,3 +397,156 @@ def test_transcribe_words_preserves_cost_on_parse_error(monkeypatch: pytest.Monk
 
     assert calls["count"] == 3
     assert exc_info.value.cost_usd == pytest.approx(0.04)
+
+
+# ---------------------------------------------------------------------------
+# _extract_chunk_mp3: a hung ffmpeg process must not block the run forever.
+# ---------------------------------------------------------------------------
+
+
+class _HangingProcess:
+    """Fake asyncio subprocess whose `communicate()` never returns on its
+    own (simulates a hung ffmpeg) but supports `kill()`/`wait()`."""
+
+    def __init__(self) -> None:
+        self.killed = False
+        self.waited = False
+        self.returncode: int | None = None
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await asyncio.sleep(10.0)
+        return b"stdout-should-not-be-reached", b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.waited = True
+        return self.returncode or 0
+
+
+def test_extract_chunk_mp3_kills_hung_ffmpeg_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cloud_asr, "_EXTRACT_CHUNK_TIMEOUT_SEC", 0.05)
+    process = _HangingProcess()
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> _HangingProcess:
+        return process
+
+    monkeypatch.setattr(cloud_asr.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    adapter = CloudAudioAsrAdapter(api_key="test-key")
+
+    async def scenario() -> None:
+        # Call the ORIGINAL (unpatched-by-autouse-fixture) implementation
+        # directly — `_REAL_EXTRACT_CHUNK_MP3` was captured at module import
+        # time, before `_no_real_ffmpeg_ffprobe` replaces the bound method.
+        await _REAL_EXTRACT_CHUNK_MP3(adapter, Path("/tmp/does-not-matter.wav"), 0.0, 5.0)
+
+    start = time.monotonic()
+    with pytest.raises(cloud_asr.CloudAudioAsrError, match="не ответил"):
+        asyncio.run(scenario())
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0  # bounded by the (patched) timeout, not the 10s hang
+    assert process.killed is True
+    assert process.waited is True
+
+
+# ---------------------------------------------------------------------------
+# Cancellation must interrupt the network request/retry wait, not only the
+# gap between chunks (see transcribe_words / _call_model / _await_cancellable).
+# ---------------------------------------------------------------------------
+
+
+def test_await_cancellable_interrupts_slow_awaitable() -> None:
+    async def scenario() -> None:
+        cancel = asyncio.Event()
+
+        async def slow() -> str:
+            await asyncio.sleep(10.0)
+            return "done"
+
+        async def trigger() -> None:
+            await asyncio.sleep(0.01)
+            cancel.set()
+
+        asyncio.ensure_future(trigger())
+        start = time.monotonic()
+        with pytest.raises(asyncio.CancelledError):
+            await CloudAudioAsrAdapter._await_cancellable(slow(), cancel)
+        assert time.monotonic() - start < 5.0
+
+    asyncio.run(scenario())
+
+
+def test_await_cancellable_returns_result_when_not_cancelled() -> None:
+    async def scenario() -> None:
+        cancel = asyncio.Event()
+
+        async def quick() -> str:
+            return "ok"
+
+        result = await CloudAudioAsrAdapter._await_cancellable(quick(), cancel)
+        assert result == "ok"
+
+    asyncio.run(scenario())
+
+
+def test_call_model_raises_immediately_if_already_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If cancellation is requested before `_call_model` even starts, no HTTP
+    request should be attempted at all."""
+    called = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called["count"] += 1
+        return _model_response("[00:01.0 — 00:02.0] ГОЛОС 1: X")
+
+    _patch_async_client(monkeypatch, handler)
+
+    async def scenario() -> None:
+        adapter = CloudAudioAsrAdapter(api_key="test-key")
+        cancel = asyncio.Event()
+        cancel.set()
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(asyncio.CancelledError):
+                await adapter._call_model(client, "audio", prompt="prompt", cancel=cancel)
+
+    asyncio.run(scenario())
+    assert called["count"] == 0
+
+
+def test_call_model_cancellation_interrupts_slow_network_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation requested while the (slow) request to the model is
+    in flight must interrupt it promptly instead of waiting out the full
+    request/backoff duration (see `_await_cancellable`)."""
+
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(10.0)
+        return _model_response("[00:01.0 — 00:02.0] ГОЛОС 1: X")
+
+    _patch_async_client(monkeypatch, slow_handler)
+
+    async def scenario() -> None:
+        adapter = CloudAudioAsrAdapter(api_key="test-key")
+        cancel = asyncio.Event()
+
+        async def trigger() -> None:
+            await asyncio.sleep(0.02)
+            cancel.set()
+
+        asyncio.ensure_future(trigger())
+
+        start = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(asyncio.CancelledError):
+                await adapter._call_model(client, "audio", prompt="prompt", cancel=cancel)
+        assert time.monotonic() - start < 5.0
+
+    asyncio.run(scenario())

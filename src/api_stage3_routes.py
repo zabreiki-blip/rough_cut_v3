@@ -17,23 +17,7 @@ from atomic_io import atomic_write_json, atomic_write_text
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
-
-
-def _scenario_revision_matches(stored: object, current: object) -> bool:
-    """Accept legacy empty IDs, but reject explicit cross-revision artifacts."""
-    stored_id = str(stored or "").strip()
-    current_id = str(current or "").strip()
-    return not stored_id or not current_id or stored_id == current_id
-
-
-def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
-    return timeline.get("normalization_revision") == normalization.get(
-        "revision"
-    ) and _scenario_revision_matches(
-        timeline.get("scenario_revision_id"),
-        normalization.get("scenario_revision_id"),
-    )
-
+from stage_common import _scenario_revision_matches, _timeline_is_current
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
 

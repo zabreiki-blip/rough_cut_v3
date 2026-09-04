@@ -190,15 +190,55 @@ _VIDEO_CUE_KEYWORD_RE = re.compile(
 )
 
 
+# _seed_video_cue_rules is idempotent at the database level (record_manual's
+# upsert never regresses a rule a user already disabled and is a no-op once
+# a keyword is already active), but generate_normalization() runs it once
+# per *document*, and every call re-issues all 24 upserts even though the
+# rows never change after the first run. Skip the redundant writes with a
+# process-local "already seeded" cache keyed by the memory database's
+# resolved path -- not a single process-wide flag -- so unrelated memory
+# databases (e.g. per-project or per-test tmp DBs opened in the same
+# process) each still get seeded on their own first use. Guarded by a lock
+# because generate_normalization can run concurrently from worker threads.
+_video_cue_seeded_db_paths: set[str] = set()
+_video_cue_seed_lock = threading.Lock()
+
+
+def invalidate_video_cue_seed_cache(db_path: Path | str | None = None) -> None:
+    """Forget that ``db_path`` (or, with no argument, every database) has
+    already been seeded, so the next ``_seed_video_cue_rules`` call for it
+    re-issues the upserts.
+
+    Needed whenever something other than ``_seed_video_cue_rules`` itself
+    can undo what seeding is responsible for -- most notably a user
+    deleting a scope='video_cue' rule via the memory API: without
+    invalidating the cache, the deleted rule would only come back after a
+    process restart (when the in-memory "already seeded" set is naturally
+    reset), making the API's behavior depend on process lifetime instead of
+    being deterministic.
+    """
+    with _video_cue_seed_lock:
+        if db_path is None:
+            _video_cue_seeded_db_paths.clear()
+            return
+        _video_cue_seeded_db_paths.discard(str(Path(db_path).resolve()))
+
+
 def _seed_video_cue_rules(memory: NormalizationMemory) -> None:
     """Seed the built-in video-cue lexicon into scope='video_cue' memory
     rules. Idempotent: ``record_manual``'s upsert never regresses a rule a
     user already disabled and is a no-op once a keyword is already active,
     so calling this once per normalization run never creates duplicates or
-    overrides manual edits.
+    overrides manual edits. Skipped entirely once this database has already
+    been seeded in this process (see ``_video_cue_seeded_db_paths`` above).
     """
-    for keyword in _VIDEO_CUE_KEYWORDS:
-        memory.record_manual(keyword, BlockType.TECHNICAL.value, scope="video_cue")
+    cache_key = str(memory.path.resolve())
+    with _video_cue_seed_lock:
+        if cache_key in _video_cue_seeded_db_paths:
+            return
+        for keyword in _VIDEO_CUE_KEYWORDS:
+            memory.record_manual(keyword, BlockType.TECHNICAL.value, scope="video_cue")
+        _video_cue_seeded_db_paths.add(cache_key)
 
 
 def _video_cue_keyword_pattern(memory: NormalizationMemory | None) -> re.Pattern[str]:

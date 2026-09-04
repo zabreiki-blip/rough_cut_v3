@@ -11,28 +11,10 @@ import wave
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
+from stage_common import _scenario_revision_matches, _timeline_is_current
+
 if TYPE_CHECKING:
     from stage2.sync_models import SyncMatch
-
-
-def _scenario_revision_matches(stored: object, current: object) -> bool:
-    """Compare scenario identities while accepting artifacts from legacy files.
-
-    An empty ID on either side means that the artifact predates scenario-level
-    versioning. Explicit, different IDs are always stale.
-    """
-    stored_id = str(stored or "").strip()
-    current_id = str(current or "").strip()
-    return not stored_id or not current_id or stored_id == current_id
-
-
-def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
-    return timeline.get("normalization_revision") == normalization.get(
-        "revision"
-    ) and _scenario_revision_matches(
-        timeline.get("scenario_revision_id"),
-        normalization.get("scenario_revision_id"),
-    )
 
 
 def _stage2_sync_sources(services: ModuleType):

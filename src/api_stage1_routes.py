@@ -5,6 +5,8 @@ from types import ModuleType
 
 from flask import Flask, jsonify, request
 
+from stage1.normalizer import invalidate_video_cue_seed_cache
+
 
 def _stage1_analyze(services: ModuleType):
     payload = request.get_json(silent=True) or {}
@@ -334,6 +336,13 @@ def _stage1_normalization_memory_update(services: ModuleType, rule_id: int):
     try:
         memory = services._memory_instance()
         result = memory.update_rule(rule_id, **updates)
+        # A video-cue rule's marker/target_type/status can drift out of sync
+        # with what the built-in seed would (re)write (e.g. renaming a seeded
+        # keyword, or changing its target type). The per-process "already
+        # seeded" cache must not hide that drift until the next restart, so
+        # invalidate it whenever a scope='video_cue' rule changes.
+        if result.get("scope") == "video_cue":
+            invalidate_video_cue_seed_cache(memory.path)
     except Exception as exc:
         return services._normalization_exception(exc)
     finally:
@@ -346,7 +355,15 @@ def _stage1_normalization_memory_delete(services: ModuleType, rule_id: int):
     memory = None
     try:
         memory = services._memory_instance()
+        rule = memory.get_rule(rule_id)
         result = memory.delete_rule(rule_id)
+        # Deleting a scope='video_cue' rule must not be silently undone by
+        # the next normalization run only because that database was already
+        # seeded earlier in this process; invalidate the cache so the deleted
+        # rule is deterministically reseeded on the next run regardless of
+        # process lifetime.
+        if result and rule is not None and rule.get("scope") == "video_cue":
+            invalidate_video_cue_seed_cache(memory.path)
     except Exception as exc:
         return services._normalization_exception(exc)
     finally:

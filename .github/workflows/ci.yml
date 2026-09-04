@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  security-events: write
 
 jobs:
   verify:
@@ -19,7 +20,7 @@ jobs:
           fetch-depth: 0
 
       - name: Gitleaks secret scan
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

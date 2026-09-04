@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import difflib
 import logging
 import math
@@ -83,6 +84,13 @@ DEFAULT_MAX_RETRIES = 3
 # сама операция дешёвая, большой таймаут не нужен, но должен быть конечным
 # (см. общий стиль вызовов ffmpeg/ffprobe в проекте, ../stage1/gemini_tts.py).
 _PROBE_TIMEOUT_SEC = 60.0
+
+# Таймаут нарезки одного фрагмента через ffmpeg (см. _extract_chunk_mp3) —
+# должен быть конечным по тем же соображениям, что и _PROBE_TIMEOUT_SEC:
+# зависший (например, из-за повреждённого входного файла) процесс ffmpeg без
+# таймаута повесил бы весь прогон навсегда, потому что
+# `process.communicate()` ждёт его завершения без ограничения по времени.
+_EXTRACT_CHUNK_TIMEOUT_SEC = 300.0
 
 # Порог схожести нормализованного текста, при котором реплики на стыке
 # частей считаются дублями одной и той же фразы (см. _texts_match).
@@ -124,8 +132,16 @@ _NAME_ROLE_STOPWORDS = frozenset(
 # Служебные слова, которые не учитываются при сравнении описаний по значимым
 # словам (мера Жаккара, см. _significant_words) — слишком общие, чтобы что-то
 # говорить о сходстве голосов (в т.ч. «голос» — он есть почти в каждом
-# описании и без исключения искусственно завышал бы схожесть).
-_DESCRIPTION_STOPWORDS = frozenset({"голос", "голоса", "и", "а", "но", "или", "с", "за", "кадром"})
+# описании и без исключения искусственно завышал бы схожесть). Обозначения
+# пола («мужской»/«женский») тоже исключены: пол уже сравнивается отдельным,
+# более сильным шагом раньше (см. `_descriptions_match`, проверка по
+# `_extract_gender`) — если оставить их значимыми словами, два РАЗНЫХ голоса
+# одного пола с типовыми описаниями («Мужской голос, уверенный тон» /
+# «Мужской голос, доброжелательный тон») набирают Жаккара только за счёт
+# совпадения пола и ошибочно склеиваются.
+_DESCRIPTION_STOPWORDS = frozenset(
+    {"голос", "голоса", "и", "а", "но", "или", "с", "за", "кадром", "мужской", "женский"}
+)
 
 # Суффиксы русских падежных окончаний (от длинных к коротким), которые
 # отбрасываются при сравнении личных имён по основе (см. _name_stem) — чтобы
@@ -1016,7 +1032,21 @@ class CloudAudioAsrAdapter:
                 f"Не найден исполняемый файл {self._ffmpeg!r}. Установите ffmpeg и добавьте в PATH."
             ) from exc
 
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=_EXTRACT_CHUNK_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError as exc:
+            # Зависший ffmpeg (без таймаута process.communicate() ждал бы его
+            # завершения бесконечно, см. комментарий у _EXTRACT_CHUNK_TIMEOUT_SEC)
+            # — убиваем процесс и поднимаем понятную ошибку вместо того, чтобы
+            # повесить весь прогон.
+            process.kill()
+            await process.wait()
+            raise CloudAudioAsrError(
+                f"ffmpeg не ответил за {_EXTRACT_CHUNK_TIMEOUT_SEC:.0f} с при нарезке "
+                f"фрагмента {media_path} (start={start_sec:.1f}с, duration={duration_sec:.1f}с)"
+            ) from exc
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()[-500:]
             raise CloudAudioAsrError(
@@ -1052,8 +1082,48 @@ class CloudAudioAsrAdapter:
         jitter = base * random.uniform(0.0, 0.25)
         await asyncio.sleep(base + jitter)
 
+    @staticmethod
+    async def _await_cancellable(aw: Any, cancel: asyncio.Event | None) -> Any:
+        """Ждёт корутину/future `aw`, прерываясь раньше, если сработает
+        `cancel` (см. `_call_model`): без этого отмена, нажатая пользователем
+        во время долгого сетевого запроса к модели (до `timeout_sec`, по
+        умолчанию 900с) или во время паузы backoff перед ретраем, не
+        замечалась бы до самого конца ожидания — отмена могла зависать на
+        минуты вместо мгновенного отклика (см. проверку `cancel.is_set()`
+        перед стартом каждого чанка в `transcribe_words`, которая покрывает
+        только границу между чанками, а не ожидание внутри одного).
+
+        Если `cancel` не передан — просто ждёт `aw` как обычно (совместимо со
+        старым поведением, использующимся, когда вызывающий код отмену не
+        поддерживает).
+        """
+        task = aw if isinstance(aw, asyncio.Task) else asyncio.ensure_future(aw)
+        if cancel is None:
+            return await task
+        cancel_task = asyncio.ensure_future(cancel.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                return task.result()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise asyncio.CancelledError("Распознавание отменено пользователем")
+        finally:
+            if not cancel_task.done():
+                cancel_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancel_task
+
     async def _call_model(
-        self, client: httpx.AsyncClient, audio_b64: str, *, prompt: str
+        self,
+        client: httpx.AsyncClient,
+        audio_b64: str,
+        *,
+        prompt: str,
+        cancel: asyncio.Event | None = None,
     ) -> tuple[str, float | None, dict]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -1090,8 +1160,12 @@ class CloudAudioAsrAdapter:
         attempt = 0
         while True:
             attempt += 1
+            if cancel is not None and cancel.is_set():
+                raise asyncio.CancelledError("Распознавание отменено пользователем")
             try:
-                resp = await client.post(self._chat_url, headers=self._headers(), json=payload)
+                resp = await self._await_cancellable(
+                    client.post(self._chat_url, headers=self._headers(), json=payload), cancel
+                )
             except httpx.HTTPError as exc:
                 if attempt >= self._max_retries:
                     raise CloudAudioAsrError(
@@ -1102,7 +1176,7 @@ class CloudAudioAsrAdapter:
                     attempt,
                     self._max_retries,
                 )
-                await self._sleep_backoff(attempt)
+                await self._await_cancellable(self._sleep_backoff(attempt), cancel)
                 continue
 
             if resp.status_code == 429 or resp.status_code >= 500:
@@ -1117,7 +1191,7 @@ class CloudAudioAsrAdapter:
                     attempt,
                     self._max_retries,
                 )
-                await self._sleep_backoff(attempt)
+                await self._await_cancellable(self._sleep_backoff(attempt), cancel)
                 continue
 
             if resp.status_code >= 400:
@@ -1161,7 +1235,12 @@ class CloudAudioAsrAdapter:
     ) -> AsrRunResult:
         self._require_available()
         audio_path = Path(audio_path)
-        duration_sec = self._probe_duration(audio_path)
+        # _probe_duration — синхронный subprocess.run (см. модульную функцию
+        # _probe_duration выше) с таймаутом до _PROBE_TIMEOUT_SEC (60 с):
+        # вызванный напрямую внутри этой корутины, он блокировал бы event
+        # loop на всё это время. asyncio.to_thread выносит блокирующий вызов
+        # в отдельный поток.
+        duration_sec = await asyncio.to_thread(self._probe_duration, audio_path)
         parts = self._plan_chunks(duration_sec)
         chunk_len = self.chunk_minutes * 60
 
@@ -1202,7 +1281,9 @@ class CloudAudioAsrAdapter:
                     next_number=next_speaker_number,
                 )
                 try:
-                    content, cost, raw = await self._call_model(client, audio_b64, prompt=prompt)
+                    content, cost, raw = await self._call_model(
+                        client, audio_b64, prompt=prompt, cancel=cancel
+                    )
                 except CloudAudioAsrError as exc:
                     # Ретраи внутри _call_model уже исчерпаны для ЭТОГО чанка —
                     # запрос окончательно не удался. Если предыдущие чанки уже

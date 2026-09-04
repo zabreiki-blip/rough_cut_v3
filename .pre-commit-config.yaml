@@ -32,5 +32,5 @@ repos:
         name: ESLint
         entry: npx eslint cep tests/cep_behavior_test.cjs
         language: system
-        files: '^cep/.*\.(js|jsx)$'
+        files: '(^cep/.*\.(js|jsx)$|^tests/cep_behavior_test\.cjs$)'
         pass_filenames: false
