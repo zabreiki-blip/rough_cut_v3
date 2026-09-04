@@ -28,3 +28,4 @@ projects/*/versions/
 
 # Local runtime scratch space (may contain real user project data)
 artifacts/
+.env.bak.*
