@@ -1070,6 +1070,11 @@ class CloudAudioAsrAdapter:
                 }
             ],
             "temperature": 0.0,
+            # Без этого флага OpenRouter не включает в ответ `usage.cost` —
+            # `_extract_cost` всегда получал бы None, и вся отчётность по
+            # деньгам (см. CloudAudioAsrError.cost_usd, total_cost ниже)
+            # была бы недоступна.
+            "usage": {"include": True},
         }
         # Расшифровке не нужны развёрнутые размышления модели: на записи
         # 15 минут они раздували ответ до 46 тысяч выходных токенов и делали
@@ -1120,7 +1125,13 @@ class CloudAudioAsrAdapter:
                     f"Облачная ASR-модель вернула ошибку {resp.status_code}: {resp.text[:300]}"
                 )
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise CloudAudioAsrError(
+                    f"Облачная ASR-модель вернула тело ответа, которое не удалось "
+                    f"разобрать как JSON: {resp.text[:300]}"
+                ) from exc
             break
 
         try:
@@ -1213,10 +1224,32 @@ class CloudAudioAsrAdapter:
                     total_cost += cost
                     cost_found = True
 
-                transcript_text, legend_text = split_transcript_and_legend(content)
-                part_segments, part_own_end = _parse_transcript_with_own_end(
-                    transcript_text, offset_sec=part_start
-                )
+                try:
+                    transcript_text, legend_text = split_transcript_and_legend(content)
+                    part_segments, part_own_end = _parse_transcript_with_own_end(
+                        transcript_text, offset_sec=part_start
+                    )
+                except Exception as exc:
+                    # Запрос к модели уже оплачен (см. total_cost выше) —
+                    # если разбор её ответа не удался (например, модель
+                    # вернула текст без ожидаемой разметки таймкодов), эта
+                    # уже потраченная сумма не должна пропасть молча вместе
+                    # с TranscriptParseError/иным исключением парсера,
+                    # которое вызывающий код (ловит только
+                    # CloudAudioAsrError) не перехватит.
+                    raise CloudAudioAsrError(
+                        f"Не удалось разобрать ответ облачной ASR-модели для части "
+                        f"{idx + 1} из {len(parts)}: {exc}"
+                        + (
+                            f" (уже потрачено ~{total_cost:.4f} USD на {idx} из "
+                            f"{len(parts)} успешно распознанных частях записи — эта "
+                            "работа оплачена и не потеряна, но текущий запуск придётся "
+                            "повторить)"
+                            if cost_found
+                            else ""
+                        ),
+                        cost_usd=total_cost if cost_found else None,
+                    ) from exc
                 if part_segments:
                     part_segments[-1] = replace(part_segments[-1], end=part_end)
                     # Конец принудительно дотянут до технической границы

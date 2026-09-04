@@ -34,6 +34,11 @@ class VideoCueDetectionTests(unittest.TestCase):
         "Планы шпилей храма",
     )
 
+    PLANY_PREFIXED_NARRATION_TEXTS = (
+        "Планы Наполеона рухнули, когда он увидел горящую Москву",
+        "Портреты кисти неизвестного художника долго считались утраченными",
+    )
+
     def _classify_after_voiceover(self, candidate_text: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -65,6 +70,11 @@ class VideoCueDetectionTests(unittest.TestCase):
         for text in self.ALREADY_CORRECT_TECHNICAL_TEXTS:
             with self.subTest(text=text):
                 self.assertEqual(self._classify_after_voiceover(text), "technical")
+
+    def test_plany_prefixed_narration_is_not_technical(self) -> None:
+        for text in self.PLANY_PREFIXED_NARRATION_TEXTS:
+            with self.subTest(text=text):
+                self.assertNotEqual(self._classify_after_voiceover(text), "technical")
 
     def test_video_cue_is_technical_without_preceding_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

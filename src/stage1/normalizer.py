@@ -1122,9 +1122,10 @@ def _classify_by_rules(
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
     elif _BARE_SPEAKER_PREFIX.match(stripped) and block.original_label and len(content) >= 40:
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
-    elif re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE) or (
-        not block.original_label and _looks_like_video_cue(stripped, video_cue_re)
-    ):
+    elif (
+        re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE)
+        or not block.original_label
+    ) and _looks_like_video_cue(stripped, video_cue_re):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
     elif block.order == 1 and not block.original_label and _looks_like_scenario_title(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
@@ -1228,7 +1229,11 @@ def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, An
         if target_type not in VALID_BLOCK_TYPES:
             block.warnings.append(f"LLM returned invalid type '{target_type}'")
             continue
-        confidence = float(item.get("confidence", 0.6))
+        try:
+            confidence = float(item.get("confidence", 0.6))
+        except (TypeError, ValueError):
+            block.warnings.append(f"LLM returned invalid confidence {item.get('confidence')!r}")
+            continue
         if confidence < _LLM_CONFIDENCE_THRESHOLD:
             block.source = DecisionSource.LLM.value
             block.confidence = max(0.0, min(1.0, confidence))

@@ -1095,6 +1095,35 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(len(result["blocks"]), 3)
             self.assertEqual([item["type"] for item in result["blocks"]], ["other"] * 3)
 
+    def test_invalid_confidence_in_one_batch_does_not_abort_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("\n".join(["А" * 7000, "Б" * 7000, "В" * 7000]), encoding="utf-8")
+
+            def classifier(items, _hint):
+                # Each block above lands in its own batch (see
+                # test_large_scenario_is_classified_in_batches). The "Б" batch
+                # simulates a malformed LLM response with a non-numeric
+                # confidence value; the other batches remain well-formed.
+                if items[0]["original_text"].startswith("Б"):
+                    return [{"uid": items[0]["uid"], "type": "other", "confidence": "high"}]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.7} for item in items]
+
+            result = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                classifier=classifier,
+            )
+
+            self.assertEqual(len(result["blocks"]), 3)
+            by_text = {block["original_text"][0]: block for block in result["blocks"]}
+            self.assertEqual(by_text["А"]["type"], "other")
+            self.assertEqual(by_text["В"]["type"], "other")
+            self.assertNotEqual(by_text["Б"]["type"], "other")
+            self.assertTrue(by_text["Б"]["warnings"])
+
     def test_default_llm_classifier_handles_multiple_compact_batches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

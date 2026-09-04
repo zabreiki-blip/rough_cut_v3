@@ -8,6 +8,7 @@ network access, no real ffmpeg/ffprobe binary required.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -316,3 +317,52 @@ def test_transcribe_cloud_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -
     assert calls["count"] == 2
     assert result["segments"][0]["text"] == "Готово после ретрая"
     assert result["cost_usd"] == pytest.approx(0.01)
+
+
+def test_call_model_payload_requests_cost_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenRouter отдаёт `usage.cost` только если запрос явно попросил об
+    этом через `usage.include = True` — без этого `_extract_cost` всегда
+    получает None."""
+    captured: dict[str, Any] = {}
+    text = "[00:01.0 — 00:02.0] ГОЛОС 1: Привет"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return _model_response(text, cost=0.01)
+
+    _patch_async_client(monkeypatch, handler)
+
+    transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    assert captured["payload"]["usage"] == {"include": True}
+
+
+def test_transcribe_words_preserves_cost_on_parse_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если последний из нескольких чанков не удалось распарсить, стоимость
+    уже успешно распознанных предыдущих чанков не должна теряться, а сама
+    ошибка должна быть CloudAudioAsrError (а не TranscriptParseError/иное
+    исключение, которое вызывающий код не ловит)."""
+    unparseable = "просто текст без таймкодов, без разметки"
+    parseable = "[00:01.0 — 00:02.0] ГОЛОС 1: Реплика"
+
+    monkeypatch.setattr(
+        CloudAudioAsrAdapter,
+        "_plan_chunks",
+        lambda self, duration_sec: [(0.0, 20.0), (20.0, 40.0), (40.0, 60.0)],
+    )
+
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            return _model_response(parseable, cost=0.02)
+        return _model_response(unparseable, cost=None)
+
+    _patch_async_client(monkeypatch, handler)
+
+    with pytest.raises(cloud_asr.CloudAudioAsrError) as exc_info:
+        transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    assert calls["count"] == 3
+    assert exc_info.value.cost_usd == pytest.approx(0.04)
