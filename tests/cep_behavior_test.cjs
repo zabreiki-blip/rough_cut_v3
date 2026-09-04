@@ -1193,6 +1193,17 @@ function testWhisperPollingAndEta() {
   element("projectsRoot").value = "/projects";
   element("transcribePath").value = "/stage2/sync-jobs/start";
 
+  for (let i = 0; i < 40; i += 1) {
+    hooks.log("diagnostic " + i, {payload: "x".repeat(8000)});
+  }
+  assert.ok(
+    element("log").textContent.length <= 100000,
+    "the long-lived CEP log must remain bounded",
+  );
+  assert.match(element("log").textContent, /diagnostic 39/);
+  assert.match(element("log").textContent, /запись журнала сокращена/);
+  element("log").textContent = "";
+
   hooks.renderWhisperJob({
     status: "running",
     message: "Transcribing audio",
@@ -1276,9 +1287,427 @@ function testWhisperPollingAndEta() {
   assert.deepStrictEqual(freshTimeline, {segments: []});
 }
 
+function testVisibilityPausesBackgroundPolling() {
+  class Element {
+    constructor() {
+      this.value = "";
+      this.textContent = "";
+      this.className = "";
+      this.style = {};
+      this.attributes = {};
+      this.children = [];
+      this.firstChild = null;
+      this.disabled = false;
+      this.checked = false;
+    }
+    addEventListener() {}
+    appendChild(child) {
+      this.children.push(child);
+      this.firstChild = this.children[0] || null;
+      return child;
+    }
+    removeChild(child) {
+      this.children = this.children.filter((item) => item !== child);
+      this.firstChild = this.children[0] || null;
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    removeAttribute(name) { delete this.attributes[name]; }
+  }
+
+  const elements = {};
+  const timers = [];
+  const requestedUrls = [];
+  let clearTimeoutCalls = 0;
+  const evalScriptCalls = [];
+  let fileSizeCounter = 0;
+
+  const job = {
+    id: "job-1",
+    status: "running",
+    message: "Matching scenario quotes",
+    total: 44,
+    done: 11,
+  };
+
+  class FakeXHR {
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+      requestedUrls.push(url);
+    }
+    setRequestHeader() {}
+    send() {
+      this.readyState = 4;
+      this.status = 200;
+      this.responseText = JSON.stringify({ok: true, result: job});
+      this.onreadystatechange();
+    }
+  }
+
+  const context = {
+    console,
+    Date,
+    JSON,
+    Math,
+    Array,
+    Error,
+    isFinite,
+    encodeURIComponent,
+    decodeURIComponent,
+    XMLHttpRequest: FakeXHR,
+  };
+  context.window = context;
+  context.__ROUGH_CUT_TEST_MODE__ = true;
+  // The panel keeps polling the backend even while backgrounded/minimized.
+  // CSInterface.evalScript is only exercised here to drive pollExport's
+  // "guide WAV not stable yet" branch, so the fake never stabilizes and the
+  // export poll keeps re-arming its timer until we pause/resume it.
+  context.CSInterface = function CSInterface() {
+    this.evalScript = function (script, callback) {
+      evalScriptCalls.push(script);
+      fileSizeCounter += 1;
+      callback(JSON.stringify({
+        ok: true,
+        file: {exists: true, size: fileSizeCounter, modifiedMs: fileSizeCounter, path: "/tmp/guide.wav"},
+      }));
+    };
+  };
+  context.localStorage = {
+    values: {},
+    getItem(key) { return this.values[key] || null; },
+    setItem(key, value) { this.values[key] = String(value); },
+  };
+  context.setTimeout = function setTimeoutFake(callback, delay) {
+    timers.push({callback, delay});
+    return timers.length;
+  };
+  context.clearTimeout = function clearTimeoutFake() {
+    clearTimeoutCalls += 1;
+  };
+  context.document = {
+    readyState: "loading",
+    hidden: false,
+    addEventListener() {},
+    createElement() { return new Element(); },
+    getElementById(id) {
+      if (!elements[id]) elements[id] = new Element();
+      return elements[id];
+    },
+  };
+
+  const mainJsSource = fs.readFileSync(path.join(root, "cep", "js", "main.js"), "utf8");
+  // `bind()` (run from `init()` at load time in the real panel) must wire the
+  // exported handleVisibilityChange hook to the real event so this pause
+  // actually engages outside of tests; the behavioural assertions below
+  // exercise that same hook directly, mirroring what the listener calls.
+  assert.match(
+    mainJsSource,
+    /addEventListener\(\s*"visibilitychange"\s*,\s*handleVisibilityChange\s*\)/,
+    "the panel must subscribe handleVisibilityChange to document visibilitychange",
+  );
+
+  vm.createContext(context);
+  vm.runInContext(mainJsSource, context, {filename: "main.js"});
+  const hooks = context.__ROUGH_CUT_TEST_HOOKS__;
+  const element = (id) => context.document.getElementById(id);
+
+  element("projectName").value = "RVK_ULINOVSK";
+  element("apiBaseUrl").value = "http://127.0.0.1:8000";
+  element("apiToken").value = "memory-only-token";
+
+  // --- whisper status polling ---
+  hooks.refreshWhisperStatus();
+  const requestsAfterInitialRefresh = requestedUrls.length;
+  assert.strictEqual(requestsAfterInitialRefresh, 1);
+  assert.strictEqual(timers.length, 1, "a poll timer must be scheduled after a status refresh");
+
+  context.document.hidden = true;
+  hooks.handleVisibilityChange();
+  assert.ok(
+    clearTimeoutCalls >= 1,
+    "hiding the panel must clear the pending whisper poll timer",
+  );
+  const timersAfterHide = timers.length;
+  const requestsAfterHide = requestedUrls.length;
+
+  // Simulate real time passing while the panel stays hidden: nothing new
+  // should be scheduled or requested because there is no live timer left.
+  assert.strictEqual(timers.length, timersAfterHide);
+  assert.strictEqual(requestedUrls.length, requestsAfterHide);
+
+  context.document.hidden = false;
+  hooks.handleVisibilityChange();
+  assert.strictEqual(
+    requestedUrls.length,
+    requestsAfterHide + 1,
+    "returning to the foreground must trigger an immediate status refresh",
+  );
+  assert.strictEqual(
+    timers.length,
+    timersAfterHide + 1,
+    "returning to the foreground must resume the normal poll cycle",
+  );
+
+  // --- export polling ---
+  hooks.pollExport("/tmp/guide.wav", "job-export-1");
+  const exportTimerIndex = timers.length - 1;
+  timers[exportTimerIndex].callback();
+  assert.strictEqual(evalScriptCalls.length, 1, "the first export check must run once armed");
+  const attemptsBeforeHide = evalScriptCalls.length;
+  const timerCountBeforeExportHide = timers.length;
+
+  context.document.hidden = true;
+  hooks.handleVisibilityChange();
+  assert.strictEqual(
+    evalScriptCalls.length,
+    attemptsBeforeHide,
+    "hiding the panel must not consume export-poll attempts",
+  );
+  assert.strictEqual(
+    timers.length,
+    timerCountBeforeExportHide,
+    "hiding the panel must not arm a new export-poll timer",
+  );
+
+  context.document.hidden = false;
+  hooks.handleVisibilityChange();
+  assert.strictEqual(
+    evalScriptCalls.length,
+    attemptsBeforeHide + 1,
+    "returning to the foreground must immediately resume the export check " +
+      "from where it left off, without wasting the attempt budget on hidden time",
+  );
+}
+
+function testVisibilityRaceDiscardsStaleInFlightRequests() {
+  // Reproduces the race an independent review flagged in
+  // pauseBackgroundPolling: it only clears *pending* timers, so a request
+  // that is already in flight (callHost round-trip or XHR) when the panel
+  // is hidden can still land afterwards and, unguarded, would re-arm a
+  // timer behind the pause's back or even double-fire pollExport's
+  // terminal branch. Unlike the other polling test, the fakes here hold
+  // every request/host call open until the test resolves it manually, so
+  // the exact hide/resolve/show ordering described in the race can be
+  // driven deterministically.
+  class Element {
+    constructor() {
+      this.value = "";
+      this.textContent = "";
+      this.className = "";
+      this.style = {};
+      this.attributes = {};
+      this.children = [];
+      this.firstChild = null;
+      this.disabled = false;
+      this.checked = false;
+    }
+    addEventListener() {}
+    appendChild(child) {
+      this.children.push(child);
+      this.firstChild = this.children[0] || null;
+      return child;
+    }
+    removeChild(child) {
+      this.children = this.children.filter((item) => item !== child);
+      this.firstChild = this.children[0] || null;
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    removeAttribute(name) { delete this.attributes[name]; }
+  }
+
+  const elements = {};
+  const timers = [];
+  const pendingXhr = [];
+  const pendingEval = [];
+
+  const job = {
+    id: "job-1",
+    status: "running",
+    message: "Matching scenario quotes",
+    total: 44,
+    done: 11,
+  };
+
+  class FakeXHR {
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+    }
+    setRequestHeader() {}
+    send() {
+      const self = this;
+      pendingXhr.push({
+        url: self.url,
+        resolve(status, body) {
+          self.readyState = 4;
+          self.status = status;
+          self.responseText = JSON.stringify(body);
+          self.onreadystatechange();
+        },
+      });
+    }
+  }
+
+  const context = {
+    console,
+    Date,
+    JSON,
+    Math,
+    Array,
+    Error,
+    isFinite,
+    encodeURIComponent,
+    decodeURIComponent,
+    XMLHttpRequest: FakeXHR,
+  };
+  context.window = context;
+  context.__ROUGH_CUT_TEST_MODE__ = true;
+  context.CSInterface = function CSInterface() {
+    this.evalScript = function (script, callback) {
+      pendingEval.push({
+        script,
+        resolve(fileObj) {
+          callback(JSON.stringify({ok: true, file: fileObj}));
+        },
+      });
+    };
+  };
+  context.localStorage = {
+    values: {},
+    getItem(key) { return this.values[key] || null; },
+    setItem(key, value) { this.values[key] = String(value); },
+  };
+  context.setTimeout = function setTimeoutFake(callback, delay) {
+    timers.push({callback, delay});
+    return timers.length;
+  };
+  context.clearTimeout = function clearTimeoutFake() {};
+  context.document = {
+    readyState: "loading",
+    hidden: false,
+    addEventListener() {},
+    createElement() { return new Element(); },
+    getElementById(id) {
+      if (!elements[id]) elements[id] = new Element();
+      return elements[id];
+    },
+  };
+
+  vm.createContext(context);
+  vm.runInContext(
+    fs.readFileSync(path.join(root, "cep", "js", "main.js"), "utf8"),
+    context,
+    {filename: "main.js"},
+  );
+  const hooks = context.__ROUGH_CUT_TEST_HOOKS__;
+  const element = (id) => context.document.getElementById(id);
+
+  element("projectName").value = "RVK_ULINOVSK";
+  element("apiBaseUrl").value = "http://127.0.0.1:8000";
+  element("apiToken").value = "memory-only-token";
+
+  // --- whisper status poll: response arrives for a request that started
+  // before the panel was hidden ---
+  hooks.refreshWhisperStatus();
+  assert.strictEqual(pendingXhr.length, 1, "the status request must be sent immediately");
+  assert.strictEqual(timers.length, 0, "no poll timer may exist before the in-flight request resolves");
+
+  context.document.hidden = true;
+  hooks.handleVisibilityChange();
+
+  pendingXhr.shift().resolve(200, {ok: true, result: job});
+  assert.strictEqual(
+    timers.length,
+    0,
+    "a stale in-flight response must not arm a poll timer while hidden",
+  );
+  assert.strictEqual(
+    pendingXhr.length,
+    0,
+    "a stale in-flight response must not trigger a new request",
+  );
+
+  context.document.hidden = false;
+  hooks.handleVisibilityChange();
+  assert.strictEqual(
+    pendingXhr.length,
+    1,
+    "returning to the foreground must trigger exactly one immediate refresh",
+  );
+
+  pendingXhr.shift().resolve(200, {ok: true, result: job});
+  assert.strictEqual(timers.length, 1, "the resumed refresh must arm exactly one poll timer");
+  assert.strictEqual(pendingXhr.length, 0);
+
+  // A redundant visibilitychange -> visible (no hide in between) must be a
+  // no-op: the WasActive flag was already consumed above.
+  hooks.handleVisibilityChange();
+  assert.strictEqual(pendingXhr.length, 0, "a redundant resume must not send another request");
+  assert.strictEqual(timers.length, 1, "a redundant resume must not arm another timer");
+
+  // --- export poll: a stale in-flight "guide WAV is stable now" response
+  // must not double-fire registerSequenceWithCallback/startTranscriptionJob ---
+  hooks.pollExport("/tmp/guide.wav", "job-export-1");
+  const exportTimersStart = timers.length;
+  assert.strictEqual(exportTimersStart, 2, "pollExport must arm its own initial timer");
+
+  function fireNextExportCheck() {
+    timers[timers.length - 1].callback();
+  }
+  function resolveNextEval(fileObj) {
+    pendingEval.shift().resolve(fileObj);
+  }
+  const stableFile = {exists: true, size: 100, modifiedMs: 100, path: "/tmp/guide.wav"};
+
+  // Three consecutive identical checks build stableChecks up to 2; a fourth
+  // identical check is what would flip it to the completion threshold (3).
+  fireNextExportCheck();
+  resolveNextEval(stableFile);
+  fireNextExportCheck();
+  resolveNextEval(stableFile);
+  fireNextExportCheck();
+  resolveNextEval(stableFile);
+  assert.strictEqual(hooks.getExportPollTerminalCallCount(), 0);
+
+  // The fourth check is sent (this is the one that would complete the
+  // export)...
+  fireNextExportCheck();
+  assert.strictEqual(pendingEval.length, 1);
+
+  // ...but the panel is hidden before its callHost round-trip returns.
+  context.document.hidden = true;
+  hooks.handleVisibilityChange();
+  const timersBeforeStaleResolve = timers.length;
+  resolveNextEval(stableFile);
+  assert.strictEqual(
+    hooks.getExportPollTerminalCallCount(),
+    0,
+    "a stale in-flight export check must not complete the export while hidden",
+  );
+  assert.strictEqual(
+    timers.length,
+    timersBeforeStaleResolve,
+    "a stale in-flight export check must not arm a new export-poll timer",
+  );
+
+  // Resuming must run exactly one fresh check, which is the one that
+  // actually reaches the stable-file threshold.
+  context.document.hidden = false;
+  hooks.handleVisibilityChange();
+  assert.strictEqual(pendingEval.length, 1, "resume must issue exactly one export check");
+  resolveNextEval(stableFile);
+  assert.strictEqual(
+    hooks.getExportPollTerminalCallCount(),
+    1,
+    "the export completion must fire exactly once despite the race",
+  );
+}
+
 testPlaceholderSelection();
 testCyrillicProjectNames();
 testSequenceRoleGuards();
 testMarkerAwareConformResume();
 testMarkerNameIndexCaching();
 testWhisperPollingAndEta();
+testVisibilityPausesBackgroundPolling();
+testVisibilityRaceDiscardsStaleInFlightRequests();

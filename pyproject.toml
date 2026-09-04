@@ -2,6 +2,8 @@
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
+timeout = 120
+timeout_method = "thread"
 
 [tool.coverage.run]
 branch = true

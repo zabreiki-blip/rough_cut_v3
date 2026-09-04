@@ -6,12 +6,29 @@
   var guideAudioPath = "";
   var exportPollTimer = null;
   var exportInProgress = false;
+  var exportPollResumeFn = null;
+  var whisperPollWasActive = false;
+  var exportPollWasActive = false;
   var whisperPollTimer = null;
+  // Bumped every time the panel is hidden so in-flight requests started
+  // before the hide can recognise themselves as stale once their callback
+  // finally arrives (see pauseBackgroundPolling/resumeBackgroundPolling).
+  var pollGeneration = 0;
+  // Counts how many times pollExport's terminal (stableChecks >= 3) branch
+  // has actually run for the current panel session. Only ever read by
+  // tests, to prove the visibilitychange race cannot double-fire
+  // registerSequenceWithCallback/startTranscriptionJob.
+  var exportPollTerminalCallCount = 0;
   var currentWhisperJobId = "";
   var currentWhisperReviewCount = 0;
   var currentWhisperJobStatus = "";
   var CONFORM_VIDEO_TRACK_INDEX = 0;
   var CONFORM_AUDIO_TRACK_INDEX = 0;
+  // CEP panels can remain open for an entire editing session. Keep their
+  // diagnostic DOM bounded even when a backend is unavailable or a job polls
+  // for a long time.
+  var MAX_LOG_ENTRY_CHARACTERS = 8000;
+  var MAX_LOG_CHARACTERS = 100000;
   var hostFunctions = {
     ping: "rcStage2_ping",
     projects: "rcStage2_listProjects",
@@ -40,6 +57,8 @@
     var target = byId("log");
     var notice = byId("panelNotice");
     var line = "[" + now() + "] " + message;
+    var retained;
+    var cutoff;
     if (data !== undefined) {
       try {
         line += "\n" + JSON.stringify(data, null, 2);
@@ -47,7 +66,16 @@
         line += "\n" + String(data);
       }
     }
-    target.textContent = target.textContent ? line + "\n\n" + target.textContent : line;
+    if (line.length > MAX_LOG_ENTRY_CHARACTERS) {
+      line = line.slice(0, MAX_LOG_ENTRY_CHARACTERS) + "\n… запись журнала сокращена";
+    }
+    retained = target.textContent ? line + "\n\n" + target.textContent : line;
+    if (retained.length > MAX_LOG_CHARACTERS) {
+      // Do not leave a partial older record: retain complete, newest entries.
+      cutoff = retained.lastIndexOf("\n\n", MAX_LOG_CHARACTERS);
+      retained = cutoff > 0 ? retained.slice(0, cutoff) : retained.slice(0, MAX_LOG_CHARACTERS);
+    }
+    target.textContent = retained;
     if (notice) {
       notice.className = "panel-notice";
       if (level === "error") {
@@ -656,8 +684,17 @@
     path = requestedJobId
       ? "/stage2/sync-jobs/" + encodeURIComponent(requestedJobId)
       : "/stage2/sync-jobs/status?project=" + encodeURIComponent(current.project);
+    var requestGeneration = pollGeneration;
     request("GET", path, null, function (error, response) {
       var job;
+      // The panel was hidden (or hidden/shown again) while this request was
+      // in flight. Drop the response instead of re-arming a timer: resume
+      // already scheduled (or will schedule) a fresh poll from the current
+      // state, so acting on stale data here would risk a duplicate cycle.
+      if (requestGeneration !== pollGeneration || document.hidden) {
+        whisperPollWasActive = true;
+        return;
+      }
       if (error) {
         if (requestedJobId && error.message === "job not found" && allowProjectFallback) {
           currentWhisperJobId = "";
@@ -688,6 +725,50 @@
         job.status === "queued" || job.status === "running" || job.status === "cancelling" ? 2500 : 10000
       );
     });
+  }
+
+  // CEP panels stay open for an entire editing shift. Polling the backend
+  // while the panel is hidden/minimized just burns requests for nobody to
+  // see, so pause client-side polling on visibilitychange and pick it back
+  // up (with an immediate refresh) once the panel is visible again. This
+  // never cancels the underlying server-side job — only the local timers
+  // that ask about its progress.
+  function pauseBackgroundPolling() {
+    // Requests already in flight (callHost/XHR round-trips) cannot be
+    // cancelled, so bump the generation counter to let their callbacks
+    // detect the pause once they finally resolve.
+    pollGeneration += 1;
+    if (whisperPollTimer) {
+      window.clearTimeout(whisperPollTimer);
+      whisperPollTimer = null;
+      whisperPollWasActive = true;
+    }
+    if (exportPollTimer) {
+      window.clearTimeout(exportPollTimer);
+      exportPollTimer = null;
+      exportPollWasActive = true;
+    }
+  }
+
+  function resumeBackgroundPolling() {
+    if (whisperPollWasActive) {
+      whisperPollWasActive = false;
+      refreshWhisperStatus();
+    }
+    if (exportPollWasActive) {
+      exportPollWasActive = false;
+      if (exportPollResumeFn) {
+        exportPollResumeFn();
+      }
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) {
+      pauseBackgroundPolling();
+    } else {
+      resumeBackgroundPolling();
+    }
   }
 
   function refreshWhisperStatusManually() {
@@ -1074,17 +1155,33 @@
     var stableChecks = 0;
     var attempts = 0;
     var maxAttempts = 900;
+    // Guards the terminal branch below so a stale in-flight response can
+    // never trigger registerSequenceWithCallback/startTranscriptionJob a
+    // second time for this export cycle.
+    var exportFinished = false;
 
     function check() {
       attempts += 1;
+      var requestGeneration = pollGeneration;
       callHost("fileInfo", { path: outputPath }, function (error, response) {
         var file;
+        // Same discard-stale-response rule as refreshWhisperStatus: never
+        // re-arm a timer (or run the terminal branch) for a request that
+        // started before the panel was hidden.
+        if (requestGeneration !== pollGeneration || document.hidden) {
+          exportPollWasActive = true;
+          return;
+        }
+        if (exportFinished) {
+          return;
+        }
         if (error) {
           log("Не удалось проверить guide WAV: " + error.message);
           if (attempts < maxAttempts) {
             exportPollTimer = window.setTimeout(check, 2000);
           } else {
             exportPollTimer = null;
+            exportPollResumeFn = null;
             exportInProgress = false;
             byId("exportAndTranscribe").disabled = whisperJobIsActive();
           }
@@ -1101,10 +1198,13 @@
         previousModified = file.modifiedMs;
 
         if (stableChecks >= 3) {
+          exportFinished = true;
           exportPollTimer = null;
+          exportPollResumeFn = null;
           exportInProgress = false;
           guideAudioPath = file.path || outputPath;
           log("Guide WAV готов: " + file.size + " байт.", file);
+          exportPollTerminalCallCount += 1;
           registerSequenceWithCallback(function (registerError) {
             if (!registerError) {
               startTranscriptionJob();
@@ -1114,6 +1214,7 @@
         }
         if (attempts >= maxAttempts) {
           exportPollTimer = null;
+          exportPollResumeFn = null;
           exportInProgress = false;
           byId("exportAndTranscribe").disabled = whisperJobIsActive();
           log("Ожидание экспорта остановлено через 30 минут. Job ID: " + jobId);
@@ -1126,6 +1227,8 @@
     if (exportPollTimer) {
       window.clearTimeout(exportPollTimer);
     }
+    exportPollResumeFn = check;
+    exportPollWasActive = false;
     exportPollTimer = window.setTimeout(check, 1000);
   }
 
@@ -1498,6 +1601,7 @@
     byId("clearLog").addEventListener("click", function () {
       byId("log").textContent = "";
     });
+    document.addEventListener("visibilitychange", handleVisibilityChange);
   }
 
   function init() {
@@ -1524,16 +1628,22 @@
       formatDuration: formatDuration,
       refreshWhisperStatus: refreshWhisperStatus,
       refreshWhisperStatusManually: refreshWhisperStatusManually,
+      handleVisibilityChange: handleVisibilityChange,
+      pollExport: pollExport,
       loadFreshTimeline: loadFreshTimeline,
       renderWhisperJob: renderWhisperJob,
       sourceRegistrationBlockReason: sourceRegistrationBlockReason,
       sourceIdentityMatchesSequence: sourceIdentityMatchesSequence,
       registeredSourceGuard: registeredSourceGuard,
       request: request,
+      log: log,
       saveConfig: saveConfig,
       hideManualRetry: hideManualRetry,
       hasPendingManualRetry: function () {
         return pendingManualRetry !== null;
+      },
+      getExportPollTerminalCallCount: function () {
+        return exportPollTerminalCallCount;
       }
     };
   }
