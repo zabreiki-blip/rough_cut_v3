@@ -93,6 +93,37 @@ def _check_whisper_backend() -> dict[str, str]:
     )
 
 
+def _macos_connector_health_url(connector_url: str) -> str:
+    """Derive the connector's health-check URL from its /synthesize URL."""
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(connector_url)
+    return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
+
+
+def _macos_connector_reachable(settings: Any) -> bool:
+    """Best-effort readiness probe for the macOS TTS connector. Never raises."""
+
+    connector_url = str(getattr(settings, "macos_connector_url", "") or "")
+    health_url = _macos_connector_health_url(connector_url)
+    headers = {}
+    token = str(getattr(settings, "macos_connector_token", "") or "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        import requests
+    except ImportError:
+        return False
+    try:
+        response = requests.get(health_url, headers=headers, timeout=2)
+    except requests.RequestException:
+        return False
+    except Exception:  # pragma: no cover - defensive, readiness must never raise
+        return False
+    return response.status_code == 200
+
+
 def _check_tts_provider(settings: Any) -> dict[str, str]:
     provider = str(getattr(settings, "tts_provider", "") or "")
     label = "TTS-провайдер"
@@ -106,6 +137,25 @@ def _check_tts_provider(settings: Any) -> dict[str, str]:
                 status="ok",
                 detail="Провайдер macos: команды say и afconvert найдены.",
             )
+        connector_url = str(getattr(settings, "macos_connector_url", "") or "")
+        if connector_url:
+            if _macos_connector_reachable(settings):
+                return _readiness_item(
+                    item_id="tts_provider",
+                    label=label,
+                    status="ok",
+                    detail=f"Провайдер macos: используется коннектор {connector_url}.",
+                )
+            return _readiness_item(
+                item_id="tts_provider",
+                label=label,
+                status="error",
+                detail=f"Провайдер macos: коннектор {connector_url} недоступен.",
+                hint=(
+                    "Запустите коннектор на macOS-хосте: scripts/run-macos-connector "
+                    "или launchctl load ~/Library/LaunchAgents/com.roughcut.macos-connector.plist."
+                ),
+            )
         missing = [
             name for name, path in (("say", say_path), ("afconvert", afconvert_path)) if not path
         ]
@@ -114,7 +164,11 @@ def _check_tts_provider(settings: Any) -> dict[str, str]:
             label=label,
             status="error",
             detail=f"Провайдер macos: не найдено {', '.join(missing)}.",
-            hint="Доступно только на macOS со стандартными системными утилитами.",
+            hint=(
+                "Доступно только на macOS со стандартными системными утилитами. "
+                "При запуске в Docker/Linux задайте MACOS_CONNECTOR_URL, указывающий "
+                "на коннектор, запущенный на macOS-хосте."
+            ),
         )
     if provider == "gemini":
         if settings.gemini_api_key:

@@ -14,6 +14,7 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from atomic_io import atomic_write_json, atomic_write_text
+from stage2.sync_models import derive_speaker_from_media_name
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
@@ -267,14 +268,7 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
                 (source for source in existing if source.id == source_id),
                 None,
             )
-        speaker = re.sub(r"^\d{6,8}[\s_.-]*", "", Path(name).stem)
-        speaker = re.sub(
-            r"\b(?:просмотровка|просмотр|review|proxy|render|final)\b",
-            " ",
-            speaker,
-            flags=re.IGNORECASE,
-        )
-        speaker = " ".join(speaker.replace("_", " ").split()) or Path(name).stem
+        speaker = derive_speaker_from_media_name(name)
         source_payload = bound_source.to_dict() if bound_source is not None else {}
         source_payload.update(
             {
@@ -289,7 +283,14 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
                     else f"RC_SRC_{Path(name).stem}"
                 ),
                 "speaker": bound_source.speaker if bound_source is not None else speaker,
-                "all_speakers": bound_source.all_speakers if bound_source is not None else False,
+                # A newly discovered scan viewing derives "speaker" from the
+                # file name, not from a real person, and the review media
+                # itself usually contains every speaker in the interview.
+                # Search it for any named speaker. An already bound source
+                # keeps whatever the user explicitly configured.
+                "all_speakers": (
+                    bound_source.all_speakers if bound_source is not None else True
+                ),
                 "fps": item.get("fps") or 25.0,
                 "duration_sec": item.get("duration_sec") or 0.0,
                 # faster-whisper/PyAV can decode the audio stream directly from the
@@ -311,6 +312,17 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
                     "media_name": name,
                     "audio_guide_name": audio.get("name") or Path(guide_audio).name,
                     "has_companion_video": visual is not None,
+                    # A brand-new scan viewing derives "speaker" from the file
+                    # name (see derive_speaker_from_media_name), not a real
+                    # person, so mark it explicitly. An already-bound source
+                    # keeps whatever flag value it already carries -- e.g. once
+                    # the user has renamed the speaker to a real person, this
+                    # scan must not re-flag it as derived.
+                    **(
+                        {"speaker_is_derived": True}
+                        if bound_source is None
+                        else {}
+                    ),
                 },
             }
         )

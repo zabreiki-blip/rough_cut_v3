@@ -314,7 +314,12 @@ def test_multi_speaker_source_is_eligible_for_every_registered_speaker(
     assert result.status in {"auto_matched", "needs_review"}
 
 
-def test_multi_speaker_source_rejects_an_unregistered_speaker() -> None:
+def test_multi_speaker_source_is_isolated_from_an_unregistered_speaker() -> None:
+    # Every registered source is tagged with a real, explicitly named
+    # speaker, and none of them match the request. A last-resort fallback
+    # that searched the mismatched source anyway used to weaken isolation
+    # between unrelated interviews (see the RVK_COSTEL regression), so the
+    # source pool is now correctly empty and the segment is left unmatched.
     phrase = "редкая цитата записана на общей секвенции интервью"
     source = _source(
         "shared",
@@ -374,7 +379,11 @@ def test_missing_source_speaker_metadata_falls_back_to_text_search() -> None:
     assert result.status in {"auto_matched", "needs_review"}
 
 
-def test_differently_named_speaker_does_not_search_unrelated_interview() -> None:
+def test_differently_named_speaker_is_isolated_from_the_only_source() -> None:
+    # A single registered source tagged with an unrelated real name is not
+    # a valid match for a different named speaker's text, so the request
+    # correctly falls through to "insufficient_input" instead of being
+    # silently routed into someone else's interview.
     phrase = "редкая точная цитата другого героя"
     result = SyncMatcher(
         [_source("vasilieva", "Татьяна Васильева")],
@@ -388,6 +397,151 @@ def test_differently_named_speaker_does_not_search_unrelated_interview() -> None
     )
     assert result.status == "not_found"
     assert result.strategy == "insufficient_input"
+
+
+def test_media_scan_derived_speaker_token_remains_eligible_for_real_speaker() -> None:
+    # An auto-scanned viewing carries a "speaker" derived from its file name
+    # (e.g. "KOSTEL SP 001"), which never matches a real scenario speaker
+    # name. Stage 3 flags such sources via metadata (managed_by +
+    # media_name matching the derived label), so the matcher must ignore
+    # that token and keep the source searchable for any real speaker.
+    phrase = "редкая точная цитата настоящего героя"
+    source = _source(
+        "kostel",
+        "KOSTEL SP 001",
+        all_speakers=False,
+        metadata={"managed_by": "stage3_media_scan", "media_name": "KOSTEL_SP_001.mp4"},
+    )
+    result = SyncMatcher([source], [_index("kostel", phrase, 10.0)]).match(
+        AlignmentRequest(
+            segment_id="media-scan-derived-speaker",
+            text=phrase,
+            speaker="ЕЛЕНА МИНЧЕНКО",
+        )
+    )
+    assert result.source_id == "kostel"
+    assert result.strategy != "insufficient_input"
+    assert result.status != "not_found"
+
+
+def test_two_media_scan_sources_both_remain_eligible_for_a_third_party_speaker() -> None:
+    # Regression test for the RVK_COSTEL bug: two auto-scanned viewings with
+    # file-derived "speaker" labels (one all_speakers=True, one False) must
+    # both stay eligible for a request naming a real speaker that belongs to
+    # neither -- the correct interview must not be starved out by the other
+    # auto-scanned viewing's stale universal fallback.
+    phrase = "уникальная фраза из настоящего интервью"
+    sources = [
+        _source(
+            "media_e4ef",
+            "KOSTEL SP 001",
+            all_speakers=False,
+            metadata={"managed_by": "stage3_media_scan", "media_name": "KOSTEL_SP_001.mp4"},
+        ),
+        _source(
+            "media_bb23",
+            "C7862",
+            all_speakers=True,
+            metadata={"managed_by": "stage3_media_scan", "media_name": "C7862.mp4"},
+        ),
+    ]
+    indexes = [
+        _index("media_e4ef", phrase, 10.0),
+        _index("media_bb23", "совсем другой текст без совпадения", 10.0),
+    ]
+    matcher = SyncMatcher(sources, indexes)
+    eligible = {
+        source.id
+        for source in matcher._eligible_sources(
+            AlignmentRequest(
+                segment_id="two-scan-sources",
+                text=phrase,
+                speaker="ЕЛЕНА МИНЧЕНКО",
+            )
+        )
+    }
+    assert eligible == {"media_e4ef", "media_bb23"}
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="two-scan-sources-match",
+            text=phrase,
+            speaker="ЕЛЕНА МИНЧЕНКО",
+        )
+    )
+    assert result.source_id == "media_e4ef"
+    assert result.status == "auto_matched"
+
+
+def test_media_scan_source_with_manually_named_speaker_stays_isolated() -> None:
+    # Once a user has renamed a scanned source's speaker to a real person's
+    # name, that name is no longer a file-name guess (the derived label from
+    # the media name does not match it), so it must be treated like any
+    # other named speaker and keep the usual isolation between interviews.
+    # Both sources here are all_speakers=False so the deliberate "search me
+    # for anyone" universal-source behaviour cannot mask the isolation check.
+    sources = [
+        _source(
+            "media_e4ef",
+            "KOSTEL SP 001",
+            all_speakers=False,
+            metadata={"managed_by": "stage3_media_scan", "media_name": "KOSTEL_SP_001.mp4"},
+        ),
+        _source(
+            "media_bb23",
+            "ЕЛЕНА МИНЧЕНКО",
+            all_speakers=False,
+            metadata={"managed_by": "stage3_media_scan", "media_name": "20260807_C7862.mp4"},
+        ),
+    ]
+    indexes = [
+        _index("media_e4ef", "любой текст", 10.0),
+        _index("media_bb23", "любой другой текст", 10.0),
+    ]
+    matcher = SyncMatcher(sources, indexes)
+    eligible = {
+        source.id
+        for source in matcher._eligible_sources(
+            AlignmentRequest(
+                segment_id="named-scan-source-isolated",
+                text="любой текст",
+                speaker="Другой Спикер",
+            )
+        )
+    }
+    # "Другой Спикер" matches neither source's real name: media_e4ef stays
+    # eligible because its speaker label is derived and thus ignored, while
+    # media_bb23 is excluded because its (manually set, real) name does not
+    # match the request.
+    assert eligible == {"media_e4ef"}
+
+
+def test_exact_speaker_match_still_wins_over_untagged_source() -> None:
+    # Priority order holds regardless of the derived-label handling: when a
+    # source with an exact speaker match exists, an unrelated named
+    # speaker's source is not searched at all.
+    phrase = "редкая точная цитата настоящего героя"
+    sources = [
+        _source("vasilieva", "Татьяна Васильева"),
+        _source(
+            "kostel",
+            "KOSTEL SP 001",
+            all_speakers=False,
+            metadata={"managed_by": "stage3_media_scan", "media_name": "KOSTEL_SP_001.mp4"},
+        ),
+    ]
+    indexes = [
+        _index("vasilieva", phrase, 10.0),
+        _index("kostel", "совсем другой текст без совпадения", 10.0),
+    ]
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="exact-still-wins",
+            text=phrase,
+            speaker="Татьяна Васильева",
+        )
+    )
+    assert result.source_id == "vasilieva"
 
 
 def test_long_queries_bound_candidate_search_without_losing_rare_anchor() -> None:

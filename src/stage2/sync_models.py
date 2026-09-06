@@ -9,11 +9,36 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from math import isfinite
+from pathlib import Path
+import re
 from typing import Any, Literal
 
 MatchStatus = Literal["auto_matched", "confirmed", "needs_review", "not_found"]
 TimecodeMode = Literal["relative", "display"]
 SyncSourceKind = Literal["premiere_sequence", "review_media"]
+
+_LEADING_DATE_OR_ID_RE = re.compile(r"^\d{6,8}[\s_.-]*")
+_REVIEW_NOISE_WORDS_RE = re.compile(
+    r"\b(?:просмотровка|просмотр|review|proxy|render|final)\b", re.IGNORECASE
+)
+
+
+def derive_speaker_from_media_name(media_name: str) -> str:
+    """Guess a placeholder "speaker" label from a scanned media file name.
+
+    Stage 3's automatic media scan has no real speaker metadata for a
+    freshly discovered viewing, so it derives a readable label from the
+    file name itself (stripping a leading date/shot number and generic
+    review/proxy wording). The result is a display convenience only -- it
+    is not a real person's name and callers that need to tell derived
+    labels apart from user-entered ones should not rely on string
+    equality alone.
+    """
+
+    stem = Path(media_name).stem
+    speaker = _LEADING_DATE_OR_ID_RE.sub("", stem)
+    speaker = _REVIEW_NOISE_WORDS_RE.sub(" ", speaker)
+    return " ".join(speaker.replace("_", " ").split()) or stem
 
 
 def _number(value: Any, default: float = 0.0) -> float:

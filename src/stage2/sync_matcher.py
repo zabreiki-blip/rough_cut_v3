@@ -17,7 +17,15 @@ from .sync_models import (
     SyncSource,
     WordIndex,
     WordTimestamp,
+    derive_speaker_from_media_name,
 )
+
+# Bump this whenever the source-selection, scoring, or matching-strategy
+# logic changes. It is folded into the sync matching fingerprint
+# (see api.py::_sync_matching_fingerprint) so that stale cached matches are
+# invalidated and recomputed instead of being silently reused after a
+# matcher code change.
+MATCHER_ALGORITHM_VERSION = 3
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 _RUSSIAN_ENDINGS = tuple(
@@ -589,6 +597,43 @@ def _has_usable_range(
     return end - start > 0.001
 
 
+def _has_derived_speaker_label(source: SyncSource) -> bool:
+    """Whether ``source.speaker`` is a file-name guess, not a real person.
+
+    Stage 3's automatic media scan (``api_stage3_routes._register_review_sources``)
+    fills a freshly discovered viewing's ``speaker`` field with a label derived
+    from the file name (see ``derive_speaker_from_media_name``) because it has
+    no real speaker metadata yet. That guess must not be treated as a speaker
+    identity for matching purposes -- otherwise a request for a real speaker's
+    name can be silently routed away from the correct interview and into an
+    unrelated auto-scanned viewing whose "speaker" merely happens to look like
+    a plausible name (see the RVK_COSTEL regression).
+
+    ``source.speakers`` (explicitly listed speakers) is never affected here --
+    only the derived primary ``speaker`` label is excluded.
+    """
+
+    metadata = source.metadata or {}
+    if bool(metadata.get("speaker_is_derived")):
+        return True
+    if metadata.get("managed_by") != "stage3_media_scan":
+        return False
+    media_name = str(metadata.get("media_name") or "").strip()
+    if not media_name:
+        return False
+    return normalize_text(source.speaker) == normalize_text(
+        derive_speaker_from_media_name(media_name)
+    )
+
+
+def _speaker_label_names(source: SyncSource) -> tuple[str, ...]:
+    """Speaker names usable for matching, excluding a derived primary label."""
+
+    if _has_derived_speaker_label(source):
+        return source.speakers
+    return source.speaker_names
+
+
 class SyncMatcher:
     def __init__(
         self,
@@ -602,7 +647,9 @@ class SyncMatcher:
             source_id: _timed_tokens(index) for source_id, index in self.indexes.items()
         }
         self.speaker_tokens = {
-            source_id: [tokens for name in source.speaker_names if (tokens := normalize_text(name))]
+            source_id: [
+                tokens for name in _speaker_label_names(source) if (tokens := normalize_text(name))
+            ]
             for source_id, source in self.sources.items()
         }
         self.config = config or MatcherConfig()

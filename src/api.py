@@ -77,7 +77,12 @@ from stage2.timeline_parser import (
 )
 from stage2.placeholder import generate_placeholder, generate_versioned_placeholder
 from stage2.sync_llm_review import SemanticCandidate, review_candidates_with_llm
-from stage2.sync_matcher import MatcherConfig, SyncMatcher, normalize_text
+from stage2.sync_matcher import (
+    MATCHER_ALGORITHM_VERSION,
+    MatcherConfig,
+    SyncMatcher,
+    normalize_text,
+)
 from stage2.sync_models import (
     AlignmentRequest,
     SyncAlternative,
@@ -1173,6 +1178,7 @@ def _sync_matching_fingerprint(
     """Identify every durable input that can change a matching decision."""
     payload = {
         "version": 2,
+        "matcher_algorithm_version": MATCHER_ALGORITHM_VERSION,
         "normalization_revision": normalization_revision,
         "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,

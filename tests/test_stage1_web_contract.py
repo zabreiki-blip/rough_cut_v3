@@ -97,7 +97,8 @@ def test_headless_whisper_model_and_source_scope_controls() -> None:
     assert 'id="sync_whisper_model"' in PROJECT_HTML
     assert '<option value="small" selected>Small — быстро</option>' in PROJECT_HTML
     assert '<option value="medium">Medium — точнее</option>' in PROJECT_HTML
-    assert 'model: ids.sync_whisper_model?.value || "small"' in STAGE1_JS
+    assert 'const model = asrEngine === "cloud" ? "" : ids.sync_whisper_model?.value || "small"' in STAGE1_JS
+    assert 'model,' in STAGE1_JS
     # `stage3MediaCount` moved from a module-level `let` to a shared `appState`
     # property so the sync/stage3 modules can read and mutate it across files.
     assert 'source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
@@ -125,7 +126,8 @@ def test_asr_engine_selector_defaults_to_local_and_is_wired_to_request() -> None
     assert '<option value="local" selected>Локально (бесплатно, медленно)</option>' in PROJECT_HTML
     assert '<option value="cloud">Облако (быстро, ~2¢/час, платно)</option>' in PROJECT_HTML
     assert 'sync_asr_engine: el("sync_asr_engine")' in STAGE1_JS
-    assert 'asr_engine: ids.sync_asr_engine?.value || "local"' in STAGE1_JS
+    assert 'const asrEngine = ids.sync_asr_engine?.value || "local"' in STAGE1_JS
+    assert 'asr_engine: asrEngine' in STAGE1_JS
 
 
 def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
