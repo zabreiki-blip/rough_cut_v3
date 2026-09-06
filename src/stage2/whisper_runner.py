@@ -129,13 +129,22 @@ def resolve_backend(requested: str | None = None) -> str:
     )
 
 
+def _looks_like_cloud_model_id(model: str) -> bool:
+    """Return True if ``model`` looks like a cloud chat-ASR id ("provider/model").
+
+    Local Whisper model names/sizes (e.g. "small", "medium") never contain a
+    slash, whereas OpenRouter-style cloud model ids always do.
+    """
+    return "/" in model
+
+
 def _default_model(backend: str) -> str:
     configured = os.getenv("SYNC_WHISPER_MODEL", "").strip()
     if backend in _CLOUD_BACKENDS:
         # SYNC_WHISPER_MODEL is a local Whisper model name/size (e.g.
         # "medium") and is not a meaningful default for a cloud chat model
         # id, unless it already looks like one ("provider/model").
-        if configured and "/" in configured:
+        if configured and _looks_like_cloud_model_id(configured):
             return configured
         from .cloud_asr import DEFAULT_MODEL as _CLOUD_DEFAULT_MODEL
 
@@ -385,7 +394,18 @@ def transcribe_audio(
         raise FileNotFoundError(f"audio guide not found: {path}")
 
     selected = resolve_backend(backend)
-    selected_model = (model or _default_model(selected)).strip()
+    requested_model = (model or "").strip()
+    if (
+        selected in _CLOUD_BACKENDS
+        and requested_model
+        and not _looks_like_cloud_model_id(requested_model)
+    ):
+        # A locally-named Whisper model (e.g. "small"/"medium", as sent by a
+        # UI still showing the local-model selector) is meaningless for a
+        # cloud chat-ASR backend, which expects a "provider/model" id.
+        # Fall back to the cloud default instead of forwarding it verbatim.
+        requested_model = ""
+    selected_model = (requested_model or _default_model(selected)).strip()
     if not selected_model:
         raise ValueError("Whisper model must not be empty")
 

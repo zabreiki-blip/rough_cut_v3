@@ -73,6 +73,12 @@ def _stage2_sync_sources(services: ModuleType):
                 # field. Do not let a previously saved list override that edit.
                 if "speaker" in source_payload and "speakers" not in source_payload:
                     merged["speakers"] = []
+                # An explicit speaker edit means the label is no longer a
+                # file-name guess (see api_stage3_routes._register_review_sources
+                # / stage2.sync_models.derive_speaker_from_media_name), so drop
+                # the "derived" flag unless the caller itself still sets it.
+                if "speaker" in source_payload and "speaker_is_derived" not in incoming_metadata:
+                    merged_metadata["speaker_is_derived"] = False
                 merged["metadata"] = merged_metadata
                 if not str(source_payload.get("guide_audio") or "").strip():
                     merged["guide_audio"] = existing.guide_audio

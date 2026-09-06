@@ -49,14 +49,78 @@ _TIMECODE_LINE_RE = re.compile(r"^(" + _TC_PAT + r")[.\s–\-]*(.*)", re.DOTALL)
 
 SNH_PLACEHOLDER_DURATION = 10.0  # seconds
 
+# A part shorter than this many words is treated as a speech pause ("Ну... я
+# думаю") rather than a deliberate splice between two distant source cuts, so
+# it gets glued back onto its neighbour instead of becoming its own fragment.
+_ELLIPSIS_MIN_WORDS = 4
+
+# Matches "..." (any run of 2+ dots) or the single-character "…", with
+# optional surrounding whitespace, as a splice marker between spliced parts
+# of a sync/host line.
+_ELLIPSIS_SPLIT_RE = re.compile(r"\s*(?:\.{2,}|…)\s*")
+
+# Matches at least one alphanumeric character (Latin, Cyrillic, or digit)
+_ALPHANUMERIC_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]")
+
 
 def sync_fragment_id(block_uid: str, index: int, count: int) -> str:
     """Return a stable match id while preserving legacy ids for one-part blocks."""
     return block_uid if count <= 1 else f"{block_uid}::fragment:{index + 1}"
 
 
+def split_text_by_ellipsis(text: str) -> list[str]:
+    """Split a spliced SNH/host line into independently matchable parts.
+
+    Scriptwriters glue speech taken from different moments of the source
+    into a single line, separating the pieces with an ellipsis ("..." or
+    "…"). Each such piece can come from anywhere in the source (including
+    out of chronological order), so it must be matched on its own rather
+    than as one continuous run of words. A short piece (fewer than
+    ``_ELLIPSIS_MIN_WORDS`` words) is instead treated as a mid-sentence
+    pause and glued back onto its neighbour, restoring the "..." separator
+    so no text is lost.
+
+    Only parts containing at least one alphanumeric character are considered
+    meaningful. Empty strings or punctuation-only parts are filtered out.
+    If no meaningful parts remain, returns an empty list.
+    """
+    raw_parts = [part.strip() for part in _ELLIPSIS_SPLIT_RE.split(text)]
+    # Filter to keep only parts with at least one alphanumeric character
+    parts = [part for part in raw_parts if part and _ALPHANUMERIC_RE.search(part)]
+    if len(parts) == 0:
+        return []
+    if len(parts) <= 1:
+        return [text.strip()] if _ALPHANUMERIC_RE.search(text) else []
+
+    merged: list[str] = []
+    for part in parts:
+        if len(part.split()) < _ELLIPSIS_MIN_WORDS and merged:
+            merged[-1] = f"{merged[-1]}... {part}"
+        else:
+            merged.append(part)
+
+    # A short leading part has no previous piece to attach to yet; glue it
+    # onto the part that follows instead.
+    while len(merged) > 1 and len(merged[0].split()) < _ELLIPSIS_MIN_WORDS:
+        first, second, *rest = merged
+        merged = [f"{first}... {second}", *rest]
+
+    return merged
+
+
 def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
-    """Read canonical speaker fragments with a backward-compatible fallback."""
+    """Read canonical speaker fragments with a backward-compatible fallback.
+
+    Each stored fragment is further split on ellipsis splice markers into a
+    flat list of independently matchable sub-fragments; every sub-fragment
+    inherits its parent's timecodes as a hint for the sync matcher.
+
+    Parts containing only punctuation or whitespace are filtered out.
+    If no meaningful sub-fragments remain after splitting, and no canonical
+    fragments were provided, a single fragment with empty text is returned
+    for backward compatibility: the calling code (sync_fragment_id in api.py)
+    expects at least one result to avoid unexpected empty lists.
+    """
     raw_fragments = block.get("sync_fragments")
     fragments: list[dict[str, str]] = []
     if isinstance(raw_fragments, list):
@@ -73,15 +137,43 @@ def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
                     "timecode_end": str(value.get("timecode_end") or "").strip(),
                 }
             )
-    if fragments:
-        return fragments
-    return [
-        {
-            "text": str(block.get("normalized_text") or block.get("original_text") or "").strip(),
-            "timecode_start": str(block.get("timecode_start") or "").strip(),
-            "timecode_end": str(block.get("timecode_end") or "").strip(),
-        }
-    ]
+    if not fragments:
+        fragments = [
+            {
+                "text": str(
+                    block.get("normalized_text") or block.get("original_text") or ""
+                ).strip(),
+                "timecode_start": str(block.get("timecode_start") or "").strip(),
+                "timecode_end": str(block.get("timecode_end") or "").strip(),
+            }
+        ]
+
+    expanded: list[dict[str, str]] = []
+    for fragment in fragments:
+        parts = split_text_by_ellipsis(fragment["text"])
+        # Only add sub-fragments for non-empty split results
+        for part in parts:
+            expanded.append(
+                {
+                    "text": part,
+                    "timecode_start": fragment["timecode_start"],
+                    "timecode_end": fragment["timecode_end"],
+                }
+            )
+
+    # Backward compatibility: if no meaningful fragments were produced,
+    # return at least one (with empty text) to avoid unexpected empty lists
+    # in calling code that assumes at least one fragment per block.
+    if not expanded:
+        expanded = [
+            {
+                "text": "",
+                "timecode_start": fragments[0]["timecode_start"] if fragments else "",
+                "timecode_end": fragments[0]["timecode_end"] if fragments else "",
+            }
+        ]
+
+    return expanded
 
 
 def _wav_duration(path: Path) -> float:

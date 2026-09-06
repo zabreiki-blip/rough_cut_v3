@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from stage2.timeline_parser import parse_normalized_timeline, parse_timeline
+from stage2.timeline_parser import (
+    normalized_sync_fragments,
+    parse_normalized_timeline,
+    parse_timeline,
+    split_text_by_ellipsis,
+    sync_fragment_id,
+)
 
 
 class ZkIdContractTest(unittest.TestCase):
@@ -403,6 +409,184 @@ class NormalizedTimelineTest(unittest.TestCase):
 
             self.assertEqual([item.match_status for item in timeline.segments], ["", ""])
             self.assertEqual([item.duration_sec for item in timeline.segments], [10.0, 10.0])
+
+
+class SplitTextByEllipsisTest(unittest.TestCase):
+    def test_two_long_parts_split_on_three_dots(self) -> None:
+        text = (
+            "Это первая длинная часть фразы записанной в самом начале..."
+            "А это вторая длинная часть фразы записанной значительно позже"
+        )
+        parts = split_text_by_ellipsis(text)
+        self.assertEqual(
+            parts,
+            [
+                "Это первая длинная часть фразы записанной в самом начале",
+                "А это вторая длинная часть фразы записанной значительно позже",
+            ],
+        )
+
+    def test_two_long_parts_split_on_unicode_ellipsis(self) -> None:
+        text = (
+            "Это первая длинная часть фразы записанной в самом начале…"
+            "А это вторая длинная часть фразы записанной значительно позже"
+        )
+        parts = split_text_by_ellipsis(text)
+        self.assertEqual(
+            parts,
+            [
+                "Это первая длинная часть фразы записанной в самом начале",
+                "А это вторая длинная часть фразы записанной значительно позже",
+            ],
+        )
+
+    def test_short_mid_sentence_pause_does_not_split(self) -> None:
+        text = "Ну... я думаю, что это важно и нужно всем"
+        self.assertEqual(split_text_by_ellipsis(text), [text])
+
+    def test_short_trailing_part_glued_to_previous_without_losing_text(self) -> None:
+        text = "Это довольно длинная и содержательная первая часть фразы... и хвост"
+        parts = split_text_by_ellipsis(text)
+        self.assertEqual(len(parts), 1)
+        self.assertIn("Это довольно длинная и содержательная первая часть фразы", parts[0])
+        self.assertIn("и хвост", parts[0])
+
+    def test_no_ellipsis_returns_single_part(self) -> None:
+        text = "Обычная фраза без многоточий."
+        self.assertEqual(split_text_by_ellipsis(text), [text])
+
+    def test_empty_string_returns_empty_list(self) -> None:
+        """Empty strings have no meaningful content, should return empty list."""
+        self.assertEqual(split_text_by_ellipsis(""), [])
+
+    def test_ellipsis_only_returns_empty_list(self) -> None:
+        """Ellipsis-only strings have no meaningful content, should return empty list."""
+        self.assertEqual(split_text_by_ellipsis("..."), [])
+
+    def test_whitespace_and_ellipsis_only_returns_empty_list(self) -> None:
+        """Whitespace and ellipsis-only strings have no meaningful content."""
+        self.assertEqual(split_text_by_ellipsis("   …  "), [])
+
+    def test_real_world_three_part_splice_regression(self) -> None:
+        text = (
+            "Устремлённость здания вверх очень символична... "
+            "Это устремлённость к божественному, к раю, к небу, к Богу... "
+            "Его любовь к жене - она была подобна любви к Богу."
+        )
+        parts = split_text_by_ellipsis(text)
+        self.assertEqual(
+            parts,
+            [
+                "Устремлённость здания вверх очень символична",
+                "Это устремлённость к божественному, к раю, к небу, к Богу",
+                "Его любовь к жене - она была подобна любви к Богу.",
+            ],
+        )
+
+
+class NormalizedSyncFragmentsEllipsisTest(unittest.TestCase):
+    def test_block_without_text_returns_single_empty_fragment_for_compatibility(self) -> None:
+        """Empty/punctuation-only blocks should return one fragment with empty text.
+
+        The calling code (sync_fragment_id in api.py) expects at least one
+        fragment per block to avoid unexpected empty lists.
+        """
+        block = {"timecode_start": "00:00:00", "timecode_end": "00:01:00"}
+        fragments = normalized_sync_fragments(block)
+        self.assertEqual(len(fragments), 1)
+        self.assertEqual(fragments[0]["text"], "")
+        self.assertEqual(fragments[0]["timecode_start"], "00:00:00")
+        self.assertEqual(fragments[0]["timecode_end"], "00:01:00")
+
+    def test_block_with_punctuation_only_text_returns_empty_fragment(self) -> None:
+        """Blocks with only punctuation should return one empty fragment."""
+        block = {
+            "normalized_text": "...",
+            "timecode_start": "00:05:00",
+            "timecode_end": "00:05:10",
+        }
+        fragments = normalized_sync_fragments(block)
+        self.assertEqual(len(fragments), 1)
+        self.assertEqual(fragments[0]["text"], "")
+        self.assertEqual(fragments[0]["timecode_start"], "00:05:00")
+
+    def test_single_fragment_with_ellipsis_expands_to_two_with_parent_timecodes(self) -> None:
+        block = {
+            "sync_fragments": [
+                {
+                    "timecode_start": "00:10:00",
+                    "timecode_end": "00:10:20",
+                    "text": (
+                        "Это первая длинная часть фразы записанной в самом начале..."
+                        "А это вторая длинная часть фразы записанной значительно позже"
+                    ),
+                }
+            ]
+        }
+        fragments = normalized_sync_fragments(block)
+        self.assertEqual(len(fragments), 2)
+        for fragment in fragments:
+            self.assertEqual(fragment["timecode_start"], "00:10:00")
+            self.assertEqual(fragment["timecode_end"], "00:10:20")
+        self.assertEqual(
+            fragments[0]["text"],
+            "Это первая длинная часть фразы записанной в самом начале",
+        )
+        self.assertEqual(
+            fragments[1]["text"],
+            "А это вторая длинная часть фразы записанной значительно позже",
+        )
+
+    def test_two_fragments_second_splits_gives_three_in_order(self) -> None:
+        block = {
+            "sync_fragments": [
+                {"timecode_start": "00:05:00", "timecode_end": "00:05:10", "text": "Первый кусок фразы целиком"},
+                {
+                    "timecode_start": "00:20:00",
+                    "timecode_end": "00:20:30",
+                    "text": (
+                        "Это первая длинная часть фразы записанной в самом начале..."
+                        "А это вторая длинная часть фразы записанной значительно позже"
+                    ),
+                },
+            ]
+        }
+        fragments = normalized_sync_fragments(block)
+        self.assertEqual(len(fragments), 3)
+        self.assertEqual(fragments[0]["text"], "Первый кусок фразы целиком")
+        self.assertEqual(fragments[0]["timecode_start"], "00:05:00")
+        self.assertEqual(
+            fragments[1]["text"],
+            "Это первая длинная часть фразы записанной в самом начале",
+        )
+        self.assertEqual(fragments[1]["timecode_start"], "00:20:00")
+        self.assertEqual(
+            fragments[2]["text"],
+            "А это вторая длинная часть фразы записанной значительно позже",
+        )
+        self.assertEqual(fragments[2]["timecode_start"], "00:20:00")
+
+    def test_expanded_fragment_ids_stay_sequential(self) -> None:
+        block = {
+            "sync_fragments": [
+                {
+                    "timecode_start": "00:10:00",
+                    "timecode_end": "00:10:20",
+                    "text": (
+                        "Это первая длинная часть фразы записанной в самом начале..."
+                        "А это вторая длинная часть фразы записанной значительно позже..."
+                        "И третья длинная часть фразы записанной ещё позднее чем вторая"
+                    ),
+                }
+            ]
+        }
+        fragments = normalized_sync_fragments(block)
+        self.assertEqual(len(fragments), 3)
+        ids = [sync_fragment_id("uid", index, len(fragments)) for index in range(len(fragments))]
+        self.assertEqual(
+            ids,
+            ["uid::fragment:1", "uid::fragment:2", "uid::fragment:3"],
+        )
 
 
 if __name__ == "__main__":

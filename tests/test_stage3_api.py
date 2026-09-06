@@ -293,7 +293,13 @@ def test_scan_registers_viewing_as_headless_whisper_source(client) -> None:
     assert source.source_kind == "review_media"
     assert source.guide_audio == "media/reviews/Курская.mp4"
     assert source.speaker == "Курская"
-    assert source.all_speakers is False
+    # "Курская" is derived from the file name, not a real speaker name, and
+    # the review viewing usually contains every speaker in the interview, so
+    # a freshly discovered source must be searched for any speaker.
+    assert source.all_speakers is True
+    # The matcher must be able to tell this file-name guess apart from a
+    # real, user-entered speaker name (see SyncMatcher._has_derived_speaker_label).
+    assert source.metadata.get("speaker_is_derived") is True
 
 
 def test_scan_pairs_same_stem_video_and_wav(client) -> None:
@@ -397,6 +403,115 @@ def test_scan_binds_viewing_to_existing_normalized_premiere_source(client) -> No
     assert sources[0].guide_audio == "work/sync_audio/ulynovsk_sinh.wav"
     assert sources[0].media_path == "media/reviews/УЛЬЯНОВСК СНХ.mp4"
     assert sources[0].all_speakers is True
+
+
+def test_rescan_preserves_explicit_all_speakers_false_on_bound_source(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    source_store, _match_store = services._sync_stores(paths)
+    source_store.replace_all(
+        [
+            services.SyncSource.from_dict(
+                {
+                    "id": "kostel_sp_001",
+                    "source_kind": "review_media",
+                    "premiere_sequence": "KOSTEL SP 001",
+                    "speaker": "KOSTEL SP 001",
+                    "all_speakers": False,
+                    "guide_audio": "media/reviews/KOSTEL SP 001.mp4",
+                    "media_path": "media/reviews/KOSTEL SP 001.mp4",
+                    "duration_sec": 100.0,
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [
+                {
+                    "source_id": "kostel_sp_001",
+                    "fingerprint": "abc",
+                    "name": "KOSTEL SP 001.mp4",
+                    "relative_path": "media/reviews/KOSTEL SP 001.mp4",
+                    "container_path": "/app/projects/BRIK/media/reviews/KOSTEL SP 001.mp4",
+                    "duration_sec": 100.0,
+                    "fps": 25.0,
+                }
+            ],
+        },
+    )
+
+    response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    sources = source_store.list()
+    assert [source.id for source in sources] == ["kostel_sp_001"]
+    # A user who explicitly narrowed an existing source to one speaker must
+    # not have that choice silently overwritten by a re-scan.
+    assert sources[0].all_speakers is False
+
+
+def test_rescan_does_not_overwrite_speaker_is_derived_flag_on_bound_source(client) -> None:
+    # Once a source is bound (matched by id/identity on a later scan), it is
+    # no longer "brand new", so the scan must not stamp or reset the
+    # speaker_is_derived flag on it -- e.g. after a user has renamed the
+    # speaker to a real person and manually cleared the flag, a re-scan must
+    # not silently flip it back to True.
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    source_store, _match_store = services._sync_stores(paths)
+    source_store.replace_all(
+        [
+            services.SyncSource.from_dict(
+                {
+                    "id": "kostel_sp_001",
+                    "source_kind": "review_media",
+                    "premiere_sequence": "KOSTEL SP 001",
+                    "speaker": "Елена Минченко",
+                    "all_speakers": False,
+                    "guide_audio": "media/reviews/KOSTEL SP 001.mp4",
+                    "media_path": "media/reviews/KOSTEL SP 001.mp4",
+                    "duration_sec": 100.0,
+                    "metadata": {"speaker_is_derived": False},
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [
+                {
+                    "source_id": "kostel_sp_001",
+                    "fingerprint": "abc",
+                    "name": "KOSTEL SP 001.mp4",
+                    "relative_path": "media/reviews/KOSTEL SP 001.mp4",
+                    "container_path": "/app/projects/BRIK/media/reviews/KOSTEL SP 001.mp4",
+                    "duration_sec": 100.0,
+                    "fps": 25.0,
+                }
+            ],
+        },
+    )
+
+    response = http.post("/stage3/media/scan", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    sources = source_store.list()
+    assert [source.id for source in sources] == ["kostel_sp_001"]
+    assert sources[0].speaker == "Елена Минченко"
+    assert sources[0].metadata.get("speaker_is_derived") is False
 
 
 def test_timeline_catalog_keeps_standalone_audio_but_collapses_companion() -> None:

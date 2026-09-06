@@ -82,6 +82,81 @@ def test_readiness_degrades_gracefully_without_ffmpeg(
     assert payload["overall"] in VALID_STATUSES
 
 
+def test_readiness_tts_macos_uses_connector_when_local_tools_missing(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When 'say'/'afconvert' are absent (e.g. in Docker) but a connector is
+    configured and reachable, readiness should report ok, not error."""
+
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _name: None)
+
+    calls: list[tuple[str, dict]] = []
+
+    class _FakeResponse:
+        status_code = 200
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append((url, headers or {}))
+        return _FakeResponse()
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "ok"
+    assert "коннектор" in check["detail"].lower()
+    assert calls, "readiness должен обратиться к health-эндпоинту коннектора"
+    assert calls[0][0] == "http://host.docker.internal:8001/health"
+
+
+def test_readiness_tts_macos_reports_error_when_connector_unreachable(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _name: None)
+
+    import requests
+
+    def fake_get(url, headers=None, timeout=None):
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "error"
+    assert "недоступен" in check["detail"].lower()
+    assert check["hint"]
+
+
+def test_readiness_tts_macos_without_tools_or_connector_hints_docker(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.delenv("MACOS_CONNECTOR_URL", raising=False)
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _name: None)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "error"
+    assert "MACOS_CONNECTOR_URL" in check["hint"]
+
+
 def test_readiness_whisper_backend_ok_when_only_cloud_configured(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:

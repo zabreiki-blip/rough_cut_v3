@@ -70,6 +70,48 @@ def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
     assert api._sync_matching_fingerprint(**changed) != first
 
 
+def test_matching_fingerprint_changes_with_matcher_algorithm_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = SyncSource(id="source", speaker="A", premiere_sequence="Sequence")
+    units = [
+        {
+            "segment_id": "block-1",
+            "parent_block_uid": "block-1",
+            "text": "точная цитата",
+            "speaker": "A",
+            "timecode_start": "00:10",
+        }
+    ]
+    index = WordIndex(
+        source_id="source",
+        words=[WordTimestamp("цитата", 10.0, 10.5)],
+        generated_at="stable",
+    )
+    arguments = {
+        "units": units,
+        "sources": [source],
+        "indexes": [index],
+        "normalization_revision": 3,
+        "timecode_mode": "relative",
+        "search_window_sec": 180.0,
+        "llm_enabled": True,
+        "llm_model": "model",
+        "llm_threshold": 0.8,
+        "llm_limit": 30,
+    }
+
+    monkeypatch.setattr(api, "MATCHER_ALGORITHM_VERSION", 1)
+    version_1 = api._sync_matching_fingerprint(**arguments)
+    assert version_1 == api._sync_matching_fingerprint(**arguments)
+
+    monkeypatch.setattr(api, "MATCHER_ALGORITHM_VERSION", 2)
+    version_2 = api._sync_matching_fingerprint(**arguments)
+    assert version_2 == api._sync_matching_fingerprint(**arguments)
+
+    assert version_1 != version_2
+
+
 def test_audio_match_accepts_precomputed_signature_without_rereading(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

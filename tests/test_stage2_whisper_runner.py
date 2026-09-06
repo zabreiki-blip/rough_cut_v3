@@ -416,6 +416,93 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertEqual(meta["timestamp_precision"], "interpolated")
         self.assertNotIn("segments", meta)
 
+    def test_transcribe_cloud_ignores_local_model_name_and_uses_cloud_default(
+        self,
+    ) -> None:
+        cloud_result = {
+            "segments": [
+                {"text": "раз", "start": 0.0, "end": 1.0, "has_explicit_end": True},
+            ],
+            "language": "ru",
+            "model": "google/gemini-3.7-flash",
+            "backend": "cloud-audio",
+            "duration_sec": 1.0,
+        }
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with patch(
+                "stage2.whisper_runner.transcribe_cloud",
+                return_value=cloud_result,
+            ) as mocked:
+                transcribe_audio(
+                    audio_path,
+                    backend="cloud-audio",
+                    # A locally-named Whisper model (as sent by a stale UI
+                    # selection) must never be forwarded to the cloud
+                    # chat-ASR backend, which needs a "provider/model" id.
+                    model="small",
+                )
+
+        used_model = mocked.call_args.kwargs.get("model", mocked.call_args.args[1:2])
+        # transcribe_cloud is invoked with the resolved cloud default model,
+        # not the local "small" model name.
+        self.assertNotEqual(used_model, "small")
+        self.assertEqual(used_model, _default_model("cloud-audio"))
+
+    def test_transcribe_cloud_preserves_explicit_cloud_model_id(self) -> None:
+        cloud_result = {
+            "segments": [
+                {"text": "раз", "start": 0.0, "end": 1.0, "has_explicit_end": True},
+            ],
+            "language": "ru",
+            "model": "google/gemini-3.7-flash",
+            "backend": "cloud-audio",
+            "duration_sec": 1.0,
+        }
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with patch(
+                "stage2.whisper_runner.transcribe_cloud",
+                return_value=cloud_result,
+            ) as mocked:
+                result = transcribe_audio(
+                    audio_path,
+                    backend="cloud-audio",
+                    model="google/gemini-3.7-flash",
+                )
+
+        used_model = mocked.call_args.kwargs.get("model", mocked.call_args.args[1:2])
+        self.assertEqual(used_model, "google/gemini-3.7-flash")
+        self.assertEqual(result["model"], "google/gemini-3.7-flash")
+
+    @patch("stage2.whisper_runner.available_backends", return_value=["openai-whisper"])
+    def test_local_backend_keeps_explicit_local_model_name(self, _available) -> None:
+        fake_result = {"language": "ru"}
+        with (
+            TemporaryDirectory() as directory,
+            patch(
+                "stage2.whisper_runner._transcribe_openai",
+                return_value=(
+                    [{"word": "раз", "start": 0.0, "end": 1.0}],
+                    fake_result,
+                ),
+            ) as mocked,
+        ):
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            result = transcribe_audio(
+                audio_path,
+                backend="openai-whisper",
+                model="small",
+            )
+
+        mocked.assert_called_once_with(
+            audio_path.resolve(), "small", "ru"
+        )
+        self.assertEqual(result["model"], "small")
+
     def test_transcribe_cloud_missing_api_key_raises_clear_error(self) -> None:
         with (
             TemporaryDirectory() as directory,

@@ -90,7 +90,11 @@ export function updateActionAvailability() {
       : "Найти СНХ автоматически";
   }
   if (ids.btn_sync_cancel) ids.btn_sync_cancel.hidden = !appState.syncJobRunning;
-  if (ids.sync_whisper_model) ids.sync_whisper_model.disabled = appState.syncJobRunning;
+  if (ids.sync_whisper_model) {
+    // The local Whisper model select is meaningless once cloud ASR is
+    // chosen: the cloud backend always uses its own default model.
+    ids.sync_whisper_model.disabled = appState.syncJobRunning || ids.sync_asr_engine?.value === "cloud";
+  }
   if (ids.sync_asr_engine) ids.sync_asr_engine.disabled = appState.syncJobRunning;
   if (ids.btn_tts_cancel) {
     ids.btn_tts_cancel.hidden = !["queued", "running", "cancelling"].includes(appState.currentTtsJobStatus);

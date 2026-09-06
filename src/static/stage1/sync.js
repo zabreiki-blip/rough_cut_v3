@@ -498,14 +498,18 @@ async function startSyncAlignment() {
     ids.btn_sync_cancel.disabled = false;
     ids.btn_sync_cancel.textContent = "Остановить после текущего шага";
   }
+  const asrEngine = ids.sync_asr_engine?.value || "local";
+  // A cloud ASR backend needs a "provider/model" id, not a local Whisper
+  // model name (small/medium/...); let the server pick the cloud default.
+  const model = asrEngine === "cloud" ? "" : ids.sync_whisper_model?.value || "small";
   const response = await optionalRequestJSON(
     "/stage2/sync-jobs/start",
     "POST",
     {
       project,
       timecode_mode: ids.sync_timecode_mode?.value || "relative",
-      model: ids.sync_whisper_model?.value || "small",
-      asr_engine: ids.sync_asr_engine?.value || "local",
+      model,
+      asr_engine: asrEngine,
       source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all",
     },
   );
@@ -603,6 +607,11 @@ async function confirmSyncMatch(matchId, card) {
 
 ids.btn_sync_align.addEventListener("click", () => safely(startSyncAlignment));
 if (ids.btn_sync_cancel) ids.btn_sync_cancel.addEventListener("click", cancelSyncJob);
+if (ids.sync_asr_engine) {
+  // Cloud ASR ignores the local Whisper model select; keep it visually
+  // disabled while cloud is chosen so the UI doesn't imply it still applies.
+  ids.sync_asr_engine.addEventListener("change", () => updateActionAvailability());
+}
 ids.sync_review_list.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action='confirm-sync-match']");
   if (!button) return;
