@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import requests
 
 import api
 import api_core_routes
@@ -138,6 +139,140 @@ def test_readiness_requires_auth_like_other_protected_routes(
         assert authorized.status_code == 200
     finally:
         api.app.config.pop("API_TOKEN", None)
+
+
+class _FakeConnectorResponse:
+    def __init__(self, status_code: int, payload: dict) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_readiness_tts_macos_connector_ok(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+
+    def fake_get(url, timeout=None):
+        assert url == "http://host.docker.internal:8001/health"
+        assert timeout is not None and timeout <= 2
+        return _FakeConnectorResponse(
+            200, {"ok": True, "say_available": True, "afconvert_available": True}
+        )
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "ok"
+    assert "коннектор" in check["detail"].lower()
+    assert payload["overall"] != "error"
+
+
+def test_readiness_tts_macos_connector_unreachable(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+
+    def fake_get(url, timeout=None):
+        raise requests.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "error"
+    assert "коннектор" in check["detail"].lower()
+    assert payload["overall"] == "error"
+
+
+def test_readiness_tts_macos_connector_missing_binaries(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+
+    def fake_get(url, timeout=None):
+        return _FakeConnectorResponse(
+            200, {"ok": True, "say_available": False, "afconvert_available": True}
+        )
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "error"
+    assert "say" in check["detail"]
+
+
+def test_readiness_tts_macos_without_connector_ok_when_binaries_present(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.delenv("MACOS_CONNECTOR_URL", raising=False)
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _name: "/usr/bin/fake")
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "ok"
+
+
+def test_readiness_tts_macos_without_connector_error_when_binaries_missing(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.delenv("MACOS_CONNECTOR_URL", raising=False)
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _name: None)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["status"] == "error"
+
+
+def test_readiness_never_leaks_macos_connector_token(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canary = "connector-secret-token-24680"
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+    monkeypatch.setenv("MACOS_CONNECTOR_TOKEN", canary)
+
+    captured_headers = {}
+
+    def fake_get(url, timeout=None, **kwargs):
+        captured_headers.update(kwargs.get("headers") or {})
+        return _FakeConnectorResponse(
+            200, {"ok": True, "say_available": True, "afconvert_available": True}
+        )
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    raw_body = response.get_data(as_text=True)
+    assert canary not in raw_body
+    assert not captured_headers
 
 
 def test_readiness_ui_contract_in_template_and_script() -> None:

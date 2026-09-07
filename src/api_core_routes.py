@@ -93,10 +93,89 @@ def _check_whisper_backend() -> dict[str, str]:
     )
 
 
+def _macos_connector_health_url(connector_url: str) -> str:
+    """Derive the connector's `/health` URL from its configured `/synthesize` URL."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(connector_url)
+    return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
+
+
+def _check_macos_connector(connector_url: str) -> dict[str, str]:
+    """Check TTS readiness via the macOS connector bridge (Docker/Linux API host).
+
+    The `/health` endpoint of the connector requires no authentication (see
+    `src/macos_connector.py`), so no token is ever sent or logged here.
+    """
+    label = "TTS-провайдер"
+    health_url = _macos_connector_health_url(connector_url)
+    unreachable = _readiness_item(
+        item_id="tts_provider",
+        label=label,
+        status="error",
+        detail=f"Провайдер macos: коннектор не отвечает ({health_url}).",
+        hint=(
+            "Запустите коннектор на macOS-хосте: python -m macos_connector; "
+            "проверьте MACOS_CONNECTOR_URL."
+        ),
+    )
+
+    try:
+        import requests
+    except ImportError:
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="error",
+            detail="Провайдер macos: библиотека requests не установлена.",
+            hint="Установите зависимости: pip install -r requirements.txt",
+        )
+
+    try:
+        response = requests.get(health_url, timeout=2)
+    except requests.RequestException:
+        return unreachable
+    if response.status_code != 200:
+        return unreachable
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    say_available = bool(payload.get("say_available"))
+    afconvert_available = bool(payload.get("afconvert_available"))
+    if say_available and afconvert_available:
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="ok",
+            detail=(
+                "Провайдер macos: синтез выполняется через коннектор на хосте, "
+                "say и afconvert доступны."
+            ),
+        )
+    missing = [
+        name
+        for name, available in (("say", say_available), ("afconvert", afconvert_available))
+        if not available
+    ]
+    return _readiness_item(
+        item_id="tts_provider",
+        label=label,
+        status="error",
+        detail=f"Провайдер macos: на хосте коннектора не найдено {', '.join(missing)}.",
+        hint="Установите недостающие утилиты на macOS-хосте коннектора.",
+    )
+
+
 def _check_tts_provider(settings: Any) -> dict[str, str]:
     provider = str(getattr(settings, "tts_provider", "") or "")
     label = "TTS-провайдер"
     if provider == "macos":
+        connector_url = str(getattr(settings, "macos_connector_url", "") or "")
+        if connector_url:
+            return _check_macos_connector(connector_url)
         say_path = shutil.which("say")
         afconvert_path = shutil.which("afconvert")
         if say_path and afconvert_path:
