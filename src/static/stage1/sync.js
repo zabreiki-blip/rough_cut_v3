@@ -612,14 +612,17 @@ async function startSyncAlignment() {
     ids.btn_sync_cancel.disabled = false;
     ids.btn_sync_cancel.textContent = "Остановить после текущего шага";
   }
+  const asrEngine = ids.sync_asr_engine?.value || "local";
   const response = await optionalRequestJSON(
     "/stage2/sync-jobs/start",
     "POST",
     {
       project,
       timecode_mode: ids.sync_timecode_mode?.value || "relative",
-      model: ids.sync_whisper_model?.value || "small",
-      asr_engine: ids.sync_asr_engine?.value || "local",
+      // Small/Medium are local Whisper model sizes. Cloud ASR chooses its
+      // own configured provider/model default, so never send a local ID.
+      model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined,
+      asr_engine: asrEngine,
       source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all",
     },
   );

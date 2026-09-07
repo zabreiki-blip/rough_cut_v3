@@ -311,6 +311,20 @@ def _stage2_sync_job_start(services: ModuleType):
         # "cloud" is the UI-facing engine choice; "backend" stays available
         # for explicit low-level overrides (tests/tooling) and wins when set.
         backend = "cloud-audio"
+    uses_cloud_backend = asr_engine == "cloud" or str(backend or "").lower() in {
+        "cloud",
+        "cloud-audio",
+        "openrouter",
+    }
+    # ``model`` is the legacy/local Whisper model-size field from the UI
+    # ("small", "medium", ...).  It is not a cloud provider model ID; using
+    # it for Cloud ASR makes the provider reject every transcription.  Keep
+    # cloud model selection in its adapter configuration instead.
+    model = (
+        str(payload.get("model")).strip()
+        if not uses_cloud_backend and payload.get("model") is not None
+        else None
+    )
 
     try:
         job = services._create_sync_job(project)
@@ -321,9 +335,7 @@ def _stage2_sync_job_start(services: ModuleType):
                 "project": project,
                 "backend": backend,
                 "asr_engine": asr_engine,
-                "model": (
-                    str(payload.get("model")).strip() if payload.get("model") is not None else None
-                ),
+                "model": model,
                 "language": language,
                 "timecode_mode": timecode_mode,
                 "rematch_confirmed": bool(payload.get("rematch_confirmed", False)),

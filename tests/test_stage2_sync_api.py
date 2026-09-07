@@ -2011,6 +2011,7 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
 
     def fake_transcribe(path, backend=None, **_kwargs):
         captured_backend["backend"] = backend
+        captured_backend["model"] = _kwargs.get("model")
         return {
             "backend": "cloud-audio",
             "model": "cloud-model",
@@ -2030,7 +2031,9 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
     ):
         response = client.post(
             "/stage2/sync-jobs/start",
-            json={"project": "demo", "asr_engine": "cloud"},
+            # The UI historically sent its local Whisper setting even for
+            # Cloud ASR.  Regression: it must not reach the provider.
+            json={"project": "demo", "asr_engine": "cloud", "model": "medium"},
         )
 
     assert response.status_code == 200, response.get_json()
@@ -2038,6 +2041,7 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
     assert job["status"] == "completed"
     assert job["asr_engine"] == "cloud"
     assert captured_backend["backend"] == "cloud-audio"
+    assert captured_backend["model"] is None
 
 
 def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backend(
@@ -2062,6 +2066,7 @@ def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backen
 
     def fake_transcribe(path, backend=None, **_kwargs):
         captured_backend["backend"] = backend
+        captured_backend["model"] = _kwargs.get("model")
         return {
             "backend": "faster-whisper",
             "model": "small",
@@ -2081,13 +2086,17 @@ def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backen
     ):
         # No asr_engine in the payload: must default to "local" and never
         # implicitly switch to the paid cloud-audio backend.
-        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "model": "medium"},
+        )
 
     assert response.status_code == 200, response.get_json()
     job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
     assert job["asr_engine"] == "local"
     assert captured_backend["backend"] is None
     assert captured_backend["backend"] != "cloud-audio"
+    assert captured_backend["model"] == "medium"
 
 
 def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
