@@ -460,6 +460,92 @@ class NormalizerTests(unittest.TestCase):
                 ],
             )
 
+    def test_date_inside_sync_quote_stays_in_text_as_single_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, историк, 00:10 Мы встретились 23.05 у музея.\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["timecode_start"], "00:10")
+            self.assertEqual(block["normalized_text"], "Мы встретились 23.05 у музея.")
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Мы встретились 23.05 у музея.",
+                        "timecode_start": "00:10",
+                    }
+                ],
+            )
+
+    def test_date_inside_sync_quote_does_not_break_later_fragment_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, историк, 00:10 Мы встретились 23.05 у музея. "
+                "01:20 Потом пошли гулять.\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["timecode_start"], "00:10")
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Мы встретились 23.05 у музея.",
+                        "timecode_start": "00:10",
+                    },
+                    {
+                        "text": "Потом пошли гулять.",
+                        "timecode_start": "01:20",
+                    },
+                ],
+            )
+
+    def test_ambiguous_dotted_timecode_with_range_is_still_a_timecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, эксперт, 23.05 — 23.40 Ответ героя\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["timecode_start"], "23.05")
+            self.assertEqual(block["timecode_end"], "23.40")
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Ответ героя",
+                        "timecode_start": "23.05",
+                        "timecode_end": "23.40",
+                    }
+                ],
+            )
+
     def test_sync_fragments_survive_docx_soft_line_breaks(self) -> None:
         from docx import Document
         from docx.enum.text import WD_BREAK
@@ -569,6 +655,40 @@ class NormalizerTests(unittest.TestCase):
                     "В 1915 году произошла встреча.",
                     "Третий закадровый абзац.",
                 ],
+            )
+
+    def test_prose_number_after_marker_is_not_treated_as_speaker_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("Диктор 1915 год стал переломным.\n", encoding="utf-8")
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "voiceover")
+            self.assertEqual(block["original_label"], "Диктор")
+            self.assertEqual(block["normalized_text"], "1915 год стал переломным.")
+
+    def test_unambiguous_speaker_index_is_still_dropped_from_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Диктор 2: Первая реплика.\nДиктор-2 Вторая реплика.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["voiceover", "voiceover"])
+            self.assertEqual([block["original_label"] for block in blocks], ["Диктор", "Диктор"])
+            self.assertEqual(
+                [block["normalized_text"] for block in blocks],
+                ["Первая реплика.", "Вторая реплика."],
             )
 
     def test_speaker_can_be_glued_to_timecode_or_use_spaced_three_part_timecode(self) -> None:

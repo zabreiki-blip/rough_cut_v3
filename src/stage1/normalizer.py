@@ -112,12 +112,6 @@ _SYNC_NAME_ONLY_LABEL = re.compile(
     r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*$"
 )
 _SYNC_CONTINUATION_NOTE = re.compile(r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE)
-_SYNC_FRAGMENT = re.compile(
-    rf"(?P<start>{_TIMECODE_TOKEN})"
-    rf"(?:\s*[-–—]\s*(?P<end>{_TIMECODE_TOKEN}))?"
-    rf"[.\s]*(?P<text>.*?)(?=(?:{_TIMECODE_TOKEN})|$)",
-    re.DOTALL,
-)
 _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"^\s*\((?:[^)\n]{{1,240}}\)\s*:?\s*|[^:\n]{{1,240}}:\s*)"
     rf"{_TIMECODE_TOKEN}",
@@ -1020,25 +1014,36 @@ def _looks_like_scenario_title(text: str) -> bool:
     return not _PERSONAL_VERB_RE.search(stripped)
 
 
-def _starts_with_unambiguous_timecode(text: str) -> bool:
-    """Recognize a bare timecode without mistaking a prose-leading date for one."""
-    stripped = text.lstrip()
-    parenthesized = re.match(rf"^\(\s*({_TIMECODE_TOKEN})\s*\)", stripped)
-    if parenthesized:
-        return True
-
-    match = _TIMECODE.match(stripped)
-    if not match:
-        return False
-    token = match.group(1)
+def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
+    """Decide whether a `_TIMECODE`-shaped match at ``text[start:end]`` is an
+    actual timecode boundary, as opposed to prose (e.g. a two-component date
+    like ``23.05``) that happens to match the same token pattern. Shared by
+    bare-timecode detection and sync fragment splitting.
+    """
+    token = text[start:end]
     inner = token.strip("[]")
     if token.startswith("[") or ":" in inner or inner.count(".") >= 2 or "-" in inner:
         return True
 
+    # A token wrapped in round brackets, e.g. "(23.05)", is unambiguous even
+    # in the two-component dot notation: the brackets themselves mark it as a
+    # structural timecode rather than prose.
+    before, after = text[:start], text[end:]
+    if before.rstrip().endswith("(") and after.lstrip().startswith(")"):
+        return True
+
     # Two-component dot notation (for example 23.05) is ambiguous with a date.
     # Treat it as a timecode only when an explicit range removes that ambiguity.
-    remainder = stripped[match.end() :]
-    return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", remainder))
+    return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", after))
+
+
+def _starts_with_unambiguous_timecode(text: str) -> bool:
+    """Recognize a bare timecode without mistaking a prose-leading date for one."""
+    stripped = text.lstrip()
+    match = re.match(rf"^\(\s*({_TIMECODE_TOKEN})\s*\)", stripped) or _TIMECODE.match(stripped)
+    if not match:
+        return False
+    return _is_unambiguous_timecode_match(stripped, match.start(1), match.end(1))
 
 
 def _split_label(text: str) -> tuple[str, str]:
@@ -1062,8 +1067,17 @@ def _split_label(text: str) -> tuple[str, str]:
     # look like one long, unknown label instead of a known voiceover marker.
     known = sorted(set(_BUILTIN_MARKERS) | _TECH_MARKERS, key=len, reverse=True)
     for marker in known:
+        # A numeric suffix right after the marker (e.g. "Диктор-1", "ЗК1:",
+        # "Диктор 2:") denotes a speaker index and is dropped from the label.
+        # It is only unambiguous when either an explicit separator glues it to
+        # the marker, or -- when separated by whitespace or glued directly --
+        # it is itself immediately followed by a structural separator or the
+        # end of the string. Otherwise the digits are prose (e.g. a year in
+        # "Диктор 1915 год...") and must stay in the content.
         match = re.match(
-            rf"^\s*({re.escape(marker)})(?:\s*[-.]?\s*\d+[A-Za-zА-Яа-я]?)?"
+            rf"^\s*({re.escape(marker)})"
+            rf"(?:[-.]\d+[A-Za-zА-Яа-я]?"
+            rf"|\s*\d+[A-Za-zА-Яа-я]?(?=\s*[.:\-–—]|\s*$))?"
             rf"(?:\s*[.:\-–—]\s*|\s+|$)(.*)$",
             text,
             flags=re.I | re.DOTALL,
@@ -1231,18 +1245,52 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
 
 
 def _extract_sync_fragments(text: str) -> list[SyncFragment]:
-    fragments: list[SyncFragment] = []
-    for match in _SYNC_FRAGMENT.finditer(text):
+    # A raw `_TIMECODE` occurrence only becomes a fragment boundary when it is
+    # unambiguous (see `_is_unambiguous_timecode_match`). Anything else -- for
+    # example a bare date like "23.05" spoken inside a quote -- stays part of
+    # the surrounding fragment's text instead of splitting it in two.
+    boundaries: list[dict[str, Any]] = []
+    search_from = 0
+    while True:
+        match = _TIMECODE.search(text, search_from)
+        if not match:
+            break
+        if not _is_unambiguous_timecode_match(text, match.start(), match.end()):
+            search_from = match.end()
+            continue
+        content_start = match.end()
+        end_value = ""
+        range_match = re.match(rf"^\s*[-–—]\s*({_TIMECODE_TOKEN})", text[content_start:])
+        if range_match:
+            end_value = range_match.group(1)
+            content_start += range_match.end()
         # The punctuation belongs to the quote; only structural whitespace and
-        # separators around the next timecode are discarded.
-        fragment_text = match.group("text").strip(" \t\r\n–—-")
+        # separators right after the boundary/range are discarded.
+        separator = re.match(r"[.\s]*", text[content_start:])
+        content_start += separator.end()
+        boundaries.append(
+            {
+                "token_start": match.start(),
+                "content_start": content_start,
+                "start": match.group(1),
+                "end": end_value,
+            }
+        )
+        search_from = content_start
+
+    fragments: list[SyncFragment] = []
+    for index, boundary in enumerate(boundaries):
+        text_end = (
+            boundaries[index + 1]["token_start"] if index + 1 < len(boundaries) else len(text)
+        )
+        fragment_text = text[boundary["content_start"] : text_end].strip(" \t\r\n–—-")
         if not fragment_text:
             continue
         fragments.append(
             SyncFragment(
                 text=fragment_text,
-                timecode_start=_canonicalize_timecode(match.group("start")),
-                timecode_end=_canonicalize_timecode(match.group("end") or ""),
+                timecode_start=_canonicalize_timecode(boundary["start"]),
+                timecode_end=_canonicalize_timecode(boundary["end"]),
             )
         )
     return fragments
