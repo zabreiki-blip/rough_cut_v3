@@ -151,6 +151,48 @@ def test_unknown_editorial_role_keeps_the_search_unrestricted() -> None:
     assert unit["speaker"] == ""
 
 
+def test_editorial_role_with_cut_marker_uses_person_name() -> None:
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "Маликов 00",
+                "normalized_text": "СНХ, Маликов 00: точная реплика",
+            }
+        ],
+        source_speakers={("малик",)},
+    )[0]
+
+    assert unit["speaker"] == "Маликов"
+
+
+def test_unknown_editorial_role_does_not_inherit_previous_person() -> None:
+    units = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "Лукьянова",
+                "normalized_text": "СНХ, Лукьянова: первая реплика",
+            },
+            {
+                "uid": "block-2",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "отец: начало реплики",
+                "normalized_text": "СНХ, отец: точная реплика",
+            },
+        ],
+        source_speakers={("лукьянов",), ("отец", "жанн")},
+    )
+
+    assert units[0]["speaker"] == "Лукьянова"
+    assert units[1]["speaker"] == "отец"
+
+
 def test_audio_match_accepts_precomputed_signature_without_rereading(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

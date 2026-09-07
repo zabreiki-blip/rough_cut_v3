@@ -905,6 +905,11 @@ def _transcription_config(
         or os.getenv("SYNC_WHISPER_MODEL", "").strip()
         or "<backend-default>"
     )
+    cloud_timestamp_mapping = (
+        "2"
+        if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"}
+        else ""
+    )
     return {
         "backend": configured_backend.lower(),
         "model": configured_model,
@@ -920,6 +925,10 @@ def _transcription_config(
         "faster_whisper_version": _installed_version("faster-whisper"),
         "mlx_whisper_version": _installed_version("mlx-whisper"),
         "openai_whisper_version": _installed_version("openai-whisper"),
+        # Bump only cloud indexes: cloud ASR now repairs rare stretched
+        # timestamp scales before word interpolation, so older cached words
+        # must not be reused with the obsolete scale.
+        "cloud_timestamp_mapping": cloud_timestamp_mapping,
     }
 
 
@@ -1075,7 +1084,7 @@ _EDITORIAL_SPEAKER_MARKERS = frozenset({"снх", "синхрон", "sync", "л�
 
 def _matching_speaker(
     block: dict, speaker: str, source_speakers: set[tuple[str, ...]] | None = None
-) -> str:
+) -> str | None:
     """Return the person name to use when selecting an interview source.
 
     Editorial drafts commonly label a quote as ``СНХ, Киркоров: ...`` or
@@ -1084,17 +1093,28 @@ def _matching_speaker(
     useful source selector. Do not apply this to ordinary ``Name, title``
     labels, where ``speaker`` already identifies the person. When a source
     list is supplied, an unknown role falls back to an unrestricted search
-    rather than excluding every named interview.
+    rather than excluding every named interview. ``None`` means that this
+    block has no own selector and may inherit a preceding one; an empty
+    string is an explicit unrestricted selector and must not inherit.
     """
     role = str(block.get("role") or "").strip()
-    if str(block.get("type") or "").lower() == "sync" and (
-        speaker.casefold() in _EDITORIAL_SPEAKER_MARKERS
-    ) and role:
+    is_editorial_cue = speaker.casefold() in _EDITORIAL_SPEAKER_MARKERS
+    if str(block.get("type") or "").lower() == "sync" and is_editorial_cue:
+        if not role:
+            return ""
         candidate = role.split(":", 1)[0].strip()
-        if source_speakers is None or tuple(normalize_text(candidate)) in source_speakers:
+        # Labels often put a cut marker after a real name: ``Маликов 00``.
+        # It is not part of the source person name.
+        candidate = re.sub(r"(?:\s+\d{1,2})+$", "", candidate).strip()
+        candidate_tokens = tuple(normalize_text(candidate))
+        if source_speakers is None or any(
+            candidate_tokens
+            and set(candidate_tokens).issubset(source_tokens)
+            for source_tokens in source_speakers
+        ):
             return candidate
         return ""
-    return speaker
+    return speaker or None
 
 
 def _sync_alignment_units(
@@ -1109,13 +1129,15 @@ def _sync_alignment_units(
         if not parent_uid:
             units.append({"segment_id": "", "parent_block_uid": "", "block": block})
             continue
-        speaker = _matching_speaker(
+        speaker_selector = _matching_speaker(
             block, str(block.get("speaker") or "").strip(), source_speakers
         )
-        if speaker:
-            last_speaker[block_type] = speaker
-        else:
+        if speaker_selector is None:
             speaker = last_speaker.get(block_type, "")
+        else:
+            speaker = speaker_selector
+            if speaker:
+                last_speaker[block_type] = speaker
         raw_fragments = block.get("sync_fragments")
         fragments = (
             normalized_sync_fragments(block)
