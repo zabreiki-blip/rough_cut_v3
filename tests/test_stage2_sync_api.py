@@ -13,6 +13,7 @@ import pytest
 
 import api
 from stage2.sync_llm_review import SemanticDecision
+from stage2.sync_matcher import SyncMatcher
 from stage2.sync_models import SyncAlternative, SyncMatch, SyncSource, WordIndex, WordTimestamp
 
 
@@ -68,6 +69,86 @@ def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
 
     changed = dict(arguments, scenario_revision_id="rev_0002")
     assert api._sync_matching_fingerprint(**changed) != first
+
+
+@pytest.mark.parametrize(
+    ("cue", "role"),
+    [
+        ("СНХ", "Киркоров"),
+        ("ЛАЙФ", "Киркоров"),
+        ("СНХ", "Киркоров: начало реплики"),
+    ],
+)
+def test_editorial_cue_role_selects_the_named_interview_source(cue: str, role: str) -> None:
+    quote = "точная реплика из интервью"
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": cue,
+                "role": role,
+                "normalized_text": f"{cue}, Киркоров: {quote}",
+            }
+        ],
+        source_speakers={("киркор",)},
+    )[0]
+
+    assert unit["speaker"] == "Киркоров"
+    result = SyncMatcher(
+        [SyncSource(id="kirkorov", speaker="Киркоров", premiere_sequence="Киркоров")],
+        [
+            WordIndex(
+                source_id="kirkorov",
+                words=[
+                    WordTimestamp(word, index, index + 0.5)
+                    for index, word in enumerate(quote.split())
+                ],
+            )
+        ],
+    ).match(
+        api.AlignmentRequest(
+            segment_id=str(unit["segment_id"]),
+            text=str(unit["text"]),
+            speaker=str(unit["speaker"]),
+        )
+    )
+
+    assert result.source_id == "kirkorov"
+    assert unit["text"] == quote
+
+
+def test_regular_speaker_role_does_not_replace_the_person_name() -> None:
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "Киркоров",
+                "role": "певец",
+                "normalized_text": "Киркоров, певец: точная реплика",
+            }
+        ]
+    )[0]
+
+    assert unit["speaker"] == "Киркоров"
+
+
+def test_unknown_editorial_role_keeps_the_search_unrestricted() -> None:
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "архив",
+                "normalized_text": "СНХ, архив: точная реплика",
+            }
+        ],
+        source_speakers={("киркор",)},
+    )[0]
+
+    assert unit["speaker"] == ""
 
 
 def test_audio_match_accepts_precomputed_signature_without_rereading(

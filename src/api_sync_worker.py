@@ -357,9 +357,15 @@ def run_sync_job(
             )
             if str(block.get("type") or "").lower() in {"sync", "host"}
         ]
-        units = _sync_alignment_units(blocks)
         indexed_source_ids = {item.source_id for item in indexes}
         matching_sources = [item for item in sources if item.id in indexed_source_ids]
+        source_speakers = {
+            tuple(normalize_text(name))
+            for source in matching_sources
+            for name in source.speaker_names
+            if normalize_text(name)
+        }
+        units = _sync_alignment_units(blocks, source_speakers=source_speakers)
         matcher = SyncMatcher(
             matching_sources,
             indexes,

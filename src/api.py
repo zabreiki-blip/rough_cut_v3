@@ -1058,15 +1058,48 @@ def _sync_quote(block: dict) -> str:
     role = str(block.get("role") or "").strip()
     if speaker and text.casefold().startswith(speaker.casefold()):
         remainder = text[len(speaker) :].lstrip(" \t,")
-        if role and remainder.casefold().startswith(role.casefold()):
-            remainder = remainder[len(role) :]
+        # A malformed legacy label can put the start of the quote into the
+        # role field (``Лукьянова: начало реплики``). Its name prefix is
+        # structural, while the rest must remain searchable text.
+        role_prefix = role.split(":", 1)[0].strip() if ":" in role else role
+        if role_prefix and remainder.casefold().startswith(role_prefix.casefold()):
+            remainder = remainder[len(role_prefix) :]
         quote = remainder.lstrip(" \t\r\n:;,.…—–-")
         if quote:
             return quote
     return text
 
 
-def _sync_alignment_units(blocks: list[dict]) -> list[dict[str, object]]:
+_EDITORIAL_SPEAKER_MARKERS = frozenset({"снх", "синхрон", "sync", "лайф", "life"})
+
+
+def _matching_speaker(
+    block: dict, speaker: str, source_speakers: set[tuple[str, ...]] | None = None
+) -> str:
+    """Return the person name to use when selecting an interview source.
+
+    Editorial drafts commonly label a quote as ``СНХ, Киркоров: ...`` or
+    ``ЛАЙФ, Орлова: ...``.  The normalizer deliberately stores the cue in
+    ``speaker`` and the person in ``role``; for matching, the latter is the
+    useful source selector. Do not apply this to ordinary ``Name, title``
+    labels, where ``speaker`` already identifies the person. When a source
+    list is supplied, an unknown role falls back to an unrestricted search
+    rather than excluding every named interview.
+    """
+    role = str(block.get("role") or "").strip()
+    if str(block.get("type") or "").lower() == "sync" and (
+        speaker.casefold() in _EDITORIAL_SPEAKER_MARKERS
+    ) and role:
+        candidate = role.split(":", 1)[0].strip()
+        if source_speakers is None or tuple(normalize_text(candidate)) in source_speakers:
+            return candidate
+        return ""
+    return speaker
+
+
+def _sync_alignment_units(
+    blocks: list[dict], *, source_speakers: set[tuple[str, ...]] | None = None
+) -> list[dict[str, object]]:
     """Expand a canonical speaker block into independently matchable pieces."""
     units: list[dict[str, object]] = []
     last_speaker = {"sync": "", "host": ""}
@@ -1076,7 +1109,9 @@ def _sync_alignment_units(blocks: list[dict]) -> list[dict[str, object]]:
         if not parent_uid:
             units.append({"segment_id": "", "parent_block_uid": "", "block": block})
             continue
-        speaker = str(block.get("speaker") or "").strip()
+        speaker = _matching_speaker(
+            block, str(block.get("speaker") or "").strip(), source_speakers
+        )
         if speaker:
             last_speaker[block_type] = speaker
         else:
@@ -1172,7 +1207,7 @@ def _sync_matching_fingerprint(
 ) -> str:
     """Identify every durable input that can change a matching decision."""
     payload = {
-        "version": 2,
+        "version": 3,
         "normalization_revision": normalization_revision,
         "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,
