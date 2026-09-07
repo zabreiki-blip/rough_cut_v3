@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from math import isfinite
-from typing import Iterable
+from typing import Any, Iterable
 
 from .sync_models import (
     AlignmentRequest,
@@ -151,6 +152,244 @@ def normalize_text(text: str) -> list[str]:
         for token in _TOKEN_RE.findall(unicodedata.normalize("NFKC", text).replace("ё", "е"))
         if (normalized := normalize_token(token))
     ]
+
+
+_NEGATION_MARKERS = {
+    "не",
+    "ни",
+    "нет",
+    "без",
+    "никогда",
+    "никто",
+    "ничего",
+    "никак",
+    "нельзя",
+}
+
+
+def _count_negations(text: str) -> int:
+    tokens = _TOKEN_RE.findall(unicodedata.normalize("NFKC", text).replace("ё", "е").casefold())
+    return sum(1 for token in tokens if token in _NEGATION_MARKERS)
+
+
+# Cardinal and (within reason) ordinal word forms for Russian numerals. Keys
+# are normalized once through `normalize_token` below so that a form found in
+# real text (which may carry a different case/gender ending) resolves to the
+# same lookup key as the canonical spelling registered here.
+_NUMBER_UNIT_FORMS = {
+    "один": 1,
+    "одна": 1,
+    "одно": 1,
+    "одного": 1,
+    "одной": 1,
+    "одним": 1,
+    "одну": 1,
+    "первый": 1,
+    "первого": 1,
+    "первая": 1,
+    "первое": 1,
+    "первым": 1,
+    "первую": 1,
+    "первой": 1,
+    "два": 2,
+    "две": 2,
+    "второй": 2,
+    "второго": 2,
+    "вторая": 2,
+    "второе": 2,
+    "три": 3,
+    "третий": 3,
+    "третьего": 3,
+    "третья": 3,
+    "третье": 3,
+    "четыре": 4,
+    "четвертый": 4,
+    "четвёртый": 4,
+    "четвертого": 4,
+    "четвёртого": 4,
+    "пять": 5,
+    "пятый": 5,
+    "пятого": 5,
+    "пятая": 5,
+    "пятое": 5,
+    "шесть": 6,
+    "шестой": 6,
+    "шестого": 6,
+    "семь": 7,
+    "седьмой": 7,
+    "седьмого": 7,
+    "восемь": 8,
+    "восьмой": 8,
+    "восьмого": 8,
+    "девять": 9,
+    "девятый": 9,
+    "девятого": 9,
+}
+_NUMBER_TEEN_FORMS = {
+    "десять": 10,
+    "десятый": 10,
+    "десятого": 10,
+    "одиннадцать": 11,
+    "одиннадцатый": 11,
+    "двенадцать": 12,
+    "двенадцатый": 12,
+    "тринадцать": 13,
+    "тринадцатый": 13,
+    "четырнадцать": 14,
+    "четырнадцатый": 14,
+    "пятнадцать": 15,
+    "пятнадцатый": 15,
+    "шестнадцать": 16,
+    "шестнадцатый": 16,
+    "семнадцать": 17,
+    "семнадцатый": 17,
+    "восемнадцать": 18,
+    "восемнадцатый": 18,
+    "девятнадцать": 19,
+    "девятнадцатый": 19,
+}
+_NUMBER_TEN_FORMS = {
+    "двадцать": 20,
+    "двадцатый": 20,
+    "тридцать": 30,
+    "тридцатый": 30,
+    "сорок": 40,
+    "сороковой": 40,
+    "пятьдесят": 50,
+    "пятидесятый": 50,
+    "шестьдесят": 60,
+    "шестидесятый": 60,
+    "семьдесят": 70,
+    "семидесятый": 70,
+    "восемьдесят": 80,
+    "восьмидесятый": 80,
+    "девяносто": 90,
+    "девяностый": 90,
+}
+_NUMBER_HUNDRED_FORMS = {
+    "сто": 100,
+    "сотый": 100,
+    "двести": 200,
+    "двухсотый": 200,
+    "триста": 300,
+    "трехсотый": 300,
+    "трёхсотый": 300,
+    "четыреста": 400,
+    "четырехсотый": 400,
+    "четырёхсотый": 400,
+    "пятьсот": 500,
+    "пятисотый": 500,
+    "шестьсот": 600,
+    "шестисотый": 600,
+    "семьсот": 700,
+    "семисотый": 700,
+    "восемьсот": 800,
+    "восьмисотый": 800,
+    "девятьсот": 900,
+    "девятисотый": 900,
+}
+_NUMBER_SCALE_FORMS = {
+    "тысяча": 1_000,
+    "тысячи": 1_000,
+    "тысяч": 1_000,
+    "тысячный": 1_000,
+    "тысячного": 1_000,
+    "миллион": 1_000_000,
+    "миллиона": 1_000_000,
+    "миллионов": 1_000_000,
+    "миллионный": 1_000_000,
+}
+
+
+def _build_number_lookup(forms: dict[str, int]) -> dict[str, int]:
+    return {normalize_token(word): value for word, value in forms.items()}
+
+
+_NUMBER_UNITS = _build_number_lookup(_NUMBER_UNIT_FORMS)
+_NUMBER_TEENS = _build_number_lookup(_NUMBER_TEEN_FORMS)
+_NUMBER_TENS = _build_number_lookup(_NUMBER_TEN_FORMS)
+_NUMBER_HUNDREDS = _build_number_lookup(_NUMBER_HUNDRED_FORMS)
+_NUMBER_SCALES = _build_number_lookup(_NUMBER_SCALE_FORMS)
+
+# Place-value levels used to decide whether consecutive number words combine
+# into a single value (classic descending-magnitude rule, e.g. "сто
+# пятьдесят" = 150) or start a new number ("два три" = [2, 3]).
+_LEVEL_UNIT = 1
+_LEVEL_TEEN = 2
+_LEVEL_TEN = 2
+_LEVEL_HUNDRED = 3
+_LEVEL_AFTER_SCALE = 4  # higher than any real level: accepts any next word
+
+
+def _extract_numbers(text: str) -> list[int]:
+    """Extract the multiset of significant numbers mentioned in ``text``.
+
+    Digits are read directly; Russian number words (cardinal and, within
+    reasonable bounds, ordinal forms) are resolved to the same integer value
+    so that "сто пятьдесят" and "150" compare equal.
+    """
+
+    tokens = _TOKEN_RE.findall(unicodedata.normalize("NFKC", text).replace("ё", "е"))
+    numbers: list[int] = []
+    group = 0
+    has_group = False
+    last_level = 0
+
+    def flush() -> None:
+        nonlocal group, has_group, last_level
+        if has_group:
+            numbers.append(group)
+        group = 0
+        has_group = False
+        last_level = 0
+
+    def add(value: int, level: int) -> None:
+        nonlocal group, has_group, last_level
+        # Only combine with the current group when the place value strictly
+        # decreases (hundreds -> tens/teens -> units). A level that repeats
+        # or jumps back up starts a new number instead of being summed in.
+        if has_group and level >= last_level:
+            flush()
+        group += value
+        has_group = True
+        last_level = level
+
+    for raw in tokens:
+        lowered = raw.casefold()
+        if lowered.isdigit():
+            flush()
+            numbers.append(int(lowered))
+            continue
+        stem = normalize_token(raw)
+        if stem in _NUMBER_UNITS:
+            add(_NUMBER_UNITS[stem], _LEVEL_UNIT)
+        elif stem in _NUMBER_TEENS:
+            add(_NUMBER_TEENS[stem], _LEVEL_TEEN)
+        elif stem in _NUMBER_TENS:
+            add(_NUMBER_TENS[stem], _LEVEL_TEN)
+        elif stem in _NUMBER_HUNDREDS:
+            add(_NUMBER_HUNDREDS[stem], _LEVEL_HUNDRED)
+        elif stem in _NUMBER_SCALES:
+            group = (group if has_group else 1) * _NUMBER_SCALES[stem]
+            has_group = True
+            last_level = _LEVEL_AFTER_SCALE
+        else:
+            flush()
+    flush()
+    return numbers
+
+
+def _semantic_gate_flags(query_text: str, candidate_text: str) -> list[str]:
+    """Detect meaning-inverting divergences that a purely textual similarity
+    score cannot see (negation, changed numbers), so a strong fuzzy match can
+    still be routed to manual review instead of being auto-assembled."""
+
+    flags: list[str] = []
+    if _count_negations(query_text) != _count_negations(candidate_text):
+        flags.append("negation")
+    if Counter(_extract_numbers(query_text)) != Counter(_extract_numbers(candidate_text)):
+        flags.append("number")
+    return flags
 
 
 def parse_timecode(value: str | float | int | None, fps: float = 25.0) -> float | None:
@@ -607,17 +846,22 @@ class SyncMatcher:
         }
         self.config = config or MatcherConfig()
 
-    def _eligible_sources(self, request: AlignmentRequest) -> list[SyncSource]:
+    def _eligible_sources(
+        self, request: AlignmentRequest
+    ) -> tuple[list[SyncSource], list[dict[str, Any]]]:
         if request.source_ids:
-            return [
-                self.sources[source_id]
-                for source_id in request.source_ids
-                if source_id in self.sources and source_id in self.indexes
-            ]
+            return (
+                [
+                    self.sources[source_id]
+                    for source_id in request.source_ids
+                    if source_id in self.sources and source_id in self.indexes
+                ],
+                [],
+            )
         available = [source for source in self.sources.values() if source.id in self.indexes]
         speaker_tokens = normalize_text(request.speaker)
         if not speaker_tokens:
-            return available
+            return available, []
         universal = [source for source in available if source.all_speakers]
 
         def source_speaker_tokens(source: SyncSource) -> list[list[str]]:
@@ -637,33 +881,52 @@ class SyncMatcher:
             if any(tokens == speaker_tokens for tokens in source_speaker_tokens(source))
         ]
         if exact:
-            return with_universal(prefer_rendered_viewings(exact))
-        query_name = set(speaker_tokens)
-        fuzzy = [
-            source
+            selected = with_universal(prefer_rendered_viewings(exact))
+        else:
+            query_name = set(speaker_tokens)
+            fuzzy = [
+                source
+                for source in available
+                if any(
+                    query_name.intersection(tokens)
+                    or SequenceMatcher(
+                        None, " ".join(speaker_tokens), " ".join(tokens), autojunk=False
+                    ).ratio()
+                    >= 0.72
+                    for tokens in source_speaker_tokens(source)
+                )
+            ]
+            if fuzzy:
+                selected = with_universal(prefer_rendered_viewings(fuzzy))
+            else:
+                # A source registered without speaker metadata remains
+                # searchable, but a clearly different named speaker is not
+                # searched in this interview.
+                selected = with_universal(
+                    prefer_rendered_viewings(
+                        [source for source in available if not source_speaker_tokens(source)]
+                    )
+                )
+        selected_ids = {source.id for source in selected}
+        # Sources excluded purely because their registered speaker names did
+        # not match the request are surfaced so the UI can explain a
+        # not_found result instead of leaving the operator to guess.
+        filtered = [
+            {"source_id": source.id, "source_speakers": list(source.speaker_names)}
             for source in available
-            if any(
-                query_name.intersection(tokens)
-                or SequenceMatcher(
-                    None, " ".join(speaker_tokens), " ".join(tokens), autojunk=False
-                ).ratio()
-                >= 0.72
-                for tokens in source_speaker_tokens(source)
-            )
+            if source.id not in selected_ids and source_speaker_tokens(source)
         ]
-        if fuzzy:
-            return with_universal(prefer_rendered_viewings(fuzzy))
-        # A source registered without speaker metadata remains searchable, but
-        # a clearly different named speaker is not searched in this interview.
-        return with_universal(
-            prefer_rendered_viewings(
-                [source for source in available if not source_speaker_tokens(source)]
-            )
-        )
+        return selected, filtered
 
     def match(self, request: AlignmentRequest) -> SyncMatch:
         query = normalize_text(request.text)
-        sources = self._eligible_sources(request)
+        sources, speaker_filtered = self._eligible_sources(request)
+
+        def _metadata(base: dict[str, Any]) -> dict[str, Any]:
+            if speaker_filtered:
+                return {**base, "speaker_filtered_sources": speaker_filtered}
+            return base
+
         if len(query) < 2 or not sources:
             return SyncMatch(
                 segment_id=request.segment_id,
@@ -672,6 +935,7 @@ class SyncMatcher:
                 approximate_timecode=str(request.approximate_timecode or ""),
                 status="not_found",
                 strategy="insufficient_input",
+                metadata=_metadata({}),
             )
 
         local: list[_Candidate] = []
@@ -757,6 +1021,7 @@ class SyncMatcher:
                 status="not_found",
                 strategy=candidates[0].strategy if candidates else "no_candidates",
                 alternatives=alternatives,
+                metadata=_metadata({}),
             )
 
         best = candidates[0]
@@ -764,12 +1029,16 @@ class SyncMatcher:
         ambiguous = bool(
             other and best.confidence - other.confidence < self.config.ambiguity_margin
         )
+        # Negations and changed numbers can flip the meaning of an otherwise
+        # highly similar sentence; such matches must never be auto-assembled.
+        semantic_flags = _semantic_gate_flags(request.text, best.text)
         # A strong global fallback is useful, but its disagreement with the
         # supplied timecode must remain visible to an editor.
         auto = (
             best.confidence >= self.config.auto_threshold
             and not ambiguous
             and best.strategy != "fallback_full"
+            and not semantic_flags
         )
         status: MatchStatus = "auto_matched" if auto else "needs_review"
         alternatives = []
@@ -798,8 +1067,11 @@ class SyncMatcher:
             matched_text=best.text,
             strategy=best.strategy,
             alternatives=alternatives,
-            metadata={
-                "ambiguous": ambiguous,
-                "timecode_mode": request.timecode_mode,
-            },
+            metadata=_metadata(
+                {
+                    "ambiguous": ambiguous,
+                    "timecode_mode": request.timecode_mode,
+                    "semantic_flags": semantic_flags,
+                }
+            ),
         )
