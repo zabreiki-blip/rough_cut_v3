@@ -160,6 +160,30 @@ def test_word_index_is_sorted_and_serializable() -> None:
     assert restored.duration_sec == 2.5
 
 
+def test_word_timestamp_speaker_round_trips() -> None:
+    word = WordTimestamp("привет", 0.0, 0.5, speaker="ГОЛОС 1")
+    restored = WordTimestamp.from_dict(word.to_dict())
+    assert restored.speaker == "ГОЛОС 1"
+
+
+def test_word_timestamp_from_dict_defaults_speaker_for_legacy_files() -> None:
+    # Files saved before the "speaker" field existed have no such key.
+    restored = WordTimestamp.from_dict({"word": "слово", "start": 0.0, "end": 0.4})
+    assert restored.speaker == ""
+
+
+def test_word_index_speaker_labels_survive_round_trip() -> None:
+    index = WordIndex(
+        source_id="s1",
+        words=[
+            WordTimestamp("привет", 0.0, 0.5, speaker="ГОЛОС 1"),
+            WordTimestamp("мир", 0.5, 1.0, speaker=""),
+        ],
+    )
+    restored = WordIndex.from_dict(index.to_dict())
+    assert [word.speaker for word in restored.words] == ["ГОЛОС 1", ""]
+
+
 def test_source_store_upserts_atomically_and_accepts_bare_list() -> None:
     with TemporaryDirectory() as temporary:
         path = Path(temporary) / "work" / "sync_sources.json"

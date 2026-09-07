@@ -178,6 +178,12 @@ class WordTimestamp:
     start: float
     end: float
     confidence: float | None = None
+    # Diarization label of the speaker who uttered this word (e.g. "ГОЛОС 1").
+    # Only the cloud ASR backend supplies this; local Whisper backends never
+    # diarize, so it stays "" for them. Optional and additive: old files
+    # saved before this field existed simply have no "speaker" key, and
+    # ``from_dict`` below defaults it to "" for those.
+    speaker: str = ""
 
     def __post_init__(self) -> None:
         if not self.word.strip():
@@ -200,6 +206,7 @@ class WordTimestamp:
             start=_number(value.get("start")),
             end=_number(value.get("end", value.get("start"))),
             confidence=None if confidence is None else max(0.0, min(1.0, _number(confidence))),
+            speaker=str(value.get("speaker") or "").strip(),
         )
 
 
@@ -335,6 +342,25 @@ class AlignmentRequest:
     approximate_timecode: str | float | None = None
     source_ids: tuple[str, ...] = ()
     timecode_mode: TimecodeMode = "relative"
+    # When all three ``anchor_*`` fields are set, ``SyncMatcher.match`` searches
+    # only inside ``[anchor_lower_sec, anchor_upper_sec]`` of ``anchor_source_id``
+    # (see the second, anchor-bounded matching pass in ``api_sync_worker.py``)
+    # instead of the usual whole-source / approximate-timecode-window search,
+    # and never widens that search via ``fallback_full``. Left unset, matching
+    # behaves exactly as before.
+    anchor_source_id: str = ""
+    anchor_lower_sec: float | None = None
+    anchor_upper_sec: float | None = None
+    # When set and the target source's word index actually carries diarization
+    # labels (``WordIndex.metadata["has_speaker_labels"]``), ``SyncMatcher``
+    # additionally requires a candidate span to be dominated by this voice
+    # label (see ``_MIN_VOICE_SHARE`` in ``sync_matcher.py``). Sources without
+    # labels ignore this field entirely, so old transcripts keep matching
+    # exactly as before. If both anchor bounds and ``voice_label`` are set,
+    # the anchor-bounded search takes priority (it is a strictly narrower,
+    # already-trustworthy window) and ``voice_label`` is not applied on top
+    # of it -- see ``SyncMatcher.match``.
+    voice_label: str = ""
 
     def __post_init__(self) -> None:
         if not self.segment_id.strip():
@@ -343,3 +369,12 @@ class AlignmentRequest:
             raise ValueError("alignment text must not be empty")
         if self.timecode_mode not in {"relative", "display"}:
             raise ValueError(f"invalid timecode_mode: {self.timecode_mode}")
+        if (self.anchor_lower_sec is None) != (self.anchor_upper_sec is None):
+            raise ValueError("anchor_lower_sec and anchor_upper_sec must be set together")
+        if self.anchor_lower_sec is not None and self.anchor_upper_sec is not None:
+            if not self.anchor_source_id.strip():
+                raise ValueError("anchor_source_id must be set when anchor bounds are given")
+            if not isfinite(self.anchor_lower_sec) or not isfinite(self.anchor_upper_sec):
+                raise ValueError("anchor bounds must be finite")
+            if self.anchor_lower_sec < 0 or self.anchor_upper_sec < self.anchor_lower_sec:
+                raise ValueError("invalid anchor bounds")

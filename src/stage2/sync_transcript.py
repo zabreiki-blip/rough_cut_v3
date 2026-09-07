@@ -66,6 +66,10 @@ def _explicit_words(values: Any) -> list[WordTimestamp]:
         confidence_value = _float_or_none(confidence)
         if confidence_value is not None:
             confidence_value = max(0.0, min(1.0, confidence_value))
+        # Cloud-diarized input carries a "speaker" label on each word/segment
+        # (see stage2.whisper_runner._transcribe_cloud); local backends never
+        # set it, so it defaults to "".
+        speaker = str(item.get("speaker") or "").strip()
         # Some engines put more than one lexical token in a timed "word".  Keep
         # time useful by interpolating the supplied interval over those tokens.
         tokens = _TOKEN_RE.findall(text)
@@ -75,7 +79,7 @@ def _explicit_words(values: Any) -> list[WordTimestamp]:
         for index, token in enumerate(tokens):
             token_start = start + width * index
             token_end = end if index == len(tokens) - 1 else start + width * (index + 1)
-            result.append(WordTimestamp(token, token_start, token_end, confidence_value))
+            result.append(WordTimestamp(token, token_start, token_end, confidence_value, speaker))
     return result
 
 
@@ -165,7 +169,31 @@ def ingest_word_index(
         raise ValueError("source_id is required for a word index")
     if not words:
         raise ValueError("transcript contains no valid timed words")
-    metadata = {**metadata, "timestamp_precision": "interpolated" if interpolated else "word"}
+    # When words are already flattened by the caller (e.g. cloud-audio's
+    # interpolated per-segment words, see whisper_runner._transcribe_cloud),
+    # the segments/chunks branch above never runs, so ``interpolated`` stays
+    # False even though the backend's own metadata already records the true
+    # precision. Prefer that authoritative value when present so the
+    # top-level flag never claims measured word-level accuracy for a backend
+    # that only interpolated within a segment span.
+    backend_metadata = metadata.get("backend_metadata")
+    backend_precision = (
+        backend_metadata.get("timestamp_precision")
+        if isinstance(backend_metadata, dict)
+        else None
+    )
+    top_level_precision = (
+        str(backend_precision) if backend_precision else ("interpolated" if interpolated else "word")
+    )
+    # Lets a consumer (e.g. the Stage 3 matcher, not built in this step) tell
+    # apart a cloud-diarized transcript from a local one without scanning
+    # every word for a non-empty ``speaker`` label.
+    has_speaker_labels = any(word.speaker for word in words)
+    metadata = {
+        **metadata,
+        "timestamp_precision": top_level_precision,
+        "has_speaker_labels": has_speaker_labels,
+    }
     return WordIndex(
         source_id=actual_source,
         words=words,

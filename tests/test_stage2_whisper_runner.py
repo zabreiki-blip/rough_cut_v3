@@ -415,6 +415,36 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertEqual(meta["cost_usd"], 0.0123)
         self.assertEqual(meta["timestamp_precision"], "interpolated")
         self.assertNotIn("segments", meta)
+        # Every interpolated word inherits its source segment's diarization label.
+        self.assertTrue(all(w["speaker"] == "ГОЛОС 1" for w in words))
+
+    def test_transcribe_cloud_leaves_speaker_empty_for_unlabelled_segments(self) -> None:
+        cloud_result = {
+            "segments": [
+                {"text": "без метки", "start": 0.0, "end": 1.0, "speaker": None},
+            ],
+            "speakers": [],
+            "language": "ru",
+            "model": "google/gemini-3.7-flash",
+            "backend": "cloud-audio",
+            "duration_sec": 1.0,
+            "cost_usd": 0.0,
+        }
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with patch(
+                "stage2.whisper_runner.transcribe_cloud",
+                return_value=cloud_result,
+            ):
+                result = transcribe_audio(
+                    audio_path,
+                    backend="cloud-audio",
+                    model="google/gemini-3.7-flash",
+                )
+
+        for word in result["words"]:
+            self.assertNotIn("speaker", word)
 
     def test_transcribe_cloud_ignores_local_model_name_and_uses_cloud_default(
         self,

@@ -56,6 +56,28 @@ def test_ingests_openai_top_level_words_and_infers_source() -> None:
     assert index.metadata["backend"] == "mlx-whisper"
 
 
+def test_cloud_audio_top_level_words_report_interpolated_precision() -> None:
+    # cloud-audio (see whisper_runner._transcribe_cloud) already flattens its
+    # segment-interpolated words into a top-level "words" list before this
+    # function sees them, so the segments/chunks branch that would otherwise
+    # set the local ``interpolated`` flag never runs. The backend's own
+    # ``backend_metadata.timestamp_precision`` must still be honoured for the
+    # top-level flag instead of defaulting to "word".
+    index = ingest_word_index(
+        {
+            "source_id": "s1",
+            "backend": "cloud-audio",
+            "backend_metadata": {"timestamp_precision": "interpolated"},
+            "words": [
+                {"word": "раз", "start": 1.0, "end": 1.05},
+                {"word": "два", "start": 1.05, "end": 1.1},
+            ],
+        }
+    )
+    assert index.metadata["timestamp_precision"] == "interpolated"
+    assert index.metadata["backend_metadata"]["timestamp_precision"] == "interpolated"
+
+
 def test_hf_chunks_are_tokenized_and_interval_is_interpolated() -> None:
     index = ingest_word_index(
         {"chunks": [{"text": "энергетическим вампиром", "timestamp": [10.0, 12.0]}]},
@@ -66,6 +88,41 @@ def test_hf_chunks_are_tokenized_and_interval_is_interpolated() -> None:
     assert index.words[0].end == 11.0
     assert index.words[1].end == 12.0
     assert index.metadata["timestamp_precision"] == "interpolated"
+
+
+def test_segment_speaker_label_is_carried_onto_every_word() -> None:
+    index = ingest_word_index(
+        {
+            "source_id": "s1",
+            "segments": [
+                {"text": "раз два", "start": 0.0, "end": 2.0, "speaker": "ГОЛОС 1"},
+                {"text": "три четыре", "start": 2.0, "end": 4.0, "speaker": "ГОЛОС 2"},
+                {"text": "пять", "start": 4.0, "end": 5.0},
+            ],
+        }
+    )
+    labels = {item.word: item.speaker for item in index.words}
+    assert labels["раз"] == "ГОЛОС 1"
+    assert labels["два"] == "ГОЛОС 1"
+    assert labels["три"] == "ГОЛОС 2"
+    assert labels["четыре"] == "ГОЛОС 2"
+    # A segment without a "speaker" key must not invent one.
+    assert labels["пять"] == ""
+    assert index.metadata["has_speaker_labels"] is True
+
+
+def test_has_speaker_labels_is_false_without_any_diarization() -> None:
+    index = ingest_word_index(
+        {
+            "source_id": "s1",
+            "words": [
+                {"word": "раз", "start": 1.0, "end": 1.2},
+                {"word": "два", "start": 1.3, "end": 1.6},
+            ],
+        }
+    )
+    assert all(item.speaker == "" for item in index.words)
+    assert index.metadata["has_speaker_labels"] is False
 
 
 def test_invalid_entries_are_skipped_but_empty_transcript_is_rejected() -> None:

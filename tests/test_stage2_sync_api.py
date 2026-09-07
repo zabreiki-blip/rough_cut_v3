@@ -12,6 +12,7 @@ import wave
 import pytest
 
 import api
+from api_sync_worker import _ANCHOR_WINDOW_PADDING_SEC, _MAX_ANCHOR_INTERVAL_SEC
 from stage2.sync_llm_review import SemanticDecision
 from stage2.sync_models import SyncAlternative, SyncMatch, SyncSource, WordIndex, WordTimestamp
 
@@ -293,6 +294,1040 @@ def _write_shared_timeline_normalization(projects: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _write_anchor_pass_normalization(projects: Path) -> Path:
+    """Two low-confidence targets bracketed by confident anchors, plus one
+    low-confidence target that only has an anchor on one side."""
+
+    def _block(uid: str, order: int, text: str, timecode: str) -> dict:
+        return {
+            "uid": uid,
+            "order": order,
+            "type": "sync",
+            "original_text": text,
+            "normalized_text": text,
+            "speaker": "Татьяна Васильева",
+            "timecode_start": timecode,
+        }
+
+    path = projects / "demo" / "work" / "scenario_normalized.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "source": "",
+                "source_hash": "",
+                "status": "confirmed",
+                "revision": 5,
+                "blocks": [
+                    _block("anchor-left", 1, "первый уверенный якорь", "00:00:10"),
+                    _block("target-fixed", 2, "цель которую нужно исправить", "00:00:30"),
+                    _block(
+                        "target-lower-conf",
+                        3,
+                        "цель для которой хуже не лучше",
+                        "00:00:40",
+                    ),
+                    _block("anchor-right", 4, "второй уверенный якорь", "00:00:50"),
+                    _block(
+                        "target-no-right-anchor",
+                        5,
+                        "цель без правого якоря",
+                        "00:01:00",
+                    ),
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_second_pass_fixes_a_far_mismatch_between_confident_anchors(sync_api) -> None:
+    client, projects = sync_api
+    _write_anchor_pass_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={
+                "project": "demo",
+                "words": [{"word": "заглушка", "start": 0.0, "end": 0.2}],
+            },
+        ).status_code
+        == 200
+    )
+
+    first_pass_results = {
+        "anchor-left": SyncMatch(
+            segment_id="anchor-left",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=15.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "anchor-right": SyncMatch(
+            segment_id="anchor-right",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=50.0,
+            source_out_sec=55.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-fixed": SyncMatch(
+            segment_id="target-fixed",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=0.60,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-lower-conf": SyncMatch(
+            segment_id="target-lower-conf",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=600.0,
+            source_out_sec=605.0,
+            confidence=0.70,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-no-right-anchor": SyncMatch(
+            segment_id="target-no-right-anchor",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=700.0,
+            source_out_sec=705.0,
+            confidence=0.55,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+    anchor_calls: list[str] = []
+
+    def fake_match(_matcher, request):
+        if request.anchor_source_id:
+            anchor_calls.append(request.segment_id)
+            if request.segment_id == "target-fixed":
+                assert request.anchor_source_id == "vasilieva_01"
+                assert request.anchor_lower_sec is not None and request.anchor_upper_sec is not None
+                assert request.anchor_lower_sec < 30.0 < request.anchor_upper_sec
+                return SyncMatch(
+                    segment_id="target-fixed",
+                    query_text=request.text,
+                    source_id="vasilieva_01",
+                    source_in_sec=30.0,
+                    source_out_sec=35.0,
+                    confidence=0.85,
+                    status="auto_matched",
+                    strategy="between_anchors",
+                )
+            if request.segment_id == "target-lower-conf":
+                return SyncMatch(
+                    segment_id="target-lower-conf",
+                    query_text=request.text,
+                    source_id="vasilieva_01",
+                    source_in_sec=42.0,
+                    source_out_sec=44.0,
+                    confidence=0.40,
+                    status="needs_review",
+                    strategy="between_anchors",
+                )
+            raise AssertionError(
+                f"unexpected anchor-mode retry for {request.segment_id!r} (no complete anchor pair)"
+            )
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    assert "target-no-right-anchor" not in anchor_calls
+    assert set(anchor_calls) == {"target-fixed", "target-lower-conf"}
+
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+
+    fixed = matches["target-fixed"]
+    assert fixed["source_in_sec"] == 30.0
+    assert fixed["confidence"] == 0.85
+    assert fixed["strategy"] == "between_anchors"
+    assert fixed["status"] == "auto_matched"
+
+    unchanged_lower_conf = matches["target-lower-conf"]
+    assert unchanged_lower_conf["source_in_sec"] == 600.0
+    assert unchanged_lower_conf["confidence"] == 0.70
+    assert unchanged_lower_conf["strategy"] == "fallback_full"
+
+    unpaired = matches["target-no-right-anchor"]
+    assert unpaired["source_in_sec"] == 700.0
+    assert unpaired["confidence"] == 0.55
+    assert unpaired["strategy"] == "fallback_full"
+
+
+def test_second_pass_handles_anchors_reordered_relative_to_the_source(sync_api) -> None:
+    """A scriptwriter can reorder quotes, so the anchor that comes first in
+    the scenario can sit *later* in the source recording than the anchor
+    that comes after it. The window must be bounded by source position, not
+    scenario order, or it collapses to a negative width and the segment is
+    silently skipped."""
+
+    client, projects = sync_api
+    _write_anchor_pass_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={
+                "project": "demo",
+                "words": [{"word": "заглушка", "start": 0.0, "end": 0.2}],
+            },
+        ).status_code
+        == 200
+    )
+
+    first_pass_results = {
+        "anchor-left": SyncMatch(
+            segment_id="anchor-left",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=50.0,
+            source_out_sec=55.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "anchor-right": SyncMatch(
+            segment_id="anchor-right",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=15.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-fixed": SyncMatch(
+            segment_id="target-fixed",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=0.60,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-lower-conf": SyncMatch(
+            segment_id="target-lower-conf",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=600.0,
+            source_out_sec=605.0,
+            confidence=0.70,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-no-right-anchor": SyncMatch(
+            segment_id="target-no-right-anchor",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=700.0,
+            source_out_sec=705.0,
+            confidence=0.55,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+    anchor_calls: list[str] = []
+
+    def fake_match(_matcher, request):
+        if request.anchor_source_id:
+            anchor_calls.append(request.segment_id)
+            assert request.anchor_lower_sec == 0.0
+            assert request.anchor_upper_sec == 55.0 + _ANCHOR_WINDOW_PADDING_SEC
+            if request.segment_id == "target-fixed":
+                return SyncMatch(
+                    segment_id="target-fixed",
+                    query_text=request.text,
+                    source_id="vasilieva_01",
+                    source_in_sec=30.0,
+                    source_out_sec=35.0,
+                    confidence=0.85,
+                    status="auto_matched",
+                    strategy="between_anchors",
+                )
+            return first_pass_results[request.segment_id]
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    assert set(anchor_calls) == {"target-fixed", "target-lower-conf"}
+
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    fixed = matches["target-fixed"]
+    assert fixed["source_in_sec"] == 30.0
+    assert fixed["confidence"] == 0.85
+    assert fixed["status"] == "auto_matched"
+
+
+def test_second_pass_skips_an_anchor_interval_wider_than_the_max(sync_api) -> None:
+    client, projects = sync_api
+    _write_anchor_pass_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={
+                "project": "demo",
+                "words": [{"word": "заглушка", "start": 0.0, "end": 0.2}],
+            },
+        ).status_code
+        == 200
+    )
+
+    far_apart_width = _MAX_ANCHOR_INTERVAL_SEC + 2 * _ANCHOR_WINDOW_PADDING_SEC + 100.0
+    first_pass_results = {
+        "anchor-left": SyncMatch(
+            segment_id="anchor-left",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=0.0,
+            source_out_sec=1.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "anchor-right": SyncMatch(
+            segment_id="anchor-right",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=far_apart_width,
+            source_out_sec=far_apart_width + 1.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-fixed": SyncMatch(
+            segment_id="target-fixed",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=0.60,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-lower-conf": SyncMatch(
+            segment_id="target-lower-conf",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=600.0,
+            source_out_sec=605.0,
+            confidence=0.70,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-no-right-anchor": SyncMatch(
+            segment_id="target-no-right-anchor",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=700.0,
+            source_out_sec=705.0,
+            confidence=0.55,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+
+    def fake_match(_matcher, request):
+        if request.anchor_source_id:
+            raise AssertionError(
+                f"anchor interval wider than _MAX_ANCHOR_INTERVAL_SEC should be skipped "
+                f"for {request.segment_id!r}"
+            )
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    fixed = matches["target-fixed"]
+    assert fixed["source_in_sec"] == 500.0
+    assert fixed["confidence"] == 0.60
+    assert fixed["strategy"] == "fallback_full"
+
+
+def _run_second_pass_replacement_scenario(
+    sync_api,
+    *,
+    prior_confidence: float,
+    prior_status: str,
+    retry_confidence: float,
+    retry_status: str,
+):
+    """Shared harness for the "should this retry replace the prior match?"
+    scenarios: a single ``target-fixed`` segment bracketed by two confident
+    anchors, whose prior and retried match are fully controlled."""
+
+    client, projects = sync_api
+    _write_anchor_pass_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={
+                "project": "demo",
+                "words": [{"word": "заглушка", "start": 0.0, "end": 0.2}],
+            },
+        ).status_code
+        == 200
+    )
+
+    first_pass_results = {
+        "anchor-left": SyncMatch(
+            segment_id="anchor-left",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=15.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "anchor-right": SyncMatch(
+            segment_id="anchor-right",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=50.0,
+            source_out_sec=55.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-fixed": SyncMatch(
+            segment_id="target-fixed",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=prior_confidence,
+            status=prior_status,
+            strategy="fallback_full",
+        ),
+        "target-lower-conf": SyncMatch(
+            segment_id="target-lower-conf",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=600.0,
+            source_out_sec=605.0,
+            confidence=0.70,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+        "target-no-right-anchor": SyncMatch(
+            segment_id="target-no-right-anchor",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=700.0,
+            source_out_sec=705.0,
+            confidence=0.55,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+
+    def fake_match(_matcher, request):
+        if request.anchor_source_id:
+            if request.segment_id == "target-fixed":
+                return SyncMatch(
+                    segment_id="target-fixed",
+                    query_text=request.text,
+                    source_id="vasilieva_01",
+                    source_in_sec=30.0,
+                    source_out_sec=35.0,
+                    confidence=retry_confidence,
+                    status=retry_status,
+                    strategy="between_anchors",
+                )
+            return first_pass_results[request.segment_id]
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    return matches["target-fixed"]
+
+
+def test_second_pass_replaces_ambiguous_needs_review_at_full_confidence_with_auto_matched(
+    sync_api,
+) -> None:
+    """confidence=1.00 status=needs_review usually means the prior pass hit
+    ``MatcherConfig.ambiguity_margin`` (a close second candidate), not a weak
+    match. Removing that competing candidate inside the narrower anchor
+    window and getting the same confidence back as an unambiguous
+    ``auto_matched`` is a real improvement and must be kept."""
+
+    fixed = _run_second_pass_replacement_scenario(
+        sync_api,
+        prior_confidence=1.0,
+        prior_status="needs_review",
+        retry_confidence=1.0,
+        retry_status="auto_matched",
+    )
+    assert fixed["source_in_sec"] == 30.0
+    assert fixed["confidence"] == 1.0
+    assert fixed["status"] == "auto_matched"
+    assert fixed["strategy"] == "between_anchors"
+
+
+def test_second_pass_keeps_prior_match_when_confidence_and_status_are_unchanged(
+    sync_api,
+) -> None:
+    fixed = _run_second_pass_replacement_scenario(
+        sync_api,
+        prior_confidence=0.60,
+        prior_status="needs_review",
+        retry_confidence=0.60,
+        retry_status="needs_review",
+    )
+    assert fixed["source_in_sec"] == 500.0
+    assert fixed["confidence"] == 0.60
+    assert fixed["status"] == "needs_review"
+    assert fixed["strategy"] == "fallback_full"
+
+
+def test_second_pass_never_replaces_prior_match_with_a_lower_confidence_result(
+    sync_api,
+) -> None:
+    """Even a better status (auto_matched) must not win over a prior result
+    if it comes with a lower confidence -- confidence never regresses."""
+
+    fixed = _run_second_pass_replacement_scenario(
+        sync_api,
+        prior_confidence=0.70,
+        prior_status="needs_review",
+        retry_confidence=0.50,
+        retry_status="auto_matched",
+    )
+    assert fixed["source_in_sec"] == 500.0
+    assert fixed["confidence"] == 0.70
+    assert fixed["status"] == "needs_review"
+    assert fixed["strategy"] == "fallback_full"
+
+
+def _voice_block(uid: str, order: int, speaker: str, text: str, timecode: str) -> dict:
+    return {
+        "uid": uid,
+        "order": order,
+        "type": "sync",
+        "original_text": text,
+        "normalized_text": text,
+        "speaker": speaker,
+        "timecode_start": timecode,
+    }
+
+
+def _write_voice_pass_normalization(projects: Path, blocks: list[dict]) -> Path:
+    path = projects / "demo" / "work" / "scenario_normalized.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "source": "",
+                "source_hash": "",
+                "status": "confirmed",
+                "revision": 6,
+                "blocks": blocks,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _put_labeled_words(client, source_id: str, words: list[dict]) -> None:
+    assert (
+        client.put(
+            f"/stage2/sync-sources/{source_id}/words",
+            json={"project": "demo", "words": words},
+        ).status_code
+        == 200
+    )
+
+
+def _labeled_words(voice: str, lower: float, upper: float, count: int = 4) -> list[dict]:
+    step = (upper - lower) / count
+    return [
+        {
+            "word": f"слово{i}",
+            "start": lower + i * step,
+            "end": lower + (i + 1) * step,
+            "speaker": voice,
+        }
+        for i in range(count)
+    ]
+
+
+def test_voice_mapping_established_with_two_anchors_fixes_weak_segment(sync_api) -> None:
+    """Two confident anchors agreeing on a voice for a scenario speaker, with
+    a clear (>=70%) majority, let the second pass fix a weak segment for
+    that same speaker even when it has no usable anchor pair of its own."""
+
+    client, projects = sync_api
+    _write_voice_pass_normalization(
+        projects,
+        [
+            _voice_block("anchor-ivan-1", 1, "Иван", "первый якорь ивана", "00:00:05"),
+            _voice_block("anchor-ivan-2", 2, "Иван", "второй якорь ивана", "00:00:15"),
+            _voice_block("target-ivan", 3, "Иван", "цель ивана без правого якоря", "00:00:25"),
+        ],
+    )
+    assert _post_source(client).status_code == 201
+    _put_labeled_words(
+        client,
+        "vasilieva_01",
+        [
+            *_labeled_words("ГОЛОС 1", 10.0, 12.0),
+            *_labeled_words("ГОЛОС 1", 20.0, 22.0),
+        ],
+    )
+
+    first_pass_results = {
+        "anchor-ivan-1": SyncMatch(
+            segment_id="anchor-ivan-1",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=12.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "anchor-ivan-2": SyncMatch(
+            segment_id="anchor-ivan-2",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=20.0,
+            source_out_sec=22.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-ivan": SyncMatch(
+            segment_id="target-ivan",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=0.60,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+    voice_calls: dict[str, str] = {}
+
+    def fake_match(_matcher, request):
+        if request.voice_label:
+            voice_calls[request.segment_id] = request.voice_label
+            return SyncMatch(
+                segment_id=request.segment_id,
+                query_text=request.text,
+                source_id="vasilieva_01",
+                source_in_sec=40.0,
+                source_out_sec=42.0,
+                confidence=0.90,
+                status="auto_matched",
+                strategy="voice_scoped",
+            )
+        assert not request.anchor_source_id, "no usable anchor pair should exist for target-ivan"
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    assert voice_calls == {"target-ivan": "ГОЛОС 1"}
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    fixed = matches["target-ivan"]
+    assert fixed["source_in_sec"] == 40.0
+    assert fixed["confidence"] == 0.90
+    assert fixed["status"] == "auto_matched"
+    assert fixed["strategy"] == "voice_scoped"
+
+
+def test_voice_mapping_not_established_with_a_single_anchor(sync_api) -> None:
+    client, projects = sync_api
+    _write_voice_pass_normalization(
+        projects,
+        [
+            _voice_block("anchor-ivan-1", 1, "Иван", "единственный якорь ивана", "00:00:05"),
+            _voice_block("target-ivan", 2, "Иван", "цель ивана без правого якоря", "00:00:25"),
+        ],
+    )
+    assert _post_source(client).status_code == 201
+    _put_labeled_words(client, "vasilieva_01", _labeled_words("ГОЛОС 1", 10.0, 12.0))
+
+    first_pass_results = {
+        "anchor-ivan-1": SyncMatch(
+            segment_id="anchor-ivan-1",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=12.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-ivan": SyncMatch(
+            segment_id="target-ivan",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=0.60,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+    voice_calls: dict[str, str] = {}
+
+    def fake_match(_matcher, request):
+        if request.voice_label:
+            voice_calls[request.segment_id] = request.voice_label
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    assert voice_calls == {}
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    unchanged = matches["target-ivan"]
+    assert unchanged["source_in_sec"] == 500.0
+    assert unchanged["confidence"] == 0.60
+    assert unchanged["status"] == "needs_review"
+
+
+def test_voice_mapping_not_established_with_an_even_split_between_voices(sync_api) -> None:
+    client, projects = sync_api
+    _write_voice_pass_normalization(
+        projects,
+        [
+            _voice_block("anchor-ivan-1", 1, "Иван", "первый якорь ивана", "00:00:05"),
+            _voice_block("anchor-ivan-2", 2, "Иван", "второй якорь ивана", "00:00:15"),
+            _voice_block("target-ivan", 3, "Иван", "цель ивана без правого якоря", "00:00:25"),
+        ],
+    )
+    assert _post_source(client).status_code == 201
+    _put_labeled_words(
+        client,
+        "vasilieva_01",
+        [
+            # 50/50 split between two voices inside each anchor's span: no
+            # majority reaches ``_MIN_VOICE_MAPPING_SHARE``.
+            *_labeled_words("ГОЛОС 1", 10.0, 11.0, count=2),
+            *_labeled_words("ГОЛОС 2", 11.0, 12.0, count=2),
+            *_labeled_words("ГОЛОС 1", 20.0, 21.0, count=2),
+            *_labeled_words("ГОЛОС 2", 21.0, 22.0, count=2),
+        ],
+    )
+
+    first_pass_results = {
+        "anchor-ivan-1": SyncMatch(
+            segment_id="anchor-ivan-1",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=12.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "anchor-ivan-2": SyncMatch(
+            segment_id="anchor-ivan-2",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=20.0,
+            source_out_sec=22.0,
+            confidence=0.95,
+            status="auto_matched",
+            strategy="near_timecode",
+        ),
+        "target-ivan": SyncMatch(
+            segment_id="target-ivan",
+            query_text="",
+            source_id="vasilieva_01",
+            source_in_sec=500.0,
+            source_out_sec=505.0,
+            confidence=0.60,
+            status="needs_review",
+            strategy="fallback_full",
+        ),
+    }
+    voice_calls: dict[str, str] = {}
+
+    def fake_match(_matcher, request):
+        if request.voice_label:
+            voice_calls[request.segment_id] = request.voice_label
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    assert voice_calls == {}
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    unchanged = matches["target-ivan"]
+    assert unchanged["confidence"] == 0.60
+    assert unchanged["status"] == "needs_review"
+
+
+def test_voice_mapping_never_assigns_one_voice_to_two_speakers(sync_api) -> None:
+    """Иван has three strong anchors on "ГОЛОС 1" and Мария only two -- on a
+    conflict over the same voice label, Иван's stronger pair keeps it and
+    Мария gets no voice mapping at all, so her weak segment is left alone."""
+
+    client, projects = sync_api
+    _write_voice_pass_normalization(
+        projects,
+        [
+            _voice_block("anchor-ivan-1", 1, "Иван", "первый якорь ивана", "00:00:05"),
+            _voice_block("anchor-ivan-2", 2, "Иван", "второй якорь ивана", "00:00:15"),
+            _voice_block("anchor-ivan-3", 3, "Иван", "третий якорь ивана", "00:00:25"),
+            _voice_block("anchor-maria-1", 4, "Мария", "первый якорь марии", "00:00:35"),
+            _voice_block("anchor-maria-2", 5, "Мария", "второй якорь марии", "00:00:45"),
+            _voice_block("target-ivan", 6, "Иван", "цель ивана без якорей рядом", "00:01:05"),
+            _voice_block("target-maria", 7, "Мария", "цель марии без якорей рядом", "00:01:15"),
+        ],
+    )
+    assert _post_source(client).status_code == 201
+    _put_labeled_words(
+        client,
+        "vasilieva_01",
+        [
+            *_labeled_words("ГОЛОС 1", 10.0, 12.0),
+            *_labeled_words("ГОЛОС 1", 20.0, 22.0),
+            *_labeled_words("ГОЛОС 1", 30.0, 32.0),
+            *_labeled_words("ГОЛОС 1", 40.0, 42.0),
+            *_labeled_words("ГОЛОС 1", 50.0, 52.0),
+        ],
+    )
+
+    first_pass_results = {
+        "anchor-ivan-1": SyncMatch(
+            segment_id="anchor-ivan-1", query_text="", source_id="vasilieva_01",
+            source_in_sec=10.0, source_out_sec=12.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "anchor-ivan-2": SyncMatch(
+            segment_id="anchor-ivan-2", query_text="", source_id="vasilieva_01",
+            source_in_sec=20.0, source_out_sec=22.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "anchor-ivan-3": SyncMatch(
+            segment_id="anchor-ivan-3", query_text="", source_id="vasilieva_01",
+            source_in_sec=30.0, source_out_sec=32.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "anchor-maria-1": SyncMatch(
+            segment_id="anchor-maria-1", query_text="", source_id="vasilieva_01",
+            source_in_sec=40.0, source_out_sec=42.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "anchor-maria-2": SyncMatch(
+            segment_id="anchor-maria-2", query_text="", source_id="vasilieva_01",
+            source_in_sec=50.0, source_out_sec=52.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "target-ivan": SyncMatch(
+            segment_id="target-ivan", query_text="", source_id="vasilieva_01",
+            source_in_sec=500.0, source_out_sec=505.0, confidence=0.60,
+            status="needs_review", strategy="fallback_full",
+        ),
+        "target-maria": SyncMatch(
+            segment_id="target-maria", query_text="", source_id="vasilieva_01",
+            source_in_sec=600.0, source_out_sec=605.0, confidence=0.60,
+            status="needs_review", strategy="fallback_full",
+        ),
+    }
+    voice_calls: dict[str, str] = {}
+
+    def fake_match(_matcher, request):
+        if request.voice_label:
+            voice_calls[request.segment_id] = request.voice_label
+            return SyncMatch(
+                segment_id=request.segment_id,
+                query_text=request.text,
+                source_id="vasilieva_01",
+                source_in_sec=70.0,
+                source_out_sec=72.0,
+                confidence=0.90,
+                status="auto_matched",
+                strategy="voice_scoped",
+            )
+        assert not request.anchor_source_id, "no usable anchor pair should exist for these targets"
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    assert voice_calls == {"target-ivan": "ГОЛОС 1"}
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    assert matches["target-ivan"]["status"] == "auto_matched"
+    assert matches["target-ivan"]["source_in_sec"] == 70.0
+    unchanged_maria = matches["target-maria"]
+    assert unchanged_maria["confidence"] == 0.60
+    assert unchanged_maria["status"] == "needs_review"
+
+
+def test_voice_attempt_never_replaces_prior_match_with_a_lower_confidence_result(sync_api) -> None:
+    client, projects = sync_api
+    _write_voice_pass_normalization(
+        projects,
+        [
+            _voice_block("anchor-ivan-1", 1, "Иван", "первый якорь ивана", "00:00:05"),
+            _voice_block("anchor-ivan-2", 2, "Иван", "второй якорь ивана", "00:00:15"),
+            _voice_block("target-ivan", 3, "Иван", "цель ивана без правого якоря", "00:00:25"),
+        ],
+    )
+    assert _post_source(client).status_code == 201
+    _put_labeled_words(
+        client,
+        "vasilieva_01",
+        [
+            *_labeled_words("ГОЛОС 1", 10.0, 12.0),
+            *_labeled_words("ГОЛОС 1", 20.0, 22.0),
+        ],
+    )
+
+    first_pass_results = {
+        "anchor-ivan-1": SyncMatch(
+            segment_id="anchor-ivan-1", query_text="", source_id="vasilieva_01",
+            source_in_sec=10.0, source_out_sec=12.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "anchor-ivan-2": SyncMatch(
+            segment_id="anchor-ivan-2", query_text="", source_id="vasilieva_01",
+            source_in_sec=20.0, source_out_sec=22.0, confidence=0.95,
+            status="auto_matched", strategy="near_timecode",
+        ),
+        "target-ivan": SyncMatch(
+            segment_id="target-ivan", query_text="", source_id="vasilieva_01",
+            source_in_sec=500.0, source_out_sec=505.0, confidence=0.70,
+            status="needs_review", strategy="fallback_full",
+        ),
+    }
+
+    def fake_match(_matcher, request):
+        if request.voice_label:
+            return SyncMatch(
+                segment_id=request.segment_id,
+                query_text=request.text,
+                source_id="vasilieva_01",
+                source_in_sec=40.0,
+                source_out_sec=42.0,
+                confidence=0.50,
+                status="auto_matched",
+                strategy="voice_scoped",
+            )
+        result = first_pass_results[request.segment_id]
+        result.query_text = request.text
+        return result
+
+    with (
+        patch.object(api.SyncMatcher, "match", fake_match),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+
+    matches = {
+        item["segment_id"]: item
+        for item in client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matches"]
+    }
+    unchanged = matches["target-ivan"]
+    assert unchanged["source_in_sec"] == 500.0
+    assert unchanged["confidence"] == 0.70
+    assert unchanged["status"] == "needs_review"
 
 
 def _post_source(client, source_id: str = "vasilieva_01", speaker: str = "Татьяна Васильева"):

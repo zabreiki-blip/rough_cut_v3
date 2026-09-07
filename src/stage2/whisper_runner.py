@@ -173,13 +173,18 @@ def _clean_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if not text or not isfinite(start) or not isfinite(end) or start < 0 or end < start:
             continue
-        cleaned.append(
-            {
-                "word": text,
-                "start": round(start, 3),
-                "end": round(end, 3),
-            }
-        )
+        cleaned_item = {
+            "word": text,
+            "start": round(start, 3),
+            "end": round(end, 3),
+        }
+        # Only the cloud backend's interpolated words carry a diarization
+        # "speaker" label (see _transcribe_cloud below); local backends never
+        # set it, so the key is omitted rather than storing "" on every word.
+        speaker = str(item.get("speaker") or "").strip()
+        if speaker:
+            cleaned_item["speaker"] = speaker
+        cleaned.append(cleaned_item)
     cleaned.sort(key=lambda item: (item["start"], item["end"]))
     return cleaned
 

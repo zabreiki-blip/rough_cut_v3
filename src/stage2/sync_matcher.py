@@ -25,7 +25,7 @@ from .sync_models import (
 # (see api.py::_sync_matching_fingerprint) so that stale cached matches are
 # invalidated and recomputed instead of being silently reused after a
 # matcher code change.
-MATCHER_ALGORITHM_VERSION = 3
+MATCHER_ALGORITHM_VERSION = 6
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 _RUSSIAN_ENDINGS = tuple(
@@ -139,6 +139,19 @@ _FUZZY_DRIFT_PENALTY = 0.05
 # as variants of one occurrence rather than distinct alternatives.
 _DUPLICATE_MIN_OVERLAP_RATIO = 0.65
 
+# Below this query length, words-per-second statistics are too noisy to be a
+# reliable signal (a single filler word can double or halve the rate), so the
+# duration-plausibility filter is skipped entirely for very short quotes.
+_MIN_QUERY_WORDS_FOR_DURATION_CHECK = 4
+
+# A candidate span is accepted for a ``voice_label``-scoped request only when
+# at least this share of the words inside it were spoken by that voice. A
+# real reply routinely captures a short interjection, laugh, or a few words
+# of the interviewer/collocutor at its edges, so requiring 100% would reject
+# genuine matches; 60% still firmly favours the requested voice over anyone
+# else's.
+_MIN_VOICE_SHARE = 0.6
+
 
 def normalize_token(token: str) -> str:
     """Normalize a token and apply a deliberately conservative Russian stem."""
@@ -212,6 +225,26 @@ class MatcherConfig:
     max_alternatives: int = 3
     head_padding_sec: float = 0.5
     tail_padding_sec: float = 1.0
+    # Plausible Russian speech-rate bounds (words per second), used to reject
+    # candidates whose duration cannot physically correspond to the number of
+    # words in the query. 0.7 wps allows for slow, deliberate, pause-heavy
+    # speech (e.g. an emotional or emphatic delivery); 6.0 wps allows for
+    # fast conversational speech and rapid-fire scripted lines, with headroom
+    # above the ~4-5 wps typical of normal spoken Russian so genuine fast
+    # speakers are not penalized. Anything outside this range is a strong
+    # signal that a candidate only matched by chance on frequent words.
+    #
+    # Known trade-off: a handful of real transcripts contain short stretches
+    # of corrupted Whisper word-level timestamps (many words crammed into a
+    # sub-second window, e.g. ~0.05s/word instead of the surrounding
+    # ~0.25s/word), which can push an otherwise-correct match's *raw* trimmed
+    # span above 6.0 wps. Rather than loosening this bound to accommodate
+    # that upstream data-quality bug -- which would let genuinely
+    # implausible candidates (~12-13 wps) back in, defeating the filter's
+    # purpose -- such rare cases are left to fall through to
+    # ``needs_review``/``not_found`` for manual confirmation.
+    min_words_per_sec: float = 0.7
+    max_words_per_sec: float = 6.0
 
     def __post_init__(self) -> None:
         if self.search_window_sec <= 0:
@@ -228,6 +261,10 @@ class MatcherConfig:
             raise ValueError("review_threshold must not exceed auto_threshold")
         if self.max_alternatives < 0:
             raise ValueError("max_alternatives must not be negative")
+        if self.min_words_per_sec <= 0:
+            raise ValueError("min_words_per_sec must be positive")
+        if self.max_words_per_sec <= self.min_words_per_sec:
+            raise ValueError("max_words_per_sec must exceed min_words_per_sec")
 
 
 @dataclass(frozen=True)
@@ -244,6 +281,18 @@ class _Candidate:
     confidence: float
     text: str
     strategy: str
+
+
+@dataclass(frozen=True)
+class _SearchResult:
+    candidates: list[_Candidate]
+    # Number of candidate starting positions actually explored, independent
+    # of how many of them survived scoring/trimming into a real candidate.
+    # This is the correct proxy for search-budget accounting in ``match``:
+    # a start that was explored but trimmed away to nothing (no matching
+    # words at all) still consumed part of the fixed candidate-start budget
+    # and must not be "refunded" to a later fallback search.
+    explored_starts: int
 
 
 def _source_start_tc(source: SyncSource) -> float:
@@ -295,6 +344,32 @@ def _score(query: list[str], candidate: list[str]) -> float:
     return min(
         1.0, 0.38 * ratio + 0.34 * ordered_coverage + 0.20 * content_coverage + 0.08 * char_ratio
     )
+
+
+def _trim_span_to_match(query: list[str], span: list[_Token]) -> list[_Token] | None:
+    """Trim leading/tailing candidate words that the query does not match.
+
+    A candidate span is picked as a contiguous run of transcript words, but
+    only a subset of it may actually correspond to the query text -- the
+    rest is neighbouring dialogue that happened to fall inside the sampled
+    length. Cutting those edges to the real matched boundary keeps
+    ``source_in_sec``/``source_out_sec`` tight and stops leaking unrelated
+    audio into the assembled clip, while also raising ``confidence`` for the
+    part that genuinely matches. Interior words are never dropped -- only
+    the unmatched prefix/suffix is removed.
+    """
+
+    if not query or not span:
+        return None
+    candidate = [item.normalized for item in span]
+    matcher = SequenceMatcher(None, query, candidate, autojunk=False)
+    blocks = [block for block in matcher.get_matching_blocks() if block.size > 0]
+    if not blocks:
+        return None
+    first_index = blocks[0].b
+    last_index = blocks[-1].b + blocks[-1].size
+    trimmed = span[first_index:last_index]
+    return trimmed or None
 
 
 def _token_positions(tokens: list[_Token]) -> dict[str, list[int]]:
@@ -472,7 +547,7 @@ def _search_one(
     timed_tokens: list[_Token] | None = None,
     max_starts: int = _MAX_CANDIDATE_STARTS,
     exclude_word_time_range: tuple[float, float] | None = None,
-) -> list[_Candidate]:
+) -> _SearchResult:
     all_tokens = timed_tokens if timed_tokens is not None else _timed_tokens(index)
     if approx is not None and window is not None:
         guide_approx = approx - source.guide_offset_sec
@@ -483,11 +558,11 @@ def _search_one(
     else:
         tokens = all_tokens
     if not tokens:
-        return []
+        return _SearchResult([], 0)
 
     min_length = max(1, len(query) - max(3, len(query) // 3))
     if len(tokens) < min_length or max_starts <= 0:
-        return []
+        return _SearchResult([], 0)
     max_length = min(len(tokens), len(query) + max(5, len(query) // 2))
     coarse_lengths, length_step = _length_samples(min_length, max_length, len(query))
     candidates: list[_Candidate] = []
@@ -503,25 +578,29 @@ def _search_one(
                 and tokens[start].word.start <= excluded_upper
             )
         ]
-    for start in _candidate_starts(
+    explored_starts = _candidate_starts(
         query,
         tokens,
         max_starts=max_starts,
         eligible_starts=eligible_starts,
-    ):
+    )
+    for start in explored_starts:
         best: _Candidate | None = None
 
         def score_length(length: int) -> _Candidate | None:
             span = tokens[start : start + length]
             if len(span) < min_length:
                 return None
-            confidence = _score(query, [item.normalized for item in span])
+            trimmed = _trim_span_to_match(query, span)
+            if not trimmed:
+                return None
+            confidence = _score(query, [item.normalized for item in trimmed])
             return _Candidate(
                 source_id=source.id,
-                start=max(0.0, span[0].word.start + source.guide_offset_sec),
-                end=span[-1].word.end + source.guide_offset_sec,
+                start=max(0.0, trimmed[0].word.start + source.guide_offset_sec),
+                end=trimmed[-1].word.end + source.guide_offset_sec,
                 confidence=confidence,
-                text=" ".join(item.word.word for item in span),
+                text=" ".join(item.word.word for item in trimmed),
                 strategy=strategy,
             )
 
@@ -544,7 +623,7 @@ def _search_one(
                     best = current
         if best is not None:
             candidates.append(best)
-    return candidates
+    return _SearchResult(candidates, len(explored_starts))
 
 
 def _deduplicate(candidates: Iterable[_Candidate]) -> list[_Candidate]:
@@ -597,6 +676,96 @@ def _has_usable_range(
     return end - start > 0.001
 
 
+def _has_plausible_duration(
+    candidate: _Candidate,
+    query_len: int,
+    config: MatcherConfig,
+) -> bool:
+    """Reject candidates whose duration cannot plausibly fit the query.
+
+    A contiguous transcript span can score a non-trivial similarity purely by
+    reusing a handful of frequent words, while its actual duration is far too
+    short (or too long) to contain the full query text at any normal speech
+    rate. This is a cheap sanity check that runs before ranking so such
+    leaders never outrank a genuine, duration-consistent match.
+    """
+
+    if query_len < _MIN_QUERY_WORDS_FOR_DURATION_CHECK:
+        return True
+    duration = candidate.end - candidate.start
+    if duration <= 0:
+        return False
+    words_per_sec = query_len / duration
+    return config.min_words_per_sec <= words_per_sec <= config.max_words_per_sec
+
+
+def _has_reliable_word_timestamps(index: WordIndex) -> bool:
+    """Whether ``index``'s per-word timestamps were individually measured.
+
+    Cloud chat-ASR backends (see ``whisper_runner._transcribe_cloud``) only
+    return segment-level timestamps; per-word times inside a segment are a
+    linear interpolation, not a measurement, and can compress to a small
+    fraction of a segment's real duration (e.g. ~0.05s/word), producing a
+    words-per-second rate the ``_has_plausible_duration`` speech-rate filter
+    correctly flags as impossible -- but for a timestamp-precision reason,
+    not a text-match reason. Sources whose index carries this signal must
+    skip that filter entirely; their candidate spans are already
+    length-bounded by ``_search_one``'s ``max_length`` instead.
+    """
+
+    metadata = index.metadata or {}
+    backend_metadata = metadata.get("backend_metadata")
+    precision = backend_metadata.get("timestamp_precision") if isinstance(backend_metadata, dict) else None
+    if not precision:
+        precision = metadata.get("timestamp_precision")
+    if precision:
+        return str(precision) != "interpolated"
+    # No explicit precision recorded at all (e.g. a hand-built or very old
+    # index): only the cloud-audio backend is known to interpolate, so treat
+    # everything else as measured word-level timing, matching prior behaviour.
+    return str(metadata.get("backend") or "") != "cloud-audio"
+
+
+def _has_speaker_labels(index: WordIndex) -> bool:
+    """Whether ``index``'s words carry usable per-word diarization labels.
+
+    Only the cloud ASR backend supplies ``WordTimestamp.speaker`` (see
+    ``sync_transcript.ingest_word_index``, which records this as the
+    ``has_speaker_labels`` metadata flag). Local Whisper backends never
+    diarize, so their indexes -- including every transcript recorded before
+    this feature existed -- must be treated as unlabeled and skip the
+    voice-scoped filter entirely rather than reject every candidate.
+    """
+
+    if not bool((index.metadata or {}).get("has_speaker_labels")):
+        return False
+    return any(word.speaker for word in index.words)
+
+
+def _voice_share(
+    index: WordIndex,
+    source: SyncSource,
+    candidate: _Candidate,
+    voice_label: str,
+) -> float:
+    """Share of words inside ``candidate``'s span spoken by ``voice_label``.
+
+    ``candidate.start``/``candidate.end`` are already shifted by
+    ``source.guide_offset_sec`` (see ``_search_one``), so it is undone here
+    to land back in the word index's own time base before scanning words.
+    """
+
+    lower = candidate.start - source.guide_offset_sec
+    upper = candidate.end - source.guide_offset_sec
+    words_in_range = [word for word in index.words if word.end >= lower and word.start <= upper]
+    if not words_in_range:
+        # The candidate span was built from this very index, so this should
+        # not happen in practice; do not reject on missing data.
+        return 1.0
+    matching = sum(1 for word in words_in_range if word.speaker == voice_label)
+    return matching / len(words_in_range)
+
+
 def _has_derived_speaker_label(source: SyncSource) -> bool:
     """Whether ``source.speaker`` is a file-name guess, not a real person.
 
@@ -646,6 +815,10 @@ class SyncMatcher:
         self.timed_tokens = {
             source_id: _timed_tokens(index) for source_id, index in self.indexes.items()
         }
+        self.reliable_word_timestamps = {
+            source_id: _has_reliable_word_timestamps(index)
+            for source_id, index in self.indexes.items()
+        }
         self.speaker_tokens = {
             source_id: [
                 tokens for name in _speaker_label_names(source) if (tokens := normalize_text(name))
@@ -653,6 +826,15 @@ class SyncMatcher:
             for source_id, source in self.sources.items()
         }
         self.config = config or MatcherConfig()
+
+    def _passes_duration_filter(self, item: _Candidate, query_len: int) -> bool:
+        # The speech-rate plausibility filter only makes sense for sources
+        # whose word timestamps were actually measured; skip it for
+        # interpolated (e.g. cloud-audio) sources, see
+        # ``_has_reliable_word_timestamps``.
+        if not self.reliable_word_timestamps.get(item.source_id, True):
+            return True
+        return _has_plausible_duration(item, query_len, self.config)
 
     def _eligible_sources(self, request: AlignmentRequest) -> list[SyncSource]:
         if request.source_ids:
@@ -710,7 +892,52 @@ class SyncMatcher:
 
     def match(self, request: AlignmentRequest) -> SyncMatch:
         query = normalize_text(request.text)
-        sources = self._eligible_sources(request)
+        anchor_mode = bool(
+            request.anchor_source_id
+            and request.anchor_lower_sec is not None
+            and request.anchor_upper_sec is not None
+        )
+        if anchor_mode:
+            anchor_source = self.sources.get(request.anchor_source_id)
+            sources = (
+                [anchor_source]
+                if anchor_source is not None and anchor_source.id in self.indexes
+                else []
+            )
+        else:
+            sources = self._eligible_sources(request)
+        # Anchor bounds are a strictly narrower and already-trustworthy
+        # window, so when both an anchor and a voice label are supplied on
+        # the same request the anchor takes priority and the voice filter
+        # below is simply not engaged.
+        voice_mode = bool(request.voice_label) and not anchor_mode
+
+        def _voice_ok(item: _Candidate) -> bool:
+            if not voice_mode:
+                return True
+            index = self.indexes.get(item.source_id)
+            if index is None or not _has_speaker_labels(index):
+                # Unlabeled sources (every local Whisper transcript, and any
+                # cloud transcript recorded before diarization existed) are
+                # never restricted by voice -- this filter is additive only.
+                return True
+            return (
+                _voice_share(index, self.sources[item.source_id], item, request.voice_label)
+                >= _MIN_VOICE_SHARE
+            )
+
+        def _voice_scoped_strategy(item: _Candidate | None) -> str | None:
+            # Only relabel the result when the voice filter was actually in
+            # play for its source -- an unlabeled source behaves exactly as
+            # an ordinary request and must keep reporting its ordinary
+            # strategy (``near_timecode``/``full_transcript``/etc.).
+            if not voice_mode or item is None:
+                return None
+            index = self.indexes.get(item.source_id)
+            if index is None or not _has_speaker_labels(index):
+                return None
+            return "voice_scoped"
+
         if len(query) < 2 or not sources:
             return SyncMatch(
                 segment_id=request.segment_id,
@@ -726,35 +953,57 @@ class SyncMatcher:
         local_word_ranges: dict[str, tuple[float, float]] = {}
         has_approx = request.approximate_timecode not in (None, "")
         for source in sources:
-            approx = _approx_for_source(request, source)
-            window = self.config.search_window_sec if approx is not None else None
-            source_candidates = _search_one(
+            if anchor_mode:
+                # Bounds are already absolute source-time seconds (same space
+                # as ``source_in_sec``/``source_out_sec``); express them as an
+                # approx/window pair around their midpoint so the existing
+                # guide-offset math in ``_search_one`` reproduces exactly
+                # ``[anchor_lower_sec, anchor_upper_sec]`` without duplicating
+                # that math here.
+                approx = (request.anchor_lower_sec + request.anchor_upper_sec) / 2.0  # type: ignore[operator]
+                window = (request.anchor_upper_sec - request.anchor_lower_sec) / 2.0  # type: ignore[operator]
+                strategy = "between_anchors"
+            else:
+                approx = _approx_for_source(request, source)
+                window = self.config.search_window_sec if approx is not None else None
+                strategy = "near_timecode" if approx is not None else "full_transcript"
+            source_result = _search_one(
                 source,
                 self.indexes[source.id],
                 query,
                 approx,
                 window,
-                "near_timecode" if approx is not None else "full_transcript",
+                strategy,
                 self.timed_tokens[source.id],
                 max_starts=(
                     _MAX_LOCAL_CANDIDATE_STARTS if approx is not None else _MAX_CANDIDATE_STARTS
                 ),
             )
-            local.extend(source_candidates)
-            local_counts[source.id] = len(source_candidates)
+            local.extend(source_result.candidates)
+            local_counts[source.id] = source_result.explored_starts
             if approx is not None and window is not None:
                 guide_approx = approx - source.guide_offset_sec
                 local_word_ranges[source.id] = (
                     guide_approx - window,
                     guide_approx + window,
                 )
-        candidates = [
+        # ``range_ok`` keeps every candidate that survived deduplication and
+        # boundary trimming, before the duration-plausibility filter below.
+        # It is retained separately so that if that filter happens to reject
+        # every candidate, "not_found" diagnostics can still fall back to it
+        # (see the alternatives selection further down) instead of showing an
+        # editor an empty list when at least one text-similar span exists.
+        range_ok = [
             item
             for item in _deduplicate(local)
             if _has_usable_range(item, self.sources[item.source_id], self.config)
+            and _voice_ok(item)
+        ]
+        candidates = [
+            item for item in range_ok if self._passes_duration_filter(item, len(query))
         ]
 
-        if has_approx and (
+        if not anchor_mode and has_approx and (
             not candidates or candidates[0].confidence < self.config.fallback_trigger
         ):
             fallback: list[_Candidate] = []
@@ -774,17 +1023,27 @@ class SyncMatcher:
                         self.timed_tokens[source.id],
                         max_starts=remaining_starts,
                         exclude_word_time_range=local_word_ranges.get(source.id),
-                    )
+                    ).candidates
                 )
+            range_ok = [
+                item
+                for item in _deduplicate([*range_ok, *fallback])
+                if _has_usable_range(item, self.sources[item.source_id], self.config)
+                and _voice_ok(item)
+            ]
             candidates = [
                 item
-                for item in _deduplicate([*candidates, *fallback])
-                if _has_usable_range(item, self.sources[item.source_id], self.config)
+                for item in range_ok
+                if self._passes_duration_filter(item, len(query))
             ]
 
         if not candidates or candidates[0].confidence < self.config.review_threshold:
+            # When the duration filter discarded everything, fall back to the
+            # unfiltered (but still range-usable) pool for alternatives, so
+            # an operator sees the best available leads instead of nothing.
+            diagnostic_pool = candidates or range_ok
             alternatives: list[SyncAlternative] = []
-            for item in candidates[: self.config.max_alternatives]:
+            for item in diagnostic_pool[: self.config.max_alternatives]:
                 item_in, item_out = _padded_range(item, self.sources[item.source_id], self.config)
                 alternatives.append(
                     SyncAlternative(
@@ -800,9 +1059,14 @@ class SyncMatcher:
                 query_text=request.text,
                 speaker=request.speaker,
                 approximate_timecode=str(request.approximate_timecode or ""),
-                confidence=round(candidates[0].confidence, 4) if candidates else 0.0,
+                confidence=(
+                    round(diagnostic_pool[0].confidence, 4) if diagnostic_pool else 0.0
+                ),
                 status="not_found",
-                strategy=candidates[0].strategy if candidates else "no_candidates",
+                strategy=(
+                    _voice_scoped_strategy(diagnostic_pool[0] if diagnostic_pool else None)
+                    or (diagnostic_pool[0].strategy if diagnostic_pool else "no_candidates")
+                ),
                 alternatives=alternatives,
             )
 
@@ -843,7 +1107,7 @@ class SyncMatcher:
             confidence=round(best.confidence, 4),
             status=status,
             matched_text=best.text,
-            strategy=best.strategy,
+            strategy=_voice_scoped_strategy(best) or best.strategy,
             alternatives=alternatives,
             metadata={
                 "ambiguous": ambiguous,
