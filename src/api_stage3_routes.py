@@ -267,14 +267,14 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
                 (source for source in existing if source.id == source_id),
                 None,
             )
-        speaker = re.sub(r"^\d{6,8}[\s_.-]*", "", Path(name).stem)
-        speaker = re.sub(
+        speaker_hint = re.sub(r"^\d{6,8}[\s_.-]*", "", Path(name).stem)
+        speaker_hint = re.sub(
             r"\b(?:просмотровка|просмотр|review|proxy|render|final)\b",
             " ",
-            speaker,
+            speaker_hint,
             flags=re.IGNORECASE,
         )
-        speaker = " ".join(speaker.replace("_", " ").split()) or Path(name).stem
+        speaker_hint = " ".join(speaker_hint.replace("_", " ").split()) or Path(name).stem
         source_payload = bound_source.to_dict() if bound_source is not None else {}
         source_payload.update(
             {
@@ -288,7 +288,14 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
                     if bound_source is not None
                     else f"RC_SRC_{Path(name).stem}"
                 ),
-                "speaker": bound_source.speaker if bound_source is not None else speaker,
+                # The filename-derived name is a technical label, not a
+                # verified speaker identity. Leaving it out of `speaker` keeps
+                # newly scanned sources searchable for every speaker (see
+                # SyncMatcher._eligible_sources) until an operator confirms
+                # who is actually in the footage; the raw guess is preserved
+                # below as a UI hint instead of being discarded.
+                "speaker": bound_source.speaker if bound_source is not None else "",
+                "speakers": bound_source.speakers if bound_source is not None else (),
                 "all_speakers": bound_source.all_speakers if bound_source is not None else False,
                 "fps": item.get("fps") or 25.0,
                 "duration_sec": item.get("duration_sec") or 0.0,
@@ -311,6 +318,7 @@ def _register_review_sources(catalog: dict, paths: dict, services: ModuleType) -
                     "media_name": name,
                     "audio_guide_name": audio.get("name") or Path(guide_audio).name,
                     "has_companion_video": visual is not None,
+                    "scanned_media_speaker_hint": speaker_hint,
                 },
             }
         )

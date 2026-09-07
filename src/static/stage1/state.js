@@ -67,6 +67,7 @@ export const ids = {
   btn_sync_cancel: el("btn_sync_cancel"),
   sync_sources_count: el("sync_sources_count"),
   sync_sources_names: el("sync_sources_names"),
+  sync_sources_list: el("sync_sources_list"),
   sync_job_status: el("sync_job_status"),
   sync_job_progress: el("sync_job_progress"),
   sync_job_message: el("sync_job_message"),

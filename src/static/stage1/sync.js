@@ -95,6 +95,97 @@ function formatSourceSecond(value) {
   return `${prefix}:${rest.toFixed(1).padStart(4, "0")}`;
 }
 
+function sourceSpeakerNames(source) {
+  return [source.speaker].concat(
+    Array.isArray(source.speakers) ? source.speakers : []
+  ).filter(Boolean);
+}
+
+// Human-readable search scope shown next to each editable source: matches
+// the wording operators need to diagnose why a source is (not) searched for
+// a given block's speaker (see docs/NORMALIZATION_MATCHING_AUDIT).
+function sourceScopeLabel(source) {
+  if (source.all_speakers) return "все спикеры";
+  const speakers = sourceSpeakerNames(source);
+  return speakers.length ? speakers.join(", ") : "спикер не указан — ищется для всех";
+}
+
+function sourceEditableId(source) {
+  return String(source.id || source.source_id || "");
+}
+
+function renderSyncSourcesList() {
+  if (!ids.sync_sources_list) return;
+  if (appState.syncFeatureAvailable === false || appState.syncSources.length === 0) {
+    ids.sync_sources_list.innerHTML = "";
+    return;
+  }
+  ids.sync_sources_list.innerHTML = appState.syncSources.map((source) => {
+    const sourceId = sourceEditableId(source);
+    const sequence = source.premiere_sequence || source.sequence_name
+      || source.name || sourceId || "без имени";
+    const duration = formatMediaDuration(source.duration_sec);
+    const speakersValue = sourceSpeakerNames(source).join(", ");
+    const checked = source.all_speakers ? " checked" : "";
+    return `
+      <article class="sync-source-card" data-source-id="${escaped(sourceId)}">
+        <div class="sync-match-head">
+          <div class="sync-match-title">${escaped(sequence)}</div>
+          <span class="sync-match-meta">${escaped(duration)}</span>
+        </div>
+        <div class="sync-match-meta">Область поиска: ${escaped(sourceScopeLabel(source))}</div>
+        <div class="sync-source-edit">
+          <label class="sync-match-field sync-source-speakers-field">
+            <span>Спикеры (через запятую)</span>
+            <input type="text" data-sync-source-speakers value="${escaped(speakersValue)}"
+              placeholder="Татьяна Васильева, Иван Иванов">
+          </label>
+          <label class="toggle sync-source-all-toggle">
+            <input type="checkbox" data-sync-source-all${checked}>
+            <span class="toggle-slider"></span>
+            <span>В этой секвенции находятся все спикеры проекта</span>
+          </label>
+          <button type="button" class="btn btn-sm btn-accent" data-action="save-sync-source">Сохранить</button>
+        </div>
+      </article>`;
+  }).join("");
+}
+
+// Pure payload builder for POST /stage2/sync-sources, kept separate from DOM
+// reads so it can be unit-tested directly. Mirrors the CEP panel's parsing
+// (cep/js/main.js registerSequenceWithCallback): the first name goes to the
+// legacy singular `speaker` field, the rest to `speakers`, and both are
+// always sent together so the backend merge never wipes one with the other
+// (see src/api_stage2_routes.py "speaker" without "speakers" clause).
+export function syncSourceEditPayload(source, speakersText, allSpeakersChecked) {
+  const names = String(speakersText || "")
+    .split(/[,;\n]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const sourceId = sourceEditableId(source);
+  return {
+    project,
+    id: sourceId,
+    source_id: sourceId,
+    speaker: names[0] || "",
+    speakers: names.slice(1),
+    all_speakers: Boolean(allSpeakersChecked),
+  };
+}
+
+export async function saveSyncSourceEdit(source, speakersText, allSpeakersChecked) {
+  const payload = syncSourceEditPayload(source, speakersText, allSpeakersChecked);
+  const response = await optionalRequestJSON("/stage2/sync-sources", "POST", payload);
+  if (!response.available) {
+    toast("Сохранение источников пока не поддерживается backend", "warn");
+    appendLog("Stage 2 sync: сохранение источника недоступно в текущей версии backend.", "warn");
+    return;
+  }
+  toast("Источник синхронизации обновлён", "success");
+  appendLog(`Stage 2 sync: обновлён источник ${payload.id}.`);
+  await loadSyncWorkspace(true);
+}
+
 function renderSyncSources() {
   if (!ids.sync_sources_count) return;
   ids.sync_sources_count.textContent = String(appState.syncSources.length);
@@ -108,9 +199,7 @@ function renderSyncSources() {
     const names = appState.syncSources.map((source) => {
       const sequence = source.premiere_sequence || source.sequence_name
         || source.name || source.id || "без имени";
-      const speakers = [source.speaker].concat(
-        Array.isArray(source.speakers) ? source.speakers : []
-      ).filter(Boolean);
+      const speakers = sourceSpeakerNames(source);
       const scope = source.all_speakers
         ? "все спикеры"
         : (speakers.length ? speakers.join(", ") : (source.speaker || "спикер не указан"));
@@ -121,6 +210,7 @@ function renderSyncSources() {
       ? `${visible} и ещё ${names.length - 3}`
       : visible;
   }
+  renderSyncSourcesList();
   updateActionAvailability();
 }
 
@@ -204,6 +294,29 @@ function renderSyncMatches(document) {
             : ""
         }. Проверьте аудио перед подтверждением.</div>`
       : "";
+    const speakerFilteredSources = Array.isArray(match.metadata?.speaker_filtered_sources)
+      ? match.metadata.speaker_filtered_sources.filter((item) => item && item.source_id)
+      : [];
+    const speakerFilterHint = speakerFilteredSources.length
+      ? (() => {
+          const entries = speakerFilteredSources.map((item) => {
+            const itemSource = candidateSource(item);
+            const itemName = itemSource.sequence_name || itemSource.premiere_sequence || item.source_id;
+            const itemSpeakers = Array.isArray(item.source_speakers)
+              ? item.source_speakers.filter(Boolean)
+              : [];
+            const itemSpeakerText = itemSpeakers.length ? itemSpeakers.join(", ") : "не указан";
+            return `«${escaped(itemName)}» (спикер «${escaped(itemSpeakerText)}»)`;
+          });
+          const visible = entries.slice(0, 3).join(", ");
+          const rest = entries.length > 3 ? ` и ещё ${entries.length - 3}` : "";
+          const many = entries.length > 1;
+          return `<div class="sync-match-speaker-filter">Источник${many ? "и" : ""} ${visible}${rest}
+            не искал${many ? "ись" : "ся"}, потому что указанный у ${many ? "них" : "него"} спикер
+            не совпадает со спикером блока «${escaped(speaker)}». Отметьте источник как «все спикеры»
+            или укажите у него верные имена спикеров.</div>`;
+        })()
+      : "";
     const sourceIn = Number(candidate.source_in_sec);
     const sourceOut = Number(candidate.source_out_sec);
     const hasCandidate = Boolean(candidate.source_id)
@@ -263,6 +376,7 @@ function renderSyncMatches(document) {
           ? escaped(matchedText)
           : "Whisper-фрагмент не найден"}</div>
         ${llmHint}
+        ${speakerFilterHint}
         <div class="sync-match-meta" data-sync-meta>
           ${escaped(source)} · ${formatSourceSecond(sourceIn)}–${formatSourceSecond(sourceOut)}
           · уверенность ${confidenceText}
@@ -603,6 +717,23 @@ async function confirmSyncMatch(matchId, card) {
 
 ids.btn_sync_align.addEventListener("click", () => safely(startSyncAlignment));
 if (ids.btn_sync_cancel) ids.btn_sync_cancel.addEventListener("click", cancelSyncJob);
+if (ids.sync_sources_list) {
+  ids.sync_sources_list.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action='save-sync-source']");
+    if (!button) return;
+    const card = button.closest(".sync-source-card");
+    const sourceId = String(card?.dataset.sourceId || "");
+    const source = appState.syncSources.find((item) => sourceEditableId(item) === sourceId);
+    if (!source) return;
+    const speakersInput = card.querySelector("[data-sync-source-speakers]");
+    const allCheckbox = card.querySelector("[data-sync-source-all]");
+    safely(() => saveSyncSourceEdit(
+      source,
+      speakersInput ? speakersInput.value : "",
+      Boolean(allCheckbox && allCheckbox.checked),
+    ));
+  });
+}
 ids.sync_review_list.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action='confirm-sync-match']");
   if (!button) return;

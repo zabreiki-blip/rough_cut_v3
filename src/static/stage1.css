@@ -1257,6 +1257,40 @@ select { cursor: pointer; }
 .sync-stat[data-state="review"] strong { color: var(--orange); }
 .sync-stat[data-state="unmatched"] strong { color: var(--red); }
 
+.sync-sources-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.sync-source-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+
+.sync-source-edit {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.sync-source-all-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+@media (max-width: 700px) {
+  .sync-source-edit { grid-template-columns: 1fr; align-items: stretch; }
+}
+
 .sync-review {
   padding-top: 14px;
   border-top: 1px solid var(--line);
@@ -1342,6 +1376,15 @@ select { cursor: pointer; }
   border-radius: 4px;
   background: var(--orange-dim);
   color: var(--orange);
+  padding: 7px 9px;
+  font-size: 10px;
+}
+
+.sync-match-speaker-filter {
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  background: var(--blue-dim);
+  color: var(--blue);
   padding: 7px 9px;
   font-size: 10px;
 }
