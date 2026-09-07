@@ -128,6 +128,10 @@ def test_asr_engine_selector_defaults_to_local_and_is_wired_to_request() -> None
     assert 'const asrEngine = ids.sync_asr_engine?.value || "local";' in STAGE1_JS
     assert 'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined' in STAGE1_JS
     assert "asr_engine: asrEngine" in STAGE1_JS
+    assert "function updateSyncAsrControls()" in STAGE1_JS
+    assert "ids.sync_whisper_model.disabled = isCloud;" in STAGE1_JS
+    assert 'ids.sync_asr_engine.addEventListener("change", updateSyncAsrControls);' in STAGE1_JS
+    assert "Модель Whisper (только локально)" in PROJECT_HTML
 
 
 def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:

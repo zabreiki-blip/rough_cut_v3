@@ -240,6 +240,15 @@ function syncCounts(document) {
   }, { auto: 0, confirmed: 0, review: 0, unmatched: 0 });
 }
 
+function updateSyncAsrControls() {
+  if (!ids.sync_whisper_model) return;
+  const isCloud = (ids.sync_asr_engine?.value || "local") === "cloud";
+  ids.sync_whisper_model.disabled = isCloud;
+  ids.sync_whisper_model.title = isCloud
+    ? "Small и Medium используются только для локального Whisper"
+    : "Выберите локальную модель Whisper";
+}
+
 function renderSyncMatches(document) {
   if (!ids.sync_review_list) return;
   const counts = syncCounts(document || {});
@@ -720,6 +729,10 @@ async function confirmSyncMatch(matchId, card) {
 
 ids.btn_sync_align.addEventListener("click", () => safely(startSyncAlignment));
 if (ids.btn_sync_cancel) ids.btn_sync_cancel.addEventListener("click", cancelSyncJob);
+if (ids.sync_asr_engine) {
+  ids.sync_asr_engine.addEventListener("change", updateSyncAsrControls);
+  updateSyncAsrControls();
+}
 if (ids.sync_sources_list) {
   ids.sync_sources_list.addEventListener("click", (event) => {
     const button = event.target.closest("[data-action='save-sync-source']");

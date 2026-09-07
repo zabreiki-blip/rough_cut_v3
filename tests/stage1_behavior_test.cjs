@@ -188,6 +188,30 @@ function testRenderEtaCells({ core }) {
   assert.doesNotThrow(() => renderEtaCells(null, null, now - 1000, 0.5, "running"));
 }
 
+function testCloudDisablesLocalWhisperModel({ state, core }) {
+  const { ids, appState } = state;
+  const originalEngine = ids.sync_asr_engine.value;
+  const originalRunning = appState.syncJobRunning;
+  try {
+    appState.syncJobRunning = false;
+    ids.sync_asr_engine.value = "cloud";
+    ids.sync_asr_engine.dispatch("change");
+    assert.strictEqual(ids.sync_whisper_model.disabled, true);
+
+    // The shared availability refresh must preserve the cloud-only lock.
+    core.updateActionAvailability();
+    assert.strictEqual(ids.sync_whisper_model.disabled, true);
+
+    ids.sync_asr_engine.value = "local";
+    ids.sync_asr_engine.dispatch("change");
+    assert.strictEqual(ids.sync_whisper_model.disabled, false);
+  } finally {
+    ids.sync_asr_engine.value = originalEngine;
+    appState.syncJobRunning = originalRunning;
+    core.updateActionAvailability();
+  }
+}
+
 function testHasUnsavedChangesAndBeforeunload({ state, normalization }) {
   const { appState } = state;
   const { hasUnsavedChanges, markNormalizationDirty } = normalization;
@@ -534,6 +558,7 @@ async function main() {
   const tests = [
     ["testComputeEtaSeconds", () => testComputeEtaSeconds(modules)],
     ["testRenderEtaCells", () => testRenderEtaCells(modules)],
+    ["testCloudDisablesLocalWhisperModel", () => testCloudDisablesLocalWhisperModel(modules)],
     ["testHasUnsavedChangesAndBeforeunload", () => testHasUnsavedChangesAndBeforeunload(modules)],
     ["testConfirmDialog", () => testConfirmDialog(modules)],
     ["testSyncMatchSpeakerFilterHint", () => testSyncMatchSpeakerFilterHint(modules)],
