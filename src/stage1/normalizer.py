@@ -95,6 +95,8 @@ _TECH_MARKERS = {
     "склейка",
     "ремарка",
     "техническое",
+    "тех",
+    "техн",
 }
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
@@ -293,7 +295,12 @@ _SCENARIO_TITLE_RE = re.compile(r"^[^а-яa-z]*[А-ЯЁA-Z][^а-яa-z]*$")
 _SCENARIO_TITLE_MAX_WORDS = 20
 _SCENARIO_TITLE_MAX_CHARS = 120
 _LLM_CONFIDENCE_THRESHOLD = 0.65
-_LLM_CACHE_VERSION = 1
+# Bumped whenever a change to the classification prompt/instructions should
+# invalidate every previously cached LLM answer, even though the prompt text
+# is already part of the cache fingerprint (see `_classifier_identity`): a
+# version bump also drops stale entries from the on-disk cache file outright
+# instead of merely leaving them unreachable under their old keys.
+_LLM_CACHE_VERSION = 2
 _LLM_CACHE_MAX_ENTRIES = 2000
 _OPENROUTER_SYSTEM_PROMPT = "You normalize TV production scripts."
 _OPENROUTER_INSTRUCTIONS = (
@@ -303,7 +310,13 @@ _OPENROUTER_INSTRUCTIONS = (
     '"label_is_marker":true|false,'
     '"text_for_tts":...,"speaker":...,"role":...,'
     '"timecode_start":...,"timecode_end":...,"notes":...}]}. '
-    "Use unknown when unsure. Do not rewrite original content. "
+    "Always choose the single most likely type, even when you are not fully "
+    "certain -- use unknown only for text that is empty or unreadable. "
+    "A line that is a URL/link to source footage, a bulleted or dashed list "
+    "item (a song/film title, a name, a credit), a section heading (e.g. "
+    "\"Клипы\", \"Хроника\"), or a production note telling the editor what "
+    "to insert/show (e.g. \"Вставить синхрон\", \"Показать фото\") is "
+    "type=technical, not unknown. Do not rewrite original content. "
     "An item with continuation_of_type=voiceover is an unlabelled paragraph "
     "continuing the preceding voiceover unless its text clearly starts a new "
     "speaker or technical cue. "
@@ -487,7 +500,7 @@ def _generate_normalization_unlocked(
 
             for batch, (batch_result, error) in zip(batches, batch_results):
                 if error is None:
-                    _apply_llm_results(batch, batch_result or [])
+                    _apply_llm_results(batch, batch_result or [], video_cue_re=video_cue_re)
                     continue
                 message = f"LLM classification failed: {type(error).__name__}: {error}"
                 for block in batch:
@@ -1014,6 +1027,175 @@ def _looks_like_scenario_title(text: str) -> bool:
     return not _PERSONAL_VERB_RE.search(stripped)
 
 
+# --- Additional "technical cue" detectors ----------------------------------
+# Documentary scripts are full of editorial/production notes that must never
+# reach TTS or the interview search: links to source footage, bulleted
+# song/film lists, dash-prefixed credits, and section headings ("Клипы",
+# "Хроника", "Вставить синхрон ..."). Each rule below is anchored to a shape
+# (a URL, a bullet glyph, a short nominal phrase) that spoken narration
+# essentially never takes, so it is safe as an unconditional builtin rule.
+
+# A URL is always a pointer to source footage for the editor, never text a
+# narrator/TTS voice would read aloud.
+_URL_RE = re.compile(r"https?://", re.IGNORECASE)
+
+# A bulleted list item (song/film title, credit, etc). "•" is the glyph
+# editors actually use in this corpus; the others are accepted for the same
+# shape even though no test line uses them.
+_BULLET_PREFIX_RE = re.compile(r"^[•‣◦*]")
+
+# A year credited in parentheses, e.g. "Ночной дозор (2004)" or "Белым
+# снегом (Новогодний Огонёк 2001)": the shape of a song/film title, not
+# spoken narration.
+_YEAR_IN_PARENS_RE = re.compile(r"\((?:[^()\n]*\b(?:19|20)\d{2}\b[^()\n]*)\)")
+
+# A dash-prefixed line is ambiguous: it has the shape both of a short credit
+# ("-Жанна Фриске") and of a spoken sentence the editor set off with a dash
+# ("- Я тогда совершенно не знала..."). It is only safe to call technical
+# when an extra signal removes that ambiguity: a URL, a year credit, or (the
+# general case) a short nominal phrase with no personal/finite verb -- the
+# same signal `_looks_like_video_cue` uses for unmarked shot-list remarks.
+_DASH_PREFIX_RE = re.compile(r"^[-–—]\s*(?P<rest>.*)$", re.DOTALL)
+_DASH_TECHNICAL_MAX_WORDS = 8
+
+# A real credit/title never contains a comma or ends the way a spoken
+# sentence does (a full stop, exclamation, question mark or ellipsis);
+# `_PERSONAL_VERB_RE` alone misses first-person singular verbs on -у/-ю
+# ("хочу", "знаю"), so these punctuation shapes are the second, structural
+# barrier keeping live speech ("- Не знаю, что сказать.") out of technical.
+_SENTENCE_END_PUNCT_RE = re.compile(r"[.!?…]$")
+
+
+def _looks_like_technical_dash_line(text: str) -> bool:
+    """Detect a dash-prefixed technical credit, as opposed to a spoken
+    sentence the editor happened to set off with a leading dash.
+    """
+    match = _DASH_PREFIX_RE.match(text)
+    if not match:
+        return False
+    rest = match.group("rest").strip()
+    if not rest:
+        return False
+    if _URL_RE.search(rest) or _YEAR_IN_PARENS_RE.search(rest):
+        return True
+    if "," in rest or _SENTENCE_END_PUNCT_RE.search(rest):
+        return False
+    if _PERSONAL_VERB_RE.search(rest):
+        return False
+    return len(rest.split()) <= _DASH_TECHNICAL_MAX_WORDS
+
+
+# Section headings ("Сольные клипы", "Художественные фильмы") and production
+# notes ("Вставить синхрон Жанны", "ФОТЫ ЖАННЫ") that group or introduce
+# footage/interview material rather than narrate it. As with
+# `_looks_like_video_cue`, the keyword lexicon only narrows the check to
+# plausible production notes; the length cap and the absence of a personal
+# (finite) verb are the real safety net, keeping an ordinary sentence that
+# happens to mention e.g. "архив" or "фото" from being misclassified.
+_SECTION_HEADING_KEYWORDS = (
+    "клипы",
+    "клип",
+    "фильмы",
+    "хроника",
+    "фоты",
+    "фото",
+    "фрагмент",
+    "вставить",
+    "поставить",
+    "показать",
+    "дать",
+    "синхрон",
+    "портфолио",
+    "портофолио",
+    "архив",
+    "последний герой",
+)
+_SECTION_HEADING_KEYWORD_RE = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(word) for word in sorted(_SECTION_HEADING_KEYWORDS, key=len, reverse=True)
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
+_SECTION_HEADING_MAX_WORDS = 8
+
+
+_SECTION_HEADING_SHORT_SENTENCE_MAX_WORDS = 4
+
+
+def _looks_like_section_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or not _SECTION_HEADING_KEYWORD_RE.search(stripped):
+        return False
+    if "," in stripped:
+        return False
+    if _PERSONAL_VERB_RE.search(stripped):
+        return False
+    word_count = len(stripped.split())
+    if word_count > _SECTION_HEADING_MAX_WORDS:
+        return False
+    # A comma-free line ending like a spoken sentence (".", "!", "?", "…")
+    # is only safe to call a heading/production note when it is very short
+    # ("Фрагмент «Ледникового периода».") -- the same structural barrier as
+    # `_looks_like_technical_dash_line`, needed because `_PERSONAL_VERB_RE`
+    # misses first-person singular -у/-ю verbs ("Хочу показать всем...").
+    if (
+        _SENTENCE_END_PUNCT_RE.search(stripped)
+        and word_count > _SECTION_HEADING_SHORT_SENTENCE_MAX_WORDS
+    ):
+        return False
+    return True
+
+
+# A scenario/treatment sometimes opens with a literal "Сценарий. <title>"
+# line instead of (or alongside) the all-caps title `_looks_like_scenario_title`
+# already covers. Restricted to the first block, like that heuristic.
+_SCENARIO_LABEL_RE = re.compile(r"^сценарий\b", re.IGNORECASE)
+
+
+def _looks_like_scenario_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or not _SCENARIO_LABEL_RE.match(stripped):
+        return False
+    if len(stripped) > _SCENARIO_TITLE_MAX_CHARS:
+        return False
+    if len(stripped.split()) > _SCENARIO_TITLE_MAX_WORDS:
+        return False
+    return not _PERSONAL_VERB_RE.search(stripped)
+
+
+def _technical_heuristic_confidence(
+    text: str, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
+) -> float | None:
+    """Return the confidence a plain (unlabelled) line is a technical cue --
+    a URL, a bulleted list item, a dash-prefixed credit, a section heading/
+    production note, or a footage/shot-list remark -- or None when none of
+    these safe heuristics apply.
+
+    Used by the LLM low-confidence/`unknown` fallback in
+    `_apply_llm_results`: a block only reaches the LLM after
+    `_classify_by_rules` already failed to classify it, so this is a second,
+    unconditional pass over the same signals (`_classify_by_rules` gates
+    some of them by label/position to avoid ever preempting an
+    already-recognized sync/voiceover marker).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if _URL_RE.search(stripped):
+        return 1.0
+    if _BULLET_PREFIX_RE.match(stripped):
+        return 1.0
+    if _looks_like_technical_dash_line(stripped):
+        return 0.9
+    if _looks_like_section_heading(stripped):
+        return 0.9
+    if _looks_like_video_cue(stripped, video_cue_re):
+        return 1.0
+    return None
+
+
 def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
     """Decide whether a `_TIMECODE`-shaped match at ``text[start:end]`` is an
     actual timecode boundary, as opposed to prose (e.g. a two-component date
@@ -1174,6 +1356,18 @@ def _classify_by_rules(
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _STRUCTURAL_HEADING.match(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _URL_RE.search(stripped):
+        # A link to source footage is always a technical cue, never text
+        # meant to be spoken.
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _BULLET_PREFIX_RE.match(stripped):
+        # A bulleted list item (song/film title, credit, etc) is always a
+        # technical cue, regardless of any label.
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _looks_like_technical_dash_line(stripped):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+    elif _looks_like_section_heading(stripped):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _BARE_SPEAKER_PREFIX.match(stripped) and block.original_label and len(content) >= 40:
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif (
@@ -1181,7 +1375,9 @@ def _classify_by_rules(
         or not block.original_label
     ) and _looks_like_video_cue(stripped, video_cue_re):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif block.order == 1 and not block.original_label and _looks_like_scenario_title(stripped):
+    elif block.order == 1 and not block.original_label and (
+        _looks_like_scenario_title(stripped) or _looks_like_scenario_heading(stripped)
+    ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif stripped.startswith("(") and stripped.endswith(")"):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.8)
@@ -1306,7 +1502,12 @@ def _canonicalize_timecode(value: str) -> str:
     return value
 
 
-def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, Any]]) -> None:
+def _apply_llm_results(
+    blocks: list[NormalizedBlock],
+    results: list[dict[str, Any]],
+    *,
+    video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+) -> None:
     by_uid = {str(item.get("uid", "")): item for item in results}
     for block in blocks:
         item = by_uid.get(block.uid)
@@ -1322,12 +1523,32 @@ def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, An
         except (TypeError, ValueError):
             block.warnings.append(f"LLM returned invalid confidence {item.get('confidence')!r}")
             continue
-        if confidence < _LLM_CONFIDENCE_THRESHOLD:
+        if confidence < _LLM_CONFIDENCE_THRESHOLD or target_type == BlockType.UNKNOWN.value:
+            # The LLM is unsure (or explicitly punted with "unknown"). Give
+            # the builtin technical-cue heuristics one more chance before
+            # leaving the block for manual resolution: `_classify_by_rules`
+            # already tried them once, but some are gated by label/position
+            # there to avoid ever preempting a sync/voiceover marker, and a
+            # block that reaches the LLM has no such marker to protect.
+            fallback_confidence = _technical_heuristic_confidence(
+                block.original_text, video_cue_re
+            )
+            if fallback_confidence is not None:
+                _apply_type(
+                    block,
+                    BlockType.TECHNICAL.value,
+                    DecisionSource.BUILTIN_RULE.value,
+                    fallback_confidence,
+                )
+                continue
             block.source = DecisionSource.LLM.value
             block.confidence = max(0.0, min(1.0, confidence))
-            block.warnings.append(
-                f"LLM confidence {confidence:.0%} is below the confirmation threshold"
-            )
+            if confidence < _LLM_CONFIDENCE_THRESHOLD:
+                block.warnings.append(
+                    f"LLM confidence {confidence:.0%} is below the confirmation threshold"
+                )
+            else:
+                block.warnings.append("LLM returned an unknown type")
             continue
         _apply_type(block, target_type, DecisionSource.LLM.value, confidence)
         if block.original_label:
@@ -1831,6 +2052,59 @@ def _validate_learning_decisions(
     return result
 
 
+# Matches a single alphabetic (Cyrillic or Latin) word, used to pull
+# candidate video-cue keywords out of a manually-corrected unlabelled block's
+# text (see `_extract_manual_video_cue_keywords`). Deliberately excludes
+# digits/punctuation so the result is always a plain, learnable word.
+_MANUAL_VIDEO_CUE_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+")
+_MANUAL_VIDEO_CUE_MAX_WORDS = 8
+_MANUAL_VIDEO_CUE_MIN_WORD_LEN = 4
+_MANUAL_VIDEO_CUE_MAX_KEYWORDS_PER_BLOCK = 3
+
+
+def _extract_manual_video_cue_keywords(text: str, known_markers: set[str]) -> list[str]:
+    """Pull up to :data:`_MANUAL_VIDEO_CUE_MAX_KEYWORDS_PER_BLOCK` new
+    video-cue keywords out of an unlabelled block's text that an operator has
+    just manually reclassified as technical, so the same unmarked shot-list
+    remark is recognized by rule alone next time (see
+    `_learn_from_confirmation`).
+
+    Deliberately conservative -- this must never turn ordinary narration into
+    a learned keyword:
+      * skips URLs and bulleted lines outright (already covered
+        unconditionally by `_URL_RE`/`_BULLET_PREFIX_RE`; the lexicon would
+        only be noise from these)
+      * skips anything containing a personal (finite) verb, or longer than
+        `_MANUAL_VIDEO_CUE_MAX_WORDS` words -- the same "looks like a shot
+        list, not a sentence" signal `_looks_like_video_cue` relies on
+      * only lower-cased, purely alphabetic words of at least
+        `_MANUAL_VIDEO_CUE_MIN_WORD_LEN` characters qualify, and words
+        already present in ``known_markers`` (normalized) are skipped
+    """
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if _URL_RE.search(stripped) or _BULLET_PREFIX_RE.match(stripped):
+        return []
+    if len(stripped.split()) > _MANUAL_VIDEO_CUE_MAX_WORDS:
+        return []
+    if _PERSONAL_VERB_RE.search(stripped):
+        return []
+    keywords: list[str] = []
+    for match in _MANUAL_VIDEO_CUE_WORD_RE.finditer(stripped):
+        word = match.group(0).lower()
+        if len(word) < _MANUAL_VIDEO_CUE_MIN_WORD_LEN:
+            continue
+        normalized = normalize_marker(word)
+        if not normalized or normalized in known_markers:
+            continue
+        known_markers.add(normalized)
+        keywords.append(word)
+        if len(keywords) >= _MANUAL_VIDEO_CUE_MAX_KEYWORDS_PER_BLOCK:
+            break
+    return keywords
+
+
 def _learn_from_confirmation(
     scenario: NormalizedScenario,
     memory_path: Path,
@@ -1846,6 +2120,8 @@ def _learn_from_confirmation(
                 )
             elif action == "never":
                 memory.suppress_marker(candidate["marker"])
+        known_video_cue_markers: set[str] | None = None
+        learned_video_cue_keyword = False
         for block in scenario.blocks:
             if (
                 not block.original_label
@@ -1856,6 +2132,24 @@ def _learn_from_confirmation(
                     BlockType.OTHER.value,
                 }
             ):
+                if (
+                    not block.original_label
+                    and block.source == DecisionSource.MANUAL.value
+                    and block.type == BlockType.TECHNICAL.value
+                ):
+                    if known_video_cue_markers is None:
+                        known_video_cue_markers = {
+                            normalize_marker(word) for word in _VIDEO_CUE_KEYWORDS
+                        }
+                        known_video_cue_markers.update(
+                            str(rule["normalized_marker"])
+                            for rule in memory.list_rules(scope="video_cue")
+                        )
+                    for keyword in _extract_manual_video_cue_keywords(
+                        block.normalized_text, known_video_cue_markers
+                    ):
+                        memory.record_manual(keyword, BlockType.TECHNICAL.value, scope="video_cue")
+                        learned_video_cue_keyword = True
                 continue
             if block.source == DecisionSource.MANUAL.value:
                 if block.memory_rule_id:
@@ -1867,6 +2161,16 @@ def _learn_from_confirmation(
                 memory.record_llm_confirmation(
                     block.original_label, block.type, scenario.source_hash
                 )
+        if learned_video_cue_keyword:
+            # A newly learned keyword was just written to this db's
+            # scope='video_cue' rules, but `_seed_video_cue_rules` may
+            # already have this db marked as "seeded" from an earlier
+            # normalization run in this process. Without invalidating that
+            # process-local cache, a later `_seed_video_cue_rules` call for
+            # the same db path stays a no-op, so nothing here forces a
+            # fresh look; keep the cache honest so it never masks what
+            # memory now actually contains.
+            invalidate_video_cue_seed_cache(memory.path)
 
 
 def _utcnow() -> str:
