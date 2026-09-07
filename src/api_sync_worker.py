@@ -1,6 +1,27 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import TypedDict
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp, tolerating a bare ``Z`` suffix.
+
+    Returns ``None`` when ``value`` is not a parseable timestamp so callers
+    can decide how to treat unrecognized input.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 class _AsrMetrics(TypedDict):
@@ -361,13 +382,22 @@ def run_sync_job(
         llm_review_failures: list[dict[str, str]] = []
         existing = {item.segment_id: item for item in match_store.list()}
         checkpoint_state = {"dirty": False}
+        matching_started_at = _utc_now_iso()
+        matching_started_at_dt = _parse_iso_datetime(matching_started_at)
+        rematched_this_run: set[str] = set()
 
         def checkpoint_matches() -> None:
             if not checkpoint_state["dirty"]:
                 return
             with _SYNC_DATA_LOCK:
                 persisted = {item.segment_id: item for item in match_store.list()}
-                # Manual edits made while matching was running are authoritative.
+                # A manual edit is only authoritative over a fresh rematch when
+                # it happened concurrently with this job (edited at/after
+                # ``matching_started_at``), or when this run never recomputed
+                # the segment at all. An older confirmation/edit that predates
+                # the job must yield to an explicit forced rematch, otherwise
+                # ``rematch_confirmed=True`` can never actually replace a
+                # previously confirmed range.
                 for persisted_id, persisted_match in persisted.items():
                     persisted_revision = persisted_match.metadata.get("normalization_revision")
                     persisted_scenario_revision_id = str(
@@ -382,10 +412,27 @@ def run_sync_job(
                         or not scenario_revision_id
                         or persisted_scenario_revision_id == scenario_revision_id
                     )
-                    if persisted_is_current and (
-                        persisted_match.status == "confirmed"
-                        or persisted_match.metadata.get("manual_updated_at")
-                    ):
+                    manual_updated_at = persisted_match.metadata.get("manual_updated_at")
+                    if manual_updated_at:
+                        manual_updated_at_dt = _parse_iso_datetime(manual_updated_at)
+                        if manual_updated_at_dt is None or matching_started_at_dt is None:
+                            # Unparseable timestamp: stay conservative and
+                            # treat the manual edit as authoritative so we
+                            # never silently discard human work.
+                            edited_during_run = True
+                        else:
+                            edited_during_run = manual_updated_at_dt >= matching_started_at_dt
+                    elif persisted_match.status == "confirmed":
+                        # A confirmed record with no manual-edit timestamp at
+                        # all cannot be time-compared against the job start
+                        # (legacy data, or a confirmation raced in without
+                        # going through the PATCH endpoint). Stay
+                        # conservative rather than silently discard it.
+                        edited_during_run = True
+                    else:
+                        edited_during_run = False
+                    not_rematched_this_run = persisted_id not in rematched_this_run
+                    if persisted_is_current and (edited_during_run or not_rematched_this_run):
                         existing[persisted_id] = persisted_match
                     elif persisted_id not in existing:
                         existing[persisted_id] = persisted_match
@@ -417,7 +464,7 @@ def run_sync_job(
             total_segments=total_segments,
             total=total_segments,
             current_source_id="",
-            matching_started_at=_utc_now_iso(),
+            matching_started_at=matching_started_at,
             matching_fingerprint=matching_fingerprint,
             scenario_revision_id=scenario_revision_id,
         )
@@ -535,6 +582,7 @@ def run_sync_job(
                 match.metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 match.metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
                 existing[segment_id] = match
+                rematched_this_run.add(segment_id)
                 checkpoint_state["dirty"] = True
             except Exception as exc:
                 segment_failures.append(

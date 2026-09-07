@@ -1103,6 +1103,137 @@ def test_background_match_never_overwrites_concurrent_confirmation(sync_api) -> 
     assert preserved.metadata["confirmed_by"] == "editor-during-job"
 
 
+def _seed_words(client) -> None:
+    words = [
+        {"word": "маленькая", "start": 10.0, "end": 10.5},
+        {"word": "женщина", "start": 10.5, "end": 11.0},
+        {"word": "покоряла", "start": 11.0, "end": 11.5},
+        {"word": "великих", "start": 11.5, "end": 12.0},
+        {"word": "людей", "start": 12.0, "end": 12.5},
+    ]
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={"project": "demo", "words": words},
+        ).status_code
+        == 200
+    )
+
+
+def test_forced_rematch_replaces_a_stale_confirmed_match(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+    stale_confirmed = api.SyncMatch(
+        segment_id="stable-sync-uid",
+        query_text="маленькая женщина покоряла великих людей",
+        speaker="Татьяна Васильева",
+        source_id="vasilieva_01",
+        source_in_sec=900.0,
+        source_out_sec=905.0,
+        confidence=1.0,
+        status="confirmed",
+        matched_text="старый подтверждённый диапазон",
+        metadata={
+            # Predates the job by construction: a PATCH confirmation made long
+            # before this rematch job was ever started.
+            "manual_updated_at": "2000-01-01T00:00:00+00:00",
+            "normalization_revision": 7,
+        },
+    )
+    store.save(stale_confirmed)
+
+    with patch.object(api.threading, "Thread", _ImmediateThread):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "rematch_confirmed": True},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    updated = store.get("stable-sync-uid")
+    assert updated is not None
+    # A forced rematch must replace the old confirmed range with the freshly
+    # computed one, not keep silently returning the stale confirmation.
+    assert (updated.source_in_sec, updated.source_out_sec) != (900.0, 905.0)
+    assert updated.metadata.get("manual_updated_at") != "2000-01-01T00:00:00+00:00"
+
+
+def test_forced_rematch_still_defers_to_a_concurrent_manual_edit(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    original_match = api.SyncMatcher.match
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+
+    def confirm_while_matching(matcher, request):
+        automatic = original_match(matcher, request)
+        if request.segment_id == "stable-sync-uid":
+            confirmed = api.SyncMatch.from_dict(automatic.to_dict())
+            confirmed.status = "confirmed"
+            confirmed.source_in_sec = 900.0
+            confirmed.source_out_sec = 905.0
+            confirmed.metadata["manual_updated_at"] = api._utc_now_iso()
+            store.save(confirmed)
+        return automatic
+
+    with (
+        patch.object(api.SyncMatcher, "match", confirm_while_matching),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "rematch_confirmed": True},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    preserved = store.get("stable-sync-uid")
+    assert preserved is not None
+    assert preserved.status == "confirmed"
+    assert (preserved.source_in_sec, preserved.source_out_sec) == (900.0, 905.0)
+
+
+def test_unforced_rematch_still_leaves_a_confirmed_match_untouched(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+    stale_confirmed = api.SyncMatch(
+        segment_id="stable-sync-uid",
+        query_text="маленькая женщина покоряла великих людей",
+        speaker="Татьяна Васильева",
+        source_id="vasilieva_01",
+        source_in_sec=900.0,
+        source_out_sec=905.0,
+        confidence=1.0,
+        status="confirmed",
+        matched_text="старый подтверждённый диапазон",
+        metadata={
+            "manual_updated_at": "2000-01-01T00:00:00+00:00",
+            "normalization_revision": 7,
+        },
+    )
+    store.save(stale_confirmed)
+
+    with patch.object(api.threading, "Thread", _ImmediateThread):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "rematch_confirmed": False},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    unchanged = store.get("stable-sync-uid")
+    assert unchanged is not None
+    assert unchanged.status == "confirmed"
+    assert (unchanged.source_in_sec, unchanged.source_out_sec) == (900.0, 905.0)
+
+
 def test_job_transcribes_only_missing_indexes_and_isolates_source_failure(sync_api) -> None:
     client, projects = sync_api
     _write_confirmed_normalization(projects)
