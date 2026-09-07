@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from functools import wraps
 import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
@@ -15,6 +16,7 @@ import unicodedata
 
 from atomic_io import atomic_write_json
 from stage4.revision_assets import (
+    activation_intent_path,
     create_revision_asset_snapshots,
     restore_revision_assets,
     snapshot_revision_assets,
@@ -86,8 +88,6 @@ def _utcnow() -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    import json
-
     with path.open("r", encoding="utf-8") as stream:
         value = json.load(stream)
     if not isinstance(value, dict):
@@ -166,8 +166,170 @@ def list_revisions(project_paths: dict[str, Path]) -> list[dict[str, Any]]:
     return revisions
 
 
+def _asset_projection_mismatches(project_paths: dict[str, Path], active_id: str) -> list[str]:
+    """Report Stage 4 asset projections that disagree with the active revision.
+
+    ``restore_revision_assets`` commits ``prepared.json`` and the active
+    voiceover manifest before it renames any ``speaker/*.wav`` alias into
+    place.  A crash partway through that rename loop leaves those two
+    projections fully describing the new revision while
+    ``active_revision.json``/``scenario_normalized.json`` still describe the
+    old one, and some aliases still hold the old revision's audio.  Neither
+    projection is covered by the ``scenario_normalized.json`` comparison
+    above, so check them independently here.
+    """
+
+    try:
+        prepared = _read_json(project_paths["prepared"])
+    except (OSError, ValueError):
+        prepared = {}
+    mismatches: list[str] = []
+    prepared_id = str(prepared.get("scenario_revision_id") or "")
+    if prepared_id and prepared_id != active_id:
+        mismatches.append("prepared")
+
+    try:
+        manifest = _read_json(project_paths["active_voiceover_manifest"])
+    except (OSError, ValueError):
+        manifest = {}
+    manifest_id = str(manifest.get("scenario_revision_id") or "")
+    if manifest_id and manifest_id != active_id:
+        mismatches.append("voiceover_manifest")
+        # The manifest itself is stale; the assets it lists cannot be
+        # meaningfully checked against it.
+        return mismatches
+
+    items = manifest.get("items")
+    speaker = project_paths["speaker"]
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        block_id = str(item.get("id") or "")
+        if not re.fullmatch(r"zk\d+", block_id):
+            continue
+        alias = speaker / f"{block_id}.wav"
+        if not alias.is_file():
+            mismatches.append(f"voiceover_asset:{block_id}")
+            continue
+        fingerprint = str(item.get("fingerprint") or "")
+        if not fingerprint:
+            continue
+        meta_path = alias.with_suffix(".wav.meta")
+        if not meta_path.is_file():
+            # No sidecar means no recorded fingerprint to compare against;
+            # this is expected for projects predating the sidecar and must
+            # not be treated as a mismatch.
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        recorded = str(meta.get("fingerprint") or "") if isinstance(meta, dict) else ""
+        if recorded and recorded != fingerprint:
+            mismatches.append(f"voiceover_asset:{block_id}")
+    return mismatches
+
+
+def recover_interrupted_activation(project_paths: dict[str, Path]) -> dict[str, Any] | None:
+    """Finish an activation that crashed mid-commit, if one was left in flight.
+
+    ``restore_revision_assets`` writes a write-ahead intent journal (see
+    ``stage4.revision_assets.activation_intent_path``) before it starts
+    committing ``prepared.json``, the active voiceover manifest and the
+    ``speaker/*.wav`` alias renames for a new revision, and removes it once
+    every alias is in place. Its presence therefore means a previous
+    ``activate_revision`` call was interrupted partway through that commit.
+    Every step it performs is either already-durable, content-addressed data
+    (the ``voiceover_assets`` sources it stages from) or an idempotent
+    ``atomic_write_json``, so resuming ``activate_revision`` (which skips
+    re-snapshotting the outgoing revision -- see the ``_resume`` parameter --
+    since a journal proves that already happened before the interrupted
+    attempt started committing) finishes exactly what was interrupted,
+    including the projections ``restore_revision_assets`` itself does not
+    own (``scenario_normalized.json``, ``sync_matches.json``, the timeline
+    and ``active_revision.json``).
+
+    Returns ``None`` when there is nothing to recover. Otherwise returns a
+    result describing the outcome and never raises: read-only integrity
+    checks (``inspect_revision_state`` and everything that calls it) must be
+    able to report a clear diagnosis instead of crashing on an interrupted
+    activation they did not cause.
+
+    Concurrent callers (every ``inspect_revision_state`` caller, including
+    plain GET status routes, can run at the same time) must not both decide
+    to resume the same interrupted activation: a second caller that only
+    acquires the lock after the first has already finished would otherwise
+    replay ``activate_revision`` against a revision that is already active.
+    Check for the journal twice -- once unlocked, so the overwhelming
+    majority of calls (no interrupted activation in flight) never pay for
+    the project lock, and once again after acquiring ``_project_lock``,
+    which is what actually rules out that race. ``_project_lock`` is
+    reentrant, so resuming into ``activate_revision`` (itself
+    ``@_locked_project_paths``) from within this lock does not deadlock.
+    """
+    journal_path = activation_intent_path(project_paths)
+    if not journal_path.is_file():
+        return None
+    with _project_lock(project_paths):
+        if not journal_path.is_file():
+            # Another thread already resumed and finished this activation
+            # while we were waiting for the lock; nothing left to do.
+            return None
+        try:
+            intent = _read_json(journal_path)
+        except (OSError, ValueError):
+            return {
+                "recovered": False,
+                "revision_id": "",
+                "error": "журнал незавершённой активации повреждён и не может быть прочитан",
+            }
+        revision_id = str(intent.get("revision_id") or "")
+        if not re.fullmatch(r"rev_\d+", revision_id):
+            return {
+                "recovered": False,
+                "revision_id": revision_id,
+                "error": "журнал незавершённой активации не содержит корректный id редакции",
+            }
+        try:
+            activate_revision(revision_id, project_paths, _resume=True)
+        except Exception as exc:  # noqa: BLE001 - report, never crash a read-only integrity check
+            return {
+                "recovered": False,
+                "revision_id": revision_id,
+                "error": f"не удалось автоматически завершить активацию {revision_id}: {exc}",
+            }
+    return {"recovered": True, "revision_id": revision_id, "error": None}
+
+
 def inspect_revision_state(project_paths: dict[str, Path]) -> dict[str, Any]:
-    """Describe whether the mutable work projection belongs to the active revision."""
+    """Describe whether the mutable work projection belongs to the active revision.
+
+    Every call first gives ``recover_interrupted_activation`` a chance to
+    finish an activation a previous crash left mid-commit, so switching,
+    importing and every status display that already goes through this
+    function (see ``import_revision``, ``reconcile_revision_state``, and the
+    ``api*.py`` routes that call it) self-heals instead of staying blocked
+    on ``active_assets_mismatch`` forever. Use ``_detect_revision_state`` to
+    inspect the raw, pre-recovery state without triggering that side effect.
+    """
+
+    recovery = recover_interrupted_activation(project_paths)
+    if recovery is not None and not recovery["recovered"]:
+        return {
+            "status": "activation_recovery_failed",
+            "blocking": True,
+            "active_revision_id": str(recovery.get("revision_id") or ""),
+            "message": (
+                "Активация редакции была прервана крэшем и не может быть завершена "
+                f"автоматически: {recovery['error']}. "
+                "Переключение и импорт заблокированы до восстановления проекта."
+            ),
+        }
+    return _detect_revision_state(project_paths)
+
+
+def _detect_revision_state(project_paths: dict[str, Path]) -> dict[str, Any]:
+    """Pure, read-only revision/asset consistency check (no recovery)."""
 
     revisions = list_revisions(project_paths)
     if not revisions:
@@ -204,6 +366,20 @@ def inspect_revision_state(project_paths: dict[str, Path]) -> dict[str, Any]:
             "message": (
                 "Активная редакция и рабочий сценарий расходятся. "
                 "Переключение и импорт заблокированы до восстановления проекта."
+            ),
+        }
+    mismatched_assets = _asset_projection_mismatches(project_paths, active_id)
+    if mismatched_assets:
+        return {
+            "status": "active_assets_mismatch",
+            "blocking": True,
+            "active_revision_id": active_id,
+            "working_revision_id": working_id,
+            "mismatched_assets": mismatched_assets,
+            "message": (
+                "Подготовленная озвучка (prepared.json, манифест или файлы speaker/*.wav) "
+                "расходится с активной редакцией. Переключение и импорт заблокированы "
+                "до восстановления проекта."
             ),
         }
     return {
@@ -796,7 +972,20 @@ def _activation_matches(
 def activate_revision(
     revision_id: str,
     project_paths: dict[str, Path],
+    *,
+    _resume: bool = False,
 ) -> dict[str, Any]:
+    """Switch the project's mutable work projection to ``revision_id``.
+
+    ``_resume`` is for internal use by ``recover_interrupted_activation``
+    only. The intent journal ``restore_revision_assets`` writes before it
+    starts committing is only created after the outgoing revision has
+    already been snapshotted below, so a journal's presence proves that step
+    already completed for the interrupted attempt being resumed. Redoing it
+    against a ``prepared.json``/manifest pair that an interrupted attempt may
+    have already overwritten with the *incoming* revision's data would
+    snapshot the outgoing revision incorrectly, so resuming must skip it.
+    """
     storage = _paths(project_paths)
     manifest_path = storage["scenarios"] / f"{revision_id}.json"
     if not manifest_path.is_file():
@@ -843,7 +1032,7 @@ def activate_revision(
             raise ValueError("invalid revision diff")
         diff = _read_json(storage["diffs"] / diff_file)
     matches, kept = _activation_matches(revision_id, manifest, diff, project_paths, storage)
-    if active_path.is_file():
+    if active_path.is_file() and not _resume:
         active_id = str(_read_json(active_path).get("revision_id") or "")
         if active_id and active_id != revision_id:
             snapshot_revision_assets(active_id, project_paths)

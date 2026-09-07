@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
+import wave
 from unittest.mock import patch
 
 import api as api_module
+from atomic_io import atomic_write_json
+from project_service import ensure_project
+from stage4.versioning import ensure_baseline, inspect_revision_state
 
 
 class _DormantThread:
@@ -222,6 +228,150 @@ class TtsCoordinationTests(unittest.TestCase):
         with api_module._TTS_JOBS_LOCK:
             self.assertNotIn("demo", api_module._TTS_ACTIVE_PROJECTS)
             self.assertNotIn(created["id"], api_module._TTS_CANCEL_EVENTS)
+
+
+def _write_wav(path: Path, marker: int) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(8_000)
+        output.writeframes(marker.to_bytes(2, "little", signed=True) * 80)
+    return path.read_bytes()
+
+
+class TtsManifestSyncTests(unittest.TestCase):
+    """A TTS batch that resynthesizes one block and is then cancelled or
+    fails partway through must not leave stage4.versioning.inspect_revision_state
+    treating that legitimate, in-progress work as project corruption.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.projects_patch = patch.object(
+            api_module, "PROJECTS_DIR", Path(self.tmp.name) / "projects"
+        )
+        self.projects_patch.start()
+        self.addCleanup(self.projects_patch.stop)
+        with api_module._TTS_JOBS_LOCK:
+            api_module._TTS_JOBS.clear()
+            api_module._TTS_ACTIVE_PROJECTS.clear()
+            api_module._TTS_CANCEL_EVENTS.clear()
+
+        self.paths = ensure_project("demo", api_module.PROJECTS_DIR)
+        source = self.paths["input"] / "scenario.docx"
+        source.write_bytes(b"revision one")
+        atomic_write_json(
+            self.paths["normalized"],
+            {
+                "source": str(source),
+                "source_hash": hashlib.sha256(b"revision one").hexdigest(),
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "voice-stable",
+                        "normalized_text": "Старый текст",
+                        "original_text": "Старый текст",
+                        "type": "voiceover",
+                        "speaker": "Закадровый голос",
+                        "original_label": "ЗК",
+                        "text_for_tts": "Старый текст",
+                    }
+                ],
+            },
+        )
+        atomic_write_json(
+            self.paths["prepared"],
+            {
+                "source": str(source),
+                "scenario_revision_id": "",
+                "items": [
+                    {
+                        "id": "zk1",
+                        "block_uid": "voice-stable",
+                        "text_original": "Старый текст",
+                        "text_for_tts": "Старый текст",
+                    }
+                ],
+            },
+        )
+        _write_wav(self.paths["speaker"] / "zk1.wav", 101)
+        atomic_write_json(
+            self.paths["speaker"] / "zk1.wav.meta", {"fingerprint": "legacy-fingerprint"}
+        )
+        ensure_baseline("demo", self.paths)
+        # ensure_baseline stamped prepared.json's scenario_revision_id; keep
+        # the on-disk prepared.json (as a real TTS job would read it) in
+        # sync with the active revision it belongs to.
+        prepared = json.loads(self.paths["prepared"].read_text(encoding="utf-8"))
+        prepared["scenario_revision_id"] = "rev_0001"
+        atomic_write_json(self.paths["prepared"], prepared)
+        self.assertEqual(inspect_revision_state(self.paths)["status"], "ok")
+
+    def test_job_failure_after_partial_resynthesis_does_not_block_revision_switching(
+        self,
+    ) -> None:
+        new_audio = b"\x00" * 8
+
+        def fake_synthesize_tts(
+            *,
+            prepared_path,
+            speaker_dir,
+            provider,
+            voice_name,
+            gender,
+            dry_run,
+            progress_callback,
+            cancel_check,
+            speed=1.0,
+        ):
+            # Resynthesize zk1 exactly like stage1.gemini_tts does: write the
+            # content-addressed asset, materialize the mutable alias and its
+            # sidecar, then report success for that one item...
+            asset = speaker_dir / "assets" / "voice-stable" / "new-fingerprint.wav"
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            asset.write_bytes(new_audio)
+            (speaker_dir / "zk1.wav").write_bytes(new_audio)
+            atomic_write_json(speaker_dir / "zk1.wav.meta", {"fingerprint": "new-fingerprint"})
+            progress_callback(
+                {
+                    "event": "item_generated",
+                    "id": "zk1",
+                    "total": 2,
+                    "completed": 1,
+                    "generated": 1,
+                    "skipped": 0,
+                }
+            )
+            # ...then blow up before the batch (and save_tts_manifest) can
+            # finish, e.g. a network failure on the next item.
+            raise RuntimeError("simulated failure on next item")
+
+        self.assertTrue(api_module._reserve_tts_project("demo"))
+        job = api_module._create_tts_job("demo")
+        with patch.object(api_module, "synthesize_tts", side_effect=fake_synthesize_tts):
+            api_module._run_tts_job(
+                job_id=job["id"],
+                project="demo",
+                prepared_path=self.paths["prepared"],
+                speaker_dir=self.paths["speaker"],
+                provider=None,
+                voice_name=None,
+                gender=None,
+                dry_run=False,
+            )
+
+        state = api_module._get_tts_job(job["id"])
+        self.assertEqual(state["status"], "failed")
+
+        manifest = json.loads(self.paths["active_voiceover_manifest"].read_text(encoding="utf-8"))
+        entry = next(item for item in manifest["items"] if item["id"] == "zk1")
+        self.assertEqual(entry["fingerprint"], "new-fingerprint")
+
+        result = inspect_revision_state(self.paths)
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["blocking"])
 
 
 if __name__ == "__main__":

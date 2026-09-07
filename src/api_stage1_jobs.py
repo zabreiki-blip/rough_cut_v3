@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from stage4.revision_assets import merge_voiceover_manifest_item
+
 
 def persist_tts_job(services: Any, job: dict) -> None:
     """Best-effort atomic snapshot of the latest TTS job for one project."""
@@ -185,6 +187,14 @@ def run_tts_job(
     speed: float = 1.0,
 ) -> None:
     cancel_event = services._tts_cancel_event(job_id)
+    project_paths = services._project_paths(project)
+    prepared_payload = services._read_json_safe(prepared_path)
+    tts_revision_id = str(prepared_payload.get("scenario_revision_id") or "")
+    block_uid_by_id = {
+        str(item.get("id") or ""): str(item.get("block_uid") or "")
+        for item in prepared_payload.get("items", [])
+        if isinstance(item, dict) and item.get("id")
+    }
     progress_persist_lock = services.threading.Lock()
     last_progress_persist_at = 0.0
 
@@ -229,6 +239,23 @@ def run_tts_job(
         msg = (
             f"{event}: {done}/{total} ({current_id})" if current_id else f"{event}: {done}/{total}"
         )
+        if event in {"item_generated", "item_skipped"} and current_id:
+            # Merge this block into the active manifest as soon as its
+            # sidecar is on disk, rather than waiting for the whole batch to
+            # finish. A batch that is later cancelled or fails partway
+            # through must not leave already-resynthesized blocks recorded
+            # with a stale fingerprint (see merge_voiceover_manifest_item).
+            meta = services._read_json_safe(project_paths["speaker"] / f"{current_id}.wav.meta")
+            fingerprint = str(meta.get("fingerprint") or "") if isinstance(meta, dict) else ""
+            if fingerprint:
+                merge_voiceover_manifest_item(
+                    project_paths,
+                    revision_id=tts_revision_id,
+                    block_id=current_id,
+                    block_uid=block_uid_by_id.get(current_id) or current_id,
+                    fingerprint=fingerprint,
+                    speaker_dir=speaker_dir,
+                )
         existing = services._get_tts_job(job_id) or {}
         services._update_tts_job(
             job_id,

@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
+import wave
 
 from api_core_routes import _active_revision_input_path
 from atomic_io import atomic_write_json
 from project_service import ensure_project
 from stage4.versioning import (
     RevisionStateConflictError,
+    _detect_revision_state,
     _inherit_blocks,
     activate_revision,
     compare_blocks,
     ensure_baseline,
     import_revision,
+    inspect_revision_state,
     reconcile_revision_state,
     repair_active_revision_metadata,
 )
@@ -28,6 +32,15 @@ def _block(uid: str, text: str, block_type: str = "sync", speaker: str = "Ива
         "original_label": speaker,
         "text_for_tts": text if block_type == "voiceover" else "",
     }
+
+
+def _write_wav(path: Path, marker: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(8_000)
+        output.writeframes(marker.to_bytes(2, "little", signed=True) * 80)
 
 
 def test_compare_detects_insert_edit_and_move_without_shifting_every_block() -> None:
@@ -442,3 +455,278 @@ def test_activation_interrupted_between_files_is_detected_and_recoverable(
     )
     assert normalized_after["scenario_revision_id"] == "rev_0002"
     assert active_after["revision_id"] == "rev_0002"
+
+
+def test_activation_interrupted_mid_asset_rename_is_detected(
+    tmp_path: Path,
+) -> None:
+    """A crash between the two commits of restore_revision_assets and the
+    per-alias rename loop must leave a detectable, blocking mismatch, even
+    though active_revision.json and scenario_normalized.json still agree on
+    the old revision.
+    """
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": [
+                _block("one", "Первая", "voiceover"),
+                _block("two", "Вторая", "voiceover"),
+            ],
+        },
+    )
+    _write_wav(paths["speaker"] / "zk1.wav", 1)
+    _write_wav(paths["speaker"] / "zk2.wav", 2)
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": [
+                _block("one", "Первая", "voiceover"),
+                _block("two", "Вторая", "voiceover"),
+            ],
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+
+    import pytest
+    from unittest.mock import patch
+
+    speaker_dir = paths["speaker"]
+    real_replace = Path.replace
+    rename_calls = {"count": 0}
+
+    def flaky_replace(self, target):
+        target_path = Path(target)
+        # Only interrupt the commit loop that renames staged files onto the
+        # live speaker/zkN.wav aliases; ignore staging copies and unrelated
+        # snapshot copies so this test stays robust to unrelated Path.replace
+        # calls elsewhere in the activation path.
+        if target_path.parent == speaker_dir and re.fullmatch(r"zk\d+\.wav", target_path.name):
+            rename_calls["count"] += 1
+            if rename_calls["count"] == 2:
+                raise RuntimeError("simulated crash mid asset rename")
+        return real_replace(self, target)
+
+    with patch.object(Path, "replace", flaky_replace):
+        with pytest.raises(RuntimeError, match="simulated crash mid asset rename"):
+            activate_revision("rev_0002", paths)
+
+    assert rename_calls["count"] == 2  # the loop was genuinely interrupted mid-way
+
+    active_after_crash = __import__("json").loads(
+        (paths["work"] / "active_revision.json").read_text(encoding="utf-8")
+    )
+    normalized_after_crash = __import__("json").loads(
+        paths["normalized"].read_text(encoding="utf-8")
+    )
+    prepared_after_crash = __import__("json").loads(paths["prepared"].read_text(encoding="utf-8"))
+    manifest_after_crash = __import__("json").loads(
+        paths["active_voiceover_manifest"].read_text(encoding="utf-8")
+    )
+
+    # The active pointer and the working normalization still agree on the
+    # old revision...
+    assert active_after_crash["revision_id"] == "rev_0001"
+    assert normalized_after_crash.get("scenario_revision_id") == "rev_0001"
+    # ...yet prepared.json and the voiceover manifest were already committed
+    # to the new revision before the rename loop was interrupted, and one of
+    # the two aliases never got renamed into place.
+    assert prepared_after_crash["scenario_revision_id"] == "rev_0002"
+    assert manifest_after_crash["scenario_revision_id"] == "rev_0002"
+    assert (speaker_dir / ".zk2.revision.tmp").is_file()
+
+    # Fix the fact of the interruption first, via the pure detector that
+    # never triggers recovery, before invoking any self-healing behaviour.
+    result = _detect_revision_state(paths)
+    assert result["status"] == "active_assets_mismatch"
+    assert result["blocking"] is True
+    assert "prepared" in result["mismatched_assets"]
+    assert "voiceover_manifest" in result["mismatched_assets"]
+
+    # inspect_revision_state's write-ahead recovery pass finds the intent
+    # journal restore_revision_assets left behind, resumes the interrupted
+    # activation to completion, and reports the project as consistent again.
+    recovered = inspect_revision_state(paths)
+    assert recovered["status"] == "ok"
+    assert recovered["blocking"] is False
+    assert recovered["active_revision_id"] == "rev_0002"
+
+    active_after_recovery = __import__("json").loads(
+        (paths["work"] / "active_revision.json").read_text(encoding="utf-8")
+    )
+    normalized_after_recovery = __import__("json").loads(
+        paths["normalized"].read_text(encoding="utf-8")
+    )
+    prepared_after_recovery = __import__("json").loads(
+        paths["prepared"].read_text(encoding="utf-8")
+    )
+    manifest_after_recovery = __import__("json").loads(
+        paths["active_voiceover_manifest"].read_text(encoding="utf-8")
+    )
+    assert active_after_recovery["revision_id"] == "rev_0002"
+    assert normalized_after_recovery["scenario_revision_id"] == "rev_0002"
+    assert prepared_after_recovery["scenario_revision_id"] == "rev_0002"
+    assert manifest_after_recovery["scenario_revision_id"] == "rev_0002"
+    assert not (speaker_dir / ".zk2.revision.tmp").is_file()
+    assert (speaker_dir / "zk2.wav").is_file()
+    assert not (paths["work"] / "activation_intent.json").is_file()
+
+
+def test_activation_recovery_reports_when_it_cannot_finish(tmp_path: Path) -> None:
+    """If the underlying voiceover asset an interrupted activation staged
+    from is gone by the time recovery runs, resuming is impossible. This
+    must be reported clearly, not silently ignored or left to crash an
+    unrelated caller of inspect_revision_state.
+    """
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": [
+                _block("one", "Первая", "voiceover"),
+                _block("two", "Вторая", "voiceover"),
+            ],
+        },
+    )
+    _write_wav(paths["speaker"] / "zk1.wav", 1)
+    _write_wav(paths["speaker"] / "zk2.wav", 2)
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": [
+                _block("one", "Первая", "voiceover"),
+                _block("two", "Вторая", "voiceover"),
+            ],
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+
+    import pytest
+    from unittest.mock import patch
+
+    speaker_dir = paths["speaker"]
+    real_replace = Path.replace
+    rename_calls = {"count": 0}
+
+    def flaky_replace(self, target):
+        target_path = Path(target)
+        if target_path.parent == speaker_dir and re.fullmatch(r"zk\d+\.wav", target_path.name):
+            rename_calls["count"] += 1
+            if rename_calls["count"] == 2:
+                raise RuntimeError("simulated crash mid asset rename")
+        return real_replace(self, target)
+
+    with patch.object(Path, "replace", flaky_replace):
+        with pytest.raises(RuntimeError, match="simulated crash mid asset rename"):
+            activate_revision("rev_0002", paths)
+
+    # Something outside this crash (a hand edit, a cleanup script, disk
+    # corruption...) removed the underlying content-addressed asset the
+    # interrupted activation staged its still-pending rename from.
+    for asset in paths["voiceover_assets"].rglob("*.wav"):
+        asset.unlink()
+
+    result = inspect_revision_state(paths)
+
+    assert result["status"] == "activation_recovery_failed"
+    assert result["blocking"] is True
+    assert result["active_revision_id"] == "rev_0002"
+    assert "rev_0002" in result["message"]
+    # The failed recovery attempt must not have thrown away the journal: a
+    # later retry (once the missing asset is restored) still needs it.
+    assert (paths["work"] / "activation_intent.json").is_file()
+
+
+def test_recover_interrupted_activation_runs_activation_exactly_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two concurrent status checks (as ordinary GET routes issue) must not
+    both decide to resume the same interrupted activation: the journal
+    presence check and the resume must be atomic with respect to each other,
+    not just internally locked inside ``activate_revision`` itself.
+    """
+    import threading
+    import time
+
+    from stage4 import versioning
+
+    paths = ensure_project("demo", tmp_path / "projects")
+    journal_path = paths["work"] / "activation_intent.json"
+    atomic_write_json(journal_path, {"revision_id": "rev_0001"})
+
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+    start_barrier = threading.Barrier(2)
+
+    def fake_activate(revision_id, project_paths, *, _resume=False):
+        with calls_lock:
+            calls.append(revision_id)
+        # Widen the window during which a second, concurrent caller could
+        # wrongly decide to resume too, mirroring how long the real
+        # ``activate_revision`` keeps the journal around while it commits.
+        time.sleep(0.05)
+        journal_path.unlink(missing_ok=True)
+        return {"revision": {}, "reused_sync_matches": 0}
+
+    monkeypatch.setattr(versioning, "activate_revision", fake_activate)
+
+    results: list[dict | None] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        start_barrier.wait()
+        outcome = versioning.recover_interrupted_activation(paths)
+        with results_lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(threads) == 2 and all(not thread.is_alive() for thread in threads)
+    assert len(calls) == 1, f"activate_revision ran {len(calls)} times, expected exactly once"
+    assert len(results) == 2
+    assert sum(1 for result in results if result is not None and result["recovered"]) == 1
+    assert not journal_path.is_file()
