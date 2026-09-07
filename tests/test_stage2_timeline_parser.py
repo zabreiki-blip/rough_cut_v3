@@ -11,6 +11,7 @@ from stage2.timeline_parser import (
     parse_normalized_timeline,
     parse_timeline,
     split_text_by_ellipsis,
+    split_text_by_sentences,
     sync_fragment_id,
 )
 
@@ -484,6 +485,86 @@ class SplitTextByEllipsisTest(unittest.TestCase):
         )
 
 
+class SplitTextBySentencesTest(unittest.TestCase):
+    def test_two_full_sentences_split_in_two(self) -> None:
+        text = "Первое предложение целиком тут. Второе предложение тоже целиком тут."
+        self.assertEqual(
+            split_text_by_sentences(text),
+            [
+                "Первое предложение целиком тут.",
+                "Второе предложение тоже целиком тут.",
+            ],
+        )
+
+    def test_four_word_sentence_stays_independent(self) -> None:
+        text = "Он же испытывает радость."
+        self.assertEqual(split_text_by_sentences(text), [text])
+
+    def test_short_fragment_glued_to_neighbour_without_losing_text(self) -> None:
+        text = "Да. Он же испытывает радость."
+        parts = split_text_by_sentences(text)
+        self.assertEqual(len(parts), 1)
+        self.assertIn("Да.", parts[0])
+        self.assertIn("Он же испытывает радость.", parts[0])
+
+    def test_abbreviations_and_initials_do_not_split_sentence(self) -> None:
+        text = "Мы изучали т. д. и т. п. вместе с А. С. Пушкиным в школе"
+        self.assertEqual(split_text_by_sentences(text), [text])
+
+    def test_no_sentence_boundaries_returns_single_part(self) -> None:
+        text = "Обычная фраза без границ предложений"
+        self.assertEqual(split_text_by_sentences(text), [text])
+
+    def test_real_world_three_sentence_splice_regression(self) -> None:
+        text = (
+            "Когда я подхожу к храму, я сразу созерцаю красоту этого храма. "
+            "Человек, когда смотрит на это, он что испытывает? "
+            "Он же испытывает радость."
+        )
+        parts = split_text_by_sentences(text)
+        self.assertEqual(
+            parts,
+            [
+                "Когда я подхожу к храму, я сразу созерцаю красоту этого храма.",
+                "Человек, когда смотрит на это, он что испытывает?",
+                "Он же испытывает радость.",
+            ],
+        )
+
+    def test_empty_string_returns_empty_list(self) -> None:
+        self.assertEqual(split_text_by_sentences(""), [])
+
+
+class NormalizedSyncFragmentsSentenceCascadeTest(unittest.TestCase):
+    def test_ellipsis_then_sentence_split_cascade_preserves_order(self) -> None:
+        block = {
+            "sync_fragments": [
+                {
+                    "timecode_start": "00:10:00",
+                    "timecode_end": "00:10:20",
+                    "text": (
+                        "Когда я подхожу к храму, я сразу созерцаю красоту этого храма. "
+                        "Человек, когда смотрит на это, он что испытывает?..."
+                        "Он же испытывает радость. И это очень важно понимать всем нам."
+                    ),
+                }
+            ]
+        }
+        fragments = normalized_sync_fragments(block)
+        self.assertEqual(
+            [f["text"] for f in fragments],
+            [
+                "Когда я подхожу к храму, я сразу созерцаю красоту этого храма.",
+                "Человек, когда смотрит на это, он что испытывает?",
+                "Он же испытывает радость.",
+                "И это очень важно понимать всем нам.",
+            ],
+        )
+        for fragment in fragments:
+            self.assertEqual(fragment["timecode_start"], "00:10:00")
+            self.assertEqual(fragment["timecode_end"], "00:10:20")
+
+
 class NormalizedSyncFragmentsEllipsisTest(unittest.TestCase):
     def test_block_without_text_returns_single_empty_fragment_for_compatibility(self) -> None:
         """Empty/punctuation-only blocks should return one fragment with empty text.
@@ -587,6 +668,334 @@ class NormalizedSyncFragmentsEllipsisTest(unittest.TestCase):
             ids,
             ["uid::fragment:1", "uid::fragment:2", "uid::fragment:3"],
         )
+
+
+class FragmentMergeTest(unittest.TestCase):
+    """Consecutive fragments of one canonical block, matched to adjacent
+    positions on the same source tape, must collapse into a single timeline
+    item instead of staying as separate back-to-back clips."""
+
+    def _document(self, sync_fragments: list[dict]) -> dict:
+        return {
+            "status": "confirmed",
+            "blocks": [
+                {
+                    "uid": "block-a",
+                    "order": 1,
+                    "type": "sync",
+                    "speaker": "ИВАН ИВАНОВ",
+                    "role": "ЭКСПЕРТ",
+                    "normalized_text": " ".join(f["text"] for f in sync_fragments),
+                    "sync_fragments": sync_fragments,
+                }
+            ],
+        }
+
+    def _match(self, source_id: str, in_sec: float, out_sec: float, status: str = "confirmed", confidence: float = 0.9) -> dict:
+        return {
+            "source_id": source_id,
+            "source_in_sec": in_sec,
+            "source_out_sec": out_sec,
+            "confidence": confidence,
+            "status": status,
+        }
+
+    def test_two_adjacent_fragments_merge_into_one_item(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:15", "text": "Вторая часть"},
+                ]
+            )
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 15.5, 20.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1"])
+            item = timeline.segments[0]
+            self.assertEqual(item.text, "Первая часть Вторая часть")
+            self.assertEqual(item.source_in_sec, 10.0)
+            self.assertEqual(item.source_out_sec, 20.0)
+            self.assertEqual(item.duration_sec, 10.0)
+
+    def test_three_consecutive_adjacent_fragments_merge_transitively(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая"},
+                    {"timecode_start": "00:15", "text": "Вторая"},
+                    {"timecode_start": "00:20", "text": "Третья"},
+                ]
+            )
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 15.5, 20.0),
+                "block-a::fragment:3": self._match("src1", 20.9, 25.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1"])
+            item = timeline.segments[0]
+            self.assertEqual(item.text, "Первая Вторая Третья")
+            self.assertEqual(item.source_in_sec, 10.0)
+            self.assertEqual(item.source_out_sec, 25.0)
+
+    def test_gap_over_threshold_keeps_fragments_separate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:20", "text": "Вторая часть"},
+                ]
+            )
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 20.0, 25.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+
+    def test_different_source_id_does_not_merge(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:15", "text": "Вторая часть"},
+                ]
+            )
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src2", 15.5, 20.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+
+    def test_unmatched_neighbour_does_not_merge(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:15", "text": "Вторая часть"},
+                ]
+            )
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                # second fragment has no match at all -> stays unmatched
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+            self.assertEqual(timeline.segments[1].match_status, "")
+            self.assertEqual(timeline.segments[1].duration_sec, 10.0)
+
+    def test_adjacent_fragments_from_different_blocks_do_not_merge(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "block-a",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Первая часть",
+                    },
+                    {
+                        "uid": "block-b",
+                        "order": 2,
+                        "type": "sync",
+                        "normalized_text": "Вторая часть",
+                    },
+                ],
+            }
+            matches = {
+                "block-a": self._match("src1", 10.0, 15.0),
+                "block-b": self._match("src1", 15.5, 20.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+            self.assertEqual(
+                [item.block_uid for item in timeline.segments], ["block-a", "block-b"]
+            )
+
+    def test_numbering_stays_sequential_after_merge_across_blocks(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "block-a",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Первая часть Вторая часть Третья часть",
+                        "sync_fragments": [
+                            {"timecode_start": "00:10", "text": "Первая часть"},
+                            {"timecode_start": "00:15", "text": "Вторая часть"},
+                            {"timecode_start": "00:20", "text": "Третья часть"},
+                        ],
+                    },
+                    {
+                        "uid": "block-b",
+                        "order": 2,
+                        "type": "sync",
+                        "normalized_text": "Отдельная реплика",
+                    },
+                ],
+            }
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 15.5, 20.0),
+                "block-a::fragment:3": self._match("src1", 20.9, 25.0),
+                "block-b": self._match("src2", 100.0, 105.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+            self.assertEqual(timeline.segments[1].block_uid, "block-b")
+
+    def test_strong_overlap_does_not_merge(self) -> None:
+        """Strong overlap (gap far below threshold) indicates nesting and must not merge."""
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:14", "text": "Вторая часть"},
+                ]
+            )
+            # gap = 11 - 15 = -4, which exceeds _FRAGMENT_MERGE_MAX_GAP_SEC (1.5)
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 11.0, 30.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            # Should not merge due to strong overlap
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+            self.assertEqual(timeline.segments[0].duration_sec, 5.0)
+            self.assertEqual(timeline.segments[1].duration_sec, 19.0)
+
+    def test_mild_overlap_within_threshold_merges(self) -> None:
+        """Mild overlap within threshold (padding from matcher) should merge."""
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:14", "text": "Вторая часть"},
+                ]
+            )
+            # gap = 14.5 - 15 = -0.5, which is within threshold
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 14.5, 20.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            # Should merge due to mild overlap within threshold
+            self.assertEqual([item.id for item in timeline.segments], ["snh1"])
+            self.assertEqual(timeline.segments[0].source_in_sec, 10.0)
+            self.assertEqual(timeline.segments[0].source_out_sec, 20.0)
+            self.assertEqual(timeline.segments[0].duration_sec, 10.0)
+
+    def test_nested_range_does_not_merge(self) -> None:
+        """Fragment whose source_out_sec is less than previous breaks monotonicity and must not merge."""
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая часть"},
+                    {"timecode_start": "00:12", "text": "Вторая часть"},
+                ]
+            )
+            # gap = 12 - 30 = -18, and source_out 20 < 30 (nested range)
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 30.0),
+                "block-a::fragment:2": self._match("src1", 12.0, 20.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            # Should not merge due to source_out monotonicity violation
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+            self.assertEqual(timeline.segments[0].duration_sec, 20.0)
+            self.assertEqual(timeline.segments[1].duration_sec, 8.0)
+
+    def test_regression_three_overlapping_fragments(self) -> None:
+        """Regression: three fragments with transitive overlaps should not collapse into one short clip.
+        F1(10–15), F2(14–30), F3(16–20) previously collapsed to a single item claiming
+        duration 10–15 = 5s instead of the real coverage 10–30s = 20s."""
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = self._document(
+                [
+                    {"timecode_start": "00:10", "text": "Первая"},
+                    {"timecode_start": "00:14", "text": "Вторая"},
+                    {"timecode_start": "00:16", "text": "Третья"},
+                ]
+            )
+            matches = {
+                "block-a::fragment:1": self._match("src1", 10.0, 15.0),
+                "block-a::fragment:2": self._match("src1", 14.0, 30.0),
+                "block-a::fragment:3": self._match("src1", 16.0, 20.0),
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches
+            )
+
+            # F1 and F2 merge (gap = -1.0, within 1.5)
+            # F2 and F3 should NOT merge (F3.source_out=20 < F2.source_out=30, violates monotonicity)
+            self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2"])
+            # First item: merged F1+F2
+            self.assertEqual(timeline.segments[0].source_in_sec, 10.0)
+            self.assertEqual(timeline.segments[0].source_out_sec, 30.0)
+            self.assertEqual(timeline.segments[0].duration_sec, 20.0)
+            # Second item: F3 alone
+            self.assertEqual(timeline.segments[1].source_in_sec, 16.0)
+            self.assertEqual(timeline.segments[1].source_out_sec, 20.0)
+            self.assertEqual(timeline.segments[1].duration_sec, 4.0)
 
 
 if __name__ == "__main__":
