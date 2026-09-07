@@ -7,8 +7,17 @@ import wave
 
 from atomic_io import atomic_write_json
 from project_service import ensure_project
-from stage4.revision_assets import save_tts_manifest, snapshot_revision_assets
-from stage4.versioning import activate_revision, ensure_baseline, import_revision
+from stage4.revision_assets import (
+    merge_voiceover_manifest_item,
+    save_tts_manifest,
+    snapshot_revision_assets,
+)
+from stage4.versioning import (
+    activate_revision,
+    ensure_baseline,
+    import_revision,
+    inspect_revision_state,
+)
 
 
 def _block(uid: str, text: str) -> dict:
@@ -311,6 +320,54 @@ def test_edited_voiceover_does_not_inherit_old_audio_before_resynthesis(
     assert not (paths["speaker"] / "zk1.wav").exists()
 
 
+def test_inspect_revision_state_detects_stale_voiceover_asset_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """A speaker/*.wav alias whose content drifted from the manifest's
+    recorded fingerprint must be flagged even when prepared.json and the
+    manifest itself still agree with the active revision.
+    """
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+
+    assert inspect_revision_state(paths)["status"] == "ok"
+
+    manifest = _read_json(paths["active_voiceover_manifest"])
+    fingerprint = _entry_for_uid(manifest, "voice-stable")["fingerprint"]
+    assert fingerprint.startswith("legacy-")
+    recorded = json.loads((paths["speaker"] / "zk1.wav.meta").read_text(encoding="utf-8"))
+    assert recorded["fingerprint"] == fingerprint
+    (paths["speaker"] / "zk1.wav.meta").write_text(
+        json.dumps({"fingerprint": "legacy-tampered"}), encoding="utf-8"
+    )
+
+    result = inspect_revision_state(paths)
+    assert result["status"] == "active_assets_mismatch"
+    assert result["blocking"] is True
+    assert result["mismatched_assets"] == ["voiceover_asset:zk1"]
+
+
+def test_restore_revision_assets_records_sidecar_for_legacy_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """Legacy content-hash fingerprints must also get a wav.meta sidecar so
+    inspect_revision_state can verify them without re-hashing audio files.
+    """
+    paths, _source, old_audio = _prepare_legacy_baseline(tmp_path)
+    imported = _import_with_voiceover_insert(tmp_path, paths)
+    manifest = _read_json(
+        paths["scenario_versions"] / imported["revision"]["voiceover_manifest_snapshot"]
+    )
+    expected_fingerprint = _entry_for_uid(manifest, "voice-stable")["fingerprint"]
+    assert expected_fingerprint.startswith("legacy-")
+
+    activate_revision("rev_0002", paths)
+
+    meta = json.loads((paths["speaker"] / "zk2.wav.meta").read_text(encoding="utf-8"))
+    assert meta["fingerprint"] == expected_fingerprint
+    assert (paths["speaker"] / "zk2.wav").read_bytes() == old_audio
+
+
 def test_stale_tts_result_is_saved_to_its_revision_not_the_active_one(
     tmp_path: Path,
 ) -> None:
@@ -351,3 +408,126 @@ def test_stale_tts_result_is_saved_to_its_revision_not_the_active_one(
     assert _read_json(paths["active_voiceover_manifest"])["scenario_revision_id"] == "rev_0002"
     saved = _read_json(paths["scenario_versions"] / "rev_0001.voiceover.json")
     assert _entry_for_uid(saved, "old")["fingerprint"] == "fp"
+
+
+def test_merge_voiceover_manifest_item_records_resynthesis_without_full_batch(
+    tmp_path: Path,
+) -> None:
+    """A single block resynthesized through Stage 1 TTS must update the
+    active manifest immediately, not only once an entire batch completes.
+    Otherwise a legitimate, still-in-progress or partially cancelled
+    resynthesis looks identical to the asset corruption
+    inspect_revision_state is meant to catch (see
+    test_activation_interrupted_mid_asset_rename_is_detected).
+    """
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    assert inspect_revision_state(paths)["status"] == "ok"
+
+    # Mimic what stage1.gemini_tts does when a block is resynthesized: the
+    # content-addressed asset and the mutable speaker/zk1.wav alias (with its
+    # sidecar) are updated to a new fingerprint.
+    new_asset = paths["speaker"] / "assets" / "voice-stable" / "new-fingerprint.wav"
+    new_audio = _write_wav(new_asset, 909)
+    (paths["speaker"] / "zk1.wav").write_bytes(new_audio)
+    atomic_write_json(paths["speaker"] / "zk1.wav.meta", {"fingerprint": "new-fingerprint"})
+
+    merge_voiceover_manifest_item(
+        paths,
+        revision_id="rev_0001",
+        block_id="zk1",
+        block_uid="voice-stable",
+        fingerprint="new-fingerprint",
+        speaker_dir=paths["speaker"],
+    )
+
+    manifest = _read_json(paths["active_voiceover_manifest"])
+    entry = _entry_for_uid(manifest, "voice-stable")
+    assert entry["fingerprint"] == "new-fingerprint"
+    assert _asset_path(entry, paths["root"]).read_bytes() == new_audio
+
+    result = inspect_revision_state(paths)
+    assert result["status"] == "ok"
+    assert result["blocking"] is False
+
+
+def test_merge_voiceover_manifest_item_is_safe_under_concurrent_updates(
+    tmp_path: Path,
+) -> None:
+    """synthesize_tts calls merge_voiceover_manifest_item from several
+    ThreadPoolExecutor worker threads as soon as each block finishes (see
+    stage1.gemini_tts). Its read-modify-write of the manifest must be
+    serialized per project so two blocks finishing at the same moment never
+    make one write clobber the other and silently drop a block from the
+    manifest.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+
+    block_count = 20
+    for index in range(2, block_count + 1):
+        block_uid = f"voice-{index}"
+        asset = paths["speaker"] / "assets" / block_uid / f"fp-{index}.wav"
+        _write_wav(asset, index)
+
+    def merge_one(index: int) -> None:
+        merge_voiceover_manifest_item(
+            paths,
+            revision_id="rev_0001",
+            block_id=f"zk{index}",
+            block_uid=f"voice-{index}",
+            fingerprint=f"fp-{index}",
+            speaker_dir=paths["speaker"],
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(merge_one, range(2, block_count + 1)))
+
+    manifest = _read_json(paths["active_voiceover_manifest"])
+    recorded_uids = {entry.get("block_uid") for entry in _manifest_entries(manifest)}
+    expected_uids = {f"voice-{index}" for index in range(2, block_count + 1)}
+    assert expected_uids <= recorded_uids
+
+
+def test_merge_voiceover_manifest_item_skips_manifest_for_other_revision(
+    tmp_path: Path,
+) -> None:
+    """TTS running against a non-active revision's prepared.json must never
+    touch the active projection; that revision gets its own snapshot once
+    save_tts_manifest runs at the end of the batch."""
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    before = _read_json(paths["active_voiceover_manifest"])
+
+    new_asset = paths["speaker"] / "assets" / "voice-stable" / "other-fingerprint.wav"
+    _write_wav(new_asset, 111)
+
+    merge_voiceover_manifest_item(
+        paths,
+        revision_id="rev_0002",
+        block_id="zk1",
+        block_uid="voice-stable",
+        fingerprint="other-fingerprint",
+        speaker_dir=paths["speaker"],
+    )
+
+    assert _read_json(paths["active_voiceover_manifest"]) == before
+
+
+def test_merge_voiceover_manifest_item_ignores_missing_asset(tmp_path: Path) -> None:
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    before = _read_json(paths["active_voiceover_manifest"])
+
+    merge_voiceover_manifest_item(
+        paths,
+        revision_id="rev_0001",
+        block_id="zk1",
+        block_uid="voice-stable",
+        fingerprint="never-written",
+        speaker_dir=paths["speaker"],
+    )
+
+    assert _read_json(paths["active_voiceover_manifest"]) == before

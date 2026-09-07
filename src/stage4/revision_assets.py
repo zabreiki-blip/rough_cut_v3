@@ -1,16 +1,36 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
 import re
 import shutil
+import threading
 from typing import Any
 
 from atomic_io import atomic_write_json
 
 
 _VOICEOVER_ALIAS_RE = re.compile(r"^zk\d+\.wav$")
+_ACTIVATION_INTENT_FILENAME = "activation_intent.json"
+
+# merge_voiceover_manifest_item() does a non-atomic read-modify-write of the
+# active voiceover manifest. Stage 1 TTS calls it once per finished block
+# from several ThreadPoolExecutor worker threads (see synthesize_tts), so
+# two blocks finishing at the same moment can both read the same manifest
+# version and one write can clobber the other, silently dropping a block.
+# Serialize updates with one lock per manifest path (not a single
+# process-wide lock) so concurrent projects never block each other. Mirrors
+# the ``_path_lock`` cache-by-resolved-path pattern in stage1/normalizer.py.
+_MANIFEST_LOCKS: dict[str, threading.Lock] = {}
+_MANIFEST_LOCKS_GUARD = threading.Lock()
+
+
+def _manifest_lock(path: Path) -> threading.Lock:
+    key = str(Path(path).resolve())
+    with _MANIFEST_LOCKS_GUARD:
+        return _MANIFEST_LOCKS.setdefault(key, threading.Lock())
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -42,6 +62,17 @@ def _project_asset_path(project_paths: dict[str, Path], value: str) -> Path | No
     root = project_paths["root"].resolve()
     candidate = (root / raw).resolve()
     return candidate if candidate.is_relative_to(root) else None
+
+
+def activation_intent_path(project_paths: dict[str, Path]) -> Path:
+    """Where restore_revision_assets records its write-ahead activation intent.
+
+    Kept directly under ``work/`` alongside the rest of the mutable
+    projection state (``project_paths["work"]`` in project_service.py) so a
+    crash recovery pass (see stage4.versioning.inspect_revision_state) only
+    has to look in one place every project already keeps its live state.
+    """
+    return project_paths["work"] / _ACTIVATION_INTENT_FILENAME
 
 
 def prepared_from_normalized(normalized: dict[str, Any]) -> dict[str, Any]:
@@ -133,16 +164,22 @@ def capture_legacy_voiceover_manifest(project_paths: dict[str, Path]) -> dict[st
         if not alias.is_file():
             continue
         audio_hash = hashlib.sha256(alias.read_bytes()).hexdigest()
+        fingerprint = f"legacy-{audio_hash}"
         destination = (
             project_paths["voiceover_assets"] / _safe_uid(block_uid) / f"legacy-{audio_hash}.wav"
         )
         if not destination.is_file():
             _atomic_copy(alias, destination)
+        # Stamp the sidecar with the fingerprint just computed from this
+        # exact alias content, so later consistency checks (see
+        # stage4.versioning.inspect_revision_state) have an accurate record
+        # to compare against instead of a stale or absent one.
+        atomic_write_json(alias.with_suffix(".wav.meta"), {"fingerprint": fingerprint})
         manifest_items.append(
             {
                 "id": block_id,
                 "block_uid": block_uid,
-                "fingerprint": f"legacy-{audio_hash}",
+                "fingerprint": fingerprint,
                 "asset": destination.relative_to(project_paths["root"]).as_posix(),
             }
         )
@@ -350,6 +387,71 @@ def save_tts_manifest(project_paths: dict[str, Path], result: dict[str, Any]) ->
     return manifest
 
 
+def merge_voiceover_manifest_item(
+    project_paths: dict[str, Path],
+    *,
+    revision_id: str,
+    block_id: str,
+    block_uid: str,
+    fingerprint: str,
+    speaker_dir: Path,
+) -> None:
+    """Record one freshly synthesized block in the active voiceover manifest.
+
+    Stage 1 TTS updates ``speaker/<id>.wav`` and its sidecar fingerprint as
+    soon as each block finishes, well before the whole batch — which may run
+    for many items and can be cancelled or fail partway through — completes.
+    ``save_tts_manifest`` only overwrites ``active_voiceover_manifest.json``
+    once, after the entire batch returns; if the batch never returns, every
+    already-resynthesized block is left recorded with a stale fingerprint in
+    the manifest even though nothing on disk is actually broken. Merging
+    each successful item here keeps the manifest a faithful, incrementally
+    updated record of what is actually on disk, so
+    ``stage4.versioning.inspect_revision_state`` does not mistake a
+    legitimate, in-progress or partially cancelled resynthesis for project
+    corruption.
+    """
+    if not re.fullmatch(r"zk\d+", block_id) or not fingerprint:
+        return
+    normalized = _read_json(project_paths["normalized"])
+    active_revision_id = str(normalized.get("scenario_revision_id") or "")
+    if revision_id and active_revision_id and revision_id != active_revision_id:
+        # This synthesis run targets a revision other than the active one;
+        # its manifest belongs in that revision's own snapshot (written by
+        # save_tts_manifest once the batch completes), not in the active
+        # projection. Never cross-contaminate the active manifest.
+        return
+    asset = speaker_dir / "assets" / _safe_uid(block_uid) / f"{fingerprint}.wav"
+    if not asset.is_file():
+        return
+    try:
+        asset_relative = asset.resolve().relative_to(project_paths["root"].resolve()).as_posix()
+    except (OSError, ValueError):
+        return
+    manifest_path = project_paths["active_voiceover_manifest"]
+    with _manifest_lock(manifest_path):
+        manifest = _read_json(manifest_path)
+        items = [
+            item
+            for item in manifest.get("items", [])
+            if isinstance(item, dict) and str(item.get("id") or "") != block_id
+        ]
+        items.append(
+            {
+                "id": block_id,
+                "block_uid": block_uid,
+                "fingerprint": fingerprint,
+                "asset": asset_relative,
+            }
+        )
+        updated = {
+            "schema_version": 1,
+            "scenario_revision_id": revision_id or str(manifest.get("scenario_revision_id") or ""),
+            "items": items,
+        }
+        atomic_write_json(manifest_path, updated)
+
+
 def restore_revision_assets(
     revision_id: str,
     revision: dict[str, Any],
@@ -391,13 +493,52 @@ def restore_revision_assets(
         destination = project_paths["speaker"] / f".{block_id}.revision.tmp"
         _atomic_copy(source, destination)
         staged[block_id] = destination
+
+    # Write a write-ahead intent journal before starting the actual commit
+    # (prepared.json, the manifest, then N per-alias renames). A crash
+    # partway through that commit leaves prepared.json/the manifest already
+    # describing ``revision_id`` while some speaker/*.wav aliases still hold
+    # the previous revision's audio. inspect_revision_state's recovery pass
+    # uses the presence of this journal to know an activation was
+    # interrupted and must be finished rather than mistaken for a project
+    # someone else corrupted by hand.
+    root = project_paths["root"].resolve()
+    intent_path = activation_intent_path(project_paths)
+    atomic_write_json(
+        intent_path,
+        {
+            "schema_version": 1,
+            "revision_id": revision_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "operations": [
+                {
+                    "block_id": block_id,
+                    "staged": staged_path.resolve().relative_to(root).as_posix(),
+                    "alias": (project_paths["speaker"] / f"{block_id}.wav")
+                    .resolve()
+                    .relative_to(root)
+                    .as_posix(),
+                    "fingerprint": desired[block_id][1],
+                }
+                for block_id, staged_path in staged.items()
+            ],
+        },
+    )
+
     atomic_write_json(project_paths["prepared"], prepared_payload)
     atomic_write_json(project_paths["active_voiceover_manifest"], manifest)
     for block_id, staged_path in staged.items():
         alias = project_paths["speaker"] / f"{block_id}.wav"
         staged_path.replace(alias)
         fingerprint = desired[block_id][1]
-        if fingerprint and not fingerprint.startswith("legacy-"):
+        if fingerprint:
+            # Record the fingerprint for every alias, including legacy
+            # content-hash fingerprints, so downstream consistency checks
+            # (see stage4.versioning.inspect_revision_state) can verify the
+            # asset on disk without re-hashing potentially large audio
+            # files. Legacy fingerprints are prefixed with "legacy-" and can
+            # never collide with a real synthesis fingerprint, so recording
+            # them here does not affect TTS cache invalidation.
             atomic_write_json(alias.with_suffix(".wav.meta"), {"fingerprint": fingerprint})
         else:
             alias.with_suffix(".wav.meta").unlink(missing_ok=True)
@@ -409,3 +550,5 @@ def restore_revision_assets(
         ):
             alias.unlink()
             alias.with_suffix(".wav.meta").unlink(missing_ok=True)
+    # Every alias now matches revision_id; the intent recorded above is done.
+    intent_path.unlink(missing_ok=True)
