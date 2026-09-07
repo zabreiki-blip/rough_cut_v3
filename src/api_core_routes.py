@@ -101,6 +101,22 @@ def _macos_connector_health_url(connector_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
 
 
+def _redact_url_userinfo(url: str) -> str:
+    """Strip any embedded credentials (userinfo) from a URL for safe display.
+
+    Only scheme, host, port and path are kept; login/password never leave this
+    function. The original URL (with userinfo, if any) must still be used for
+    the actual HTTP request.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def _check_macos_connector(connector_url: str) -> dict[str, str]:
     """Check TTS readiness via the macOS connector bridge (Docker/Linux API host).
 
@@ -109,11 +125,12 @@ def _check_macos_connector(connector_url: str) -> dict[str, str]:
     """
     label = "TTS-провайдер"
     health_url = _macos_connector_health_url(connector_url)
+    display_url = _redact_url_userinfo(health_url)
     unreachable = _readiness_item(
         item_id="tts_provider",
         label=label,
         status="error",
-        detail=f"Провайдер macos: коннектор не отвечает ({health_url}).",
+        detail=f"Провайдер macos: коннектор не отвечает ({display_url}).",
         hint=(
             "Запустите коннектор на macOS-хосте: python -m macos_connector; "
             "проверьте MACOS_CONNECTOR_URL."

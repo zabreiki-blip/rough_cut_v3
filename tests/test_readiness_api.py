@@ -275,6 +275,64 @@ def test_readiness_never_leaks_macos_connector_token(
     assert not captured_headers
 
 
+def test_readiness_strips_userinfo_from_macos_connector_url_in_detail(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://user:s3cret@127.0.0.1:9999/synthesize")
+
+    captured_urls = []
+
+    def fake_get(url, timeout=None, **kwargs):
+        captured_urls.append(url)
+        raise requests.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    raw_body = response.get_data(as_text=True)
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+
+    # Секреты (логин и пароль) не должны попадать ни в detail/hint, ни в тело ответа целиком.
+    assert "user" not in check["detail"]
+    assert "s3cret" not in check["detail"]
+    assert "user" not in (check.get("hint") or "")
+    assert "s3cret" not in (check.get("hint") or "")
+    assert "user:s3cret" not in raw_body
+    assert "s3cret" not in raw_body
+
+    # Хост и порт остаются видны для диагностики.
+    assert "127.0.0.1:9999" in check["detail"]
+
+    # Запрос всё равно должен уйти по полному исходному URL (с userinfo).
+    assert captured_urls == ["http://user:s3cret@127.0.0.1:9999/health"]
+
+
+def test_readiness_macos_connector_url_without_userinfo_unchanged(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+
+    def fake_get(url, timeout=None):
+        raise requests.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    response = client.get("/system/readiness")
+
+    payload = response.get_json()
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    check = checks_by_id["tts_provider"]
+    assert check["detail"] == (
+        "Провайдер macos: коннектор не отвечает (http://host.docker.internal:8001/health)."
+    )
+
+
 def test_readiness_ui_contract_in_template_and_script() -> None:
     root = Path(__file__).parents[1]
     # `stage1.js` is a thin ES-module entry point (see U7); the readiness DOM
