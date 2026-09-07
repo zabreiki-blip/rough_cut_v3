@@ -8,16 +8,28 @@ import stage2.sync_matcher as sync_matcher_module
 from stage2.sync_matcher import (
     MatcherConfig,
     SyncMatcher,
+    _Candidate,
     _candidate_starts,
+    _has_plausible_duration,
+    _has_reliable_word_timestamps,
     _length_samples,
     _timed_tokens,
+    _Token,
+    _trim_span_to_match,
     normalize_text,
+    normalize_token,
     parse_timecode,
 )
 from stage2.sync_models import AlignmentRequest, SyncSource, WordIndex, WordTimestamp
 
 
-def _index(source_id: str, text: str, start: float, step: float = 0.5) -> WordIndex:
+def _index(
+    source_id: str,
+    text: str,
+    start: float,
+    step: float = 0.5,
+    metadata: dict | None = None,
+) -> WordIndex:
     words = text.split()
     return WordIndex(
         source_id=source_id,
@@ -25,6 +37,7 @@ def _index(source_id: str, text: str, start: float, step: float = 0.5) -> WordIn
             WordTimestamp(word, start + index * step, start + (index + 1) * step)
             for index, word in enumerate(words)
         ],
+        metadata=dict(metadata) if metadata is not None else {},
     )
 
 
@@ -39,6 +52,67 @@ def _source(
         premiere_sequence=f"SYNC_{source_id.upper()}",
         **kwargs,
     )
+
+
+def _span(words: list[str], start: float = 0.0, step: float = 0.5) -> list[_Token]:
+    return [
+        _Token(
+            normalize_token(word),
+            WordTimestamp(word, start + index * step, start + (index + 1) * step),
+        )
+        for index, word in enumerate(words)
+    ]
+
+
+def test_trim_span_to_match_drops_only_unmatched_head_and_tail_words() -> None:
+    query = normalize_text("мы хотели разладить отношения")
+    span = _span(["ну", "мы", "хотели", "разладить", "отношения", "вот", "я", "ж"])
+
+    trimmed = _trim_span_to_match(query, span)
+
+    assert trimmed is not None
+    assert [item.word.word for item in trimmed] == ["мы", "хотели", "разладить", "отношения"]
+    # Trimming only cuts the edges; nothing inside the matched run is dropped.
+    assert trimmed == span[1:5]
+
+
+def test_trim_span_to_match_is_a_no_op_when_the_whole_span_matches() -> None:
+    query = normalize_text("мы хотели разладить отношения")
+    span = _span(["мы", "хотели", "разладить", "отношения"])
+
+    trimmed = _trim_span_to_match(query, span)
+
+    assert trimmed == span
+
+
+def test_trim_span_to_match_returns_none_when_nothing_matches() -> None:
+    query = normalize_text("абсолютно другая фраза")
+    span = _span(["ну", "мы", "хотели", "разладить", "отношения", "вот"])
+
+    assert _trim_span_to_match(query, span) is None
+
+
+def test_matched_span_excludes_trailing_noise_and_raises_confidence() -> None:
+    transcript = "вступление перед цитатой они хотели разладить отношения ну потом дальше по тексту"
+    matcher = SyncMatcher(
+        [_source()],
+        [_index("vasilieva_01", transcript, 1000.0)],
+    )
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="trim-tail",
+            text="они хотели разладить отношения",
+            speaker="Татьяна Васильева",
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.confidence >= 0.95
+    assert "ну" not in result.matched_text.lower().split()
+    # The trailing filler word ("ну", 0.5s long) must not leak into the clip
+    # boundary beyond the configured tail padding.
+    assert result.source_out_sec is not None and result.source_out_sec < 1004.6
 
 
 def test_russian_normalization_handles_case_yo_punctuation_and_inflections() -> None:
@@ -181,6 +255,170 @@ def test_missing_local_match_falls_back_to_full_transcript_and_requires_review()
     assert result.strategy == "fallback_full"
     assert result.status == "needs_review"
     assert result.confidence > 0.9
+
+
+def test_anchor_bounds_restrict_search_to_interval_and_use_between_anchors_strategy() -> None:
+    phrase = "этот редкий ключевой фрагмент звучит именно здесь"
+    inside = _index("s1", phrase, 500.0)
+    outside = _index("s1", phrase, 100.0)
+    index = WordIndex(source_id="s1", words=[*outside.words, *inside.words])
+    matcher = SyncMatcher([_source("s1")], [index])
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="snh-anchor",
+            text=phrase,
+            anchor_source_id="s1",
+            anchor_lower_sec=400.0,
+            anchor_upper_sec=600.0,
+        )
+    )
+
+    assert result.strategy == "between_anchors"
+    assert result.source_id == "s1"
+    assert result.source_in_sec is not None and result.source_in_sec > 490
+
+
+def test_anchor_bounds_never_fall_back_outside_the_interval() -> None:
+    phrase = "уникальный рассказ о старинном семейном архиве"
+    matcher = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", phrase, 900.0)],
+    )
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="snh-anchor-2",
+            text=phrase,
+            anchor_source_id="s1",
+            anchor_lower_sec=0.0,
+            anchor_upper_sec=30.0,
+        )
+    )
+
+    assert result.status == "not_found"
+    assert result.strategy != "fallback_full"
+    assert result.source_id == ""
+
+
+def test_unset_anchor_fields_keep_prior_behaviour() -> None:
+    phrase = "этот редкий ключевой фрагмент звучит именно здесь"
+    first = _index("s1", phrase, 100.0)
+    second = _index("s1", phrase, 500.0)
+    index = WordIndex(source_id="s1", words=[*first.words, *second.words])
+    matcher = SyncMatcher([_source("s1")], [index])
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="snh-anchor-3",
+            text=phrase,
+            speaker="Татьяна Васильева",
+            approximate_timecode="00:08:20",
+        )
+    )
+
+    assert result.strategy == "near_timecode"
+    assert result.source_in_sec is not None and result.source_in_sec > 490
+
+
+def _labeled_index(
+    source_id: str,
+    text: str,
+    speaker_labels: list[str],
+    start: float = 0.0,
+    step: float = 0.5,
+) -> WordIndex:
+    words = text.split()
+    assert len(words) == len(speaker_labels)
+    return WordIndex(
+        source_id=source_id,
+        words=[
+            WordTimestamp(
+                word,
+                start + index * step,
+                start + (index + 1) * step,
+                speaker=speaker_labels[index],
+            )
+            for index, word in enumerate(words)
+        ],
+        metadata={"has_speaker_labels": True},
+    )
+
+
+def test_voice_label_rejects_candidate_dominated_by_another_voice() -> None:
+    phrase = "мы обсуждали важные детали проекта завтра"
+    index = _labeled_index("s1", phrase, ["ГОЛОС 2"] * len(phrase.split()))
+    matcher = SyncMatcher([_source("s1")], [index])
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="voice-1",
+            text=phrase,
+            voice_label="ГОЛОС 1",
+        )
+    )
+
+    assert result.status == "not_found"
+    assert result.source_id == ""
+
+
+def test_voice_label_accepts_candidate_from_requested_voice() -> None:
+    phrase = "мы обсуждали важные детали проекта завтра"
+    index = _labeled_index("s1", phrase, ["ГОЛОС 1"] * len(phrase.split()))
+    matcher = SyncMatcher([_source("s1")], [index])
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="voice-2",
+            text=phrase,
+            voice_label="ГОЛОС 1",
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.source_id == "s1"
+    assert result.strategy == "voice_scoped"
+
+
+def test_voice_label_is_ignored_when_source_has_no_speaker_labels() -> None:
+    phrase = "мы обсуждали важные детали проекта завтра"
+    index = _index("s1", phrase, 0.0)
+    matcher_with_voice = SyncMatcher([_source("s1")], [index])
+    matcher_without_voice = SyncMatcher([_source("s1")], [index])
+
+    with_voice = matcher_with_voice.match(
+        AlignmentRequest(segment_id="voice-3", text=phrase, voice_label="ГОЛОС 1")
+    )
+    without_voice = matcher_without_voice.match(
+        AlignmentRequest(segment_id="voice-3", text=phrase)
+    )
+
+    assert with_voice.status == without_voice.status == "auto_matched"
+    assert with_voice.source_in_sec == without_voice.source_in_sec
+    assert with_voice.strategy == without_voice.strategy != "voice_scoped"
+
+
+def test_voice_share_threshold_around_min_voice_share() -> None:
+    assert sync_matcher_module._MIN_VOICE_SHARE == 0.6
+    phrase_words = "раз два три четыре пять шесть семь восемь девять десять".split()
+    # 5.5/10 words from the requested voice: below the 0.6 threshold.
+    below_threshold_labels = ["ГОЛОС 1"] * 5 + ["ГОЛОС 2"] * 5
+    below_index = _labeled_index("s1", " ".join(phrase_words), below_threshold_labels)
+    below_matcher = SyncMatcher([_source("s1")], [below_index])
+    below_result = below_matcher.match(
+        AlignmentRequest(segment_id="voice-below", text=" ".join(phrase_words), voice_label="ГОЛОС 1")
+    )
+    assert below_result.status == "not_found"
+
+    # 6.5/10 words from the requested voice: above the 0.6 threshold.
+    above_threshold_labels = ["ГОЛОС 1"] * 7 + ["ГОЛОС 2"] * 3
+    above_index = _labeled_index("s1", " ".join(phrase_words), above_threshold_labels)
+    above_matcher = SyncMatcher([_source("s1")], [above_index])
+    above_result = above_matcher.match(
+        AlignmentRequest(segment_id="voice-above", text=" ".join(phrase_words), voice_label="ГОЛОС 1")
+    )
+    assert above_result.status == "auto_matched"
+    assert above_result.source_id == "s1"
 
 
 def test_ambiguous_equal_quotes_require_review_and_return_alternative() -> None:
@@ -697,3 +935,191 @@ def test_words_past_registered_duration_cannot_auto_match_zero_length_range() ->
     assert result.status == "not_found"
     assert result.source_in_sec is None
     assert result.source_out_sec is None
+
+
+def _duration_candidate(start: float, end: float) -> _Candidate:
+    return _Candidate(
+        source_id="s1",
+        start=start,
+        end=end,
+        confidence=0.5,
+        text="irrelevant",
+        strategy="full_transcript",
+    )
+
+
+def test_plausible_duration_rejects_implausibly_fast_candidate() -> None:
+    # 40 query words matched to a 3-second span implies ~13.3 words/sec,
+    # far above any realistic Russian speech rate -- a text-similarity
+    # fluke, not a real utterance.
+    candidate = _duration_candidate(100.0, 103.0)
+    assert _has_plausible_duration(candidate, query_len=40, config=MatcherConfig()) is False
+
+
+def test_plausible_duration_accepts_normal_pace_candidate() -> None:
+    # 40 words over 15 seconds is ~2.7 words/sec, well within normal speech.
+    candidate = _duration_candidate(100.0, 115.0)
+    assert _has_plausible_duration(candidate, query_len=40, config=MatcherConfig()) is True
+
+
+def test_plausible_duration_rejects_implausibly_slow_candidate() -> None:
+    # 40 words over 300 seconds is ~0.13 words/sec -- far too slow to be a
+    # real reading of that much text; likely an over-wide, wrongly trimmed
+    # span.
+    candidate = _duration_candidate(100.0, 400.0)
+    assert _has_plausible_duration(candidate, query_len=40, config=MatcherConfig()) is False
+
+
+def test_plausible_duration_is_skipped_for_very_short_queries() -> None:
+    # A 2-3 word query has too little statistical signal for a words-per-sec
+    # sanity check to be reliable, so the filter is a no-op regardless of
+    # duration.
+    fast_candidate = _duration_candidate(100.0, 100.2)
+    slow_candidate = _duration_candidate(100.0, 500.0)
+    config = MatcherConfig()
+    assert _has_plausible_duration(fast_candidate, query_len=2, config=config) is True
+    assert _has_plausible_duration(slow_candidate, query_len=3, config=config) is True
+
+
+def test_match_keeps_correct_slow_paced_match_despite_duration_filter() -> None:
+    # A realistic ~3.3 words/sec reading of a 20-word quote must still auto-
+    # match once the duration-plausibility filter is applied.
+    transcript = (
+        "мы долго обсуждали дальнейшую судьбу этого проекта и в итоге решили "
+        "переработать сценарий полностью прежде чем показывать его команде"
+    )
+    matcher = SyncMatcher(
+        [_source()],
+        [_index("vasilieva_01", transcript, 1000.0, step=0.3)],
+    )
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="duration-ok",
+            text=transcript,
+            speaker="Татьяна Васильева",
+        )
+    )
+
+    assert result.status == "auto_matched"
+
+
+def test_match_reports_duration_implausible_candidate_as_alternative_not_lost() -> None:
+    # The only textual match is stretched over a physically implausible
+    # duration (40 words in ~0.4s). It must not surface as a confident
+    # match, but it also must not vanish from diagnostics -- an operator
+    # should still see it listed as an alternative for manual review.
+    query_text = " ".join(f"слово{i}редкое" for i in range(40))
+    matcher = SyncMatcher(
+        [_source()],
+        [_index("vasilieva_01", query_text, 1000.0, step=0.01)],
+    )
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="duration-bad",
+            text=query_text,
+            speaker="Татьяна Васильева",
+        )
+    )
+
+    assert result.status == "not_found"
+    assert result.alternatives
+    assert result.alternatives[0].confidence > 0.9
+
+
+def test_reliable_word_timestamps_prefers_backend_metadata_precision() -> None:
+    index = _index(
+        "s1",
+        "ok",
+        0.0,
+        metadata={
+            "backend": "cloud-audio",
+            "timestamp_precision": "word",  # stale/misleading top-level value
+            "backend_metadata": {"timestamp_precision": "interpolated"},
+        },
+    )
+    assert _has_reliable_word_timestamps(index) is False
+
+
+def test_reliable_word_timestamps_falls_back_to_top_level_precision() -> None:
+    index = _index("s1", "ok", 0.0, metadata={"timestamp_precision": "interpolated"})
+    assert _has_reliable_word_timestamps(index) is False
+
+    index_word = _index("s1", "ok", 0.0, metadata={"timestamp_precision": "word"})
+    assert _has_reliable_word_timestamps(index_word) is True
+
+
+def test_reliable_word_timestamps_falls_back_to_cloud_audio_backend_name() -> None:
+    # No explicit precision recorded anywhere: only cloud-audio is known to
+    # interpolate, so it is the only backend treated as unreliable by name.
+    cloud_index = _index("s1", "ok", 0.0, metadata={"backend": "cloud-audio"})
+    assert _has_reliable_word_timestamps(cloud_index) is False
+
+    local_index = _index("s1", "ok", 0.0, metadata={"backend": "mlx-whisper"})
+    assert _has_reliable_word_timestamps(local_index) is True
+
+    unlabeled_index = _index("s1", "ok", 0.0)
+    assert _has_reliable_word_timestamps(unlabeled_index) is True
+
+
+def test_match_skips_duration_filter_for_interpolated_source() -> None:
+    # Same physically-impossible-tempo transcript as the word-level test
+    # above (40 words crammed into ~0.4s), but this source is tagged as
+    # having cloud-audio interpolated timestamps -- the speech-rate filter
+    # must not reject a textually exact match on that source, since the
+    # implausible rate is a timestamp artifact, not a text-match problem.
+    query_text = " ".join(f"слово{i}редкое" for i in range(40))
+    matcher = SyncMatcher(
+        [_source()],
+        [
+            _index(
+                "vasilieva_01",
+                query_text,
+                1000.0,
+                step=0.01,
+                metadata={"backend_metadata": {"timestamp_precision": "interpolated"}},
+            )
+        ],
+    )
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="duration-interpolated",
+            text=query_text,
+            speaker="Татьяна Васильева",
+        )
+    )
+
+    assert result.status == "auto_matched"
+
+
+def test_match_applies_duration_filter_for_word_level_source() -> None:
+    # The exact same crammed-timing candidate, but this time the source is
+    # explicitly tagged as word-level (measured) timestamps: the implausible
+    # rate is real, and the filter must still reject it as unfiltered above.
+    query_text = " ".join(f"слово{i}редкое" for i in range(40))
+    matcher = SyncMatcher(
+        [_source()],
+        [
+            _index(
+                "vasilieva_01",
+                query_text,
+                1000.0,
+                step=0.01,
+                metadata={"timestamp_precision": "word"},
+            )
+        ],
+    )
+
+    result = matcher.match(
+        AlignmentRequest(
+            segment_id="duration-word-level",
+            text=query_text,
+            speaker="Татьяна Васильева",
+        )
+    )
+
+    assert result.status == "not_found"
+    assert result.alternatives
+    assert result.alternatives[0].confidence > 0.9
