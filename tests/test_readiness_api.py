@@ -153,6 +153,8 @@ class _FakeConnectorResponse:
 def test_readiness_tts_macos_connector_ok(client, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TTS_PROVIDER", "macos")
     monkeypatch.setenv("MACOS_CONNECTOR_URL", "http://host.docker.internal:8001/synthesize")
+    # This test covers the connector response, not host-level ffmpeg readiness.
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _name: "/usr/bin/tool")
 
     def fake_get(url, timeout=None):
         assert url == "http://host.docker.internal:8001/health"
