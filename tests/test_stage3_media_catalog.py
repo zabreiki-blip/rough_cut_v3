@@ -109,6 +109,28 @@ def test_unchanged_file_uses_persistent_ffprobe_cache(tmp_path: Path) -> None:
     assert list(cache["entries"]) == ["project/clip.mp4"]
 
 
+def test_scanning_another_directory_keeps_unchanged_ffprobe_entries(tmp_path: Path) -> None:
+    root = tmp_path / "media"
+    first_folder = root / "first"
+    second_folder = root / "second"
+    first_folder.mkdir(parents=True)
+    second_folder.mkdir()
+    (first_folder / "first.mp4").write_bytes(b"first")
+    (second_folder / "second.mp4").write_bytes(b"second")
+    calls = 0
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _probe_result()
+
+    scan_media_directory(str(first_folder), media_root=root, run=fake_run)
+    scan_media_directory(str(second_folder), media_root=root, run=fake_run)
+    scan_media_directory(str(first_folder), media_root=root, run=fake_run)
+
+    assert calls == 2
+
+
 def test_changed_size_invalidates_ffprobe_cache(tmp_path: Path) -> None:
     root = tmp_path / "media"
     folder = root / "project"

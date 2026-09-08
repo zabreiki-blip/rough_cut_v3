@@ -1463,6 +1463,7 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
         # The punctuation belongs to the quote; only structural whitespace and
         # separators right after the boundary/range are discarded.
         separator = re.match(r"[.\s]*", text[content_start:])
+        assert separator is not None
         content_start += separator.end()
         boundaries.append(
             {

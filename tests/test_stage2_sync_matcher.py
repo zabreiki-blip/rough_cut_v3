@@ -137,7 +137,9 @@ def test_fuzzy_match_tolerates_whisper_insertions_and_word_inflections() -> None
     assert result.source_id == "vasilieva_01"
     assert result.status in {"auto_matched", "needs_review"}
     assert result.confidence >= 0.70
-    assert result.source_in_sec is not None and 1001.0 <= result.source_in_sec <= 1003.0
+    assert result.source_in_sec is not None and 999.0 <= result.source_in_sec <= 1001.0
+    assert result.metadata["speech_in_sec"] == pytest.approx(1002.5)
+    assert result.metadata["speech_out_sec"] > result.metadata["speech_in_sec"]
     assert "энергетическим" in result.matched_text
 
 
@@ -573,11 +575,11 @@ def test_display_timecode_and_guide_offset_are_converted_to_sequence_seconds() -
         )
     )
     assert result.strategy == "near_timecode"
-    assert result.source_in_sec == pytest.approx(29.5)
-    assert result.source_out_sec == pytest.approx(34.0)
+    assert result.source_in_sec == pytest.approx(28.0)
+    assert result.source_out_sec == pytest.approx(34.5)
 
 
-def test_tail_padding_is_clamped_to_registered_sequence_duration() -> None:
+def test_speech_past_registered_sequence_duration_is_rejected_even_with_handles() -> None:
     source = _source("s1", duration_sec=3.0)
     index = _index("s1", "короткая точная цитата в самом конце", 1.0)
     result = SyncMatcher([source], [index]).match(
@@ -587,7 +589,8 @@ def test_tail_padding_is_clamped_to_registered_sequence_duration() -> None:
             source_ids=("s1",),
         )
     )
-    assert result.source_out_sec == 3.0
+    assert result.status == "not_found"
+    assert result.source_out_sec is None
 
 
 def test_words_past_registered_duration_cannot_auto_match_zero_length_range() -> None:

@@ -25,6 +25,7 @@ projects/*/speaker/
 projects/*/input/
 projects/*/media/
 projects/*/versions/
+projects/*/ЗАГРУЗИТЬ/
 
 # Local runtime scratch space (may contain real user project data)
 artifacts/

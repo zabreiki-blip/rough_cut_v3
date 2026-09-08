@@ -343,11 +343,15 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
         except ValueError as exc:
             return services._json_error(str(exc), 400)
 
-        project_dir = services.PROJECTS_DIR / project
-        if not project_dir.exists():
-            return services._json_error("Проект не найден", 404)
-
-        shutil.rmtree(project_dir)
+        with services._project_transition_lock(project):
+            if services._project_has_active_mutation(project):
+                return services._json_error(
+                    "Нельзя удалить проект, пока выполняется фоновая задача", 409
+                )
+            project_dir = services.PROJECTS_DIR / project
+            if not project_dir.exists():
+                return services._json_error("Проект не найден", 404)
+            shutil.rmtree(project_dir)
         return jsonify({"ok": True, "project": project})
 
     @app.get("/project/<project>")

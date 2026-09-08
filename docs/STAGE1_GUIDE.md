@@ -223,6 +223,9 @@ scripts/run-local
 | POST | `/stage1/tts-jobs/start` | Асинхронный TTS с live-прогрессом |
 | GET | `/stage1/tts-jobs/<job_id>` | Статус job |
 | POST | `/stage1/tts-phrase` | Озвучка одной фразы |
+| POST | `/stage2/final-review/start` | Распознать WAV собранной sequence и создать отчёт проверки |
+| GET | `/stage2/final-review/jobs/<job_id>` | Статус финальной проверки |
+| POST | `/stage2/final-review/jobs/<job_id>/apply` | Подготовить черновую итерацию с безопасными правками границ |
 | POST | `/stage1/validate` | Валидация + манифест |
 | GET | `/stage4/inbox?project=<p>` | Сценарии и просмотровки в папках загрузки |
 | GET | `/stage4/revisions?project=<p>` | История редакций и проверка целостности |
@@ -335,7 +338,7 @@ scripts/run-macos-connector
 |------------|---------|----------|
 | `OPENROUTER_API_KEY` | — | Ключ для LLM и OpenRouter TTS |
 | `GEMINI_API_KEY` | — | Ключ для Gemini TTS |
-| `TTS_PROVIDER` | `gemini` | Провайдер TTS |
+| `TTS_PROVIDER` | `openrouter` | Провайдер TTS |
 | `TTS_GENDER` | `female` | Пол голоса |
 | `MAX_ZK_BLOCKS` | `40` | Максимум legacy-блоков после объединения |
 | `MACOS_COMMAND_TIMEOUT` | `900` | Таймаут `say`/`afconvert`, секунд |

@@ -272,7 +272,11 @@ def scan_media_directory(
     )
     cache_path = _metadata_cache_path(root)
     cached_entries = _load_metadata_cache(cache_path)
-    next_entries: dict[str, dict[str, Any]] = {}
+    # One project cache is shared by both supported review folders. Preserve
+    # entries outside this scan; switching folders must not make unchanged
+    # media pay for ffprobe again.
+    next_entries: dict[str, dict[str, Any]] = dict(cached_entries)
+    scanned_paths: set[str] = set()
     iterator = resolved.rglob("*") if recursive else resolved.iterdir()
     sources: list[MediaSource] = []
     for candidate in sorted(iterator, key=lambda item: item.as_posix().casefold()):
@@ -286,6 +290,7 @@ def scan_media_directory(
             continue
         stat = safe_path.stat()
         relative_path = safe_path.relative_to(root).as_posix()
+        scanned_paths.add(relative_path)
         extension = safe_path.suffix.lower()
         metadata = _cached_probe_metadata(
             cached_entries.get(relative_path),
@@ -321,6 +326,16 @@ def scan_media_directory(
                 has_audio=bool(metadata["has_audio"]),
             )
         )
+    scan_relative = resolved.relative_to(root).as_posix()
+    for cached_path in tuple(next_entries):
+        cached_candidate = Path(cached_path)
+        in_scan_directory = (
+            cached_path == scan_relative
+            or cached_path.startswith(f"{scan_relative}/")
+        )
+        is_direct_child = cached_candidate.parent.as_posix() == scan_relative
+        if in_scan_directory and (recursive or is_direct_child) and cached_path not in scanned_paths:
+            del next_entries[cached_path]
     if next_entries != cached_entries:
         atomic_write_json(cache_path, {"version": CACHE_VERSION, "entries": next_entries})
     return {

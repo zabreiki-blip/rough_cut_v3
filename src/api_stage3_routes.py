@@ -354,16 +354,31 @@ def _scan_project_media(
         raise MediaCatalogError("project directory resolves outside the projects root") from exc
     inbox_reviews = paths.get("inbox_reviews", project_root / "ЗАГРУЗИТЬ" / "Просмотровки")
     legacy_reviews = paths.get("media_reviews", project_root / "media" / "reviews")
+    # The friendly inbox and legacy folder coexist during migration. Scanning
+    # only the inbox after its first upload used to silently remove all legacy
+    # review-media registrations.
+    directories = [Path(legacy_reviews)]
     inbox_path = Path(inbox_reviews)
-    has_inbox_media = inbox_path.is_dir() and any(
+    if inbox_path.is_dir() and any(
         item.is_file() and item.suffix.lower() in MEDIA_EXTENSIONS for item in inbox_path.iterdir()
-    )
-    review_directory = inbox_reviews if has_inbox_media else legacy_reviews
-    return scan_media_directory(
-        str(review_directory),
-        recursive=recursive,
-        media_root=project_root,
-    )
+    ):
+        directories.insert(0, inbox_path)
+
+    catalogs = [
+        scan_media_directory(str(directory), recursive=recursive, media_root=project_root)
+        for directory in directories
+    ]
+    sources_by_path: dict[str, dict] = {}
+    for catalog in catalogs:
+        for source in catalog.get("sources", []):
+            if isinstance(source, dict):
+                sources_by_path.setdefault(str(source.get("relative_path") or ""), source)
+    return {
+        "directory": str(project_root),
+        "relative_directory": ".",
+        "recursive": recursive,
+        "sources": list(sources_by_path.values()),
+    }
 
 
 def _perform_scan(

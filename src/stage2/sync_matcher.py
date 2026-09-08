@@ -441,8 +441,10 @@ class MatcherConfig:
     ambiguity_margin: float = 0.07
     fallback_trigger: float = 0.64
     max_alternatives: int = 3
-    head_padding_sec: float = 0.5
-    tail_padding_sec: float = 1.0
+    # ASR word timestamps regularly start a little after the audible onset.
+    # These are editorial handles, not confidence margins.
+    head_padding_sec: float = 2.0
+    tail_padding_sec: float = 1.5
 
     def __post_init__(self) -> None:
         if self.search_window_sec <= 0:
@@ -824,6 +826,10 @@ def _has_usable_range(
     source: SyncSource,
     config: MatcherConfig,
 ) -> bool:
+    # A long head handle must never manufacture a valid-looking range when
+    # the recognised speech itself lies beyond the registered source.
+    if source.duration_sec > 0 and candidate.end > source.duration_sec + 0.001:
+        return False
     start, end = _padded_range(candidate, source, config)
     return end - start > 0.001
 
@@ -1072,6 +1078,10 @@ class SyncMatcher:
                     "ambiguous": ambiguous,
                     "timecode_mode": request.timecode_mode,
                     "semantic_flags": semantic_flags,
+                    "speech_in_sec": round(best.start, 4),
+                    "speech_out_sec": round(best.end, 4),
+                    "head_padding_sec": self.config.head_padding_sec,
+                    "tail_padding_sec": self.config.tail_padding_sec,
                 }
             ),
         )

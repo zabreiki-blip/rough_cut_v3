@@ -395,6 +395,11 @@ def parse_normalized_timeline(
                 source = sources.get(source_id)
                 source_in = float(field(match, "source_in_sec", 0.0) or 0.0)
                 source_out = float(field(match, "source_out_sec", 0.0) or 0.0)
+                match_metadata = field(match, "metadata", {})
+                if not isinstance(match_metadata, dict):
+                    match_metadata = {}
+                speech_in = float(match_metadata.get("speech_in_sec", source_in) or source_in)
+                speech_out = float(match_metadata.get("speech_out_sec", source_out) or source_out)
                 matched = (
                     match_status in {"auto_matched", "confirmed"}
                     and source_id
@@ -427,6 +432,8 @@ def parse_normalized_timeline(
                         sequence_id=str(field(source, "sequence_id", "") or ""),
                         source_in_sec=source_in,
                         source_out_sec=source_out,
+                        speech_in_sec=speech_in,
+                        speech_out_sec=speech_out,
                         match_status=match_status,
                         match_confidence=float(field(match, "confidence", 0.0) or 0.0),
                         placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),

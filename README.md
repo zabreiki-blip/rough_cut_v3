@@ -175,7 +175,10 @@ matches и таймлайн. Озвучка привязана к стабиль
 - `TTS_GENDER=female|male` (пол голоса по умолчанию)
 - `TTS_MAX_WORKERS=3` ограничивает параллельные запросы синтеза (`1–4`)
 - `ANALYZER_LLM_WORKERS=4` ограничивает параллельный анализ независимых LLM-чанков (`1–4`)
-- для `openrouter`: `OPENROUTER_TTS_MODEL`, `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
+- для `openrouter` рабочий preset — `microsoft/mai-voice-2` через отдельный
+  TTS endpoint; русские preset-голоса: `ru-RU-Masha:MAI-Voice-2` и
+  `ru-RU-Lev:MAI-Voice-2`. Их можно сменить через `OPENROUTER_TTS_MODEL`,
+  `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
   - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
 - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
@@ -483,7 +486,7 @@ docker compose config --quiet
 хуки проверяют только то, что уже обязательно и в CI — `ruff check`,
 `gitleaks` и базовую гигиену файлов (trailing whitespace, EOF, YAML/TOML/JSON).
 `mypy` и `eslint` пока намеренно не входят в pre-commit из-за накопленного
-технического долга и остаются non-blocking шагами CI.
+технического долга, но оба остаются обязательными шагами CI.
 
 ## Локальная автоматизация
 

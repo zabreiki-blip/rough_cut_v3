@@ -241,6 +241,7 @@ def _write_meta_fingerprint(wav_path: Path, fingerprint: str) -> None:
 
 
 def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
+    """Synthesize through OpenRouter's dedicated OpenAI-compatible TTS endpoint."""
     try:
         import requests
     except ImportError as exc:
@@ -248,31 +249,23 @@ def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
 
     payload = {
         "model": settings.openrouter_tts_model,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "Прочитай вслух без добавлений и комментариев следующий текст:\n\n" + text
-                ),
-            }
-        ],
-        "modalities": ["text", "audio"],
-        "audio": {"voice": voice, "format": "pcm16"},
-        "stream": True,
-        "max_tokens": 512,
+        "input": text,
+        "voice": voice,
+        # MAI-Voice-2 emits 24 kHz mono PCM through this endpoint. Keep the
+        # downstream project contract as WAV by wrapping it below.
+        "response_format": "pcm",
     }
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
+        "Accept": "audio/pcm",
     }
 
     response = requests.post(
-        f"{settings.openrouter_base_url}/chat/completions",
+        f"{settings.openrouter_base_url}/audio/speech",
         headers=headers,
         json=payload,
         timeout=240,
-        stream=True,
     )
     try:
         if response.status_code != 200:
@@ -284,31 +277,15 @@ def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
             error.status_code = response.status_code  # type: ignore[attr-defined]
             raise error
 
-        audio_chunks: list[bytes] = []
-        for raw in response.iter_lines(decode_unicode=True):
-            if not raw or not raw.startswith("data: "):
-                continue
-            data = raw[6:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                event = pyjson.loads(data)
-            except Exception:
-                continue
-            choice = (event.get("choices") or [{}])[0]
-            delta = choice.get("delta") or {}
-            audio = delta.get("audio")
-            if isinstance(audio, dict) and audio.get("data"):
-                audio_chunks.append(base64.b64decode(audio["data"]))
+        audio_bytes = response.content
     finally:
         response.close()
 
-    if not audio_chunks:
-        raise RuntimeError("OpenRouter stream returned no audio chunks")
+    if not audio_bytes:
+        raise RuntimeError("OpenRouter TTS returned an empty audio response")
 
-    pcm_bytes = b"".join(audio_chunks)
     return _build_wav_from_pcm(
-        pcm_bytes=pcm_bytes,
+        pcm_bytes=audio_bytes,
         sample_rate=settings.openrouter_tts_sample_rate,
         channels=1,
         sample_width=2,
@@ -693,7 +670,14 @@ def _plan_tts_items(
             fp_sample_rate,
             fp_extra_rate,
         )
-        asset_file = speaker_dir / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
+        if dry_run:
+            # A placeholder must never become a production cache entry. Keep
+            # its fingerprint distinct too: the legacy positional alias may
+            # be the only file present on older projects.
+            fingerprint = hashlib.sha256(f"dry-run\\n{fingerprint}".encode()).hexdigest()
+            asset_file = speaker_dir / "dry-run" / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
+        else:
+            asset_file = speaker_dir / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
         legacy_cache_hit = (
             not dry_run
             and _is_valid_wav(out_file)
@@ -735,7 +719,9 @@ def _publish_local_item(
         _materialize_voiceover_alias(asset_file, out_file, fingerprint)
         skipped.append(str(out_file))
         event = "item_skipped"
-    elif _block_uid == block_id and _is_valid_wav(out_file):
+    elif _is_valid_wav(out_file):
+        # Dry-run placeholders are useful for a fresh project, but must not
+        # overwrite any existing real positional WAV, regardless of UID.
         skipped.append(str(out_file))
         event = "item_skipped"
     else:

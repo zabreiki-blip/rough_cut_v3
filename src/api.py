@@ -29,6 +29,7 @@ from api_core_routes import register_core_routes
 import api_stage1_jobs as stage1_jobs
 from api_stage1_routes import register_stage1_routes
 from api_stage2_routes import register_stage2_routes
+from api_final_review_routes import register_final_review_routes
 from api_stage3_routes import register_stage3_routes
 from api_stage4_routes import register_stage4_routes
 from api_sync_worker import run_sync_job
@@ -85,6 +86,8 @@ from stage2.sync_models import (
     SyncSource,
     WordIndex,
 )
+from stage2.models import FullTimeline
+from stage2.final_review import review_rendered_timeline
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
 from stage2.whisper_process import (
@@ -162,6 +165,10 @@ _SYNC_JOBS_TTL_SECONDS = 24 * 60 * 60
 _SYNC_ACTIVE_PROJECTS = _SYNC_RUNTIME.active_projects
 _SYNC_CANCEL_EVENTS = _SYNC_RUNTIME.cancel_events
 _SYNC_DATA_LOCK = threading.Lock()
+_FINAL_REVIEW_RUNTIME = JobRegistry()
+_FINAL_REVIEW_JOBS = _FINAL_REVIEW_RUNTIME.jobs
+_FINAL_REVIEW_JOBS_LOCK = _FINAL_REVIEW_RUNTIME.lock
+_FINAL_REVIEW_ACTIVE_PROJECTS = _FINAL_REVIEW_RUNTIME.active_projects
 _NORMALIZATION_RUNTIME = JobRegistry()
 _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
@@ -176,6 +183,7 @@ _PROJECT_TRANSITION_LOCKS_GUARD = threading.Lock()
 register_job_registry("озвучки", _TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS)
 register_job_registry("нормализации", _NORMALIZATION_JOBS_LOCK, _NORMALIZATION_ACTIVE_PROJECTS)
 register_job_registry("сопоставления СНХ", _SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS)
+register_job_registry("финальной проверки", _FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS)
 
 
 class AudioUploadTooLargeError(ValueError):
@@ -1526,7 +1534,84 @@ def _run_sync_job(
     )
 
 
+def _reserve_final_review_project(project: str) -> bool:
+    with _project_transition_lock(project):
+        if _project_has_active_mutation(project):
+            return False
+        return reserve_project(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS, project)
+
+
+def _release_final_review_project(project: str) -> None:
+    release_project(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS, project)
+
+
+def _create_final_review_job(project: str, audio_path: Path, payload: dict) -> dict:
+    now = _utc_now_iso()
+    job = {
+        "id": uuid.uuid4().hex, "project": project, "status": "queued", "message": "Queued",
+        "audio_path": str(audio_path.relative_to(_project_paths(project)["root"])),
+        "source_sequence": dict(payload.get("source_sequence") or {}), "created_at": now,
+        "started_at": "", "finished_at": "", "error": "", "report_path": "",
+    }
+    job_id = str(job["id"])
+    with _FINAL_REVIEW_JOBS_LOCK:
+        _FINAL_REVIEW_JOBS[job_id] = job
+    _atomic_write_json_file(_project_paths(project)["final_review_job_status"], job)
+    return dict(job)
+
+
+def _get_final_review_job(job_id: str) -> dict | None:
+    return get_job(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_JOBS, job_id)
+
+
+def _update_final_review_job(job_id: str, **updates) -> dict | None:
+    snapshot = update_job(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_JOBS, job_id, updates)
+    if snapshot:
+        _atomic_write_json_file(_project_paths(snapshot["project"])["final_review_job_status"], snapshot)
+    return snapshot
+
+
+def _run_final_review_job(
+    *, job_id: str, project: str, audio_path: Path, language: str, backend: str | None,
+    model: str | None, source_sequence: dict,
+) -> None:
+    try:
+        _update_final_review_job(job_id, status="running", message="Transcribing rendered timeline", started_at=_utc_now_iso())
+        result = transcribe_audio(audio_path, backend=backend, model=model, language=language)
+        index = ingest_word_index(result, "final-render", model=str(result.get("model") or model or ""), language=str(result.get("language") or language))
+        paths = _project_paths(project)
+        timeline_data = _read_json_safe(paths["work"] / "full_timeline.json")
+        timeline = FullTimeline.from_dict(timeline_data)
+        report = review_rendered_timeline(timeline, index)
+        report.update({
+            "project": project, "job_id": job_id, "created_at": _utc_now_iso(),
+            "audio_path": str(audio_path.relative_to(paths["root"])), "source_sequence": source_sequence,
+            "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
+        })
+        _atomic_write_json_file(paths["final_review_report"], report)
+        _update_final_review_job(job_id, status="completed", message="Final review completed", finished_at=_utc_now_iso(), report_path=str(paths["final_review_report"].relative_to(paths["root"])))
+    except Exception as exc:
+        _update_final_review_job(job_id, status="failed", message="Final review failed", error=str(exc), finished_at=_utc_now_iso())
+    finally:
+        _release_final_review_project(project)
+
+
+def _record_final_review_iteration(project: str, job: dict, corrections: list[dict]) -> dict:
+    paths = _project_paths(project)
+    history = _read_json_safe(paths["final_review_iterations"])
+    items = list(history.get("iterations") or [])
+    iteration = {
+        "id": f"iteration_{len(items) + 1:04d}", "review_job_id": job["id"],
+        "source_sequence": dict(job.get("source_sequence") or {}), "corrections": corrections,
+        "status": "prepared", "created_at": _utc_now_iso(),
+    }
+    items.append(iteration)
+    _atomic_write_json_file(paths["final_review_iterations"], {"iterations": items})
+    return iteration
+
+
 register_stage2_routes(app, sys.modules[__name__])
+register_final_review_routes(app, sys.modules[__name__])
 _expose_registered_views(
     "stage2_sync_sources",
     "stage2_sync_source_audio",

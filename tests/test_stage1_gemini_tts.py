@@ -40,21 +40,19 @@ class TtsErrorClassificationTests(unittest.TestCase):
         )
 
 
-class OpenRouterStreamTests(unittest.TestCase):
-    def test_response_is_closed_when_stream_iteration_fails(self) -> None:
-        class BrokenResponse:
+class OpenRouterTtsTests(unittest.TestCase):
+    def test_dedicated_tts_endpoint_wraps_pcm_and_closes_response(self) -> None:
+        class Response:
             status_code = 200
 
             def __init__(self) -> None:
                 self.closed = False
-
-            def iter_lines(self, **_kwargs):
-                raise RuntimeError("broken SSE stream")
+                self.content = b"\\x01\\x02" * 24
 
             def close(self) -> None:
                 self.closed = True
 
-        response = BrokenResponse()
+        response = Response()
         requests_module = SimpleNamespace(post=lambda *_args, **_kwargs: response)
         settings = SimpleNamespace(
             openrouter_tts_model="test-model",
@@ -64,10 +62,24 @@ class OpenRouterStreamTests(unittest.TestCase):
         )
 
         with patch.dict(sys.modules, {"requests": requests_module}):
-            with self.assertRaisesRegex(RuntimeError, "broken SSE"):
-                _synthesize_openrouter_wav("text", settings, "voice")
+            wav = _synthesize_openrouter_wav("text", settings, "voice")
 
         self.assertTrue(response.closed)
+        self.assertTrue(wav.startswith(b"RIFF"))
+
+    def test_dry_run_never_populates_production_cache(self) -> None:
+        from stage1 import gemini_tts as tts
+
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            settings = SimpleNamespace(gemini_tts_model="model")
+            args = ([("zk1", "versioned-uid", "text")], base, "gemini", "voice", "female", 1.0, settings)
+            dry = tts._plan_tts_items(*args, True, None)
+            tts._publish_local_item(dry[0], 1, [], [], None)
+            real = tts._plan_tts_items(*args, False, None)
+
+            self.assertEqual(real[0][-1], "synthesize")
+            self.assertFalse(real[0][5].exists())
 
 
 class TempoTests(unittest.TestCase):

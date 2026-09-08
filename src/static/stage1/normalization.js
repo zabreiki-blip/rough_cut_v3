@@ -9,6 +9,7 @@ import {
 } from "./core.js";
 
 let memoryRules = [];
+let normalizationEditGeneration = 0;
 
 function canonicalDocument(value) {
   if (!value) return null;
@@ -26,6 +27,7 @@ export function hasUnsavedChanges() {
 
 export function markNormalizationDirty() {
   if (!appState.normalization) return;
+  normalizationEditGeneration += 1;
   appState.normalizationDirty = true;
   appState.normalizationEligible = false;
   if (appState.normalization.status === "confirmed") appState.normalization.status = "draft";
@@ -239,7 +241,12 @@ function normalizationPayload() {
 }
 
 export async function saveNormalization() {
+  const savedGeneration = normalizationEditGeneration;
   const result = await requestJSON("/stage1/normalization", "PUT", normalizationPayload());
+  if (normalizationEditGeneration !== savedGeneration) {
+    toast("Черновик сохранён; новые правки ещё не сохранены", "success");
+    return appState.normalization;
+  }
   appState.normalization = canonicalDocument(result);
   appState.normalizationDirty = false;
   renderNormalization();

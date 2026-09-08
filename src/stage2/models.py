@@ -31,6 +31,10 @@ class TimelineSegment:
     sequence_id: str = ""
     source_in_sec: float = 0.0
     source_out_sec: float = 0.0
+    # Unpadded ASR word boundaries.  ``source_*`` is the range sent to
+    # Premiere; keeping both makes a clipped edit diagnosable later.
+    speech_in_sec: float = 0.0
+    speech_out_sec: float = 0.0
     match_status: str = ""
     match_confidence: float = 0.0
     # ZK-specific
@@ -64,6 +68,8 @@ class TimelineSegment:
             "start_sec",
             "source_in_sec",
             "source_out_sec",
+            "speech_in_sec",
+            "speech_out_sec",
             "match_confidence",
         ):
             if key in kwargs:
