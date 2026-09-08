@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from stage2.models import TimelineSegment
 from stage2.timeline_parser import parse_normalized_timeline, parse_timeline
 
 
@@ -429,6 +430,7 @@ class NormalizedTimelineTest(unittest.TestCase):
             self.assertEqual(segment.id, "life1")
             self.assertEqual(segment.type, "life")
             self.assertEqual(segment.speaker, "ЛАЙФ")
+            self.assertEqual(TimelineSegment.from_dict(segment.to_dict()).type, "life")
             self.assertEqual(segment.role, "концерт Фриске")
             self.assertEqual(segment.timecode, "01.10")
             self.assertEqual(segment.duration_sec, 10.0)

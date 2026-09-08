@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
-SegmentType = Literal["zk", "snh", "host", "tech"]
+SegmentType = Literal["zk", "snh", "host", "life", "tech"]
 TIMELINE_SCHEMA_VERSION = 1
 
 
@@ -65,7 +65,7 @@ class TimelineSegment:
         if missing:
             raise ValueError(f"timeline segment is missing: {', '.join(missing)}")
         kwargs = {key: value[key] for key in init_fields if key in value}
-        if kwargs["type"] not in {"zk", "snh", "host", "tech"}:
+        if kwargs["type"] not in {"zk", "snh", "host", "life", "tech"}:
             raise ValueError(f"invalid timeline segment type: {kwargs['type']!r}")
         for key in (
             "duration_sec",
