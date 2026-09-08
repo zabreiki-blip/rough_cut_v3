@@ -48,6 +48,7 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage1/normalization/reset": {"POST"},
         "/stage1/status": {"GET"},
         "/stage1/tts": {"POST"},
+        "/stage1/tts/clear": {"POST"},
         "/stage1/tts-jobs/<job_id>": {"GET"},
         "/stage1/tts-jobs/<job_id>/cancel": {"POST"},
         "/stage1/tts-jobs/start": {"POST"},

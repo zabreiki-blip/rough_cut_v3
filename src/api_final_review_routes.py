@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import ModuleType
 import time
+import wave
 
 from flask import Flask, jsonify, request
 
@@ -36,6 +37,14 @@ def _stable_wav(path: Path) -> bool:
     )
 
 
+def _wav_duration(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as source:
+            return source.getnframes() / float(source.getframerate())
+    except (OSError, EOFError, wave.Error, ZeroDivisionError) as exc:
+        raise ValueError(f"invalid final review WAV: {exc}") from exc
+
+
 def _start(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -47,13 +56,49 @@ def _start(services: ModuleType):
     gate = services._normalization_required(project)
     if gate:
         return gate
+    timeline_path = paths["work"] / "full_timeline.json"
+    if not timeline_path.is_file():
+        return services._json_error("full_timeline.json not found — run Build first", 404)
+    try:
+        timeline = services.FullTimeline.from_dict(services._read_json_safe(timeline_path))
+    except (TypeError, ValueError) as exc:
+        return services._json_error(f"invalid full_timeline.json: {exc}", 400)
     if not audio_path.is_file():
         return services._json_error("final review WAV was not found", 404)
     if not _stable_wav(audio_path):
         return services._json_error("final review WAV is still being exported", 409)
+    try:
+        wav_duration = _wav_duration(audio_path)
+        sequence = dict(payload.get("source_sequence") or {})
+        expected_duration = float(
+            sequence.get("durationSeconds") or timeline.total_duration_sec
+        )
+    except (TypeError, ValueError) as exc:
+        return services._json_error(str(exc), 400)
+    duration_tolerance = max(1.0, expected_duration * 0.002)
+    if expected_duration <= 0 or abs(wav_duration - expected_duration) > duration_tolerance:
+        return services._json_error(
+            "stale_snapshot: final review WAV duration "
+            f"{wav_duration:.3f}s does not match sequence duration {expected_duration:.3f}s",
+            409,
+        )
     if not services._reserve_final_review_project(project):
         return services._json_error(f"another mutating job is active for project {project}", 409)
     try:
+        manifest = services.build_assembly_manifest(
+            project=project,
+            timeline=services.FullTimeline.from_dict(
+                services._read_json_safe(timeline_path)
+            ),
+            timeline_path=timeline_path,
+            scenario_path=paths["normalized"],
+            audio_path=audio_path,
+            source_sequence=dict(payload.get("source_sequence") or {}),
+            layout=dict(payload.get("assembly_layout") or {}),
+        )
+        services.attach_scenario_revision(manifest, paths["normalized"])
+        services._atomic_write_json_file(paths["assembly_manifest"], manifest)
+        payload["assembly_manifest_id"] = str(manifest["manifest_id"])
         job = services._create_final_review_job(project, audio_path, payload)
         worker = services.threading.Thread(
             target=services._run_final_review_job,
@@ -65,6 +110,9 @@ def _start(services: ModuleType):
             daemon=True,
         )
         worker.start()
+    except ValueError as exc:
+        services._release_final_review_project(project)
+        return services._json_error(str(exc), 409)
     except Exception:
         services._release_final_review_project(project)
         raise
@@ -92,6 +140,21 @@ def _apply(services: ModuleType, job_id: str):
     if project != job.get("project"):
         return services._json_error("project does not match final review job", 409)
     report = services._read_json_safe(services._project_paths(project)["final_review_report"])
+    if str(report.get("job_id") or "") != str(job_id):
+        return services._json_error("final review report does not belong to this job", 409)
+    if str(report.get("project") or "") != project:
+        return services._json_error("final review report does not belong to this project", 409)
+    if str(report.get("assembly_manifest_id") or "") != str(
+        job.get("assembly_manifest_id") or ""
+    ):
+        return services._json_error("final review assembly snapshot changed", 409)
+    report_sequence = dict(report.get("source_sequence") or {})
+    job_sequence = dict(job.get("source_sequence") or {})
+    if (
+        str(report_sequence.get("sequenceId") or "")
+        != str(job_sequence.get("sequenceId") or "")
+    ):
+        return services._json_error("final review sequence identity changed", 409)
     corrections = report.get("corrections") if isinstance(report.get("corrections"), list) else []
     iteration = services._record_final_review_iteration(project, job, corrections)
     return jsonify({"ok": True, "result": {"project": project, "iteration": iteration, "corrections": corrections}})

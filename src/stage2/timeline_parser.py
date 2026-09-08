@@ -84,6 +84,31 @@ def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
     ]
 
 
+def _spoken_text(text: str, *, block_type: str, speaker: str = "") -> str:
+    """Return speech-only text without changing the canonical scenario."""
+    value = re.sub(r"\b(?:СКЛ|СКЛЕЙКА)\b", " ", text, flags=re.IGNORECASE)
+    value = re.sub(r"(?<!\d)\d{1,2}[:.]\d{2}(?:[:.]\d{2})?(?!\d)", " ", value)
+    life_cue = bool(re.match(r"^\s*ЛАЙФ\b", value, flags=re.IGNORECASE))
+    value = re.sub(r"^\s*(?:(?:СНХ|ЛАЙФ)\s*[,.:–-]?\s*)+", "", value, flags=re.IGNORECASE)
+    if life_cue:
+        value = re.sub(r"^\s*«[^»]{1,80}»\s*", "", value)
+    if speaker:
+        value = re.sub(
+            r"^\s*" + re.escape(speaker.strip()) + r"\s*[,.:–-]\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+    if block_type == "sync":
+        value = re.sub(
+            r"^\s*(?:отец|мать|мама|папа|брат|сестра|ведущий|ведущая)\s*:\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+    return re.sub(r"\s+", " ", value).strip(" ,.:;–—-")
+
+
 def _wav_duration(path: Path) -> float:
     try:
         with wave.open(str(path), "rb") as f:
@@ -326,7 +351,7 @@ def parse_normalized_timeline(
         raise ValueError("normalized scenario must be confirmed")
 
     segments: list[TimelineSegment] = []
-    counters = {"voiceover": 0, "sync": 0, "host": 0, "tech": 0}
+    counters = {"voiceover": 0, "sync": 0, "host": 0, "life": 0, "tech": 0}
     blocks = sorted(
         normalization.get("blocks", []),
         key=lambda item: int(item.get("order", 0) or 0),
@@ -363,6 +388,9 @@ def parse_normalized_timeline(
                     block_uid=block_uid,
                     revision_status=revision_status,
                     wav_path=str(wav_path) if wav_path.exists() else "",
+                    spoken_text=_spoken_text(
+                        str(block.get("text_for_tts") or text), block_type=block_type
+                    ),
                 )
             )
             continue
@@ -437,8 +465,34 @@ def parse_normalized_timeline(
                         match_status=match_status,
                         match_confidence=float(field(match, "confidence", 0.0) or 0.0),
                         placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+                        spoken_text=_spoken_text(
+                            fragment["text"],
+                            block_type=block_type,
+                            speaker=str(block.get("speaker") or ""),
+                        ),
                     )
                 )
+            continue
+
+        if block_type == "life":
+            counters["life"] += 1
+            seg_id = f"life{counters['life']}"
+            segments.append(
+                TimelineSegment(
+                    id=seg_id,
+                    type="life",
+                    text=text,
+                    duration_sec=SNH_PLACEHOLDER_DURATION,
+                    block_uid=block_uid,
+                    revision_status=revision_status,
+                    speaker="ЛАЙФ",
+                    role=str(block.get("source_description") or "ОРИГИНАЛЬНЫЙ ЗВУК").strip(),
+                    timecode=str(block.get("timecode_start") or "").strip(),
+                    timecode_end=str(block.get("timecode_end") or "").strip(),
+                    placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+                    spoken_text="",
+                )
+            )
             continue
 
         counters["tech"] += 1

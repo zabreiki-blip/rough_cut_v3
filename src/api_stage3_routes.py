@@ -442,7 +442,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
             "placeholder_segments": sum(
                 1
                 for segment in timeline_data.get("segments", [])
-                if isinstance(segment, dict) and segment.get("type") in {"snh", "host"}
+                if isinstance(segment, dict) and segment.get("type") in {"snh", "host", "life"}
             ),
             "source_mapping": [],
         }

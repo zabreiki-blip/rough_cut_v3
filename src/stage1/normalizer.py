@@ -79,10 +79,11 @@ _BUILTIN_MARKERS = {
     "интервью": BlockType.SYNC.value,
     "ведущий": BlockType.HOST.value,
     "ведущая": BlockType.HOST.value,
+    "лайф": BlockType.LIFE.value,
+    "life": BlockType.LIFE.value,
 }
 _TECH_MARKERS = {
     "видео",
-    "лайф",
     "титр",
     "титры",
     "плашка",
@@ -98,6 +99,18 @@ _TECH_MARKERS = {
     "тех",
     "техн",
 }
+_LIFE_PREFIX = re.compile(
+    r"^\s*(?P<label>ЛАЙФ|LIFE)\b\s*(?:[,.:\-–—]\s*)?(?P<body>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPLICIT_SYNC_CREDIT = re.compile(
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s*,\s*"
+    r"(?P<speaker>[^:\n]{1,80}?)\s*:\s*[,;]?\s*(?P<content>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPLICIT_SYNC_LABEL = re.compile(
+    r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE
+)
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
     r"\[?\d{1,2}[:.]\d{2}\]?|\[?\d{1,2}-\d{2}\]?)"
@@ -300,12 +313,12 @@ _LLM_CONFIDENCE_THRESHOLD = 0.65
 # is already part of the cache fingerprint (see `_classifier_identity`): a
 # version bump also drops stale entries from the on-disk cache file outright
 # instead of merely leaving them unreachable under their old keys.
-_LLM_CACHE_VERSION = 2
+_LLM_CACHE_VERSION = 3
 _LLM_CACHE_MAX_ENTRIES = 2000
 _OPENROUTER_SYSTEM_PROMPT = "You normalize TV production scripts."
 _OPENROUTER_INSTRUCTIONS = (
     "Classify every scenario paragraph without deleting or merging any item. "
-    "Allowed types: voiceover, sync, host, technical, other, unknown. "
+    "Allowed types: voiceover, sync, host, life, technical, other, unknown. "
     'Return JSON {"items":[{"uid":...,"type":...,"confidence":0..1,'
     '"label_is_marker":true|false,'
     '"text_for_tts":...,"speaker":...,"role":...,'
@@ -317,6 +330,9 @@ _OPENROUTER_INSTRUCTIONS = (
     "\"Клипы\", \"Хроника\"), or a production note telling the editor what "
     "to insert/show (e.g. \"Вставить синхрон\", \"Показать фото\") is "
     "type=technical, not unknown. Do not rewrite original content. "
+    "A paragraph beginning with ЛАЙФ or LIFE is always type=life, even when "
+    "it contains a title, colon, quote text, or timecode; it is source sound "
+    "and must never become voiceover or sync. "
     "An item with continuation_of_type=voiceover is an unlabelled paragraph "
     "continuing the preceding voiceover unless its text clearly starts a new "
     "speaker or technical cue. "
@@ -1233,6 +1249,18 @@ def _split_label(text: str) -> tuple[str, str]:
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
         return "", text.strip()
+    explicit_sync = _EXPLICIT_SYNC_CREDIT.match(text)
+    if explicit_sync:
+        marker = explicit_sync.group("marker").strip()
+        speaker = explicit_sync.group("speaker").strip(" \t,;:")
+        return f"{marker}, {speaker}", explicit_sync.group("content").strip()
+    life = _LIFE_PREFIX.match(text)
+    if life:
+        body = life.group("body").strip()
+        described = re.match(r"^([^:\n«»]{2,100}):\s*(.+)$", body, flags=re.DOTALL)
+        if described:
+            body = described.group(2).strip()
+        return life.group("label").strip(), body
     # Real editorial drafts commonly spell the voice-over marker as ``З.к.``,
     # ``З.К`` or glue it directly to the first word (``З.КВ 1915 году``).
     # Marker normalization alone cannot recover that punctuation, so split it
@@ -1260,7 +1288,7 @@ def _split_label(text: str) -> tuple[str, str]:
             rf"^\s*({re.escape(marker)})"
             rf"(?:[-.]\d+[A-Za-zА-Яа-я]?"
             rf"|\s*\d+[A-Za-zА-Яа-я]?(?=\s*[.:\-–—]|\s*$))?"
-            rf"(?:\s*[.:\-–—]\s*|\s+|$)(.*)$",
+            rf"(?:\s*[,.:\-–—]\s*|\s+|$)(.*)$",
             text,
             flags=re.I | re.DOTALL,
         )
@@ -1345,7 +1373,9 @@ def _classify_by_rules(
     stripped = block.original_text.strip()
     _label, content = _split_label(block.original_text)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
-    if (
+    if _EXPLICIT_SYNC_LABEL.match(block.original_label):
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif (
         _SYNC_LABEL_METADATA.match(block.original_label)
         or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
     ) and _TIMECODE.match(sync_content):
@@ -1389,6 +1419,8 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
     block.confidence = max(0.0, min(1.0, confidence))
     if block.type == BlockType.VOICEOVER.value and not block.text_for_tts:
         block.text_for_tts = block.normalized_text
+    elif block.type == BlockType.LIFE.value:
+        block.text_for_tts = ""
     timecodes = _TIMECODE.findall(block.original_text)
     if timecodes:
         block.timecode_start = _canonicalize_timecode(timecodes[0])
@@ -1397,14 +1429,33 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
 
 
 def _extract_block_metadata(block: NormalizedBlock) -> None:
+    if block.type == BlockType.LIFE.value:
+        life = _LIFE_PREFIX.match(block.original_text)
+        block.speaker = ""
+        block.role = ""
+        block.text_for_tts = ""
+        if life:
+            body = life.group("body").strip()
+            quoted = re.match(r"^«([^»]*)»", body)
+            described = re.match(r"^([^:\n«»]{2,100}):\s*(.+)$", body, flags=re.DOTALL)
+            if quoted:
+                block.source_description = quoted.group(1).strip()
+            elif described:
+                block.source_description = described.group(1).strip(" \t,;:")
+        return
     if block.type == BlockType.HOST.value and not block.speaker:
         block.speaker = block.original_label or "ВЕДУЩИЙ"
     if block.type != BlockType.SYNC.value:
         return
     fragment_source = _SYNC_CONTINUATION_NOTE.sub("", block.normalized_text)
     has_sync_metadata = False
+    explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
     match = _SYNC_METADATA.match(block.normalized_text)
-    if match:
+    if explicit_label:
+        block.speaker = explicit_label.group(1).strip(" \t,;:")
+        block.role = ""
+        has_sync_metadata = True
+    elif match:
         block.speaker = match.group(1).strip()
         block.role = match.group(2).strip()
         fragment_source = block.normalized_text[match.start(3) :].strip()
@@ -1426,6 +1477,10 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         ):
             block.speaker = block.original_label.strip()
 
+    if block.role.casefold() in {"sync", "снх", "синхрон"}:
+        block.role = ""
+        block.warnings.append("Technical sync type was removed from role")
+
     # A bare timecoded paragraph is an older supported sync form whose
     # normalized_text intentionally retains the leading timecode. Structured
     # fragments apply only when the block also has explicit speaker metadata.
@@ -1435,8 +1490,9 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     if not fragments:
         return
     block.sync_fragments = fragments
-    block.timecode_start = fragments[0].timecode_start
-    block.timecode_end = fragments[0].timecode_end
+    first_timed = next((fragment for fragment in fragments if fragment.timecode_start), fragments[0])
+    block.timecode_start = first_timed.timecode_start
+    block.timecode_end = first_timed.timecode_end
     block.normalized_text = " ".join(fragment.text for fragment in fragments if fragment.text)
 
 
@@ -1462,7 +1518,7 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
             content_start += range_match.end()
         # The punctuation belongs to the quote; only structural whitespace and
         # separators right after the boundary/range are discarded.
-        separator = re.match(r"[.\s]*", text[content_start:])
+        separator = re.match(r"[.,\s]*", text[content_start:])
         assert separator is not None
         content_start += separator.end()
         boundaries.append(
@@ -1476,11 +1532,17 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
         search_from = content_start
 
     fragments: list[SyncFragment] = []
+    if boundaries:
+        leading = text[: boundaries[0]["token_start"]].strip(" \t\r\n–—-")
+        leading = re.sub(r"\.\s*,", ",", leading)
+        if leading:
+            fragments.append(SyncFragment(text=leading, timecode_start=""))
     for index, boundary in enumerate(boundaries):
         text_end = (
             boundaries[index + 1]["token_start"] if index + 1 < len(boundaries) else len(text)
         )
         fragment_text = text[boundary["content_start"] : text_end].strip(" \t\r\n–—-")
+        fragment_text = re.sub(r"\.\s*,", ",", fragment_text)
         if not fragment_text:
             continue
         fragments.append(
@@ -1952,6 +2014,7 @@ def _raw_projection(scenario: NormalizedScenario) -> str:
         BlockType.VOICEOVER.value: "ЗК",
         BlockType.SYNC.value: "СНХ",
         BlockType.HOST.value: "ВЕДУЩИЙ",
+        BlockType.LIFE.value: "ЛАЙФ",
         BlockType.TECHNICAL.value: "ТЕХ",
         BlockType.OTHER.value: "ПРОЧЕЕ",
         BlockType.UNKNOWN.value: "НЕИЗВЕСТНО",

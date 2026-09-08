@@ -88,6 +88,11 @@ from stage2.sync_models import (
 )
 from stage2.models import FullTimeline
 from stage2.final_review import review_rendered_timeline
+from stage2.assembly_manifest import (
+    build_assembly_manifest,
+    attach_scenario_revision,
+    validate_assembly_manifest,
+)
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
 from stage2.whisper_process import (
@@ -1551,6 +1556,7 @@ def _create_final_review_job(project: str, audio_path: Path, payload: dict) -> d
         "id": uuid.uuid4().hex, "project": project, "status": "queued", "message": "Queued",
         "audio_path": str(audio_path.relative_to(_project_paths(project)["root"])),
         "source_sequence": dict(payload.get("source_sequence") or {}), "created_at": now,
+        "assembly_manifest_id": str(payload.get("assembly_manifest_id") or ""),
         "started_at": "", "finished_at": "", "error": "", "report_path": "",
     }
     job_id = str(job["id"])
@@ -1576,10 +1582,24 @@ def _run_final_review_job(
     model: str | None, source_sequence: dict,
 ) -> None:
     try:
+        paths = _project_paths(project)
+        manifest = _read_json_safe(paths["assembly_manifest"])
+        validate_assembly_manifest(
+            manifest,
+            timeline_path=paths["timeline"],
+            scenario_path=paths["normalized"],
+            audio_path=audio_path,
+        )
         _update_final_review_job(job_id, status="running", message="Transcribing rendered timeline", started_at=_utc_now_iso())
         result = transcribe_audio(audio_path, backend=backend, model=model, language=language)
+        validate_assembly_manifest(
+            manifest,
+            timeline_path=paths["timeline"],
+            scenario_path=paths["normalized"],
+            audio_path=audio_path,
+        )
         index = ingest_word_index(result, "final-render", model=str(result.get("model") or model or ""), language=str(result.get("language") or language))
-        paths = _project_paths(project)
+        save_word_index(paths["final_review_words"], index)
         timeline_data = _read_json_safe(paths["work"] / "full_timeline.json")
         timeline = FullTimeline.from_dict(timeline_data)
         report = review_rendered_timeline(timeline, index)
@@ -1587,6 +1607,9 @@ def _run_final_review_job(
             "project": project, "job_id": job_id, "created_at": _utc_now_iso(),
             "audio_path": str(audio_path.relative_to(paths["root"])), "source_sequence": source_sequence,
             "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
+            "assembly_manifest_id": str(manifest.get("manifest_id") or ""),
+            "assembly_summary": dict(manifest.get("summary") or {}),
+            "assembly_findings": list(manifest.get("findings") or []),
         })
         _atomic_write_json_file(paths["final_review_report"], report)
         _update_final_review_job(job_id, status="completed", message="Final review completed", finished_at=_utc_now_iso(), report_path=str(paths["final_review_report"].relative_to(paths["root"])))

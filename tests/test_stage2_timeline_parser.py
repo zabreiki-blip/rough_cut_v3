@@ -404,6 +404,37 @@ class NormalizedTimelineTest(unittest.TestCase):
             self.assertEqual([item.match_status for item in timeline.segments], ["", ""])
             self.assertEqual([item.duration_sec for item in timeline.segments], [10.0, 10.0])
 
+    def test_life_block_becomes_non_speech_graphic_placeholder(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            timeline = parse_normalized_timeline(
+                {
+                    "status": "confirmed",
+                    "blocks": [{
+                        "uid": "life-block",
+                        "order": 1,
+                        "type": "life",
+                        "normalized_text": "01.10 Подойду к тебе, шепну на ушко",
+                        "source_description": "концерт Фриске",
+                        "timecode_start": "01.10",
+                    }],
+                },
+                base,
+                base,
+                "TEST",
+            )
+
+            self.assertEqual(len(timeline.segments), 1)
+            segment = timeline.segments[0]
+            self.assertEqual(segment.id, "life1")
+            self.assertEqual(segment.type, "life")
+            self.assertEqual(segment.speaker, "ЛАЙФ")
+            self.assertEqual(segment.role, "концерт Фриске")
+            self.assertEqual(segment.timecode, "01.10")
+            self.assertEqual(segment.duration_sec, 10.0)
+            self.assertTrue(segment.placeholder_path.endswith("life1_placeholder.png"))
+            self.assertEqual(segment.spoken_text, "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -417,6 +417,77 @@ class NormalizerTests(unittest.TestCase):
                 ],
             )
 
+    def test_life_markers_are_a_distinct_non_tts_type(self) -> None:
+        cases = (
+            ("ЛАЙФ, «» А я всё летала, но я так и знала", ""),
+            ("ЛАЙФ, «А на море белый песок» А на море белый песок", "А на море белый песок"),
+            ("ЛАЙФ, «Килиманджаро» 00.55", "Килиманджаро"),
+            ("ЛАЙФ, концерт Фриске: 01.10 Подойду к тебе", "концерт Фриске"),
+        )
+        for original, description in cases:
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "scenario.txt"
+                source.write_text(original, encoding="utf-8")
+                block = generate_normalization(
+                    source, root / "out.json",
+                    memory_path=root / "memory.sqlite3", use_llm=False,
+                )["blocks"][0]
+                self.assertEqual(block["type"], "life")
+                self.assertEqual(block["original_label"].casefold(), "лайф")
+                self.assertEqual(block["text_for_tts"], "")
+                self.assertEqual(block["speaker"], "")
+                self.assertEqual(block["role"], "")
+                self.assertEqual(block["source_description"], description)
+
+    def test_explicit_snh_preserves_speech_before_inline_timecodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ, Харута: насколько я знаю, по-моему, ни у кого из российских "
+                "артистов такого не было, когда она выступала на корпоративе, ей "
+                "00.45.07 кричат: «Еще давай!». 00.27.15, потому что она выходила "
+                "на сцену и людям было хорошо.",
+                encoding="utf-8",
+            )
+            block = generate_normalization(
+                source, root / "out.json",
+                memory_path=root / "memory.sqlite3", use_llm=False,
+            )["blocks"][0]
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["speaker"], "Харута")
+            self.assertEqual(block["role"], "")
+            self.assertEqual(block["original_label"], "СНХ, Харута")
+            self.assertIn("насколько я знаю", block["normalized_text"])
+            self.assertIn("кричат", block["normalized_text"])
+            self.assertIn("людям было хорошо", block["normalized_text"])
+            self.assertNotIn(". ,", block["normalized_text"])
+            self.assertEqual(
+                [item["timecode_start"] for item in block["sync_fragments"]],
+                ["", "00.45.07", "00.27.15"],
+            )
+
+    def test_explicit_snh_tolerates_colon_comma_and_never_uses_type_as_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ, отец:, когда я первый раз увидел, как ее крутило. СКЛ Я уходил "
+                "оттуда, 00:46:03 Прямо не мог все это смотреть.",
+                encoding="utf-8",
+            )
+            block = generate_normalization(
+                source, root / "out.json",
+                memory_path=root / "memory.sqlite3", use_llm=False,
+            )["blocks"][0]
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["original_label"], "СНХ, отец")
+            self.assertEqual(block["speaker"], "отец")
+            self.assertEqual(block["role"], "")
+            self.assertIn("когда я первый раз", block["normalized_text"])
+            self.assertIn("Прямо не мог", block["normalized_text"])
+
     def test_sync_speaker_block_can_contain_multiple_timecoded_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -25,6 +25,13 @@ def test_restored_tts_job_rehydrates_every_resume_control() -> None:
     assert "restoreTtsControls(response.result);" in STAGE1_JS
 
 
+def test_voiceover_can_be_cleared_with_explicit_confirmation() -> None:
+    assert 'id="btn_tts_clear"' in PROJECT_HTML
+    assert 'title: "Очистить всю озвучку?"' in STAGE1_JS
+    assert 'postJSON("/stage1/tts/clear", { project })' in STAGE1_JS
+    assert 'ids.btn_tts_clear.addEventListener("click"' in STAGE1_JS
+
+
 def test_tts_and_sync_polling_retry_transient_errors_with_bounded_backoff() -> None:
     assert "const MAX_POLL_BACKOFF_MS = 10000;" in STAGE1_JS
     assert "function isTransientPollingError(error)" in STAGE1_JS
@@ -110,6 +117,24 @@ def test_normalization_offers_safe_openrouter_speed_presets() -> None:
     assert 'llm_preset: ids.normalization_llm_preset?.value || "standard"' in STAGE1_JS
 
 
+def test_normalization_supports_life_and_problem_navigation() -> None:
+    assert 'life: "Лайф"' in STAGE1_JS
+    assert '<option value="life">Лайф</option>' in PROJECT_HTML
+    assert 'id="norm_count_life"' in PROJECT_HTML
+    for element_id in (
+        "btn_norm_issue_prev",
+        "btn_norm_issue_next",
+        "btn_norm_issue_filter",
+        "norm_issue_position",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+    assert "function blockNeedsReview(block)" in STAGE1_JS
+    assert "function focusIssue(offset)" in STAGE1_JS
+    assert 'card.scrollIntoView({ behavior: "smooth", block: "center" });' in STAGE1_JS
+    assert 'control.value === "life"' in STAGE1_JS
+    assert 'block.text_for_tts = "";' in STAGE1_JS
+
+
 def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     # `normalizationDirty` likewise moved onto the shared `appState` object.
     assert "if (appState.normalizationDirty)" in STAGE1_JS
@@ -159,7 +184,7 @@ def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
     assert 'acceptBtn.classList.toggle("danger", Boolean(danger));' in STAGE1_JS
     assert "if (acceptBtn.disabled) return;" in STAGE1_JS
     assert "acceptBtn.disabled = true;" in STAGE1_JS
-    assert STAGE1_JS.count("await confirmDialog({") == 5
+    assert STAGE1_JS.count("await confirmDialog({") == 6
 
 
 def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None:

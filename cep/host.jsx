@@ -3041,9 +3041,16 @@
             var clips;
             var i;
             var j;
+            var muted;
+            var enabled;
             for (i = 0; i < collection.numTracks; i++) {
                 track = collection[i];
                 clips = [];
+                muted = null;
+                try {
+                    muted = typeof track.isMuted === "function" ?
+                        (track.isMuted() ? true : false) : null;
+                } catch (ignoreTrackMute) { muted = null; }
                 for (j = 0; j < track.clips.numItems; j++) {
                     clip = track.clips[j];
                     clipStart = secondsOf(clip.start);
@@ -3051,6 +3058,9 @@
                     if (clipEnd < fromSeconds || clipStart > toSeconds) {
                         continue;
                     }
+                    enabled = null;
+                    try { enabled = clip.disabled ? false : true; }
+                    catch (ignoreClipDisabled) { enabled = null; }
                     clips.push({
                         name: asString(clip.name),
                         projectItemName: clip.projectItem ? asString(clip.projectItem.name) : "",
@@ -3059,12 +3069,15 @@
                         endSeconds: clipEnd,
                         durationSeconds: Math.max(0, clipEnd - clipStart),
                         sourceInSeconds: secondsOf(clip.inPoint),
-                        sourceOutSeconds: secondsOf(clip.outPoint)
+                        sourceOutSeconds: secondsOf(clip.outPoint),
+                        enabled: enabled,
+                        hasAudioComponent: prefix === "A"
                     });
                 }
                 destination.push({
                     track: prefix + (i + 1),
                     clipCount: Number(track.clips.numItems),
+                    muted: muted,
                     clips: clips
                 });
             }
@@ -3410,16 +3423,13 @@
         },
 
         exportFinalReviewAudio: function (encodedPayload) {
-            /* Direct export is intentional. Final review must not share AME's
-               mutable global queue: a paused queue otherwise leaves CEP
-               polling a WAV that will never be written. */
             var params;
             var sequence;
             var outputFile;
             var presetPath;
             var presetFile;
+            var jobId;
             var roughCutGuard;
-            var exported;
             try {
                 params = parsePayload(encodedPayload);
                 sequence = app.project ? app.project.activeSequence : null;
@@ -3451,14 +3461,29 @@
                 if (!presetFile.exists || !/\.epr$/i.test(presetFile.name)) {
                     throw new Error("Wave48mono24.epr was not found for final review export.");
                 }
-                if (typeof sequence.exportAsMediaDirect !== "function") {
-                    throw new Error("Premiere Sequence.exportAsMediaDirect is unavailable in this version.");
+                if (!app.encoder || !app.encoder.encodeSequence) {
+                    throw new Error("Premiere encoder API is unavailable.");
                 }
-                exported = sequence.exportAsMediaDirect(outputFile.fsName, presetFile.fsName, 0);
-                if (exported === false || !outputFile.exists || Number(outputFile.length) <= 44) {
-                    throw new Error("Premiere direct final-review export did not produce a WAV.");
+                app.encoder.launchEncoder();
+                jobId = app.encoder.encodeSequence(
+                    sequence,
+                    outputFile.fsName,
+                    presetFile.fsName,
+                    0,
+                    1
+                );
+                if (!jobId || String(jobId) === "0") {
+                    throw new Error("Adobe Media Encoder rejected the final-review export job.");
                 }
-                return success({ file: { path: outputFile.fsName, size: Number(outputFile.length) }, sequence: sequenceMetadata(sequence) });
+                app.encoder.startBatch();
+                return success({
+                    job: {
+                        jobId: asString(jobId),
+                        outputPath: outputFile.fsName,
+                        presetPath: presetFile.fsName,
+                        sequence: sequenceMetadata(sequence)
+                    }
+                });
             } catch (error) {
                 return fail(error.message);
             }
@@ -3566,6 +3591,13 @@ function rcStage2_inspectActiveSequence() {
 }
 
 function rcStage2_inspectActiveSequenceLayout(encodedPayload) {
+    return $._roughCutStage2.inspectActiveSequenceLayout(encodedPayload);
+}
+
+// Final-review lineage uses the same bounded reader through a production API
+// name; the diagnostic command remains absent from the production panel UI.
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_captureAssemblyLayout(encodedPayload) {
     return $._roughCutStage2.inspectActiveSequenceLayout(encodedPayload);
 }
 

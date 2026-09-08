@@ -46,7 +46,7 @@ export function isBusy() {
 
 export function setBusy(state) {
   busy = state;
-  [ids.btn_analyze, ids.btn_tts, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline,
+  [ids.btn_analyze, ids.btn_tts, ids.btn_tts_clear, ids.btn_phrase_tts, ids.btn_validate, ids.btn_run_all, ids.btn_build_timeline,
     ids.btn_sync_align, ids.btn_export_xml,
     ids.btn_normalize, ids.btn_save_normalization, ids.btn_confirm_normalization, ids.btn_add_normalization_block,
     ids.btn_reset_normalization,
@@ -81,6 +81,9 @@ export function updateActionAvailability() {
   });
   if (ids.btn_tts && ["queued", "running", "cancelling"].includes(appState.currentTtsJobStatus)) {
     ids.btn_tts.disabled = true;
+  }
+  if (ids.btn_tts_clear) {
+    ids.btn_tts_clear.disabled = ["queued", "running", "cancelling"].includes(appState.currentTtsJobStatus);
   }
   if (ids.btn_sync_align) {
     ids.btn_sync_align.disabled = blocked || appState.syncJobRunning
@@ -233,7 +236,7 @@ export function pollingBackoffMs(failures, baseDelay) {
 }
 
 export const blockTypeLabels = {
-  voiceover: "Закадр", sync: "Синхрон", host: "Ведущий",
+  voiceover: "Закадр", sync: "Синхрон", host: "Ведущий", life: "Лайф",
   technical: "Технический", other: "Прочее", unknown: "Не определён",
 };
 export const sourceLabels = {

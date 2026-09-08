@@ -675,7 +675,7 @@ def _stage2_build(services: ModuleType):
     # Generate placeholder PNGs for speaker and presenter segments.
     placeholder_warnings: list[str] = []
     for seg in timeline.segments:
-        if seg.type in {"snh", "host"} and seg.placeholder_path:
+        if seg.type in {"snh", "host", "life"} and seg.placeholder_path:
             from pathlib import Path as _Path
 
             stable_uid = str(seg.block_uid or seg.parent_block_uid or "").strip()
@@ -723,6 +723,7 @@ def _stage2_build(services: ModuleType):
     zk_count = sum(1 for s in timeline.segments if s.type == "zk")
     snh_count = sum(1 for s in timeline.segments if s.type == "snh")
     host_count = sum(1 for s in timeline.segments if s.type == "host")
+    life_count = sum(1 for s in timeline.segments if s.type == "life")
     tech_count = sum(1 for s in timeline.segments if s.type == "tech")
     zk_missing_wav = [s.id for s in timeline.segments if s.type == "zk" and not s.wav_path]
     sync_segments = [s for s in timeline.segments if s.type in {"snh", "host"}]
@@ -743,6 +744,7 @@ def _stage2_build(services: ModuleType):
                 "zk": zk_count,
                 "snh": snh_count,
                 "host": host_count,
+                "life": life_count,
                 "tech": tech_count,
                 "total_duration_sec": timeline.total_duration_sec,
                 "timeline_path": str(timeline_path.relative_to(services.ROOT_DIR)),

@@ -41,6 +41,10 @@ class TimelineSegment:
     wav_path: str = ""
     # placeholder PNG (generated for SNH)
     placeholder_path: str = ""
+    # Text that is actually expected in speech recognition. The canonical
+    # scenario text stays intact in ``text``; older timelines fall back to a
+    # deterministic derivation in final_review.
+    spoken_text: str = ""
 
     @property
     def end_sec(self) -> float:

@@ -35,6 +35,7 @@
     ping: "rcStage2_ping",
     projects: "rcStage2_listProjects",
     inspect: "rcStage2_inspectActiveSequence",
+    inspectLayout: "rcStage2_captureAssemblyLayout",
     resolve: "rcStage2_resolveSequence",
     conform: "rcStage2_conformSequenceRanges",
     exportAudio: "rcStage2_exportActiveSequenceAudio",
@@ -1619,11 +1620,14 @@
     });
   }
 
-  function submitFinalReview(sequence) {
+  function submitFinalReview(sequence, layout) {
     request("POST", "/stage2/final-review/start", {
       project: config().project,
       audio_path: "work/final_review.wav",
-      source_sequence: sequence || {}
+      backend: "cloud-audio",
+      model: "google/gemini-3.7-flash",
+      source_sequence: sequence || {},
+      assembly_layout: layout || {}
     }, function (startError, started) {
       byId("startFinalReview").disabled = false;
       byId("startFinalReviewFromWav").disabled = false;
@@ -1635,6 +1639,86 @@
       setFinalReviewStatus("Распознаю и сверяю собранный таймлайн…");
       pollFinalReviewJob();
     });
+  }
+
+  function inspectFinalReviewLayout(sequence, callback) {
+    var duration = Math.max(0.04, Number(sequence && sequence.durationSeconds || 0));
+    callHost("inspectLayout", {
+      fromSeconds: 0,
+      toSeconds: duration
+    }, function (error, response) {
+      callback(error, response && (response.layout || response));
+    });
+  }
+
+  function pollFinalReviewExport(outputPath, jobId, sequence) {
+    var previousSize = -1;
+    var previousModified = -1;
+    var stableChecks = 0;
+    var attempts = 0;
+    var maxAttempts = 1800;
+    var exportFinished = false;
+
+    function check() {
+      attempts += 1;
+      var requestGeneration = pollGeneration;
+      callHost("fileInfo", { path: outputPath }, function (error, response) {
+        var file;
+        if (requestGeneration !== pollGeneration || document.hidden) {
+          exportPollWasActive = true;
+          return;
+        }
+        if (exportFinished) {
+          return;
+        }
+        if (error) {
+          setFinalReviewStatus("Не удалось проверить WAV: " + error.message);
+        } else {
+          file = response.file;
+          if (file.exists && file.size > 44 &&
+              file.size === previousSize && file.modifiedMs === previousModified) {
+            stableChecks += 1;
+          } else {
+            stableChecks = 0;
+          }
+          previousSize = file.size;
+          previousModified = file.modifiedMs;
+          if (stableChecks >= 3) {
+            exportFinished = true;
+            exportPollTimer = null;
+            exportPollResumeFn = null;
+            setFinalReviewStatus("WAV готов. Создаю manifest таймлайна…");
+            inspectFinalReviewLayout(sequence, function (layoutError, layout) {
+              if (layoutError) {
+                byId("startFinalReview").disabled = false;
+                byId("startFinalReviewFromWav").disabled = false;
+                log("WAV экспортирован, но manifest sequence не создан: " + layoutError.message, layout, "error");
+                return;
+              }
+              submitFinalReview(sequence, layout);
+            });
+            return;
+          }
+        }
+        if (attempts >= maxAttempts) {
+          exportPollTimer = null;
+          exportPollResumeFn = null;
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          setFinalReviewStatus("Ожидание финального WAV остановлено через 60 минут.");
+          log("Ожидание final-review экспорта остановлено через 60 минут. Job ID: " + jobId, response, "error");
+          return;
+        }
+        exportPollTimer = window.setTimeout(check, 2000);
+      });
+    }
+
+    if (exportPollTimer) {
+      window.clearTimeout(exportPollTimer);
+    }
+    exportPollResumeFn = check;
+    exportPollWasActive = false;
+    exportPollTimer = window.setTimeout(check, 1000);
   }
 
   function startFinalReviewFromWav() {
@@ -1651,7 +1735,15 @@
         return;
       }
       currentFinalReviewSequence = sequence || null;
-      submitFinalReview(sequence);
+      inspectFinalReviewLayout(sequence, function (layoutError, layout) {
+        if (layoutError) {
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          log("Не удалось создать manifest активной sequence: " + layoutError.message, layout, "error");
+          return;
+        }
+        submitFinalReview(sequence, layout);
+      });
     });
   }
 
@@ -1681,7 +1773,8 @@
           log("Не удалось экспортировать финальный WAV: " + exportError.message, exported, "error");
           return;
         }
-        submitFinalReview(sequence);
+        log("Экспорт финального WAV поставлен в очередь. Ожидаю стабильный файл…", exported.job);
+        pollFinalReviewExport(exported.job.outputPath, exported.job.jobId, sequence);
       });
     });
   }

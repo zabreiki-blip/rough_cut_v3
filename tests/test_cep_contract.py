@@ -121,6 +121,16 @@ def test_source_registration_supports_shared_and_all_speaker_sequences() -> None
     assert "registeredSpeakers.concat(existing.speakers)" in PANEL
 
 
+def test_final_review_export_is_async_and_waits_for_stable_wav() -> None:
+    assert "exportFinalReviewAudio: function (encodedPayload)" in HOST
+    assert "app.encoder.encodeSequence(" in HOST
+    assert "app.encoder.startBatch();" in HOST
+    assert "sequence.exportAsMediaDirect" not in HOST
+    assert "function pollFinalReviewExport(outputPath, jobId, sequence)" in PANEL
+    assert "pollFinalReviewExport(exported.job.outputPath, exported.job.jobId, sequence)" in PANEL
+    assert "Ожидание final-review экспорта остановлено через 60 минут." in PANEL
+
+
 def test_batch_conform_preserves_editorial_context_as_sequence_markers() -> None:
     assert "upsertConformMarker(target, item)" in HOST
     assert "markers.createMarker" in HOST

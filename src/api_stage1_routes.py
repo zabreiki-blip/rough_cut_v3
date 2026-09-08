@@ -560,6 +560,68 @@ def _stage1_tts_job_cancel(services: ModuleType, job_id: str):
     return jsonify({"ok": True, "result": snapshot}), 202
 
 
+def _stage1_tts_clear(services: ModuleType):
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = services._resolve_project_name(payload.get("project"))
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
+
+    paths = services._ensure_project(project)
+    if services._project_has_active_mutation(project):
+        return services._json_error(
+            "Нельзя очистить озвучку, пока выполняется фоновая задача проекта", 409
+        )
+
+    removed = 0
+    for pattern in ("zk*.wav", "zk*.wav.meta"):
+        for path in paths["speaker"].glob(pattern):
+            if path.is_file():
+                path.unlink()
+                removed += 1
+
+    validation_manifest = paths["speaker"] / "manifest.json"
+    if validation_manifest.is_file():
+        validation_manifest.unlink()
+        removed += 1
+
+    normalized = services._read_json_safe(paths["normalized"])
+    services._atomic_write_json_file(
+        paths["active_voiceover_manifest"],
+        {
+            "schema_version": 1,
+            "scenario_revision_id": str(normalized.get("scenario_revision_id") or ""),
+            "items": [],
+        },
+    )
+
+    if paths["tts_job_status"].is_file():
+        paths["tts_job_status"].unlink()
+        removed += 1
+    with services._TTS_JOBS_LOCK:
+        stale_job_ids = [
+            job_id
+            for job_id, job in services._TTS_JOBS.items()
+            if job.get("project") == project
+            and job.get("status") not in {"queued", "running", "cancelling"}
+        ]
+        for job_id in stale_job_ids:
+            services._TTS_JOBS.pop(job_id, None)
+            services._TTS_CANCEL_EVENTS.pop(job_id, None)
+
+    return jsonify(
+        {
+            "ok": True,
+            "result": {
+                "project": project,
+                "files_removed": removed,
+                "manifests_reset": 2,
+                "history_preserved": True,
+            },
+        }
+    )
+
+
 def _stage1_tts_phrase(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -761,6 +823,11 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
     @app.post("/stage1/tts-jobs/<job_id>/cancel")
     def stage1_tts_job_cancel(job_id: str):
         return _stage1_tts_job_cancel(services, job_id)
+
+    @app.post("/stage1/tts/clear")
+    @serialize_project_mutation
+    def stage1_tts_clear():
+        return _stage1_tts_clear(services)
 
     @app.post("/stage1/tts-phrase")
     def stage1_tts_phrase():

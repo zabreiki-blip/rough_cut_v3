@@ -5,7 +5,7 @@ import { ids, appState, project, live } from "./state.js";
 import {
   toast, appendLog, setStepState, formData, assertRequiredPath,
   postJSON, getJSON, isTransientPollingError, pollingBackoffMs,
-  optionalRequestJSON, renderEtaCells, updateActionAvailability, safely,
+  optionalRequestJSON, renderEtaCells, updateActionAvailability, confirmDialog, safely,
 } from "./core.js";
 import { refreshStatus } from "./normalization.js";
 
@@ -213,6 +213,36 @@ async function cancelTTSJob() {
   }
 }
 
+async function clearTTS() {
+  const accepted = await confirmDialog({
+    title: "Очистить всю озвучку?",
+    message: "Будут удалены все текущие файлы закадрового голоса и результаты валидации. Текст сценария и история редакций останутся без изменений.",
+    confirmLabel: "Очистить всё",
+    cancelLabel: "Отмена",
+    danger: true,
+  });
+  if (!accepted) return;
+
+  const result = await postJSON("/stage1/tts/clear", { project });
+  currentTtsJobId = "";
+  appState.currentTtsJobStatus = "";
+  if (ttsPollTimer) window.clearTimeout(ttsPollTimer);
+  ttsPollTimer = null;
+  ttsPollFailures = 0;
+  ids.progress_bar.style.width = "0%";
+  ids.m_progress.textContent = "0%";
+  ids.speaker_hint.textContent = "Озвучка очищена — можно запускать TTS через OpenRouter";
+  setStepState(ids.step_tts, "idle");
+  setStepState(ids.step_validate, "idle");
+  setLive({
+    status: "idle", event: "—", current: "—",
+    retries: 0, done: 0, total: 0, error: "",
+  });
+  toast(`Озвучка очищена: удалено ${result.files_removed || 0} файлов`, "success");
+  appendLog(`TTS cleared: files=${result.files_removed || 0}, manifests=${result.manifests_reset || 0}`);
+  await refreshStatus();
+}
+
 function restoreTtsControls(state) {
   if (!state || typeof state !== "object") return;
   if (state.prepared_path) ids.prepared_path.value = String(state.prepared_path);
@@ -388,6 +418,7 @@ export async function doBuildTimeline() {
 if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
 ids.btn_tts.addEventListener("click", () => safely(doTTS));
 if (ids.btn_tts_cancel) ids.btn_tts_cancel.addEventListener("click", cancelTTSJob);
+if (ids.btn_tts_clear) ids.btn_tts_clear.addEventListener("click", () => safely(clearTTS));
 ids.btn_phrase_tts.addEventListener("click", () => safely(doPhraseTTS));
 ids.btn_validate.addEventListener("click", () => safely(doValidate));
 ids.btn_run_all.addEventListener("click", () =>
