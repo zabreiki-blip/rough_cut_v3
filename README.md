@@ -587,6 +587,8 @@ curl -X POST http://localhost:8000/stage1/analyze \
 
 ## Документация
 
+- [`docs/README.md`](docs/README.md) — полный индекс актуальной документации и
+  архивных отчётов.
 - [`docs/STAGE1_GUIDE.md`](docs/STAGE1_GUIDE.md) — подробное руководство по
   работе со сценарием на Stage 1: разметка диктора, нормализация, TTS.
 - [`docs/E2E_PILOT_CHECKLIST.md`](docs/E2E_PILOT_CHECKLIST.md) — пошаговый
@@ -598,5 +600,5 @@ curl -X POST http://localhost:8000/stage1/analyze \
   конкурентный анализ (для контекста продукта, не для эксплуатации).
 - [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — план разработки и roadmap
   (уже упомянут выше в разделе про Stage 2.1).
-- [`AUDIT.md`](AUDIT.md) — сводный аудит производительности и версии
-  сценариев с историей закрытых и открытых пунктов.
+- [`docs/archive/audits/README.md`](docs/archive/audits/README.md) — архив
+  датированных аудитов. Это исторические снимки, а не текущий backlog.

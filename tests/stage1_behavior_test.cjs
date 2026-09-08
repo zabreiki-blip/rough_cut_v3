@@ -423,7 +423,7 @@ async function testSyncMatchSpeakerFilterHint({ state, sync }) {
 // operator no longer has to reopen the CEP panel in Premiere to fix a
 // source's speaker names or "all speakers" flag - a wrong/missing speaker
 // on a source silently excludes it from matching (see
-// docs/NORMALIZATION_MATCHING_AUDIT_2026-09-07.md).
+// docs/archive/audits/NORMALIZATION_MATCHING_AUDIT_2026-09-07.md).
 async function testSyncSourcesEditor({ state, sync }) {
   const { ids, appState, project } = state;
   const originalFetch = globalThis.fetch;

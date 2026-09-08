@@ -103,7 +103,8 @@ function sourceSpeakerNames(source) {
 
 // Human-readable search scope shown next to each editable source: matches
 // the wording operators need to diagnose why a source is (not) searched for
-// a given block's speaker (see docs/NORMALIZATION_MATCHING_AUDIT).
+// a given block's speaker (see
+// docs/archive/audits/NORMALIZATION_MATCHING_AUDIT_2026-09-07.md).
 function sourceScopeLabel(source) {
   if (source.all_speakers) return "все спикеры";
   const speakers = sourceSpeakerNames(source);
