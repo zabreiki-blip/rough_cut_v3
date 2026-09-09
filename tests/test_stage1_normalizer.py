@@ -488,6 +488,35 @@ class NormalizerTests(unittest.TestCase):
             self.assertIn("когда я первый раз", block["normalized_text"])
             self.assertIn("Прямо не мог", block["normalized_text"])
 
+    def test_skl_splits_sync_into_independently_matchable_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ, Киркоров:00:05:43 Жанна принадлежит к роду артиста, "
+                "когда СКЛ ты можешь даже не петь, и глаз оторвать невозможно.",
+                encoding="utf-8",
+            )
+            block = generate_normalization(
+                source, root / "out.json",
+                memory_path=root / "memory.sqlite3", use_llm=False,
+            )["blocks"][0]
+
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Жанна принадлежит к роду артиста, когда",
+                        "timecode_start": "00:05:43",
+                    },
+                    {
+                        "text": "ты можешь даже не петь, и глаз оторвать невозможно.",
+                        "timecode_start": "",
+                    },
+                ],
+            )
+            self.assertNotIn("СКЛ", block["normalized_text"])
+
     def test_sync_speaker_block_can_contain_multiple_timecoded_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

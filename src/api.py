@@ -94,7 +94,12 @@ from stage2.assembly_manifest import (
     validate_assembly_manifest,
 )
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
-from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
+from stage2.sync_transcript import (
+    ingest_word_index,
+    load_word_index,
+    rescale_stretched_word_index,
+    save_word_index,
+)
 from stage2.whisper_process import (
     WhisperCancelledError,
     transcribe_audio_in_process as transcribe_audio,

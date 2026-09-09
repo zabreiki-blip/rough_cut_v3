@@ -72,6 +72,7 @@ def run_sync_job(
     _TRANSCRIPTION_CACHE_KEY = services._TRANSCRIPTION_CACHE_KEY
     _transcription_cache_metadata = services._transcription_cache_metadata
     save_word_index = services.save_word_index
+    rescale_stretched_word_index = services.rescale_stretched_word_index
     _audio_stat_signature = services._audio_stat_signature
     _audio_cache_signature = services._audio_cache_signature
     app = services.app
@@ -215,6 +216,16 @@ def run_sync_job(
                     ):
                         cache_metadata["audio"] = audio_signature
                         save_word_index(index_path, cached_index)
+
+                if cached_index is not None:
+                    backend_name = str(cached_index.metadata.get("backend") or "").lower()
+                    precision = str(cached_index.metadata.get("timestamp_precision") or "").lower()
+                    if backend_name == "cloud-audio" and precision == "interpolated":
+                        scale = rescale_stretched_word_index(
+                            cached_index, float(source.duration_sec or 0.0)
+                        )
+                        if scale is not None:
+                            save_word_index(index_path, cached_index)
 
                 cache_matches_audio = bool(
                     cached_index is not None

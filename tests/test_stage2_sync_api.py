@@ -168,6 +168,29 @@ def test_editorial_role_with_cut_marker_uses_person_name() -> None:
     assert unit["speaker"] == "Маликов"
 
 
+def test_skl_fragments_become_separate_alignment_units() -> None:
+    units = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-8",
+                "type": "sync",
+                "speaker": "Киркоров",
+                "normalized_text": "первая фраза вторая фраза",
+                "sync_fragments": [
+                    {"text": "первая фраза", "timecode_start": "00:05:43"},
+                    {"text": "вторая фраза", "timecode_start": ""},
+                ],
+            }
+        ]
+    )
+
+    assert [unit["segment_id"] for unit in units] == [
+        "block-8::fragment:1",
+        "block-8::fragment:2",
+    ]
+    assert [unit["text"] for unit in units] == ["первая фраза", "вторая фраза"]
+
+
 def test_unknown_editorial_role_does_not_inherit_previous_person() -> None:
     units = api._sync_alignment_units(
         [

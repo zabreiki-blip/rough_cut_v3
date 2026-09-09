@@ -1552,7 +1552,34 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
                 timecode_end=_canonicalize_timecode(boundary["end"]),
             )
         )
-    return fragments
+
+    # ``СКЛ`` / ``СКЛЕЙКА`` is an editorial splice, not spoken text. Each
+    # side must be found and cut independently so omitted speech between the
+    # phrases never leaks into the assembled range. Only the first side keeps
+    # the explicit timecode; later sides are searched in the same speaker
+    # source without pretending they start at that exact timestamp.
+    if not fragments and re.search(r"\b(?:СКЛ|СКЛЕЙКА)\b", text, flags=re.IGNORECASE):
+        fragments = [SyncFragment(text=text.strip(), timecode_start="")]
+    expanded: list[SyncFragment] = []
+    for fragment in fragments:
+        parts = []
+        for raw_part in re.split(
+            r"\b(?:СКЛ|СКЛЕЙКА)\b", fragment.text, flags=re.IGNORECASE
+        ):
+            # Remove only separators adjacent to the splice marker. Sentence
+            # punctuation at the far end of each fragment belongs to speech.
+            part = raw_part.strip(" \t\r\n–—-").lstrip(",.;:")
+            parts.append(part)
+        parts = [part for part in parts if part]
+        for index, part in enumerate(parts):
+            expanded.append(
+                SyncFragment(
+                    text=part,
+                    timecode_start=fragment.timecode_start if index == 0 else "",
+                    timecode_end=fragment.timecode_end if index == 0 else "",
+                )
+            )
+    return expanded
 
 
 def _canonicalize_timecode(value: str) -> str:
