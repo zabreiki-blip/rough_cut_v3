@@ -191,6 +191,35 @@ def load_word_index(
     return ingest_word_index(payload, source_id, model=model, language=language)
 
 
+def rescale_stretched_word_index(index: WordIndex, duration_sec: float) -> float | None:
+    """Repair cached interpolated timestamps that extend past real media.
+
+    Older cloud responses occasionally described a uniformly stretched time
+    axis. Reusing such a cache makes valid quotes near the end of an interview
+    impossible to match because their ranges lie beyond ffprobe duration.
+    """
+    duration = float(duration_sec or 0.0)
+    observed_end = index.duration_sec
+    if duration <= 0 or observed_end <= duration * 1.02:
+        return None
+    scale = duration / observed_end
+    index.words = [
+        WordTimestamp(
+            word=item.word,
+            start=max(0.0, item.start * scale),
+            end=max(0.0, item.end * scale),
+            confidence=item.confidence,
+        )
+        for item in index.words
+    ]
+    index.metadata["timestamp_scale_repair"] = {
+        "observed_end_sec": observed_end,
+        "duration_sec": duration,
+        "scale": scale,
+    }
+    return scale
+
+
 def save_word_index(path: Path | str, index: WordIndex) -> None:
     """Atomically save an already-generated index beside its final path."""
     atomic_write_json(path, index.to_dict())

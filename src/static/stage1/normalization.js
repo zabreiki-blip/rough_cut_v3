@@ -7,8 +7,12 @@ import {
   blockTypeLabels, sourceLabels, setStepState, updateActionAvailability,
   assertRequiredPath, safely,
 } from "./core.js";
+import { renderOpenRouterUsage } from "./usage.js";
 
 let memoryRules = [];
+let normalizationEditGeneration = 0;
+let issueFilterEnabled = false;
+let activeIssueUid = "";
 
 function canonicalDocument(value) {
   if (!value) return null;
@@ -26,6 +30,7 @@ export function hasUnsavedChanges() {
 
 export function markNormalizationDirty() {
   if (!appState.normalization) return;
+  normalizationEditGeneration += 1;
   appState.normalizationDirty = true;
   appState.normalizationEligible = false;
   if (appState.normalization.status === "confirmed") appState.normalization.status = "draft";
@@ -36,6 +41,60 @@ export function markNormalizationDirty() {
 function blockValue(block, ...names) {
   for (const name of names) if (block[name] != null) return block[name];
   return "";
+}
+
+function blockNeedsReview(block) {
+  const type = block.type || block.block_type || "unknown";
+  const status = String(block.status || block.review_status || "").trim().toLowerCase();
+  const warnings = Array.isArray(block.warnings) ? block.warnings : [];
+  const role = String(block.role || "").trim().toLocaleLowerCase("ru");
+  return type === "unknown"
+    || status === "needs_review"
+    || warnings.length > 0
+    || (type === "voiceover" && !String(block.text_for_tts || "").trim())
+    || ["sync", "снх", "синхрон"].includes(role);
+}
+
+function issueBlocks(blocks) {
+  return blocks.filter(blockNeedsReview);
+}
+
+function updateIssueNavigation(blocks) {
+  const issues = issueBlocks(blocks);
+  if (!issues.length) issueFilterEnabled = false;
+  if (!issues.some((block) => block.uid === activeIssueUid)) {
+    activeIssueUid = issues[0]?.uid || "";
+  }
+  const position = issues.findIndex((block) => block.uid === activeIssueUid);
+  ids.norm_issue_position.textContent = issues.length
+    ? `Проблема ${position + 1} из ${issues.length}`
+    : "Проблем нет";
+  ids.btn_norm_issue_prev.disabled = issues.length === 0;
+  ids.btn_norm_issue_next.disabled = issues.length === 0;
+  ids.btn_norm_issue_filter.disabled = issues.length === 0;
+  ids.btn_norm_issue_filter.setAttribute("aria-pressed", String(issueFilterEnabled));
+  ids.btn_norm_issue_filter.textContent = issueFilterEnabled
+    ? "Показать все блоки"
+    : "Показать только требующие проверки";
+}
+
+function focusIssue(offset) {
+  const blocks = appState.normalization?.blocks || [];
+  const issues = issueBlocks(blocks);
+  if (!issues.length) return;
+  let position = issues.findIndex((block) => block.uid === activeIssueUid);
+  if (position < 0) position = 0;
+  position = (position + offset + issues.length) % issues.length;
+  activeIssueUid = issues[position].uid;
+  renderNormalization();
+  requestAnimationFrame(() => {
+    const card = Array.from(ids.normalization_blocks.querySelectorAll(".normalization-block"))
+      .find((item) => item.dataset.uid === activeIssueUid);
+    if (!card) return;
+    card.scrollIntoView({ behavior: "smooth", block: "center" });
+    const control = card.querySelector("select, textarea:not([readonly]), input:not([readonly])");
+    if (control) control.focus({ preventScroll: true });
+  });
 }
 
 export function renderNormalizationStatus() {
@@ -57,7 +116,9 @@ export function renderNormalization() {
   ids.norm_count_total.textContent = String(blocks.length);
   ids.norm_count_voiceover.textContent = String(counts.voiceover || 0);
   ids.norm_count_sync.textContent = String(counts.sync || 0);
+  ids.norm_count_life.textContent = String(counts.life || 0);
   ids.norm_count_unknown.textContent = String(counts.unknown || 0);
+  updateIssueNavigation(blocks);
 
   const warnings = (appState.normalization && appState.normalization.warnings ? appState.normalization.warnings : []).concat(
     blocks.flatMap((block) => Array.isArray(block.warnings) ? block.warnings : [])
@@ -93,13 +154,16 @@ export function renderNormalization() {
     const type = block.type || block.block_type || "unknown";
     const source = block.source || block.decision_source || "unknown";
     const blockWarnings = Array.isArray(block.warnings) ? block.warnings : [];
+    const needsReview = blockNeedsReview(block);
+    if (issueFilterEnabled && !needsReview) return;
     const syncFragments = Array.isArray(block.sync_fragments)
       ? block.sync_fragments.filter((fragment) => fragment && typeof fragment === "object")
       : [];
     const hasMultipleFragments = type === "sync" && syncFragments.length > 1;
     const card = document.createElement("article");
-    card.className = `normalization-block${type === "unknown" || blockWarnings.length ? " has-warning" : ""}`;
+    card.className = `normalization-block${needsReview ? " has-warning" : ""}${block.uid === activeIssueUid ? " is-active-issue" : ""}`;
     card.dataset.index = String(index);
+    card.dataset.uid = String(block.uid || "");
     card.innerHTML = `
       <div class="block-head">
         <span class="block-order">#${index + 1}</span>
@@ -121,6 +185,7 @@ export function renderNormalization() {
         <label class="field"><span>Исходное обозначение</span><input data-field="original_label" value="${escaped(blockValue(block, "original_label", "original_marker", "marker"))}"></label>
         <label class="field"><span>Спикер</span><input data-field="speaker" value="${escaped(blockValue(block, "speaker", "speaker_name"))}"></label>
         <label class="field"><span>Роль / должность</span><input data-field="role" value="${escaped(blockValue(block, "role"))}"></label>
+        <label class="field"><span>Описание источника</span><input data-field="source_description" value="${escaped(blockValue(block, "source_description"))}"></label>
         <label class="field"><span>Таймкод начала</span><input data-field="timecode_start" value="${escaped(blockValue(block, "timecode_start", "timecode", "start_timecode"))}"${hasMultipleFragments ? " readonly title=\"Редактируйте таймкоды отдельных фрагментов ниже\"" : ""}></label>
         <label class="field"><span>Таймкод конца</span><input data-field="timecode_end" value="${escaped(blockValue(block, "timecode_end", "end_timecode"))}"${hasMultipleFragments ? " readonly title=\"Редактируйте таймкоды отдельных фрагментов ниже\"" : ""}></label>
         <label class="field"><span>Заметка</span><input data-field="notes" value="${escaped(blockValue(block, "notes"))}"></label>
@@ -154,8 +219,9 @@ export function updateBlockFromControl(control) {
     fragment[control.dataset.fragmentField] = control.value;
     block.normalized_text = fragments.map((item) => String(item.text || "").trim())
       .filter(Boolean).join(" ");
-    block.timecode_start = String(fragments[0]?.timecode_start || "");
-    block.timecode_end = String(fragments[0]?.timecode_end || "");
+    const firstTimed = fragments.find((item) => String(item.timecode_start || "").trim()) || fragments[0];
+    block.timecode_start = String(firstTimed?.timecode_start || "");
+    block.timecode_end = String(firstTimed?.timecode_end || "");
     const normalizedControl = card.querySelector('[data-field="normalized_text"]');
     const startControl = card.querySelector('[data-field="timecode_start"]');
     const endControl = card.querySelector('[data-field="timecode_end"]');
@@ -184,6 +250,11 @@ export function updateBlockFromControl(control) {
     block.warnings = [];
     if (control.value === "voiceover" && !block.text_for_tts) {
       block.text_for_tts = block.normalized_text || "";
+    }
+    if (control.value === "life") {
+      block.text_for_tts = "";
+      block.speaker = "";
+      block.role = "";
     }
   }
   markNormalizationDirty();
@@ -239,7 +310,12 @@ function normalizationPayload() {
 }
 
 export async function saveNormalization() {
+  const savedGeneration = normalizationEditGeneration;
   const result = await requestJSON("/stage1/normalization", "PUT", normalizationPayload());
+  if (normalizationEditGeneration !== savedGeneration) {
+    toast("Черновик сохранён; новые правки ещё не сохранены", "success");
+    return appState.normalization;
+  }
   appState.normalization = canonicalDocument(result);
   appState.normalizationDirty = false;
   renderNormalization();
@@ -439,6 +515,7 @@ async function deleteMemoryRule(ruleId) {
 }
 
 export function applyStatus(status) {
+  renderOpenRouterUsage(status.openrouter_usage || {});
   const prepared = Number(status.prepared_items_count || 0);
   const wav = Number(status.speaker_files_count || 0);
   const missing = Array.isArray(status.missing_ids) ? status.missing_ids.length : 0;
@@ -527,6 +604,13 @@ ids.btn_add_normalization_block.addEventListener("click", () => {
   });
   markNormalizationDirty();
   renderNormalization();
+});
+ids.btn_norm_issue_prev.addEventListener("click", () => focusIssue(-1));
+ids.btn_norm_issue_next.addEventListener("click", () => focusIssue(1));
+ids.btn_norm_issue_filter.addEventListener("click", () => {
+  issueFilterEnabled = !issueFilterEnabled;
+  renderNormalization();
+  if (issueFilterEnabled) focusIssue(0);
 });
 ids.btn_normalize.addEventListener("click", () => safely(generateNormalization));
 ids.btn_reset_normalization.addEventListener("click", () => safely(resetNormalization));

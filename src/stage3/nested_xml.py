@@ -637,7 +637,7 @@ def build_nested_xml(
                 media_type="audio",
                 timeline_fps=full_timeline.fps,
             )
-        elif segment.type in {"snh", "host"} and segment.placeholder_path:
+        elif segment.type in {"snh", "host", "life"} and segment.placeholder_path:
             clip_number += 1
             _placeholder_clip(
                 video_track,

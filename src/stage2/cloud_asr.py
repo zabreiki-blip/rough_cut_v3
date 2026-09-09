@@ -79,6 +79,10 @@ DEFAULT_CHUNK_MINUTES = 20.0
 DEFAULT_OVERLAP_SEC = 60.0
 DEFAULT_TIMEOUT_SEC = 900.0
 DEFAULT_MAX_RETRIES = 3
+# Some audio-capable models occasionally return a consistently stretched
+# timestamp scale (for example, 493 s of segments for a 405 s source). A
+# tiny overrun is normal rounding noise; anything larger is repaired below.
+_TIMESTAMP_RESCALE_OVERSHOOT_RATIO = 1.02
 
 # Таймаут ffprobe при определении длительности файла (см. _probe_duration) —
 # сама операция дешёвая, большой таймаут не нужен, но должен быть конечным
@@ -757,6 +761,36 @@ def _reconcile_speakers(
     return renamed_segments, final_speakers, final_descriptions
 
 
+def _rescale_stretched_timestamps(
+    segments: list[AsrSegment], duration_sec: float
+) -> tuple[list[AsrSegment], float | None]:
+    """Repair a uniformly stretched model timestamp scale.
+
+    The source duration comes from ffprobe, while the model supplies relative
+    timestamps. When the latter run materially past the source end, retaining
+    them makes otherwise exact matches unusable and can produce invalid edit
+    ranges. Scale the complete timeline (rather than clipping its tail) so
+    relative timing remains intact.
+    """
+    if duration_sec <= 0 or not segments:
+        return segments, None
+    observed_end = max(segment.end for segment in segments)
+    if observed_end <= duration_sec * _TIMESTAMP_RESCALE_OVERSHOOT_RATIO:
+        return segments, None
+    scale = duration_sec / observed_end
+    return (
+        [
+            replace(
+                segment,
+                start=max(0.0, segment.start * scale),
+                end=max(0.0, segment.end * scale),
+            )
+            for segment in segments
+        ],
+        scale,
+    )
+
+
 def _stitch_chunk(
     accumulated: list[AsrSegment],
     new_segments: list[AsrSegment],
@@ -1403,6 +1437,10 @@ class CloudAudioAsrAdapter:
             # модели» до вызывающего кода — см. AsrSegment.has_explicit_end.
             final_segments.append(replace(seg, end=end, has_explicit_end=is_own_end))
 
+        final_segments, timestamp_scale = _rescale_stretched_timestamps(
+            final_segments, duration_sec
+        )
+
         # Пункт 3 защиты: склеиваем метки одного и того же человека и
         # перенумеровываем итоговые метки по убыванию суммарной длительности
         # речи (ГОЛОС 1 — тот, кто говорит дольше всех).
@@ -1429,6 +1467,7 @@ class CloudAudioAsrAdapter:
                 "overlap_sec": self.overlap_sec,
                 "base_url": self._base_url,
                 "speaker_descriptions": speaker_descriptions,
+                "timestamp_scale": timestamp_scale,
             },
             word_count=word_count,
             speakers=speakers,
@@ -1489,4 +1528,5 @@ def transcribe_cloud(
         "backend": result.backend,
         "duration_sec": result.duration_sec,
         "cost_usd": result.cost_usd,
+        "base_url": str(result.params.get("base_url") or ""),
     }

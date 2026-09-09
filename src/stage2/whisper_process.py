@@ -166,7 +166,15 @@ def _transcribe_worker(connection: Connection) -> None:
                 connection.send(("result", request_id, result))
             except BaseException as exc:
                 try:
-                    connection.send(("error", request_id, type(exc).__name__, str(exc)))
+                    connection.send(
+                        (
+                            "error",
+                            request_id,
+                            type(exc).__name__,
+                            str(exc),
+                            getattr(exc, "cost_usd", None),
+                        )
+                    )
                 except (BrokenPipeError, EOFError, OSError):
                     pass
                 # A failed inference may leave a backend/model in an unknown state.
@@ -459,7 +467,10 @@ def transcribe_audio_in_process(
                 elif kind == "error":
                     worker_error = f"{message[2]}: {message[3]}"
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError(worker_error)
+                    error = WhisperProcessError(worker_error)
+                    if len(message) > 4:
+                        error.cost_usd = message[4]  # type: ignore[attr-defined]
+                    raise error
                 else:
                     _discard_worker_locked(worker)
                     raise WhisperProcessError(

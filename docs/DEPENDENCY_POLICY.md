@@ -21,7 +21,7 @@ separate resolver outputs for Linux
 CPython 3.11 and native Apple Silicon; do not reuse a lock produced by one
 platform on the other.
 
-CI measures branch coverage for `src/` and enforces a 75% floor. The initial
+CI measures branch coverage for `src/` and enforces a 79% floor. The initial
 measured baseline on 2026-08-04 was 77.5%. New work should raise the floor
 gradually rather than introducing a large unreviewed test rewrite.
 

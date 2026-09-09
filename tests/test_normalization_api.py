@@ -320,6 +320,53 @@ class NormalizationApiTest(unittest.TestCase):
             )
         self.assertEqual(preview.status_code, 200, preview.get_json())
 
+    def test_tts_clear_removes_current_outputs_but_preserves_versioned_assets(self) -> None:
+        paths = api._ensure_project("demo")
+        (paths["speaker"] / "zk1.wav").write_bytes(b"current wav")
+        (paths["speaker"] / "zk1.wav.meta").write_text(
+            '{"fingerprint":"old"}', encoding="utf-8"
+        )
+        (paths["speaker"] / "manifest.json").write_text('{"items":[]}', encoding="utf-8")
+        historic = paths["voiceover_assets"] / "uid-1" / "old.wav"
+        historic.parent.mkdir(parents=True, exist_ok=True)
+        historic.write_bytes(b"historic wav")
+        paths["normalized"].write_text(
+            '{"scenario_revision_id":"rev_7"}', encoding="utf-8"
+        )
+        paths["tts_job_status"].write_text(
+            '{"id":"old-job","project":"demo","status":"completed"}', encoding="utf-8"
+        )
+        with api._TTS_JOBS_LOCK:
+            api._TTS_JOBS["old-job"] = {
+                "id": "old-job", "project": "demo", "status": "completed"
+            }
+
+        response = self.client.post("/stage1/tts/clear", json={"project": "demo"})
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertFalse((paths["speaker"] / "zk1.wav").exists())
+        self.assertFalse((paths["speaker"] / "zk1.wav.meta").exists())
+        self.assertFalse((paths["speaker"] / "manifest.json").exists())
+        self.assertFalse(paths["tts_job_status"].exists())
+        self.assertEqual(historic.read_bytes(), b"historic wav")
+        active_manifest = json.loads(paths["active_voiceover_manifest"].read_text(encoding="utf-8"))
+        self.assertEqual(active_manifest["scenario_revision_id"], "rev_7")
+        self.assertEqual(active_manifest["items"], [])
+        with api._TTS_JOBS_LOCK:
+            self.assertNotIn("old-job", api._TTS_JOBS)
+
+    def test_tts_clear_is_rejected_while_project_job_is_active(self) -> None:
+        api._ensure_project("demo")
+        with api._TTS_JOBS_LOCK:
+            api._TTS_ACTIVE_PROJECTS.add("demo")
+        try:
+            response = self.client.post("/stage1/tts/clear", json={"project": "demo"})
+        finally:
+            with api._TTS_JOBS_LOCK:
+                api._TTS_ACTIVE_PROJECTS.discard("demo")
+
+        self.assertEqual(response.status_code, 409, response.get_json())
+
     def test_confirmed_pipeline_is_gated_after_source_changes(self) -> None:
         source = self._source()
         generated = self.client.post(

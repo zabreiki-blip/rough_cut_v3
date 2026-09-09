@@ -18,11 +18,31 @@ def test_restored_tts_job_rehydrates_every_resume_control() -> None:
     assert "state.prepared_path" in STAGE1_JS
     assert "state.speaker_dir" in STAGE1_JS
     assert "state.provider" in STAGE1_JS
+    assert "state.tts_model" in STAGE1_JS
+    assert "state.tts_style" in STAGE1_JS
     assert "state.voice" in STAGE1_JS
     assert "state.gender" in STAGE1_JS
     assert 'hasOwnProperty.call(state, "dry_run")' in STAGE1_JS
     assert "Number(state.speed)" in STAGE1_JS
     assert "restoreTtsControls(response.result);" in STAGE1_JS
+
+
+def test_tts_menu_uses_openrouter_models_and_style_direction() -> None:
+    assert '<option value="gemini"' not in PROJECT_HTML
+    assert "OpenRouter · MAI-Voice-2" in PROJECT_HTML
+    assert "Gemini 2.5 Flash TTS" not in PROJECT_HTML
+    assert "OpenRouter · Gemini 3.1 Flash TTS" in PROJECT_HTML
+    assert 'id="tts_style"' in PROJECT_HTML
+    assert "tts_model: f.tts_model || null" in STAGE1_JS
+    assert "tts_style: f.tts_style" in STAGE1_JS
+    assert 'ids.provider.addEventListener("change", syncTtsStyleAvailability)' in STAGE1_JS
+
+
+def test_voiceover_can_be_cleared_with_explicit_confirmation() -> None:
+    assert 'id="btn_tts_clear"' in PROJECT_HTML
+    assert 'title: "Очистить всю озвучку?"' in STAGE1_JS
+    assert 'postJSON("/stage1/tts/clear", { project })' in STAGE1_JS
+    assert 'ids.btn_tts_clear.addEventListener("click"' in STAGE1_JS
 
 
 def test_tts_and_sync_polling_retry_transient_errors_with_bounded_backoff() -> None:
@@ -97,7 +117,7 @@ def test_headless_whisper_model_and_source_scope_controls() -> None:
     assert 'id="sync_whisper_model"' in PROJECT_HTML
     assert '<option value="small" selected>Small — быстро</option>' in PROJECT_HTML
     assert '<option value="medium">Medium — точнее</option>' in PROJECT_HTML
-    assert 'model: ids.sync_whisper_model?.value || "small"' in STAGE1_JS
+    assert 'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined' in STAGE1_JS
     # `stage3MediaCount` moved from a module-level `let` to a shared `appState`
     # property so the sync/stage3 modules can read and mutate it across files.
     assert 'source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
@@ -108,6 +128,24 @@ def test_normalization_offers_safe_openrouter_speed_presets() -> None:
     assert '<option value="fast" selected>Быстро</option>' in PROJECT_HTML
     assert '<option value="standard">Стандарт</option>' in PROJECT_HTML
     assert 'llm_preset: ids.normalization_llm_preset?.value || "standard"' in STAGE1_JS
+
+
+def test_normalization_supports_life_and_problem_navigation() -> None:
+    assert 'life: "Лайф"' in STAGE1_JS
+    assert '<option value="life">Лайф</option>' in PROJECT_HTML
+    assert 'id="norm_count_life"' in PROJECT_HTML
+    for element_id in (
+        "btn_norm_issue_prev",
+        "btn_norm_issue_next",
+        "btn_norm_issue_filter",
+        "norm_issue_position",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+    assert "function blockNeedsReview(block)" in STAGE1_JS
+    assert "function focusIssue(offset)" in STAGE1_JS
+    assert 'card.scrollIntoView({ behavior: "smooth", block: "center" });' in STAGE1_JS
+    assert 'control.value === "life"' in STAGE1_JS
+    assert 'block.text_for_tts = "";' in STAGE1_JS
 
 
 def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
@@ -125,7 +163,13 @@ def test_asr_engine_selector_defaults_to_local_and_is_wired_to_request() -> None
     assert '<option value="local" selected>Локально (бесплатно, медленно)</option>' in PROJECT_HTML
     assert '<option value="cloud">Облако (быстро, ~2¢/час, платно)</option>' in PROJECT_HTML
     assert 'sync_asr_engine: el("sync_asr_engine")' in STAGE1_JS
-    assert 'asr_engine: ids.sync_asr_engine?.value || "local"' in STAGE1_JS
+    assert 'const asrEngine = ids.sync_asr_engine?.value || "local";' in STAGE1_JS
+    assert 'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined' in STAGE1_JS
+    assert "asr_engine: asrEngine" in STAGE1_JS
+    assert "function updateSyncAsrControls()" in STAGE1_JS
+    assert "ids.sync_whisper_model.disabled = isCloud;" in STAGE1_JS
+    assert 'ids.sync_asr_engine.addEventListener("change", updateSyncAsrControls);' in STAGE1_JS
+    assert "Модель Whisper (только локально)" in PROJECT_HTML
 
 
 def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
@@ -153,7 +197,7 @@ def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
     assert 'acceptBtn.classList.toggle("danger", Boolean(danger));' in STAGE1_JS
     assert "if (acceptBtn.disabled) return;" in STAGE1_JS
     assert "acceptBtn.disabled = true;" in STAGE1_JS
-    assert STAGE1_JS.count("await confirmDialog({") == 5
+    assert STAGE1_JS.count("await confirmDialog({") == 6
 
 
 def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None:
@@ -173,6 +217,14 @@ def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None
     assert '"бесплатно"' in STAGE1_JS
     assert '"точные"' in STAGE1_JS
     assert '"интерполированные"' in STAGE1_JS
+
+
+def test_sidebar_reports_cumulative_openrouter_usage() -> None:
+    assert 'id="openrouter_usage"' in PROJECT_HTML
+    usage_js = (ROOT / "src" / "static" / "stage1" / "usage.js").read_text(encoding="utf-8")
+    assert "/stage1/openrouter-usage" in usage_js
+    assert "уточняется" in usage_js
+    assert "toFixed(4)" in usage_js
 
 
 def test_stage1_entry_point_is_loaded_as_module_without_native_confirm() -> None:

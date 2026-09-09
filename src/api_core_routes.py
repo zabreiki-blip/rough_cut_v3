@@ -93,10 +93,106 @@ def _check_whisper_backend() -> dict[str, str]:
     )
 
 
+def _macos_connector_health_url(connector_url: str) -> str:
+    """Derive the connector's `/health` URL from its configured `/synthesize` URL."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(connector_url)
+    return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
+
+
+def _redact_url_userinfo(url: str) -> str:
+    """Strip any embedded credentials (userinfo) from a URL for safe display.
+
+    Only scheme, host, port and path are kept; login/password never leave this
+    function. The original URL (with userinfo, if any) must still be used for
+    the actual HTTP request.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _check_macos_connector(connector_url: str) -> dict[str, str]:
+    """Check TTS readiness via the macOS connector bridge (Docker/Linux API host).
+
+    The `/health` endpoint of the connector requires no authentication (see
+    `src/macos_connector.py`), so no token is ever sent or logged here.
+    """
+    label = "TTS-провайдер"
+    health_url = _macos_connector_health_url(connector_url)
+    display_url = _redact_url_userinfo(health_url)
+    unreachable = _readiness_item(
+        item_id="tts_provider",
+        label=label,
+        status="error",
+        detail=f"Провайдер macos: коннектор не отвечает ({display_url}).",
+        hint=(
+            "Запустите коннектор на macOS-хосте: python -m macos_connector; "
+            "проверьте MACOS_CONNECTOR_URL."
+        ),
+    )
+
+    try:
+        import requests
+    except ImportError:
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="error",
+            detail="Провайдер macos: библиотека requests не установлена.",
+            hint="Установите зависимости: pip install -r requirements.txt",
+        )
+
+    try:
+        response = requests.get(health_url, timeout=2)
+    except requests.RequestException:
+        return unreachable
+    if response.status_code != 200:
+        return unreachable
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    say_available = bool(payload.get("say_available"))
+    afconvert_available = bool(payload.get("afconvert_available"))
+    if say_available and afconvert_available:
+        return _readiness_item(
+            item_id="tts_provider",
+            label=label,
+            status="ok",
+            detail=(
+                "Провайдер macos: синтез выполняется через коннектор на хосте, "
+                "say и afconvert доступны."
+            ),
+        )
+    missing = [
+        name
+        for name, available in (("say", say_available), ("afconvert", afconvert_available))
+        if not available
+    ]
+    return _readiness_item(
+        item_id="tts_provider",
+        label=label,
+        status="error",
+        detail=f"Провайдер macos: на хосте коннектора не найдено {', '.join(missing)}.",
+        hint="Установите недостающие утилиты на macOS-хосте коннектора.",
+    )
+
+
 def _check_tts_provider(settings: Any) -> dict[str, str]:
     provider = str(getattr(settings, "tts_provider", "") or "")
     label = "TTS-провайдер"
     if provider == "macos":
+        connector_url = str(getattr(settings, "macos_connector_url", "") or "")
+        if connector_url:
+            return _check_macos_connector(connector_url)
         say_path = shutil.which("say")
         afconvert_path = shutil.which("afconvert")
         if say_path and afconvert_path:
@@ -247,11 +343,15 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
         except ValueError as exc:
             return services._json_error(str(exc), 400)
 
-        project_dir = services.PROJECTS_DIR / project
-        if not project_dir.exists():
-            return services._json_error("Проект не найден", 404)
-
-        shutil.rmtree(project_dir)
+        with services._project_transition_lock(project):
+            if services._project_has_active_mutation(project):
+                return services._json_error(
+                    "Нельзя удалить проект, пока выполняется фоновая задача", 409
+                )
+            project_dir = services.PROJECTS_DIR / project
+            if not project_dir.exists():
+                return services._json_error("Проект не найден", 404)
+            shutil.rmtree(project_dir)
         return jsonify({"ok": True, "project": project})
 
     @app.get("/project/<project>")
@@ -276,6 +376,7 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
             "speaker_dir": f"projects/{project}/speaker",
             "manifest_path": f"projects/{project}/speaker/manifest.json",
             "provider": settings.tts_provider,
+            "tts_model": settings.openrouter_tts_model,
             "gender": settings.tts_gender,
         }
         return render_template("project.html", defaults=defaults, status=status)

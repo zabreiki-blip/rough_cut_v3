@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
+
+from openrouter_usage import report_json_usage
 
 try:
     import requests
@@ -100,7 +102,11 @@ def _normalize_blocks(raw_items: list[dict[str, Any]]) -> list[NarrationBlock]:
     return blocks
 
 
-def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[NarrationBlock]:
+def analyze_with_openrouter(
+    settings: Settings,
+    scenario_text: str,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[NarrationBlock]:
     if requests is None:
         raise RuntimeError("requests is not installed. Install dependencies from requirements.txt.")
 
@@ -170,6 +176,7 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         response = _do_request()
 
     data = response.json()
+    report_json_usage(usage_callback, data, model=settings.openrouter_model)
     content = data["choices"][0]["message"]["content"]
     parsed = _extract_json(content if isinstance(content, str) else json.dumps(content))
     items = parsed.get("items", [])

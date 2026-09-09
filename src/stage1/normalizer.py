@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from atomic_io import atomic_write_json as _atomic_write_json
 from atomic_io import atomic_write_text as _atomic_write_text
+from openrouter_usage import report_json_usage
 
 from .config import get_settings
 from .io_utils import extract_paragraphs, read_json
@@ -79,10 +80,11 @@ _BUILTIN_MARKERS = {
     "интервью": BlockType.SYNC.value,
     "ведущий": BlockType.HOST.value,
     "ведущая": BlockType.HOST.value,
+    "лайф": BlockType.LIFE.value,
+    "life": BlockType.LIFE.value,
 }
 _TECH_MARKERS = {
     "видео",
-    "лайф",
     "титр",
     "титры",
     "плашка",
@@ -95,7 +97,21 @@ _TECH_MARKERS = {
     "склейка",
     "ремарка",
     "техническое",
+    "тех",
+    "техн",
 }
+_LIFE_PREFIX = re.compile(
+    r"^\s*(?P<label>ЛАЙФ|LIFE)\b\s*(?:[,.:\-–—]\s*)?(?P<body>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPLICIT_SYNC_CREDIT = re.compile(
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s*,\s*"
+    r"(?P<speaker>[^:\n]{1,80}?)\s*:\s*[,;]?\s*(?P<content>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPLICIT_SYNC_LABEL = re.compile(
+    r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE
+)
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
     r"\[?\d{1,2}[:.]\d{2}\]?|\[?\d{1,2}-\d{2}\]?)"
@@ -112,16 +128,14 @@ _SYNC_NAME_ONLY_LABEL = re.compile(
     r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*$"
 )
 _SYNC_CONTINUATION_NOTE = re.compile(r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE)
-_SYNC_FRAGMENT = re.compile(
-    rf"(?P<start>{_TIMECODE_TOKEN})"
-    rf"(?:\s*[-–—]\s*(?P<end>{_TIMECODE_TOKEN}))?"
-    rf"[.\s]*(?P<text>.*?)(?=(?:{_TIMECODE_TOKEN})|$)",
-    re.DOTALL,
-)
 _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"^\s*\((?:[^)\n]{{1,240}}\)\s*:?\s*|[^:\n]{{1,240}}:\s*)"
     rf"{_TIMECODE_TOKEN}",
     re.DOTALL,
+)
+_PLAYBACK_LIFE_CUE = re.compile(
+    r"(?:\bзвучит\s+песня\b|\bпереход\s+на\s+клип\b|\bклип\b.{0,60}\bна\s+припев\b)",
+    re.IGNORECASE | re.DOTALL,
 )
 _VOICEOVER_ZK_PREFIX = re.compile(
     r"^\s*(?P<label>з\s*\.?\s*[кК]\.?)"
@@ -299,17 +313,31 @@ _SCENARIO_TITLE_RE = re.compile(r"^[^а-яa-z]*[А-ЯЁA-Z][^а-яa-z]*$")
 _SCENARIO_TITLE_MAX_WORDS = 20
 _SCENARIO_TITLE_MAX_CHARS = 120
 _LLM_CONFIDENCE_THRESHOLD = 0.65
-_LLM_CACHE_VERSION = 1
+# Bumped whenever a change to the classification prompt/instructions should
+# invalidate every previously cached LLM answer, even though the prompt text
+# is already part of the cache fingerprint (see `_classifier_identity`): a
+# version bump also drops stale entries from the on-disk cache file outright
+# instead of merely leaving them unreachable under their old keys.
+_LLM_CACHE_VERSION = 3
 _LLM_CACHE_MAX_ENTRIES = 2000
 _OPENROUTER_SYSTEM_PROMPT = "You normalize TV production scripts."
 _OPENROUTER_INSTRUCTIONS = (
     "Classify every scenario paragraph without deleting or merging any item. "
-    "Allowed types: voiceover, sync, host, technical, other, unknown. "
+    "Allowed types: voiceover, sync, host, life, technical, other, unknown. "
     'Return JSON {"items":[{"uid":...,"type":...,"confidence":0..1,'
     '"label_is_marker":true|false,'
     '"text_for_tts":...,"speaker":...,"role":...,'
     '"timecode_start":...,"timecode_end":...,"notes":...}]}. '
-    "Use unknown when unsure. Do not rewrite original content. "
+    "Always choose the single most likely type, even when you are not fully "
+    "certain -- use unknown only for text that is empty or unreadable. "
+    "A line that is a URL/link to source footage, a bulleted or dashed list "
+    "item (a song/film title, a name, a credit), a section heading (e.g. "
+    "\"Клипы\", \"Хроника\"), or a production note telling the editor what "
+    "to insert/show (e.g. \"Вставить синхрон\", \"Показать фото\") is "
+    "type=technical, not unknown. Do not rewrite original content. "
+    "A paragraph beginning with ЛАЙФ or LIFE is always type=life, even when "
+    "it contains a title, colon, quote text, or timecode; it is source sound "
+    "and must never become voiceover or sync. "
     "An item with continuation_of_type=voiceover is an unlabelled paragraph "
     "continuing the preceding voiceover unless its text clearly starts a new "
     "speaker or technical cue. "
@@ -327,6 +355,7 @@ def generate_normalization(
     hint: str = "",
     classifier: LLMClassifier | None = None,
     llm_preset: str = "standard",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     llm_preset = normalize_llm_preset(llm_preset)
     with _path_lock(output_path):
@@ -338,6 +367,7 @@ def generate_normalization(
             hint=hint,
             classifier=classifier,
             llm_preset=llm_preset,
+            usage_callback=usage_callback,
         )
 
 
@@ -350,6 +380,7 @@ def _generate_normalization_unlocked(
     hint: str = "",
     classifier: LLMClassifier | None = None,
     llm_preset: str = "standard",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Create and persist a complete, ordered normalization draft."""
     input_path = Path(input_path)
@@ -418,13 +449,20 @@ def _generate_normalization_unlocked(
         if unresolved and use_llm:
             if classifier is not None:
                 llm = classifier
-            elif llm_preset == "standard":
+            elif llm_preset == "standard" and usage_callback is None:
                 # Keep the legacy call shape: integrations and tests may patch
                 # this classifier with a two-argument callable.
                 llm = _openrouter_classifier
-            else:
+            elif usage_callback is None:
                 llm = lambda batch, author_hint: _openrouter_classifier(
                     batch, author_hint, llm_preset=llm_preset
+                )
+            else:
+                llm = lambda batch, author_hint: _openrouter_classifier(
+                    batch,
+                    author_hint,
+                    llm_preset=llm_preset,
+                    usage_callback=usage_callback,
                 )
             batches = _llm_batches(unresolved)
             payloads = [[_llm_input(block) for block in batch] for batch in batches]
@@ -493,7 +531,7 @@ def _generate_normalization_unlocked(
 
             for batch, (batch_result, error) in zip(batches, batch_results):
                 if error is None:
-                    _apply_llm_results(batch, batch_result or [])
+                    _apply_llm_results(batch, batch_result or [], video_cue_re=video_cue_re)
                     continue
                 message = f"LLM classification failed: {type(error).__name__}: {error}"
                 for block in batch:
@@ -1020,25 +1058,205 @@ def _looks_like_scenario_title(text: str) -> bool:
     return not _PERSONAL_VERB_RE.search(stripped)
 
 
-def _starts_with_unambiguous_timecode(text: str) -> bool:
-    """Recognize a bare timecode without mistaking a prose-leading date for one."""
-    stripped = text.lstrip()
-    parenthesized = re.match(rf"^\(\s*({_TIMECODE_TOKEN})\s*\)", stripped)
-    if parenthesized:
-        return True
+# --- Additional "technical cue" detectors ----------------------------------
+# Documentary scripts are full of editorial/production notes that must never
+# reach TTS or the interview search: links to source footage, bulleted
+# song/film lists, dash-prefixed credits, and section headings ("Клипы",
+# "Хроника", "Вставить синхрон ..."). Each rule below is anchored to a shape
+# (a URL, a bullet glyph, a short nominal phrase) that spoken narration
+# essentially never takes, so it is safe as an unconditional builtin rule.
 
-    match = _TIMECODE.match(stripped)
+# A URL is always a pointer to source footage for the editor, never text a
+# narrator/TTS voice would read aloud.
+_URL_RE = re.compile(r"https?://", re.IGNORECASE)
+
+# A bulleted list item (song/film title, credit, etc). "•" is the glyph
+# editors actually use in this corpus; the others are accepted for the same
+# shape even though no test line uses them.
+_BULLET_PREFIX_RE = re.compile(r"^[•‣◦*]")
+
+# A year credited in parentheses, e.g. "Ночной дозор (2004)" or "Белым
+# снегом (Новогодний Огонёк 2001)": the shape of a song/film title, not
+# spoken narration.
+_YEAR_IN_PARENS_RE = re.compile(r"\((?:[^()\n]*\b(?:19|20)\d{2}\b[^()\n]*)\)")
+
+# A dash-prefixed line is ambiguous: it has the shape both of a short credit
+# ("-Жанна Фриске") and of a spoken sentence the editor set off with a dash
+# ("- Я тогда совершенно не знала..."). It is only safe to call technical
+# when an extra signal removes that ambiguity: a URL, a year credit, or (the
+# general case) a short nominal phrase with no personal/finite verb -- the
+# same signal `_looks_like_video_cue` uses for unmarked shot-list remarks.
+_DASH_PREFIX_RE = re.compile(r"^[-–—]\s*(?P<rest>.*)$", re.DOTALL)
+_DASH_TECHNICAL_MAX_WORDS = 8
+
+# A real credit/title never contains a comma or ends the way a spoken
+# sentence does (a full stop, exclamation, question mark or ellipsis);
+# `_PERSONAL_VERB_RE` alone misses first-person singular verbs on -у/-ю
+# ("хочу", "знаю"), so these punctuation shapes are the second, structural
+# barrier keeping live speech ("- Не знаю, что сказать.") out of technical.
+_SENTENCE_END_PUNCT_RE = re.compile(r"[.!?…]$")
+
+
+def _looks_like_technical_dash_line(text: str) -> bool:
+    """Detect a dash-prefixed technical credit, as opposed to a spoken
+    sentence the editor happened to set off with a leading dash.
+    """
+    match = _DASH_PREFIX_RE.match(text)
     if not match:
         return False
-    token = match.group(1)
+    rest = match.group("rest").strip()
+    if not rest:
+        return False
+    if _URL_RE.search(rest) or _YEAR_IN_PARENS_RE.search(rest):
+        return True
+    if "," in rest or _SENTENCE_END_PUNCT_RE.search(rest):
+        return False
+    if _PERSONAL_VERB_RE.search(rest):
+        return False
+    return len(rest.split()) <= _DASH_TECHNICAL_MAX_WORDS
+
+
+# Section headings ("Сольные клипы", "Художественные фильмы") and production
+# notes ("Вставить синхрон Жанны", "ФОТЫ ЖАННЫ") that group or introduce
+# footage/interview material rather than narrate it. As with
+# `_looks_like_video_cue`, the keyword lexicon only narrows the check to
+# plausible production notes; the length cap and the absence of a personal
+# (finite) verb are the real safety net, keeping an ordinary sentence that
+# happens to mention e.g. "архив" or "фото" from being misclassified.
+_SECTION_HEADING_KEYWORDS = (
+    "клипы",
+    "клип",
+    "фильмы",
+    "хроника",
+    "фоты",
+    "фото",
+    "фрагмент",
+    "вставить",
+    "поставить",
+    "показать",
+    "дать",
+    "синхрон",
+    "портфолио",
+    "портофолио",
+    "архив",
+    "последний герой",
+)
+_SECTION_HEADING_KEYWORD_RE = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(word) for word in sorted(_SECTION_HEADING_KEYWORDS, key=len, reverse=True)
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
+_SECTION_HEADING_MAX_WORDS = 8
+
+
+_SECTION_HEADING_SHORT_SENTENCE_MAX_WORDS = 4
+
+
+def _looks_like_section_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or not _SECTION_HEADING_KEYWORD_RE.search(stripped):
+        return False
+    if "," in stripped:
+        return False
+    if _PERSONAL_VERB_RE.search(stripped):
+        return False
+    word_count = len(stripped.split())
+    if word_count > _SECTION_HEADING_MAX_WORDS:
+        return False
+    # A comma-free line ending like a spoken sentence (".", "!", "?", "…")
+    # is only safe to call a heading/production note when it is very short
+    # ("Фрагмент «Ледникового периода».") -- the same structural barrier as
+    # `_looks_like_technical_dash_line`, needed because `_PERSONAL_VERB_RE`
+    # misses first-person singular -у/-ю verbs ("Хочу показать всем...").
+    if (
+        _SENTENCE_END_PUNCT_RE.search(stripped)
+        and word_count > _SECTION_HEADING_SHORT_SENTENCE_MAX_WORDS
+    ):
+        return False
+    return True
+
+
+# A scenario/treatment sometimes opens with a literal "Сценарий. <title>"
+# line instead of (or alongside) the all-caps title `_looks_like_scenario_title`
+# already covers. Restricted to the first block, like that heuristic.
+_SCENARIO_LABEL_RE = re.compile(r"^сценарий\b", re.IGNORECASE)
+
+
+def _looks_like_scenario_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or not _SCENARIO_LABEL_RE.match(stripped):
+        return False
+    if len(stripped) > _SCENARIO_TITLE_MAX_CHARS:
+        return False
+    if len(stripped.split()) > _SCENARIO_TITLE_MAX_WORDS:
+        return False
+    return not _PERSONAL_VERB_RE.search(stripped)
+
+
+def _technical_heuristic_confidence(
+    text: str, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
+) -> float | None:
+    """Return the confidence a plain (unlabelled) line is a technical cue --
+    a URL, a bulleted list item, a dash-prefixed credit, a section heading/
+    production note, or a footage/shot-list remark -- or None when none of
+    these safe heuristics apply.
+
+    Used by the LLM low-confidence/`unknown` fallback in
+    `_apply_llm_results`: a block only reaches the LLM after
+    `_classify_by_rules` already failed to classify it, so this is a second,
+    unconditional pass over the same signals (`_classify_by_rules` gates
+    some of them by label/position to avoid ever preempting an
+    already-recognized sync/voiceover marker).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if _URL_RE.search(stripped):
+        return 1.0
+    if _BULLET_PREFIX_RE.match(stripped):
+        return 1.0
+    if _looks_like_technical_dash_line(stripped):
+        return 0.9
+    if _looks_like_section_heading(stripped):
+        return 0.9
+    if _looks_like_video_cue(stripped, video_cue_re):
+        return 1.0
+    return None
+
+
+def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
+    """Decide whether a `_TIMECODE`-shaped match at ``text[start:end]`` is an
+    actual timecode boundary, as opposed to prose (e.g. a two-component date
+    like ``23.05``) that happens to match the same token pattern. Shared by
+    bare-timecode detection and sync fragment splitting.
+    """
+    token = text[start:end]
     inner = token.strip("[]")
     if token.startswith("[") or ":" in inner or inner.count(".") >= 2 or "-" in inner:
         return True
 
+    # A token wrapped in round brackets, e.g. "(23.05)", is unambiguous even
+    # in the two-component dot notation: the brackets themselves mark it as a
+    # structural timecode rather than prose.
+    before, after = text[:start], text[end:]
+    if before.rstrip().endswith("(") and after.lstrip().startswith(")"):
+        return True
+
     # Two-component dot notation (for example 23.05) is ambiguous with a date.
     # Treat it as a timecode only when an explicit range removes that ambiguity.
-    remainder = stripped[match.end() :]
-    return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", remainder))
+    return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", after))
+
+
+def _starts_with_unambiguous_timecode(text: str) -> bool:
+    """Recognize a bare timecode without mistaking a prose-leading date for one."""
+    stripped = text.lstrip()
+    match = re.match(rf"^\(\s*({_TIMECODE_TOKEN})\s*\)", stripped) or _TIMECODE.match(stripped)
+    if not match:
+        return False
+    return _is_unambiguous_timecode_match(stripped, match.start(1), match.end(1))
 
 
 def _split_label(text: str) -> tuple[str, str]:
@@ -1046,6 +1264,18 @@ def _split_label(text: str) -> tuple[str, str]:
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
         return "", text.strip()
+    explicit_sync = _EXPLICIT_SYNC_CREDIT.match(text)
+    if explicit_sync:
+        marker = explicit_sync.group("marker").strip()
+        speaker = explicit_sync.group("speaker").strip(" \t,;:")
+        return f"{marker}, {speaker}", explicit_sync.group("content").strip()
+    life = _LIFE_PREFIX.match(text)
+    if life:
+        body = life.group("body").strip()
+        described = re.match(r"^([^:\n«»]{2,100}):\s*(.+)$", body, flags=re.DOTALL)
+        if described:
+            body = described.group(2).strip()
+        return life.group("label").strip(), body
     # Real editorial drafts commonly spell the voice-over marker as ``З.к.``,
     # ``З.К`` or glue it directly to the first word (``З.КВ 1915 году``).
     # Marker normalization alone cannot recover that punctuation, so split it
@@ -1062,9 +1292,18 @@ def _split_label(text: str) -> tuple[str, str]:
     # look like one long, unknown label instead of a known voiceover marker.
     known = sorted(set(_BUILTIN_MARKERS) | _TECH_MARKERS, key=len, reverse=True)
     for marker in known:
+        # A numeric suffix right after the marker (e.g. "Диктор-1", "ЗК1:",
+        # "Диктор 2:") denotes a speaker index and is dropped from the label.
+        # It is only unambiguous when either an explicit separator glues it to
+        # the marker, or -- when separated by whitespace or glued directly --
+        # it is itself immediately followed by a structural separator or the
+        # end of the string. Otherwise the digits are prose (e.g. a year in
+        # "Диктор 1915 год...") and must stay in the content.
         match = re.match(
-            rf"^\s*({re.escape(marker)})(?:\s*[-.]?\s*\d+[A-Za-zА-Яа-я]?)?"
-            rf"(?:\s*[.:\-–—]\s*|\s+|$)(.*)$",
+            rf"^\s*({re.escape(marker)})"
+            rf"(?:[-.]\d+[A-Za-zА-Яа-я]?"
+            rf"|\s*\d+[A-Za-zА-Яа-я]?(?=\s*[.:\-–—]|\s*$))?"
+            rf"(?:\s*[,.:\-–—]\s*|\s+|$)(.*)$",
             text,
             flags=re.I | re.DOTALL,
         )
@@ -1115,6 +1354,7 @@ def _classify_by_rules(
     video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
 ) -> None:
     marker = normalize_marker(block.original_label)
+    stripped = block.original_text.strip()
     if marker:
         exact = memory.resolve_exact(marker)
         if exact and exact.get("conflict"):
@@ -1126,6 +1366,9 @@ def _classify_by_rules(
                 _apply_type(block, rule["target_type"], DecisionSource.MEMORY.value, 1.0)
                 block.memory_rule_id = int(rule["id"])
                 return
+        if marker not in _BUILTIN_MARKERS and _PLAYBACK_LIFE_CUE.search(stripped):
+            _apply_type(block, BlockType.LIFE.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+            return
         if marker in _BUILTIN_MARKERS:
             _apply_type(block, _BUILTIN_MARKERS[marker], DecisionSource.BUILTIN_RULE.value, 1.0)
             return
@@ -1146,10 +1389,14 @@ def _classify_by_rules(
             block.warnings.append(
                 f"Possible learned alias '{block.suggested_label}' ({suggestion['score']:.0%})"
             )
-    stripped = block.original_text.strip()
+    if not marker and _PLAYBACK_LIFE_CUE.search(stripped):
+        _apply_type(block, BlockType.LIFE.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+        return
     _label, content = _split_label(block.original_text)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
-    if (
+    if _EXPLICIT_SYNC_LABEL.match(block.original_label):
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif (
         _SYNC_LABEL_METADATA.match(block.original_label)
         or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
     ) and _TIMECODE.match(sync_content):
@@ -1160,6 +1407,18 @@ def _classify_by_rules(
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _STRUCTURAL_HEADING.match(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _URL_RE.search(stripped):
+        # A link to source footage is always a technical cue, never text
+        # meant to be spoken.
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _BULLET_PREFIX_RE.match(stripped):
+        # A bulleted list item (song/film title, credit, etc) is always a
+        # technical cue, regardless of any label.
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _looks_like_technical_dash_line(stripped):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+    elif _looks_like_section_heading(stripped):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _BARE_SPEAKER_PREFIX.match(stripped) and block.original_label and len(content) >= 40:
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif (
@@ -1167,7 +1426,9 @@ def _classify_by_rules(
         or not block.original_label
     ) and _looks_like_video_cue(stripped, video_cue_re):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif block.order == 1 and not block.original_label and _looks_like_scenario_title(stripped):
+    elif block.order == 1 and not block.original_label and (
+        _looks_like_scenario_title(stripped) or _looks_like_scenario_heading(stripped)
+    ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif stripped.startswith("(") and stripped.endswith(")"):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.8)
@@ -1179,6 +1440,8 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
     block.confidence = max(0.0, min(1.0, confidence))
     if block.type == BlockType.VOICEOVER.value and not block.text_for_tts:
         block.text_for_tts = block.normalized_text
+    elif block.type == BlockType.LIFE.value:
+        block.text_for_tts = ""
     timecodes = _TIMECODE.findall(block.original_text)
     if timecodes:
         block.timecode_start = _canonicalize_timecode(timecodes[0])
@@ -1187,14 +1450,33 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
 
 
 def _extract_block_metadata(block: NormalizedBlock) -> None:
+    if block.type == BlockType.LIFE.value:
+        life = _LIFE_PREFIX.match(block.original_text)
+        block.speaker = ""
+        block.role = ""
+        block.text_for_tts = ""
+        if life:
+            body = life.group("body").strip()
+            quoted = re.match(r"^«([^»]*)»", body)
+            described = re.match(r"^([^:\n«»]{2,100}):\s*(.+)$", body, flags=re.DOTALL)
+            if quoted:
+                block.source_description = quoted.group(1).strip()
+            elif described:
+                block.source_description = described.group(1).strip(" \t,;:")
+        return
     if block.type == BlockType.HOST.value and not block.speaker:
         block.speaker = block.original_label or "ВЕДУЩИЙ"
     if block.type != BlockType.SYNC.value:
         return
     fragment_source = _SYNC_CONTINUATION_NOTE.sub("", block.normalized_text)
     has_sync_metadata = False
+    explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
     match = _SYNC_METADATA.match(block.normalized_text)
-    if match:
+    if explicit_label:
+        block.speaker = explicit_label.group(1).strip(" \t,;:")
+        block.role = ""
+        has_sync_metadata = True
+    elif match:
         block.speaker = match.group(1).strip()
         block.role = match.group(2).strip()
         fragment_source = block.normalized_text[match.start(3) :].strip()
@@ -1216,6 +1498,10 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         ):
             block.speaker = block.original_label.strip()
 
+    if block.role.casefold() in {"sync", "снх", "синхрон"}:
+        block.role = ""
+        block.warnings.append("Technical sync type was removed from role")
+
     # A bare timecoded paragraph is an older supported sync form whose
     # normalized_text intentionally retains the leading timecode. Structured
     # fragments apply only when the block also has explicit speaker metadata.
@@ -1225,27 +1511,96 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     if not fragments:
         return
     block.sync_fragments = fragments
-    block.timecode_start = fragments[0].timecode_start
-    block.timecode_end = fragments[0].timecode_end
+    first_timed = next((fragment for fragment in fragments if fragment.timecode_start), fragments[0])
+    block.timecode_start = first_timed.timecode_start
+    block.timecode_end = first_timed.timecode_end
     block.normalized_text = " ".join(fragment.text for fragment in fragments if fragment.text)
 
 
 def _extract_sync_fragments(text: str) -> list[SyncFragment]:
-    fragments: list[SyncFragment] = []
-    for match in _SYNC_FRAGMENT.finditer(text):
+    # A raw `_TIMECODE` occurrence only becomes a fragment boundary when it is
+    # unambiguous (see `_is_unambiguous_timecode_match`). Anything else -- for
+    # example a bare date like "23.05" spoken inside a quote -- stays part of
+    # the surrounding fragment's text instead of splitting it in two.
+    boundaries: list[dict[str, Any]] = []
+    search_from = 0
+    while True:
+        match = _TIMECODE.search(text, search_from)
+        if not match:
+            break
+        if not _is_unambiguous_timecode_match(text, match.start(), match.end()):
+            search_from = match.end()
+            continue
+        content_start = match.end()
+        end_value = ""
+        range_match = re.match(rf"^\s*[-–—]\s*({_TIMECODE_TOKEN})", text[content_start:])
+        if range_match:
+            end_value = range_match.group(1)
+            content_start += range_match.end()
         # The punctuation belongs to the quote; only structural whitespace and
-        # separators around the next timecode are discarded.
-        fragment_text = match.group("text").strip(" \t\r\n–—-")
+        # separators right after the boundary/range are discarded.
+        separator = re.match(r"[.,\s]*", text[content_start:])
+        assert separator is not None
+        content_start += separator.end()
+        boundaries.append(
+            {
+                "token_start": match.start(),
+                "content_start": content_start,
+                "start": match.group(1),
+                "end": end_value,
+            }
+        )
+        search_from = content_start
+
+    fragments: list[SyncFragment] = []
+    if boundaries:
+        leading = text[: boundaries[0]["token_start"]].strip(" \t\r\n–—-")
+        leading = re.sub(r"\.\s*,", ",", leading)
+        if leading:
+            fragments.append(SyncFragment(text=leading, timecode_start=""))
+    for index, boundary in enumerate(boundaries):
+        text_end = (
+            boundaries[index + 1]["token_start"] if index + 1 < len(boundaries) else len(text)
+        )
+        fragment_text = text[boundary["content_start"] : text_end].strip(" \t\r\n–—-")
+        fragment_text = re.sub(r"\.\s*,", ",", fragment_text)
         if not fragment_text:
             continue
         fragments.append(
             SyncFragment(
                 text=fragment_text,
-                timecode_start=_canonicalize_timecode(match.group("start")),
-                timecode_end=_canonicalize_timecode(match.group("end") or ""),
+                timecode_start=_canonicalize_timecode(boundary["start"]),
+                timecode_end=_canonicalize_timecode(boundary["end"]),
             )
         )
-    return fragments
+
+    # ``СКЛ`` / ``СКЛЕЙКА`` is an editorial splice, not spoken text. Each
+    # side must be found and cut independently so omitted speech between the
+    # phrases never leaks into the assembled range. Only the first side keeps
+    # the explicit timecode; later sides are searched in the same speaker
+    # source without pretending they start at that exact timestamp.
+    if not fragments and re.search(r"\b(?:СКЛ|СКЛЕЙКА)\b", text, flags=re.IGNORECASE):
+        fragments = [SyncFragment(text=text.strip(), timecode_start="")]
+    expanded: list[SyncFragment] = []
+    for fragment in fragments:
+        parts = []
+        for raw_part in re.split(
+            r"\b(?:СКЛ|СКЛЕЙКА)\b", fragment.text, flags=re.IGNORECASE
+        ):
+            # Remove only separators adjacent to the splice marker. Sentence
+            # punctuation at the far end of each fragment belongs to speech.
+            part = raw_part.strip(" \t\r\n–—-").lstrip(",.;:")
+            parts.append(part)
+        parts = [part for part in parts if part]
+        for index, part in enumerate(parts):
+            expanded.append(
+                SyncFragment(
+                    text=part,
+                    timecode_start=fragment.timecode_start if index == 0 else "",
+                    timecode_end=fragment.timecode_end if index == 0 else "",
+                )
+            )
+    return expanded
 
 
 def _canonicalize_timecode(value: str) -> str:
@@ -1258,7 +1613,12 @@ def _canonicalize_timecode(value: str) -> str:
     return value
 
 
-def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, Any]]) -> None:
+def _apply_llm_results(
+    blocks: list[NormalizedBlock],
+    results: list[dict[str, Any]],
+    *,
+    video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+) -> None:
     by_uid = {str(item.get("uid", "")): item for item in results}
     for block in blocks:
         item = by_uid.get(block.uid)
@@ -1274,12 +1634,32 @@ def _apply_llm_results(blocks: list[NormalizedBlock], results: list[dict[str, An
         except (TypeError, ValueError):
             block.warnings.append(f"LLM returned invalid confidence {item.get('confidence')!r}")
             continue
-        if confidence < _LLM_CONFIDENCE_THRESHOLD:
+        if confidence < _LLM_CONFIDENCE_THRESHOLD or target_type == BlockType.UNKNOWN.value:
+            # The LLM is unsure (or explicitly punted with "unknown"). Give
+            # the builtin technical-cue heuristics one more chance before
+            # leaving the block for manual resolution: `_classify_by_rules`
+            # already tried them once, but some are gated by label/position
+            # there to avoid ever preempting a sync/voiceover marker, and a
+            # block that reaches the LLM has no such marker to protect.
+            fallback_confidence = _technical_heuristic_confidence(
+                block.original_text, video_cue_re
+            )
+            if fallback_confidence is not None:
+                _apply_type(
+                    block,
+                    BlockType.TECHNICAL.value,
+                    DecisionSource.BUILTIN_RULE.value,
+                    fallback_confidence,
+                )
+                continue
             block.source = DecisionSource.LLM.value
             block.confidence = max(0.0, min(1.0, confidence))
-            block.warnings.append(
-                f"LLM confidence {confidence:.0%} is below the confirmation threshold"
-            )
+            if confidence < _LLM_CONFIDENCE_THRESHOLD:
+                block.warnings.append(
+                    f"LLM confidence {confidence:.0%} is below the confirmation threshold"
+                )
+            else:
+                block.warnings.append("LLM returned an unknown type")
             continue
         _apply_type(block, target_type, DecisionSource.LLM.value, confidence)
         if block.original_label:
@@ -1563,7 +1943,11 @@ def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
 
 
 def _openrouter_classifier(
-    blocks: list[dict[str, Any]], hint: str, *, llm_preset: str = "standard"
+    blocks: list[dict[str, Any]],
+    hint: str,
+    *,
+    llm_preset: str = "standard",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     llm_preset = normalize_llm_preset(llm_preset)
     settings = get_settings()
@@ -1611,7 +1995,9 @@ def _openrouter_classifier(
         time.sleep(2**attempt)
     assert response is not None
     response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+    body = response.json()
+    report_json_usage(usage_callback, body, model=settings.openrouter_model)
+    content = body["choices"][0]["message"]["content"]
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
     content = content.strip()
@@ -1682,6 +2068,7 @@ def _raw_projection(scenario: NormalizedScenario) -> str:
         BlockType.VOICEOVER.value: "ЗК",
         BlockType.SYNC.value: "СНХ",
         BlockType.HOST.value: "ВЕДУЩИЙ",
+        BlockType.LIFE.value: "ЛАЙФ",
         BlockType.TECHNICAL.value: "ТЕХ",
         BlockType.OTHER.value: "ПРОЧЕЕ",
         BlockType.UNKNOWN.value: "НЕИЗВЕСТНО",
@@ -1783,6 +2170,59 @@ def _validate_learning_decisions(
     return result
 
 
+# Matches a single alphabetic (Cyrillic or Latin) word, used to pull
+# candidate video-cue keywords out of a manually-corrected unlabelled block's
+# text (see `_extract_manual_video_cue_keywords`). Deliberately excludes
+# digits/punctuation so the result is always a plain, learnable word.
+_MANUAL_VIDEO_CUE_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+")
+_MANUAL_VIDEO_CUE_MAX_WORDS = 8
+_MANUAL_VIDEO_CUE_MIN_WORD_LEN = 4
+_MANUAL_VIDEO_CUE_MAX_KEYWORDS_PER_BLOCK = 3
+
+
+def _extract_manual_video_cue_keywords(text: str, known_markers: set[str]) -> list[str]:
+    """Pull up to :data:`_MANUAL_VIDEO_CUE_MAX_KEYWORDS_PER_BLOCK` new
+    video-cue keywords out of an unlabelled block's text that an operator has
+    just manually reclassified as technical, so the same unmarked shot-list
+    remark is recognized by rule alone next time (see
+    `_learn_from_confirmation`).
+
+    Deliberately conservative -- this must never turn ordinary narration into
+    a learned keyword:
+      * skips URLs and bulleted lines outright (already covered
+        unconditionally by `_URL_RE`/`_BULLET_PREFIX_RE`; the lexicon would
+        only be noise from these)
+      * skips anything containing a personal (finite) verb, or longer than
+        `_MANUAL_VIDEO_CUE_MAX_WORDS` words -- the same "looks like a shot
+        list, not a sentence" signal `_looks_like_video_cue` relies on
+      * only lower-cased, purely alphabetic words of at least
+        `_MANUAL_VIDEO_CUE_MIN_WORD_LEN` characters qualify, and words
+        already present in ``known_markers`` (normalized) are skipped
+    """
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if _URL_RE.search(stripped) or _BULLET_PREFIX_RE.match(stripped):
+        return []
+    if len(stripped.split()) > _MANUAL_VIDEO_CUE_MAX_WORDS:
+        return []
+    if _PERSONAL_VERB_RE.search(stripped):
+        return []
+    keywords: list[str] = []
+    for match in _MANUAL_VIDEO_CUE_WORD_RE.finditer(stripped):
+        word = match.group(0).lower()
+        if len(word) < _MANUAL_VIDEO_CUE_MIN_WORD_LEN:
+            continue
+        normalized = normalize_marker(word)
+        if not normalized or normalized in known_markers:
+            continue
+        known_markers.add(normalized)
+        keywords.append(word)
+        if len(keywords) >= _MANUAL_VIDEO_CUE_MAX_KEYWORDS_PER_BLOCK:
+            break
+    return keywords
+
+
 def _learn_from_confirmation(
     scenario: NormalizedScenario,
     memory_path: Path,
@@ -1798,6 +2238,8 @@ def _learn_from_confirmation(
                 )
             elif action == "never":
                 memory.suppress_marker(candidate["marker"])
+        known_video_cue_markers: set[str] | None = None
+        learned_video_cue_keyword = False
         for block in scenario.blocks:
             if (
                 not block.original_label
@@ -1808,6 +2250,24 @@ def _learn_from_confirmation(
                     BlockType.OTHER.value,
                 }
             ):
+                if (
+                    not block.original_label
+                    and block.source == DecisionSource.MANUAL.value
+                    and block.type == BlockType.TECHNICAL.value
+                ):
+                    if known_video_cue_markers is None:
+                        known_video_cue_markers = {
+                            normalize_marker(word) for word in _VIDEO_CUE_KEYWORDS
+                        }
+                        known_video_cue_markers.update(
+                            str(rule["normalized_marker"])
+                            for rule in memory.list_rules(scope="video_cue")
+                        )
+                    for keyword in _extract_manual_video_cue_keywords(
+                        block.normalized_text, known_video_cue_markers
+                    ):
+                        memory.record_manual(keyword, BlockType.TECHNICAL.value, scope="video_cue")
+                        learned_video_cue_keyword = True
                 continue
             if block.source == DecisionSource.MANUAL.value:
                 if block.memory_rule_id:
@@ -1819,6 +2279,16 @@ def _learn_from_confirmation(
                 memory.record_llm_confirmation(
                     block.original_label, block.type, scenario.source_hash
                 )
+        if learned_video_cue_keyword:
+            # A newly learned keyword was just written to this db's
+            # scope='video_cue' rules, but `_seed_video_cue_rules` may
+            # already have this db marked as "seeded" from an earlier
+            # normalization run in this process. Without invalidating that
+            # process-local cache, a later `_seed_video_cue_rules` call for
+            # the same db path stays a no-op, so nothing here forces a
+            # fresh look; keep the cache honest so it never masks what
+            # memory now actually contains.
+            invalidate_video_cue_seed_cache(memory.path)
 
 
 def _utcnow() -> str:

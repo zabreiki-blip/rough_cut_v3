@@ -311,6 +311,20 @@ def _stage2_sync_job_start(services: ModuleType):
         # "cloud" is the UI-facing engine choice; "backend" stays available
         # for explicit low-level overrides (tests/tooling) and wins when set.
         backend = "cloud-audio"
+    uses_cloud_backend = asr_engine == "cloud" or str(backend or "").lower() in {
+        "cloud",
+        "cloud-audio",
+        "openrouter",
+    }
+    # ``model`` is the legacy/local Whisper model-size field from the UI
+    # ("small", "medium", ...).  It is not a cloud provider model ID; using
+    # it for Cloud ASR makes the provider reject every transcription.  Keep
+    # cloud model selection in its adapter configuration instead.
+    model = (
+        str(payload.get("model")).strip()
+        if not uses_cloud_backend and payload.get("model") is not None
+        else None
+    )
 
     try:
         job = services._create_sync_job(project)
@@ -321,9 +335,7 @@ def _stage2_sync_job_start(services: ModuleType):
                 "project": project,
                 "backend": backend,
                 "asr_engine": asr_engine,
-                "model": (
-                    str(payload.get("model")).strip() if payload.get("model") is not None else None
-                ),
+                "model": model,
                 "language": language,
                 "timecode_mode": timecode_mode,
                 "rematch_confirmed": bool(payload.get("rematch_confirmed", False)),
@@ -663,7 +675,7 @@ def _stage2_build(services: ModuleType):
     # Generate placeholder PNGs for speaker and presenter segments.
     placeholder_warnings: list[str] = []
     for seg in timeline.segments:
-        if seg.type in {"snh", "host"} and seg.placeholder_path:
+        if seg.type in {"snh", "host", "life"} and seg.placeholder_path:
             from pathlib import Path as _Path
 
             stable_uid = str(seg.block_uid or seg.parent_block_uid or "").strip()
@@ -711,6 +723,7 @@ def _stage2_build(services: ModuleType):
     zk_count = sum(1 for s in timeline.segments if s.type == "zk")
     snh_count = sum(1 for s in timeline.segments if s.type == "snh")
     host_count = sum(1 for s in timeline.segments if s.type == "host")
+    life_count = sum(1 for s in timeline.segments if s.type == "life")
     tech_count = sum(1 for s in timeline.segments if s.type == "tech")
     zk_missing_wav = [s.id for s in timeline.segments if s.type == "zk" and not s.wav_path]
     sync_segments = [s for s in timeline.segments if s.type in {"snh", "host"}]
@@ -731,6 +744,7 @@ def _stage2_build(services: ModuleType):
                 "zk": zk_count,
                 "snh": snh_count,
                 "host": host_count,
+                "life": life_count,
                 "tech": tech_count,
                 "total_duration_sec": timeline.total_duration_sec,
                 "timeline_path": str(timeline_path.relative_to(services.ROOT_DIR)),

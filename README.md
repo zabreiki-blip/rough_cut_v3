@@ -171,13 +171,19 @@ matches и таймлайн. Озвучка привязана к стабиль
 - `MAX_ZK_BLOCKS=40` (верхняя граница количества блоков `zkN` после анализа; по умолчанию `40`)
 - `VALIDATE_MIN_WAV_DURATION_MS=350` (warning, если WAV короче порога; `0` отключает)
 - `VALIDATE_SILENCE_RMS_THRESHOLD=120` (warning, если RMS слишком низкий; `0` отключает)
-- `TTS_PROVIDER=gemini|openrouter|macos` (какой движок синтеза использовать)
+- `TTS_PROVIDER=openrouter|macos` (в веб-интерфейсе OpenRouter-модель выбирается отдельно)
 - `TTS_GENDER=female|male` (пол голоса по умолчанию)
 - `TTS_MAX_WORKERS=3` ограничивает параллельные запросы синтеза (`1–4`)
 - `ANALYZER_LLM_WORKERS=4` ограничивает параллельный анализ независимых LLM-чанков (`1–4`)
-- для `openrouter`: `OPENROUTER_TTS_MODEL`, `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
+- для `openrouter` доступны `microsoft/mai-voice-2` и
+  `google/gemini-3.1-flash-tts-preview` через отдельный TTS endpoint.
+  Русские MAI preset-голоса: `ru-RU-Masha:MAI-Voice-2` и
+  `ru-RU-Lev:MAI-Voice-2`. Их можно сменить через `OPENROUTER_TTS_MODEL`,
+  `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
   - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
+  - поле «Интонация / стиль / формат ролика» передаёт Gemini режиссёрский prompt,
+    а для MAI сопоставляет описание с Azure style; изменение поля инвалидирует TTS-кэш
 - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
   - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`
 - для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper`,
@@ -483,7 +489,7 @@ docker compose config --quiet
 хуки проверяют только то, что уже обязательно и в CI — `ruff check`,
 `gitleaks` и базовую гигиену файлов (trailing whitespace, EOF, YAML/TOML/JSON).
 `mypy` и `eslint` пока намеренно не входят в pre-commit из-за накопленного
-технического долга и остаются non-blocking шагами CI.
+технического долга, но оба остаются обязательными шагами CI.
 
 ## Локальная автоматизация
 
@@ -584,6 +590,8 @@ curl -X POST http://localhost:8000/stage1/analyze \
 
 ## Документация
 
+- [`docs/README.md`](docs/README.md) — полный индекс актуальной документации и
+  архивных отчётов.
 - [`docs/STAGE1_GUIDE.md`](docs/STAGE1_GUIDE.md) — подробное руководство по
   работе со сценарием на Stage 1: разметка диктора, нормализация, TTS.
 - [`docs/E2E_PILOT_CHECKLIST.md`](docs/E2E_PILOT_CHECKLIST.md) — пошаговый
@@ -595,5 +603,5 @@ curl -X POST http://localhost:8000/stage1/analyze \
   конкурентный анализ (для контекста продукта, не для эксплуатации).
 - [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — план разработки и roadmap
   (уже упомянут выше в разделе про Stage 2.1).
-- [`AUDIT.md`](AUDIT.md) — сводный аудит производительности и версии
-  сценариев с историей закрытых и открытых пунктов.
+- [`docs/archive/audits/README.md`](docs/archive/audits/README.md) — архив
+  датированных аудитов. Это исторические снимки, а не текущий backlog.

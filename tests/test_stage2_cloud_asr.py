@@ -24,6 +24,7 @@ from stage2.cloud_asr import (
     _parse_timecode,
     _parse_transcript_with_own_end,
     _reconcile_speakers,
+    _rescale_stretched_timestamps,
     _stitch_chunk,
     parse_speaker_legend,
     parse_transcript,
@@ -139,6 +140,31 @@ def test_plan_chunks_zero_duration() -> None:
 def test_plan_chunks_exactly_chunk_length() -> None:
     parts = _plan_chunks_for(20 * 60)
     assert parts == [(0.0, 1200.0)]
+
+
+def test_rescale_stretched_timestamps_preserves_relative_position() -> None:
+    """Cloud models can return a uniformly longer timeline than ffprobe."""
+    segments = [
+        _seg("Первая", 0.0, 120.0, "ГОЛОС 1"),
+        _seg("Искомая фраза", 419.938, 493.1, "ГОЛОС 1"),
+    ]
+
+    repaired, scale = _rescale_stretched_timestamps(segments, 404.64)
+
+    assert scale == pytest.approx(404.64 / 493.1)
+    assert repaired[-1].end == pytest.approx(404.64)
+    # This mirrors the real Киркоров source: 419.938 becomes ~344.7 s,
+    # close to the script timecode 00:05:43.
+    assert repaired[-1].start == pytest.approx(344.7, abs=0.1)
+
+
+def test_rescale_stretched_timestamps_keeps_small_rounding_overrun() -> None:
+    segments = [_seg("Реплика", 59.0, 60.5, "ГОЛОС 1")]
+
+    repaired, scale = _rescale_stretched_timestamps(segments, 60.0)
+
+    assert repaired == segments
+    assert scale is None
 
 
 # ---------------------------------------------------------------------------

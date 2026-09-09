@@ -15,6 +15,30 @@ DEFAULT_MEMORY_PATH = Path(__file__).resolve().parents[2] / "data" / "normalizat
 
 VALID_ALIAS_SCOPES = {"marker", "video_cue"}
 
+# Service-cue prefixes that a speaker index is commonly glued directly to
+# ("тех32", "зк5", "снх12"), as opposed to a person's name ("Сергей1",
+# "Сергей2") where the glued digit is part of what distinguishes two
+# different speakers and must NOT be stripped. Kept in sync (by hand) with
+# `_BUILTIN_MARKERS`/`_TECH_MARKERS` in normalizer.py; duplicated here rather
+# than imported to avoid a circular import between the two modules.
+_GLUED_NUMBER_STRIPPABLE_PREFIXES = frozenset(
+    {
+        "тех",
+        "техн",
+        "зк",
+        "з",
+        "снх",
+        "синхр",
+        "синхрон",
+        "лайф",
+        "вид",
+        "видео",
+        "титр",
+        "vo",
+        "sync",
+    }
+)
+
 
 def _validate_scope(scope: str) -> str:
     if scope not in VALID_ALIAS_SCOPES:
@@ -27,7 +51,22 @@ def _validate_scope(scope: str) -> str:
 def normalize_marker(marker: str) -> str:
     value = marker.casefold().replace("ё", "е").strip()
     value = re.sub(r"[\s.:;,_/\\|\-–—]+", " ", value)
-    value = re.sub(r"\s+\d+[a-zа-я]?\s*$", "", value)
+    # A speaker index separated by whitespace ("диктор 1") is stripped for
+    # any marker -- this was the original behaviour and is safe because the
+    # letter part alone (before the space) is what gets matched on.
+    spaced_match = re.search(r"\s+\d+[a-zа-я]?\s*$", value)
+    if spaced_match:
+        candidate = value[: spaced_match.start()].strip()
+        if candidate:
+            value = candidate
+    else:
+        # A glued digit ("тех32", "зк5") is only stripped for the closed set
+        # of known service-cue prefixes. Stripping it for arbitrary markers
+        # would merge distinct speakers who happen to share a name prefix
+        # and a trailing index, e.g. "Сергей1" vs "Сергей2".
+        glued_match = re.match(r"^([a-zа-я]+)(\d+[a-zа-я]?)$", value)
+        if glued_match and glued_match.group(1) in _GLUED_NUMBER_STRIPPABLE_PREFIXES:
+            value = glued_match.group(1)
     return value.strip()
 
 

@@ -346,7 +346,9 @@ def _transcribe_cloud(
         # CloudAudioAsrError messages (see cloud_asr.py) are already
         # Russian-language, project-styled, and never include the API key
         # itself (only its presence/absence) — safe to surface as-is.
-        raise WhisperTranscriptionError(f"Облачное распознавание речи не удалось: {exc}") from exc
+        error = WhisperTranscriptionError(f"Облачное распознавание речи не удалось: {exc}")
+        error.cost_usd = exc.cost_usd  # type: ignore[attr-defined]
+        raise error from exc
 
     segments = result.get("segments") or []
     timestamps, _interpolated = segment_words_interpolated(segments)
@@ -360,6 +362,7 @@ def _transcribe_cloud(
         # kept for later matching work, not consumed by this stage yet.
         "speakers": result.get("speakers") or [],
         "cost_usd": result.get("cost_usd"),
+        "base_url": result.get("base_url"),
         "timestamp_precision": "interpolated",
         "segment_count": len(segments),
         "explicit_end_segment_count": explicit_end_count,
@@ -409,9 +412,11 @@ def transcribe_audio(
         words, backend_meta = _transcribe_openai(path, selected_model, language)
 
     if not words:
-        raise WhisperTranscriptionError(
+        error = WhisperTranscriptionError(
             f"{selected} returned no usable word timestamps for {path.name}"
         )
+        error.cost_usd = backend_meta.get("cost_usd")  # type: ignore[attr-defined]
+        raise error
 
     completed_duration = float(backend_meta.get("duration_sec") or words[-1]["end"])
     _emit_progress(

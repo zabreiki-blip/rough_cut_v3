@@ -22,6 +22,8 @@
   var currentWhisperJobId = "";
   var currentWhisperReviewCount = 0;
   var currentWhisperJobStatus = "";
+  var currentFinalReviewJobId = "";
+  var currentFinalReviewSequence = null;
   var CONFORM_VIDEO_TRACK_INDEX = 0;
   var CONFORM_AUDIO_TRACK_INDEX = 0;
   // CEP panels can remain open for an entire editing session. Keep their
@@ -33,10 +35,13 @@
     ping: "rcStage2_ping",
     projects: "rcStage2_listProjects",
     inspect: "rcStage2_inspectActiveSequence",
+    inspectLayout: "rcStage2_captureAssemblyLayout",
     resolve: "rcStage2_resolveSequence",
     conform: "rcStage2_conformSequenceRanges",
     exportAudio: "rcStage2_exportActiveSequenceAudio",
-    fileInfo: "rcStage2_fileInfo"
+    exportFinalReview: "rcStage2_exportFinalReviewAudio",
+    fileInfo: "rcStage2_fileInfo",
+    clone: "rcStage2_cloneActiveSequence"
   };
 
   function byId(id) {
@@ -988,18 +993,35 @@
     return absolute;
   }
 
-  function registerSequenceWithCallback(callback) {
-    var current = config();
-    var sourceId = byId("sourceId").value.trim();
-    var timebase = Number(activeSource && activeSource.timebaseTicks);
+  function captureSourceOperation(guidePath) {
+    return {
+      current: config(),
+      source: activeSource,
+      sourceId: byId("sourceId").value.trim(),
+      speakerNames: byId("speakerName").value.split(/[,;\n]+/).map(function (value) {
+        return value.trim();
+      }).filter(function (value) {
+        return Boolean(value);
+      }),
+      allSpeakers: byId("allSpeakers").checked,
+      guideAudioPath: guidePath == null ? guideAudioPath : guidePath
+    };
+  }
+
+  function registerSequenceWithCallback(callback, operation) {
+    var operationContext = operation || captureSourceOperation();
+    var current = operationContext.current;
+    var source = operationContext.source;
+    var sourceId = operationContext.sourceId;
+    var timebase = Number(source && source.timebaseTicks);
     var fps = isFinite(timebase) && timebase > 0 ? 254016000000 / timebase : 25;
     var done = callback || function () {};
-    if (!activeSource) {
+    if (!source) {
       log("Сначала считайте активную секвенцию.");
       done(new Error("No active source."));
       return;
     }
-    var roleBlock = sourceRegistrationBlockReason(activeSource);
+    var roleBlock = sourceRegistrationBlockReason(source);
     if (roleBlock) {
       log("Регистрация не выполнена: " + roleBlock);
       done(new Error(roleBlock));
@@ -1021,41 +1043,37 @@
       return;
     }
 
-    var speakerNames = byId("speakerName").value.split(/[,;\n]+/).map(function (value) {
-      return value.trim();
-    }).filter(function (value) {
-      return Boolean(value);
-    });
+    var speakerNames = operationContext.speakerNames;
     var payload = {
       project: current.project,
       id: sourceId,
       source_id: sourceId,
       speaker: speakerNames[0] || "",
       speakers: speakerNames.slice(1),
-      all_speakers: byId("allSpeakers").checked,
-      premiere_sequence: activeSource.name,
-      sequence_id: activeSource.sequenceId,
-      sequence_name: activeSource.name,
-      sequence_start_tc: secondsToTimecode(activeSource.zeroPointSeconds, fps),
-      project_path: activeSource.projectPath,
+      all_speakers: operationContext.allSpeakers,
+      premiere_sequence: source.name,
+      sequence_id: source.sequenceId,
+      sequence_name: source.name,
+      sequence_start_tc: secondsToTimecode(source.zeroPointSeconds, fps),
+      project_path: source.projectPath,
       fps: fps,
-      duration_sec: activeSource.durationSeconds,
-      guide_audio: guideAudioPath ? guideReference(guideAudioPath, current) : "",
+      duration_sec: source.durationSeconds,
+      guide_audio: operationContext.guideAudioPath ? guideReference(operationContext.guideAudioPath, current) : "",
       guide_offset_sec: 0,
       metadata: {
-        sequence_role: activeSource.roughCutGuard.isRoughCutTarget
+        sequence_role: source.roughCutGuard.isRoughCutTarget
           ? "rough_cut_target"
           : "sync_source",
-        rough_cut_target: Boolean(activeSource.roughCutGuard.isRoughCutTarget),
-        guide_audio_absolute: guideAudioPath,
-        project_item_node_id: activeSource.projectItemNodeId,
-        project_item_tree_path: activeSource.projectItemTreePath,
-        zero_point_sec: activeSource.zeroPointSeconds,
-        zero_point_ticks: activeSource.zeroPointTicks,
-        timebase_ticks: activeSource.timebaseTicks,
-        video_display_format: activeSource.videoDisplayFormat,
-        video_track_count: activeSource.videoTrackCount,
-        audio_track_count: activeSource.audioTrackCount
+        rough_cut_target: Boolean(source.roughCutGuard.isRoughCutTarget),
+        guide_audio_absolute: operationContext.guideAudioPath,
+        project_item_node_id: source.projectItemNodeId,
+        project_item_tree_path: source.projectItemTreePath,
+        zero_point_sec: source.zeroPointSeconds,
+        zero_point_ticks: source.zeroPointTicks,
+        timebase_ticks: source.timebaseTicks,
+        video_display_format: source.videoDisplayFormat,
+        video_track_count: source.videoTrackCount,
+        audio_track_count: source.audioTrackCount
       }
     };
 
@@ -1080,9 +1098,10 @@
     return current.projectsRoot + "/" + current.project + "/work/sync_audio/" + sourceId + ".wav";
   }
 
-  function startTranscriptionJob() {
-    var current = config();
-    var sourceId = byId("sourceId").value.trim();
+  function startTranscriptionJob(operation) {
+    var operationContext = operation || captureSourceOperation();
+    var current = operationContext.current;
+    var sourceId = operationContext.sourceId;
     var path = current.transcribePath || "/stage2/sync-jobs/start";
     request("POST", path, {
       project: current.project,
@@ -1149,7 +1168,8 @@
     );
   }
 
-  function pollExport(outputPath, jobId) {
+  function pollExport(outputPath, jobId, operation) {
+    operation = operation || captureSourceOperation(outputPath);
     var previousSize = -1;
     var previousModified = -1;
     var stableChecks = 0;
@@ -1202,14 +1222,15 @@
           exportPollTimer = null;
           exportPollResumeFn = null;
           exportInProgress = false;
-          guideAudioPath = file.path || outputPath;
+          operation.guideAudioPath = file.path || outputPath;
+          guideAudioPath = operation.guideAudioPath;
           log("Guide WAV готов: " + file.size + " байт.", file);
           exportPollTerminalCallCount += 1;
           registerSequenceWithCallback(function (registerError) {
             if (!registerError) {
-              startTranscriptionJob();
+              startTranscriptionJob(operation);
             }
-          });
+          }, operation);
           return;
         }
         if (attempts >= maxAttempts) {
@@ -1252,6 +1273,10 @@
       log("Экспорт уже выполняется.");
       return;
     }
+    // Export may take minutes. Freeze source and project fields before the
+    // asynchronous host request; another inspected sequence must not inherit
+    // this WAV when the export completes.
+    var operation = captureSourceOperation(outputPath);
     exportInProgress = true;
     byId("exportAndTranscribe").disabled = true;
     byId("guideOutputPath").value = outputPath;
@@ -1259,7 +1284,7 @@
     callHost("exportAudio", {
       outputPath: outputPath,
       presetPath: presetPath,
-      expectedSequenceId: activeSource.sequenceId,
+      expectedSequenceId: operation.source.sequenceId,
       overwrite: byId("overwriteGuide").checked
     }, function (error, response) {
       if (error) {
@@ -1270,7 +1295,7 @@
       }
       guideAudioPath = response.job.outputPath;
       log("Экспорт поставлен в очередь. Ожидаю стабильный WAV…", response.job);
-      pollExport(response.job.outputPath, response.job.jobId);
+      pollExport(response.job.outputPath, response.job.jobId, operation);
     });
   }
 
@@ -1562,6 +1587,259 @@
     });
   }
 
+  function finalReviewOutputPath() {
+    var current = config();
+    return current.projectsRoot && current.project
+      ? current.projectsRoot + "/" + current.project + "/work/final_review.wav"
+      : "";
+  }
+
+  function setFinalReviewStatus(message) {
+    byId("finalReviewStatus").textContent = message;
+  }
+
+  function pollFinalReviewJob() {
+    if (!currentFinalReviewJobId) return;
+    request("GET", "/stage2/final-review/jobs/" + encodeURIComponent(currentFinalReviewJobId), null, function (error, response) {
+      var job = response && (response.result || response);
+      if (error) {
+        setFinalReviewStatus("Не удалось получить статус проверки: " + error.message);
+        return;
+      }
+      setFinalReviewStatus(job.message || job.status || "Проверка выполняется…");
+      if (job.status === "completed") {
+        byId("applyFinalReview").disabled = false;
+        log("Финальная проверка завершена. Можно создать черновую итерацию.", job, "success");
+        return;
+      }
+      if (job.status === "failed") {
+        log("Финальная проверка завершилась ошибкой: " + (job.error || ""), job, "error");
+        return;
+      }
+      window.setTimeout(pollFinalReviewJob, 3000);
+    });
+  }
+
+  function submitFinalReview(sequence, layout) {
+    request("POST", "/stage2/final-review/start", {
+      project: config().project,
+      audio_path: "work/final_review.wav",
+      backend: "cloud-audio",
+      model: "google/gemini-3.7-flash",
+      source_sequence: sequence || {},
+      assembly_layout: layout || {}
+    }, function (startError, started) {
+      byId("startFinalReview").disabled = false;
+      byId("startFinalReviewFromWav").disabled = false;
+      if (startError) {
+        log("Финальная проверка не запущена: " + startError.message, started, "error");
+        return;
+      }
+      currentFinalReviewJobId = (started.result || started).job_id;
+      setFinalReviewStatus("Распознаю и сверяю собранный таймлайн…");
+      pollFinalReviewJob();
+    });
+  }
+
+  function inspectFinalReviewLayout(sequence, callback) {
+    var duration = Math.max(0.04, Number(sequence && sequence.durationSeconds || 0));
+    callHost("inspectLayout", {
+      fromSeconds: 0,
+      toSeconds: duration
+    }, function (error, response) {
+      callback(error, response && (response.layout || response));
+    });
+  }
+
+  function pollFinalReviewExport(outputPath, jobId, sequence) {
+    var previousSize = -1;
+    var previousModified = -1;
+    var stableChecks = 0;
+    var attempts = 0;
+    var maxAttempts = 1800;
+    var exportFinished = false;
+
+    function check() {
+      attempts += 1;
+      var requestGeneration = pollGeneration;
+      callHost("fileInfo", { path: outputPath }, function (error, response) {
+        var file;
+        if (requestGeneration !== pollGeneration || document.hidden) {
+          exportPollWasActive = true;
+          return;
+        }
+        if (exportFinished) {
+          return;
+        }
+        if (error) {
+          setFinalReviewStatus("Не удалось проверить WAV: " + error.message);
+        } else {
+          file = response.file;
+          if (file.exists && file.size > 44 &&
+              file.size === previousSize && file.modifiedMs === previousModified) {
+            stableChecks += 1;
+          } else {
+            stableChecks = 0;
+          }
+          previousSize = file.size;
+          previousModified = file.modifiedMs;
+          if (stableChecks >= 3) {
+            exportFinished = true;
+            exportPollTimer = null;
+            exportPollResumeFn = null;
+            setFinalReviewStatus("WAV готов. Создаю manifest таймлайна…");
+            inspectFinalReviewLayout(sequence, function (layoutError, layout) {
+              if (layoutError) {
+                byId("startFinalReview").disabled = false;
+                byId("startFinalReviewFromWav").disabled = false;
+                log("WAV экспортирован, но manifest sequence не создан: " + layoutError.message, layout, "error");
+                return;
+              }
+              submitFinalReview(sequence, layout);
+            });
+            return;
+          }
+        }
+        if (attempts >= maxAttempts) {
+          exportPollTimer = null;
+          exportPollResumeFn = null;
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          setFinalReviewStatus("Ожидание финального WAV остановлено через 60 минут.");
+          log("Ожидание final-review экспорта остановлено через 60 минут. Job ID: " + jobId, response, "error");
+          return;
+        }
+        exportPollTimer = window.setTimeout(check, 2000);
+      });
+    }
+
+    if (exportPollTimer) {
+      window.clearTimeout(exportPollTimer);
+    }
+    exportPollResumeFn = check;
+    exportPollWasActive = false;
+    exportPollTimer = window.setTimeout(check, 1000);
+  }
+
+  function startFinalReviewFromWav() {
+    byId("startFinalReview").disabled = true;
+    byId("startFinalReviewFromWav").disabled = true;
+    byId("applyFinalReview").disabled = true;
+    setFinalReviewStatus("Запускаю проверку из готового WAV…");
+    callHost("inspect", {}, function (inspectError, inspected) {
+      var sequence = inspected && (inspected.sequence || inspected);
+      if (inspectError) {
+        byId("startFinalReview").disabled = false;
+        byId("startFinalReviewFromWav").disabled = false;
+        log("Не удалось прочитать активную sequence: " + inspectError.message, inspected, "error");
+        return;
+      }
+      currentFinalReviewSequence = sequence || null;
+      inspectFinalReviewLayout(sequence, function (layoutError, layout) {
+        if (layoutError) {
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          log("Не удалось создать manifest активной sequence: " + layoutError.message, layout, "error");
+          return;
+        }
+        submitFinalReview(sequence, layout);
+      });
+    });
+  }
+
+  function startFinalReview() {
+    var outputPath = finalReviewOutputPath();
+    if (!outputPath) {
+      log("Укажите каталог projects и проект для финальной проверки.");
+      return;
+    }
+    byId("startFinalReview").disabled = true;
+    byId("startFinalReviewFromWav").disabled = true;
+    byId("applyFinalReview").disabled = true;
+    callHost("inspect", {}, function (inspectError, inspected) {
+      var sequence = inspected && (inspected.sequence || inspected);
+      if (inspectError || !sequence || !sequence.sequenceId) {
+        byId("startFinalReview").disabled = false;
+        byId("startFinalReviewFromWav").disabled = false;
+        log("Не удалось прочитать собранную sequence: " + (inspectError ? inspectError.message : "нет sequence"), inspected, "error");
+        return;
+      }
+      currentFinalReviewSequence = sequence;
+      setFinalReviewStatus("Экспортирую звук собранного таймлайна напрямую из Premiere…");
+      callHost("exportFinalReview", { outputPath: outputPath, expectedSequenceId: sequence.sequenceId, overwrite: true }, function (exportError, exported) {
+        if (exportError) {
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          log("Не удалось экспортировать финальный WAV: " + exportError.message, exported, "error");
+          return;
+        }
+        log("Экспорт финального WAV поставлен в очередь. Ожидаю стабильный файл…", exported.job);
+        pollFinalReviewExport(exported.job.outputPath, exported.job.jobId, sequence);
+      });
+    });
+  }
+
+  function applyFinalReview() {
+    if (!currentFinalReviewJobId || !currentFinalReviewSequence) return;
+    byId("applyFinalReview").disabled = true;
+    request("POST", "/stage2/final-review/jobs/" + encodeURIComponent(currentFinalReviewJobId) + "/apply", { project: config().project }, function (error, response) {
+      if (error) {
+        byId("applyFinalReview").disabled = false;
+        log("Не удалось подготовить итерацию: " + error.message, response, "error");
+        return;
+      }
+      var result = response.result || response;
+      callHost("clone", { expectedSequenceId: currentFinalReviewSequence.sequenceId, nameSuffix: " · RC iteration " + result.iteration.id }, function (cloneError, cloned) {
+        if (cloneError) {
+          byId("applyFinalReview").disabled = false;
+          log("Черновая sequence не создана: " + cloneError.message, cloned, "error");
+          return;
+        }
+        var corrections = result.corrections || [];
+        if (!corrections.length) {
+          setFinalReviewStatus("Создана черновая sequence «" + cloned.draft.name + "»; автоматических правок нет.");
+          log("Черновая итерация создана; исходная sequence не изменена.", result, "success");
+          return;
+        }
+        var items = corrections.map(function (item) {
+          return {
+            segmentId: item.segment_id,
+            blockUid: item.block_uid,
+            sourceSequenceId: item.source_sequence_id || "",
+            sourceSequenceName: item.source_sequence_name || "",
+            sourceInSeconds: Number(item.source_in_sec),
+            sourceOutSeconds: Number(item.source_out_sec),
+            timelineSeconds: Number(item.timeline_seconds),
+            placeholderIdentity: item.placeholder_identity || ("RC_BLOCK " + item.block_uid),
+            placeholderIdentityRequired: true,
+            placeholderName: "",
+            placeholderNames: []
+          };
+        });
+        callHost("conform", {
+          items: items,
+          videoTrackIndex: CONFORM_VIDEO_TRACK_INDEX,
+          audioTrackIndex: CONFORM_AUDIO_TRACK_INDEX,
+          expectedTargetSequenceId: cloned.draft.sequenceId,
+          expectedTargetSequenceName: cloned.draft.name,
+          expectedProjectPath: cloned.draft.projectPath,
+          expectedTimelineDuration: Number(cloned.draft.durationSeconds || 0),
+          registeredSourceGuards: [],
+          enableExplicitTrackShiftBatch: true,
+          repairStaleInsertions: true
+        }, function (conformError, conformed) {
+          if (conformError) {
+            setFinalReviewStatus("Черновая sequence создана, но правки границ не применены: " + conformError.message);
+            log("Исправления остались подготовленными в отчёте.", conformed, "error");
+            return;
+          }
+          setFinalReviewStatus("Создана и исправлена черновая sequence «" + cloned.draft.name + "».");
+          log("Финальная итерация применена только к черновой sequence.", conformed, "success");
+        });
+      });
+    });
+  }
+
   function bind() {
     byId("saveConfig").addEventListener("click", saveConfig);
     byId("refreshProjects").addEventListener("click", loadProjects);
@@ -1570,6 +1848,9 @@
     byId("refreshWhisper").addEventListener("click", refreshWhisperStatusManually);
     byId("resumeWhisper").addEventListener("click", resumeTranscriptionJob);
     byId("cancelWhisper").addEventListener("click", cancelTranscriptionJob);
+    byId("startFinalReview").addEventListener("click", startFinalReview);
+    byId("startFinalReviewFromWav").addEventListener("click", startFinalReviewFromWav);
+    byId("applyFinalReview").addEventListener("click", applyFinalReview);
     byId("apiToken").addEventListener("change", function () {
       loadProjects();
       refreshWhisperStatus();

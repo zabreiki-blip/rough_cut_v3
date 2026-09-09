@@ -3041,9 +3041,16 @@
             var clips;
             var i;
             var j;
+            var muted;
+            var enabled;
             for (i = 0; i < collection.numTracks; i++) {
                 track = collection[i];
                 clips = [];
+                muted = null;
+                try {
+                    muted = typeof track.isMuted === "function" ?
+                        (track.isMuted() ? true : false) : null;
+                } catch (ignoreTrackMute) { muted = null; }
                 for (j = 0; j < track.clips.numItems; j++) {
                     clip = track.clips[j];
                     clipStart = secondsOf(clip.start);
@@ -3051,6 +3058,9 @@
                     if (clipEnd < fromSeconds || clipStart > toSeconds) {
                         continue;
                     }
+                    enabled = null;
+                    try { enabled = clip.disabled ? false : true; }
+                    catch (ignoreClipDisabled) { enabled = null; }
                     clips.push({
                         name: asString(clip.name),
                         projectItemName: clip.projectItem ? asString(clip.projectItem.name) : "",
@@ -3059,12 +3069,15 @@
                         endSeconds: clipEnd,
                         durationSeconds: Math.max(0, clipEnd - clipStart),
                         sourceInSeconds: secondsOf(clip.inPoint),
-                        sourceOutSeconds: secondsOf(clip.outPoint)
+                        sourceOutSeconds: secondsOf(clip.outPoint),
+                        enabled: enabled,
+                        hasAudioComponent: prefix === "A"
                     });
                 }
                 destination.push({
                     track: prefix + (i + 1),
                     clipCount: Number(track.clips.numItems),
+                    muted: muted,
                     clips: clips
                 });
             }
@@ -3346,7 +3359,7 @@
                         "Не удалось безопасно проверить роль активной секвенции; экспорт для расшифровки отменён."
                     );
                 }
-                if (roughCutGuard.isRoughCutTarget) {
+                if (roughCutGuard.isRoughCutTarget && !params.allowRoughCutTarget) {
                     throw new Error(
                         "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя экспортировать как sync-источник для расшифровки."
                     );
@@ -3404,6 +3417,115 @@
                         sequence: sequenceMetadata(sequence)
                     }
                 });
+            } catch (error) {
+                return fail(error.message);
+            }
+        },
+
+        exportFinalReviewAudio: function (encodedPayload) {
+            var params;
+            var sequence;
+            var outputFile;
+            var presetPath;
+            var presetFile;
+            var jobId;
+            var roughCutGuard;
+            try {
+                params = parsePayload(encodedPayload);
+                sequence = app.project ? app.project.activeSequence : null;
+                if (!sequence) {
+                    throw new Error("Open the assembled target sequence before final review export.");
+                }
+                if (params.expectedSequenceId && asString(sequence.sequenceID) !== asString(params.expectedSequenceId)) {
+                    throw new Error("The active sequence changed after final review started.");
+                }
+                roughCutGuard = sequenceRoughCutSignals(sequence);
+                if (!roughCutGuard.inspectionComplete || !roughCutGuard.isRoughCutTarget) {
+                    throw new Error("Final review requires an assembled Rough Cut target sequence.");
+                }
+                outputFile = new File(asString(params.outputPath));
+                if (!/\.wav$/i.test(outputFile.name)) {
+                    throw new Error("Final review outputPath must end with .wav.");
+                }
+                if (outputFile.exists && !params.overwrite) {
+                    throw new Error("Final review WAV already exists. Enable overwrite and retry.");
+                }
+                if (outputFile.exists && !outputFile.remove()) {
+                    throw new Error("Existing final review WAV could not be removed.");
+                }
+                if (!ensureFolder(outputFile.parent)) {
+                    throw new Error("Cannot create final review output folder: " + outputFile.parent.fsName);
+                }
+                presetPath = asString(params.presetPath) || discoverAudioPreset();
+                presetFile = new File(presetPath);
+                if (!presetFile.exists || !/\.epr$/i.test(presetFile.name)) {
+                    throw new Error("Wave48mono24.epr was not found for final review export.");
+                }
+                if (!app.encoder || !app.encoder.encodeSequence) {
+                    throw new Error("Premiere encoder API is unavailable.");
+                }
+                app.encoder.launchEncoder();
+                jobId = app.encoder.encodeSequence(
+                    sequence,
+                    outputFile.fsName,
+                    presetFile.fsName,
+                    0,
+                    1
+                );
+                if (!jobId || String(jobId) === "0") {
+                    throw new Error("Adobe Media Encoder rejected the final-review export job.");
+                }
+                app.encoder.startBatch();
+                return success({
+                    job: {
+                        jobId: asString(jobId),
+                        outputPath: outputFile.fsName,
+                        presetPath: presetFile.fsName,
+                        sequence: sequenceMetadata(sequence)
+                    }
+                });
+            } catch (error) {
+                return fail(error.message);
+            }
+        },
+
+        cloneActiveSequence: function (encodedPayload) {
+            var params;
+            var source;
+            var known = {};
+            var candidate = null;
+            var i;
+            try {
+                params = parsePayload(encodedPayload);
+                source = app.project ? app.project.activeSequence : null;
+                if (!source) {
+                    throw new Error("Open the assembled target sequence before creating an iteration.");
+                }
+                if (params.expectedSequenceId && asString(source.sequenceID) !== asString(params.expectedSequenceId)) {
+                    throw new Error("The active sequence changed after final review.");
+                }
+                for (i = 0; i < app.project.sequences.numSequences; i++) {
+                    known[asString(app.project.sequences[i].sequenceID)] = true;
+                }
+                if (typeof source.clone !== "function") {
+                    throw new Error("Premiere Sequence.clone is unavailable in this version.");
+                }
+                source.clone();
+                for (i = 0; i < app.project.sequences.numSequences; i++) {
+                    if (!known[asString(app.project.sequences[i].sequenceID)]) {
+                        candidate = app.project.sequences[i];
+                    }
+                }
+                if (!candidate) {
+                    throw new Error("Premiere did not create a draft sequence.");
+                }
+                if (params.nameSuffix) {
+                    candidate.name = asString(source.name) + asString(params.nameSuffix);
+                }
+                if (typeof app.project.openSequence === "function") {
+                    app.project.openSequence(candidate.sequenceID);
+                }
+                return success({ source: sequenceMetadata(source), draft: sequenceMetadata(candidate) });
             } catch (error) {
                 return fail(error.message);
             }
@@ -3472,6 +3594,13 @@ function rcStage2_inspectActiveSequenceLayout(encodedPayload) {
     return $._roughCutStage2.inspectActiveSequenceLayout(encodedPayload);
 }
 
+// Final-review lineage uses the same bounded reader through a production API
+// name; the diagnostic command remains absent from the production panel UI.
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_captureAssemblyLayout(encodedPayload) {
+    return $._roughCutStage2.inspectActiveSequenceLayout(encodedPayload);
+}
+
 function rcStage2_resolveSequence(encodedPayload) {
     return $._roughCutStage2.resolveSequence(encodedPayload);
 }
@@ -3486,6 +3615,16 @@ function rcStage2_conformSequenceRanges(encodedPayload) {
 
 function rcStage2_exportActiveSequenceAudio(encodedPayload) {
     return $._roughCutStage2.exportActiveSequenceAudio(encodedPayload);
+}
+
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_exportFinalReviewAudio(encodedPayload) {
+    return $._roughCutStage2.exportFinalReviewAudio(encodedPayload);
+}
+
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_cloneActiveSequence(encodedPayload) {
+    return $._roughCutStage2.cloneActiveSequence(encodedPayload);
 }
 
 function rcStage2_fileInfo(encodedPayload) {

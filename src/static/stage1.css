@@ -76,7 +76,15 @@ nav { display: grid; gap: 4px; }
 .nav-item:hover { background: var(--bg-hover); color: var(--ink); }
 .nav-item.active { background: var(--accent-glow); color: var(--accent-light); }
 
-.sidebar-footer { margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line); }
+.sidebar-footer {
+  margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line);
+  display: grid; gap: 8px;
+}
+.openrouter-usage {
+  font-size: 11px; color: var(--ink); font-family: "JetBrains Mono", monospace;
+  white-space: nowrap;
+}
+.openrouter-usage[data-state="unavailable"] { color: var(--danger); }
 .version { font-size: 11px; color: var(--muted); font-family: "JetBrains Mono", monospace; }
 
 /* Main */
@@ -257,7 +265,7 @@ nav { display: grid; gap: 4px; }
 .normalization-hint-field textarea { min-height: 56px; resize: vertical; }
 .normalization-llm-toggle { padding-bottom: 10px; }
 .normalization-summary {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 12px;
 }
 .summary-stat {
   padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-sm);
@@ -271,6 +279,14 @@ nav { display: grid; gap: 4px; }
   font-size: 12px; line-height: 1.5;
 }
 .warning-count { color: var(--muted); font-weight: 600; }
+.normalization-review-nav {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding: 10px 12px;
+}
+.normalization-review-nav strong { min-width: 130px; text-align: center; font-size: 11px; }
+.normalization-review-nav #btn_norm_issue_filter { margin-left: auto; }
+.normalization-review-nav #btn_norm_issue_filter[aria-pressed="true"] {
+  color: var(--accent-light); border-color: var(--accent); background: var(--accent-glow);
+}
 .normalization-workspace {
   display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(270px, .75fr);
   gap: 12px;
@@ -282,6 +298,9 @@ nav { display: grid; gap: 4px; }
   padding: 12px;
 }
 .normalization-block.has-warning { border-color: rgba(253, 203, 110, .45); }
+.normalization-block.is-active-issue {
+  border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow);
+}
 .learning-dialog {
   width: min(720px, calc(100vw - 32px)); max-height: min(80vh, 760px); overflow: auto;
   color: var(--ink); background: var(--bg-card); border: 1px solid var(--line);
@@ -645,6 +664,17 @@ h3 { font-size: 14px; font-weight: 600; margin: 0; }
   color: var(--muted); text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+
+.tts-style-field { margin-bottom: 10px; }
+.tts-style-field textarea { min-height: 72px; resize: vertical; line-height: 1.45; }
+.tts-style-field small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.tts-style-field.is-disabled { opacity: 0.48; }
 
 input, select, textarea {
   width: 100%;
@@ -1257,6 +1287,40 @@ select { cursor: pointer; }
 .sync-stat[data-state="review"] strong { color: var(--orange); }
 .sync-stat[data-state="unmatched"] strong { color: var(--red); }
 
+.sync-sources-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.sync-source-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+
+.sync-source-edit {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.sync-source-all-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+@media (max-width: 700px) {
+  .sync-source-edit { grid-template-columns: 1fr; align-items: stretch; }
+}
+
 .sync-review {
   padding-top: 14px;
   border-top: 1px solid var(--line);
@@ -1342,6 +1406,15 @@ select { cursor: pointer; }
   border-radius: 4px;
   background: var(--orange-dim);
   color: var(--orange);
+  padding: 7px 9px;
+  font-size: 10px;
+}
+
+.sync-match-speaker-filter {
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  background: var(--blue-dim);
+  color: var(--blue);
   padding: 7px 9px;
   font-size: 10px;
 }

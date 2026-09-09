@@ -13,6 +13,7 @@ import pytest
 
 import api
 from stage2.sync_llm_review import SemanticDecision
+from stage2.sync_matcher import SyncMatcher
 from stage2.sync_models import SyncAlternative, SyncMatch, SyncSource, WordIndex, WordTimestamp
 
 
@@ -68,6 +69,151 @@ def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
 
     changed = dict(arguments, scenario_revision_id="rev_0002")
     assert api._sync_matching_fingerprint(**changed) != first
+
+
+@pytest.mark.parametrize(
+    ("cue", "role"),
+    [
+        ("СНХ", "Киркоров"),
+        ("ЛАЙФ", "Киркоров"),
+        ("СНХ", "Киркоров: начало реплики"),
+    ],
+)
+def test_editorial_cue_role_selects_the_named_interview_source(cue: str, role: str) -> None:
+    quote = "точная реплика из интервью"
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": cue,
+                "role": role,
+                "normalized_text": f"{cue}, Киркоров: {quote}",
+            }
+        ],
+        source_speakers={("киркор",)},
+    )[0]
+
+    assert unit["speaker"] == "Киркоров"
+    result = SyncMatcher(
+        [SyncSource(id="kirkorov", speaker="Киркоров", premiere_sequence="Киркоров")],
+        [
+            WordIndex(
+                source_id="kirkorov",
+                words=[
+                    WordTimestamp(word, index, index + 0.5)
+                    for index, word in enumerate(quote.split())
+                ],
+            )
+        ],
+    ).match(
+        api.AlignmentRequest(
+            segment_id=str(unit["segment_id"]),
+            text=str(unit["text"]),
+            speaker=str(unit["speaker"]),
+        )
+    )
+
+    assert result.source_id == "kirkorov"
+    assert unit["text"] == quote
+
+
+def test_regular_speaker_role_does_not_replace_the_person_name() -> None:
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "Киркоров",
+                "role": "певец",
+                "normalized_text": "Киркоров, певец: точная реплика",
+            }
+        ]
+    )[0]
+
+    assert unit["speaker"] == "Киркоров"
+
+
+def test_unknown_editorial_role_keeps_the_search_unrestricted() -> None:
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "архив",
+                "normalized_text": "СНХ, архив: точная реплика",
+            }
+        ],
+        source_speakers={("киркор",)},
+    )[0]
+
+    assert unit["speaker"] == ""
+
+
+def test_editorial_role_with_cut_marker_uses_person_name() -> None:
+    unit = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "Маликов 00",
+                "normalized_text": "СНХ, Маликов 00: точная реплика",
+            }
+        ],
+        source_speakers={("малик",)},
+    )[0]
+
+    assert unit["speaker"] == "Маликов"
+
+
+def test_skl_fragments_become_separate_alignment_units() -> None:
+    units = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-8",
+                "type": "sync",
+                "speaker": "Киркоров",
+                "normalized_text": "первая фраза вторая фраза",
+                "sync_fragments": [
+                    {"text": "первая фраза", "timecode_start": "00:05:43"},
+                    {"text": "вторая фраза", "timecode_start": ""},
+                ],
+            }
+        ]
+    )
+
+    assert [unit["segment_id"] for unit in units] == [
+        "block-8::fragment:1",
+        "block-8::fragment:2",
+    ]
+    assert [unit["text"] for unit in units] == ["первая фраза", "вторая фраза"]
+
+
+def test_unknown_editorial_role_does_not_inherit_previous_person() -> None:
+    units = api._sync_alignment_units(
+        [
+            {
+                "uid": "block-1",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "Лукьянова",
+                "normalized_text": "СНХ, Лукьянова: первая реплика",
+            },
+            {
+                "uid": "block-2",
+                "type": "sync",
+                "speaker": "СНХ",
+                "role": "отец: начало реплики",
+                "normalized_text": "СНХ, отец: точная реплика",
+            },
+        ],
+        source_speakers={("лукьянов",), ("отец", "жанн")},
+    )
+
+    assert units[0]["speaker"] == "Лукьянова"
+    assert units[1]["speaker"] == "отец"
 
 
 def test_audio_match_accepts_precomputed_signature_without_rereading(
@@ -1103,6 +1249,137 @@ def test_background_match_never_overwrites_concurrent_confirmation(sync_api) -> 
     assert preserved.metadata["confirmed_by"] == "editor-during-job"
 
 
+def _seed_words(client) -> None:
+    words = [
+        {"word": "маленькая", "start": 10.0, "end": 10.5},
+        {"word": "женщина", "start": 10.5, "end": 11.0},
+        {"word": "покоряла", "start": 11.0, "end": 11.5},
+        {"word": "великих", "start": 11.5, "end": 12.0},
+        {"word": "людей", "start": 12.0, "end": 12.5},
+    ]
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={"project": "demo", "words": words},
+        ).status_code
+        == 200
+    )
+
+
+def test_forced_rematch_replaces_a_stale_confirmed_match(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+    stale_confirmed = api.SyncMatch(
+        segment_id="stable-sync-uid",
+        query_text="маленькая женщина покоряла великих людей",
+        speaker="Татьяна Васильева",
+        source_id="vasilieva_01",
+        source_in_sec=900.0,
+        source_out_sec=905.0,
+        confidence=1.0,
+        status="confirmed",
+        matched_text="старый подтверждённый диапазон",
+        metadata={
+            # Predates the job by construction: a PATCH confirmation made long
+            # before this rematch job was ever started.
+            "manual_updated_at": "2000-01-01T00:00:00+00:00",
+            "normalization_revision": 7,
+        },
+    )
+    store.save(stale_confirmed)
+
+    with patch.object(api.threading, "Thread", _ImmediateThread):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "rematch_confirmed": True},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    updated = store.get("stable-sync-uid")
+    assert updated is not None
+    # A forced rematch must replace the old confirmed range with the freshly
+    # computed one, not keep silently returning the stale confirmation.
+    assert (updated.source_in_sec, updated.source_out_sec) != (900.0, 905.0)
+    assert updated.metadata.get("manual_updated_at") != "2000-01-01T00:00:00+00:00"
+
+
+def test_forced_rematch_still_defers_to_a_concurrent_manual_edit(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    original_match = api.SyncMatcher.match
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+
+    def confirm_while_matching(matcher, request):
+        automatic = original_match(matcher, request)
+        if request.segment_id == "stable-sync-uid":
+            confirmed = api.SyncMatch.from_dict(automatic.to_dict())
+            confirmed.status = "confirmed"
+            confirmed.source_in_sec = 900.0
+            confirmed.source_out_sec = 905.0
+            confirmed.metadata["manual_updated_at"] = api._utc_now_iso()
+            store.save(confirmed)
+        return automatic
+
+    with (
+        patch.object(api.SyncMatcher, "match", confirm_while_matching),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "rematch_confirmed": True},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    preserved = store.get("stable-sync-uid")
+    assert preserved is not None
+    assert preserved.status == "confirmed"
+    assert (preserved.source_in_sec, preserved.source_out_sec) == (900.0, 905.0)
+
+
+def test_unforced_rematch_still_leaves_a_confirmed_match_untouched(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+    stale_confirmed = api.SyncMatch(
+        segment_id="stable-sync-uid",
+        query_text="маленькая женщина покоряла великих людей",
+        speaker="Татьяна Васильева",
+        source_id="vasilieva_01",
+        source_in_sec=900.0,
+        source_out_sec=905.0,
+        confidence=1.0,
+        status="confirmed",
+        matched_text="старый подтверждённый диапазон",
+        metadata={
+            "manual_updated_at": "2000-01-01T00:00:00+00:00",
+            "normalization_revision": 7,
+        },
+    )
+    store.save(stale_confirmed)
+
+    with patch.object(api.threading, "Thread", _ImmediateThread):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "rematch_confirmed": False},
+        )
+
+    assert response.status_code == 200, response.get_json()
+    unchanged = store.get("stable-sync-uid")
+    assert unchanged is not None
+    assert unchanged.status == "confirmed"
+    assert (unchanged.source_in_sec, unchanged.source_out_sec) == (900.0, 905.0)
+
+
 def test_job_transcribes_only_missing_indexes_and_isolates_source_failure(sync_api) -> None:
     client, projects = sync_api
     _write_confirmed_normalization(projects)
@@ -1880,6 +2157,7 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
 
     def fake_transcribe(path, backend=None, **_kwargs):
         captured_backend["backend"] = backend
+        captured_backend["model"] = _kwargs.get("model")
         return {
             "backend": "cloud-audio",
             "model": "cloud-model",
@@ -1899,7 +2177,9 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
     ):
         response = client.post(
             "/stage2/sync-jobs/start",
-            json={"project": "demo", "asr_engine": "cloud"},
+            # The UI historically sent its local Whisper setting even for
+            # Cloud ASR.  Regression: it must not reach the provider.
+            json={"project": "demo", "asr_engine": "cloud", "model": "medium"},
         )
 
     assert response.status_code == 200, response.get_json()
@@ -1907,6 +2187,7 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
     assert job["status"] == "completed"
     assert job["asr_engine"] == "cloud"
     assert captured_backend["backend"] == "cloud-audio"
+    assert captured_backend["model"] is None
 
 
 def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backend(
@@ -1931,6 +2212,7 @@ def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backen
 
     def fake_transcribe(path, backend=None, **_kwargs):
         captured_backend["backend"] = backend
+        captured_backend["model"] = _kwargs.get("model")
         return {
             "backend": "faster-whisper",
             "model": "small",
@@ -1950,13 +2232,17 @@ def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backen
     ):
         # No asr_engine in the payload: must default to "local" and never
         # implicitly switch to the paid cloud-audio backend.
-        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "model": "medium"},
+        )
 
     assert response.status_code == 200, response.get_json()
     job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
     assert job["asr_engine"] == "local"
     assert captured_backend["backend"] is None
     assert captured_backend["backend"] != "cloud-audio"
+    assert captured_backend["model"] == "medium"
 
 
 def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
@@ -2010,3 +2296,5 @@ def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
     assert job["asr_cost_usd_total"] == pytest.approx(0.02)
     assert job["asr_timestamp_precision"] == "interpolated"
     assert job["transcription_wall_sec_total"] >= 0.0
+    usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
+    assert usage["total_cost_usd"] == pytest.approx(0.02)

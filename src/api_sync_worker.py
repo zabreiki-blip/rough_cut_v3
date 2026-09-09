@@ -1,6 +1,27 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import TypedDict
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp, tolerating a bare ``Z`` suffix.
+
+    Returns ``None`` when ``value`` is not a parseable timestamp so callers
+    can decide how to treat unrecognized input.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 class _AsrMetrics(TypedDict):
@@ -51,6 +72,7 @@ def run_sync_job(
     _TRANSCRIPTION_CACHE_KEY = services._TRANSCRIPTION_CACHE_KEY
     _transcription_cache_metadata = services._transcription_cache_metadata
     save_word_index = services.save_word_index
+    rescale_stretched_word_index = services.rescale_stretched_word_index
     _audio_stat_signature = services._audio_stat_signature
     _audio_cache_signature = services._audio_cache_signature
     app = services.app
@@ -76,6 +98,12 @@ def run_sync_job(
     _SYNC_JOBS_LOCK = services._SYNC_JOBS_LOCK
     _SYNC_CANCEL_EVENTS = services._SYNC_CANCEL_EVENTS
     paths = _project_paths(project)
+    asr_usage_callback = services._make_openrouter_usage_callback(
+        project, stage="assembly", operation="sync_asr", job_id=job_id
+    )
+    semantic_usage_callback = services._make_openrouter_usage_callback(
+        project, stage="assembly", operation="sync_llm_review", job_id=job_id
+    )
     source_store, match_store = _sync_stores(paths)
     cancel_event = _sync_cancel_event(job_id)
     progress_persist_lock = threading.Lock()
@@ -195,6 +223,17 @@ def run_sync_job(
                         cache_metadata["audio"] = audio_signature
                         save_word_index(index_path, cached_index)
 
+                if cached_index is not None:
+                    # A word index is always relative to its guide media, so
+                    # it cannot legitimately extend materially past ffprobe
+                    # duration regardless of which backend originally wrote
+                    # it. Repair old cloud caches as well as imported indexes.
+                    scale = rescale_stretched_word_index(
+                        cached_index, float(source.duration_sec or 0.0)
+                    )
+                    if scale is not None:
+                        save_word_index(index_path, cached_index)
+
                 cache_matches_audio = bool(
                     cached_index is not None
                     and audio_is_available
@@ -273,12 +312,20 @@ def run_sync_job(
                         cancel_event=cancel_event,
                         timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
                     )
+                    result_backend_metadata = result.get("backend_metadata") or {}
+                    if str(result.get("backend") or backend or "") == "cloud-audio":
+                        asr_usage_callback(
+                            {
+                                "event_id": f"sync-asr:{job_id}:{source.id}",
+                                "model": str(result.get("model") or model or ""),
+                                "cost_usd": result_backend_metadata.get("cost_usd"),
+                            }
+                        )
                     transcription_wall_sec = time.monotonic() - transcription_started_at
                     if _audio_cache_signature(audio_path) != input_audio_signature:
                         raise RuntimeError(
                             f"audio guide changed during transcription: {audio_path.name}"
                         )
-                    result_backend_metadata = result.get("backend_metadata") or {}
                     asr_metrics["transcription_wall_sec_total"] += transcription_wall_sec
                     asr_metrics["asr_backend_used"] = str(result.get("backend") or backend or "")
                     asr_metrics["asr_cost_usd_total"] += float(
@@ -303,6 +350,15 @@ def run_sync_job(
                     transcribed += 1
                 indexes.append(index)
             except Exception as exc:
+                failed_cost = getattr(exc, "cost_usd", None)
+                if failed_cost is not None:
+                    asr_usage_callback(
+                        {
+                            "event_id": f"sync-asr:{job_id}:{source.id}",
+                            "model": str(model or ""),
+                            "cost_usd": failed_cost,
+                        }
+                    )
                 if isinstance(exc, WhisperCancelledError) or (
                     cancel_event is not None and cancel_event.is_set()
                 ):
@@ -336,9 +392,15 @@ def run_sync_job(
             )
             if str(block.get("type") or "").lower() in {"sync", "host"}
         ]
-        units = _sync_alignment_units(blocks)
         indexed_source_ids = {item.source_id for item in indexes}
         matching_sources = [item for item in sources if item.id in indexed_source_ids]
+        source_speakers = {
+            tuple(normalize_text(name))
+            for source in matching_sources
+            for name in source.speaker_names
+            if normalize_text(name)
+        }
+        units = _sync_alignment_units(blocks, source_speakers=source_speakers)
         matcher = SyncMatcher(
             matching_sources,
             indexes,
@@ -361,13 +423,22 @@ def run_sync_job(
         llm_review_failures: list[dict[str, str]] = []
         existing = {item.segment_id: item for item in match_store.list()}
         checkpoint_state = {"dirty": False}
+        matching_started_at = _utc_now_iso()
+        matching_started_at_dt = _parse_iso_datetime(matching_started_at)
+        rematched_this_run: set[str] = set()
 
         def checkpoint_matches() -> None:
             if not checkpoint_state["dirty"]:
                 return
             with _SYNC_DATA_LOCK:
                 persisted = {item.segment_id: item for item in match_store.list()}
-                # Manual edits made while matching was running are authoritative.
+                # A manual edit is only authoritative over a fresh rematch when
+                # it happened concurrently with this job (edited at/after
+                # ``matching_started_at``), or when this run never recomputed
+                # the segment at all. An older confirmation/edit that predates
+                # the job must yield to an explicit forced rematch, otherwise
+                # ``rematch_confirmed=True`` can never actually replace a
+                # previously confirmed range.
                 for persisted_id, persisted_match in persisted.items():
                     persisted_revision = persisted_match.metadata.get("normalization_revision")
                     persisted_scenario_revision_id = str(
@@ -382,10 +453,27 @@ def run_sync_job(
                         or not scenario_revision_id
                         or persisted_scenario_revision_id == scenario_revision_id
                     )
-                    if persisted_is_current and (
-                        persisted_match.status == "confirmed"
-                        or persisted_match.metadata.get("manual_updated_at")
-                    ):
+                    manual_updated_at = persisted_match.metadata.get("manual_updated_at")
+                    if manual_updated_at:
+                        manual_updated_at_dt = _parse_iso_datetime(manual_updated_at)
+                        if manual_updated_at_dt is None or matching_started_at_dt is None:
+                            # Unparseable timestamp: stay conservative and
+                            # treat the manual edit as authoritative so we
+                            # never silently discard human work.
+                            edited_during_run = True
+                        else:
+                            edited_during_run = manual_updated_at_dt >= matching_started_at_dt
+                    elif persisted_match.status == "confirmed":
+                        # A confirmed record with no manual-edit timestamp at
+                        # all cannot be time-compared against the job start
+                        # (legacy data, or a confirmation raced in without
+                        # going through the PATCH endpoint). Stay
+                        # conservative rather than silently discard it.
+                        edited_during_run = True
+                    else:
+                        edited_during_run = False
+                    not_rematched_this_run = persisted_id not in rematched_this_run
+                    if persisted_is_current and (edited_during_run or not_rematched_this_run):
                         existing[persisted_id] = persisted_match
                     elif persisted_id not in existing:
                         existing[persisted_id] = persisted_match
@@ -417,7 +505,7 @@ def run_sync_job(
             total_segments=total_segments,
             total=total_segments,
             current_source_id="",
-            matching_started_at=_utc_now_iso(),
+            matching_started_at=matching_started_at,
             matching_fingerprint=matching_fingerprint,
             scenario_revision_id=scenario_revision_id,
         )
@@ -509,6 +597,7 @@ def run_sync_job(
                             speaker=match.speaker,
                             candidates=semantic_candidates,
                             settings=settings,
+                            usage_callback=semantic_usage_callback,
                         )
                         llm_reviewed += 1
                         if decision is not None:
@@ -535,6 +624,7 @@ def run_sync_job(
                 match.metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 match.metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
                 existing[segment_id] = match
+                rematched_this_run.add(segment_id)
                 checkpoint_state["dirty"] = True
             except Exception as exc:
                 segment_failures.append(

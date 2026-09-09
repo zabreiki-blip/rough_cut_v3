@@ -130,7 +130,7 @@ def get_settings() -> Settings:
         macos_command_timeout = 30
 
     return Settings(
-        tts_provider=os.getenv("TTS_PROVIDER", "gemini").strip().lower(),
+        tts_provider=os.getenv("TTS_PROVIDER", "openrouter").strip().lower(),
         tts_gender=os.getenv("TTS_GENDER", "female").strip().lower(),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip(),
@@ -140,16 +140,18 @@ def get_settings() -> Settings:
         ).strip(),
         openrouter_tts_model=os.getenv(
             "OPENROUTER_TTS_MODEL",
-            "openai/gpt-4o-audio-preview",
+            "microsoft/mai-voice-2",
         ).strip(),
-        openrouter_tts_voice=os.getenv("OPENROUTER_TTS_VOICE", "alloy").strip(),
+        openrouter_tts_voice=os.getenv(
+            "OPENROUTER_TTS_VOICE", "ru-RU-Masha:MAI-Voice-2"
+        ).strip(),
         openrouter_tts_voice_female=os.getenv(
             "OPENROUTER_TTS_VOICE_FEMALE",
-            "shimmer",
+            "ru-RU-Masha:MAI-Voice-2",
         ).strip(),
         openrouter_tts_voice_male=os.getenv(
             "OPENROUTER_TTS_VOICE_MALE",
-            "onyx",
+            "ru-RU-Lev:MAI-Voice-2",
         ).strip(),
         openrouter_tts_sample_rate=sample_rate,
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),

@@ -9,6 +9,7 @@ class BlockType(str, Enum):
     VOICEOVER = "voiceover"
     SYNC = "sync"
     HOST = "host"
+    LIFE = "life"
     TECHNICAL = "technical"
     OTHER = "other"
     UNKNOWN = "unknown"
@@ -69,6 +70,7 @@ class NormalizedBlock:
     suggested_label: str = ""
     speaker: str = ""
     role: str = ""
+    source_description: str = ""
     timecode_start: str = ""
     timecode_end: str = ""
     sync_fragments: list[SyncFragment] = field(default_factory=list)

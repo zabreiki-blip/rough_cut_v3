@@ -89,7 +89,8 @@ def test_sequence_roles_block_self_transcription_and_conform_into_sources() -> N
     assert "roughCutGuard: sequenceRoughCutSignals(sequence)" in HOST
     assert "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя экспортировать" in HOST
     assert "sourceRegistrationBlockReason(activeSource)" in PANEL
-    assert "sequence_role: activeSource.roughCutGuard.isRoughCutTarget" in PANEL
+    assert "sequence_role: source.roughCutGuard.isRoughCutTarget" in PANEL
+    assert "function captureSourceOperation(guidePath)" in PANEL
     assert "function sourceIdentityMatchesSequence(source, sequence)" in PANEL
     assert '"/stage2/sync-sources?project="' in PANEL
     assert "registeredSourceGuards: sourceGuards" in PANEL
@@ -116,8 +117,18 @@ def test_source_registration_supports_shared_and_all_speaker_sequences() -> None
     assert 'id="allSpeakers"' in html
     assert 'id="speakerName"' in html
     assert "speakers: speakerNames.slice(1)" in PANEL
-    assert 'all_speakers: byId("allSpeakers").checked' in PANEL
+    assert "all_speakers: operationContext.allSpeakers" in PANEL
     assert "registeredSpeakers.concat(existing.speakers)" in PANEL
+
+
+def test_final_review_export_is_async_and_waits_for_stable_wav() -> None:
+    assert "exportFinalReviewAudio: function (encodedPayload)" in HOST
+    assert "app.encoder.encodeSequence(" in HOST
+    assert "app.encoder.startBatch();" in HOST
+    assert "sequence.exportAsMediaDirect" not in HOST
+    assert "function pollFinalReviewExport(outputPath, jobId, sequence)" in PANEL
+    assert "pollFinalReviewExport(exported.job.outputPath, exported.job.jobId, sequence)" in PANEL
+    assert "Ожидание final-review экспорта остановлено через 60 минут." in PANEL
 
 
 def test_batch_conform_preserves_editorial_context_as_sequence_markers() -> None:

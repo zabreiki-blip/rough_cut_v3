@@ -29,11 +29,13 @@ from api_core_routes import register_core_routes
 import api_stage1_jobs as stage1_jobs
 from api_stage1_routes import register_stage1_routes
 from api_stage2_routes import register_stage2_routes
+from api_final_review_routes import register_final_review_routes
 from api_stage3_routes import register_stage3_routes
 from api_stage4_routes import register_stage4_routes
 from api_sync_worker import run_sync_job
 from atomic_io import atomic_write_json
 from job_runtime import JobRegistry, get_job, release_project, reserve_project, update_job
+from openrouter_usage import make_usage_callback, reconcile_pending, usage_summary
 from inbox_service import discover_project_inbox
 from logging_config import configure_logging
 from project_service import (
@@ -53,7 +55,13 @@ from project_service import (
 # ``api``, so they are intentionally retained without direct local references.
 from stage1.analyzer import analyze_script
 from stage1.config import get_settings, validate_env
-from stage1.gemini_tts import TtsCancelledError, synthesize_phrase, synthesize_tts
+from stage1.gemini_tts import (
+    TtsCancelledError,
+    normalize_openrouter_tts_model,
+    normalize_tts_style,
+    synthesize_phrase,
+    synthesize_tts,
+)
 from stage1.normalizer import (
     NormalizationMemory,
     NormalizationError,
@@ -85,8 +93,20 @@ from stage2.sync_models import (
     SyncSource,
     WordIndex,
 )
+from stage2.models import FullTimeline
+from stage2.final_review import review_rendered_timeline
+from stage2.assembly_manifest import (
+    build_assembly_manifest,
+    attach_scenario_revision,
+    validate_assembly_manifest,
+)
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
-from stage2.sync_transcript import ingest_word_index, load_word_index, save_word_index
+from stage2.sync_transcript import (
+    ingest_word_index,
+    load_word_index,
+    rescale_stretched_word_index,
+    save_word_index,
+)
 from stage2.whisper_process import (
     WhisperCancelledError,
     transcribe_audio_in_process as transcribe_audio,
@@ -162,6 +182,10 @@ _SYNC_JOBS_TTL_SECONDS = 24 * 60 * 60
 _SYNC_ACTIVE_PROJECTS = _SYNC_RUNTIME.active_projects
 _SYNC_CANCEL_EVENTS = _SYNC_RUNTIME.cancel_events
 _SYNC_DATA_LOCK = threading.Lock()
+_FINAL_REVIEW_RUNTIME = JobRegistry()
+_FINAL_REVIEW_JOBS = _FINAL_REVIEW_RUNTIME.jobs
+_FINAL_REVIEW_JOBS_LOCK = _FINAL_REVIEW_RUNTIME.lock
+_FINAL_REVIEW_ACTIVE_PROJECTS = _FINAL_REVIEW_RUNTIME.active_projects
 _NORMALIZATION_RUNTIME = JobRegistry()
 _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
@@ -176,6 +200,7 @@ _PROJECT_TRANSITION_LOCKS_GUARD = threading.Lock()
 register_job_registry("озвучки", _TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS)
 register_job_registry("нормализации", _NORMALIZATION_JOBS_LOCK, _NORMALIZATION_ACTIVE_PROJECTS)
 register_job_registry("сопоставления СНХ", _SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS)
+register_job_registry("финальной проверки", _FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS)
 
 
 class AudioUploadTooLargeError(ValueError):
@@ -294,6 +319,43 @@ def _normalize_project_name(name: str) -> str:
 
 def _project_paths(project: str) -> dict[str, Path]:
     return build_project_paths(project, PROJECTS_DIR)
+
+
+def _make_openrouter_usage_callback(
+    project: str,
+    *,
+    stage: str,
+    operation: str,
+    job_id: str = "",
+    revision_id: str = "",
+):
+    paths = _ensure_project(project)
+    settings = get_settings()
+    return make_usage_callback(
+        paths["openrouter_usage"],
+        stage=stage,
+        operation=operation,
+        job_id=job_id,
+        revision_id=revision_id,
+        base_url=settings.openrouter_base_url,
+    )
+
+
+def _openrouter_usage_summary(project: str, *, reconcile: bool = False) -> dict:
+    paths = _ensure_project(project)
+    if reconcile:
+        try:
+            import requests
+
+            settings = get_settings()
+            reconcile_pending(
+                paths["openrouter_usage"],
+                api_key=settings.openrouter_api_key,
+                request_fn=requests.get,
+            )
+        except Exception:
+            app.logger.exception("Could not reconcile OpenRouter TTS usage")
+    return usage_summary(paths["openrouter_usage"])
 
 
 def _save_voiceover_revision_assets(project: str, result: dict) -> dict:
@@ -504,6 +566,7 @@ def _build_status(project: str) -> dict:
             and confirmed_normalization
             and timeline.get("normalization_revision") == confirmed_normalization.get("revision")
         ),
+        "openrouter_usage": _openrouter_usage_summary(project),
     }
 
 
@@ -562,6 +625,8 @@ def _create_tts_job(
     gender: str | None = None,
     dry_run: bool = False,
     speed: float = 1.0,
+    tts_model: str | None = None,
+    tts_style: str = "",
 ) -> dict:
     return stage1_jobs.create_tts_job(
         _stage1_job_services(),
@@ -573,6 +638,8 @@ def _create_tts_job(
         gender=gender,
         dry_run=dry_run,
         speed=speed,
+        tts_model=tts_model,
+        tts_style=tts_style,
     )
 
 
@@ -609,6 +676,8 @@ def _run_tts_job(
     gender: str | None,
     dry_run: bool,
     speed: float = 1.0,
+    tts_model: str | None = None,
+    tts_style: str = "",
 ) -> None:
     stage1_jobs.run_tts_job(
         _stage1_job_services(),
@@ -621,6 +690,8 @@ def _run_tts_job(
         gender=gender,
         dry_run=dry_run,
         speed=speed,
+        tts_model=tts_model,
+        tts_style=tts_style,
     )
 
 
@@ -775,6 +846,7 @@ _expose_registered_views(
     "stage1_normalization_job_start",
     "stage1_normalization_job_get",
     "stage1_normalization_job_status",
+    "stage1_openrouter_usage",
     "stage1_normalization_generate",
     "stage1_normalization_get",
     "stage1_normalization_save",
@@ -905,6 +977,11 @@ def _transcription_config(
         or os.getenv("SYNC_WHISPER_MODEL", "").strip()
         or "<backend-default>"
     )
+    cloud_timestamp_mapping = (
+        "2"
+        if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"}
+        else ""
+    )
     return {
         "backend": configured_backend.lower(),
         "model": configured_model,
@@ -920,6 +997,10 @@ def _transcription_config(
         "faster_whisper_version": _installed_version("faster-whisper"),
         "mlx_whisper_version": _installed_version("mlx-whisper"),
         "openai_whisper_version": _installed_version("openai-whisper"),
+        # Bump only cloud indexes: cloud ASR now repairs rare stretched
+        # timestamp scales before word interpolation, so older cached words
+        # must not be reused with the obsolete scale.
+        "cloud_timestamp_mapping": cloud_timestamp_mapping,
     }
 
 
@@ -1058,15 +1139,59 @@ def _sync_quote(block: dict) -> str:
     role = str(block.get("role") or "").strip()
     if speaker and text.casefold().startswith(speaker.casefold()):
         remainder = text[len(speaker) :].lstrip(" \t,")
-        if role and remainder.casefold().startswith(role.casefold()):
-            remainder = remainder[len(role) :]
+        # A malformed legacy label can put the start of the quote into the
+        # role field (``Лукьянова: начало реплики``). Its name prefix is
+        # structural, while the rest must remain searchable text.
+        role_prefix = role.split(":", 1)[0].strip() if ":" in role else role
+        if role_prefix and remainder.casefold().startswith(role_prefix.casefold()):
+            remainder = remainder[len(role_prefix) :]
         quote = remainder.lstrip(" \t\r\n:;,.…—–-")
         if quote:
             return quote
     return text
 
 
-def _sync_alignment_units(blocks: list[dict]) -> list[dict[str, object]]:
+_EDITORIAL_SPEAKER_MARKERS = frozenset({"снх", "синхрон", "sync", "лайф", "life"})
+
+
+def _matching_speaker(
+    block: dict, speaker: str, source_speakers: set[tuple[str, ...]] | None = None
+) -> str | None:
+    """Return the person name to use when selecting an interview source.
+
+    Editorial drafts commonly label a quote as ``СНХ, Киркоров: ...`` or
+    ``ЛАЙФ, Орлова: ...``.  The normalizer deliberately stores the cue in
+    ``speaker`` and the person in ``role``; for matching, the latter is the
+    useful source selector. Do not apply this to ordinary ``Name, title``
+    labels, where ``speaker`` already identifies the person. When a source
+    list is supplied, an unknown role falls back to an unrestricted search
+    rather than excluding every named interview. ``None`` means that this
+    block has no own selector and may inherit a preceding one; an empty
+    string is an explicit unrestricted selector and must not inherit.
+    """
+    role = str(block.get("role") or "").strip()
+    is_editorial_cue = speaker.casefold() in _EDITORIAL_SPEAKER_MARKERS
+    if str(block.get("type") or "").lower() == "sync" and is_editorial_cue:
+        if not role:
+            return ""
+        candidate = role.split(":", 1)[0].strip()
+        # Labels often put a cut marker after a real name: ``Маликов 00``.
+        # It is not part of the source person name.
+        candidate = re.sub(r"(?:\s+\d{1,2})+$", "", candidate).strip()
+        candidate_tokens = tuple(normalize_text(candidate))
+        if source_speakers is None or any(
+            candidate_tokens
+            and set(candidate_tokens).issubset(source_tokens)
+            for source_tokens in source_speakers
+        ):
+            return candidate
+        return ""
+    return speaker or None
+
+
+def _sync_alignment_units(
+    blocks: list[dict], *, source_speakers: set[tuple[str, ...]] | None = None
+) -> list[dict[str, object]]:
     """Expand a canonical speaker block into independently matchable pieces."""
     units: list[dict[str, object]] = []
     last_speaker = {"sync": "", "host": ""}
@@ -1076,11 +1201,15 @@ def _sync_alignment_units(blocks: list[dict]) -> list[dict[str, object]]:
         if not parent_uid:
             units.append({"segment_id": "", "parent_block_uid": "", "block": block})
             continue
-        speaker = str(block.get("speaker") or "").strip()
-        if speaker:
-            last_speaker[block_type] = speaker
-        else:
+        speaker_selector = _matching_speaker(
+            block, str(block.get("speaker") or "").strip(), source_speakers
+        )
+        if speaker_selector is None:
             speaker = last_speaker.get(block_type, "")
+        else:
+            speaker = speaker_selector
+            if speaker:
+                last_speaker[block_type] = speaker
         raw_fragments = block.get("sync_fragments")
         fragments = (
             normalized_sync_fragments(block)
@@ -1172,7 +1301,7 @@ def _sync_matching_fingerprint(
 ) -> str:
     """Identify every durable input that can change a matching decision."""
     payload = {
-        "version": 2,
+        "version": 3,
         "normalization_revision": normalization_revision,
         "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,
@@ -1469,7 +1598,123 @@ def _run_sync_job(
     )
 
 
+def _reserve_final_review_project(project: str) -> bool:
+    with _project_transition_lock(project):
+        if _project_has_active_mutation(project):
+            return False
+        return reserve_project(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS, project)
+
+
+def _release_final_review_project(project: str) -> None:
+    release_project(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS, project)
+
+
+def _create_final_review_job(project: str, audio_path: Path, payload: dict) -> dict:
+    now = _utc_now_iso()
+    job = {
+        "id": uuid.uuid4().hex, "project": project, "status": "queued", "message": "Queued",
+        "audio_path": str(audio_path.relative_to(_project_paths(project)["root"])),
+        "source_sequence": dict(payload.get("source_sequence") or {}), "created_at": now,
+        "assembly_manifest_id": str(payload.get("assembly_manifest_id") or ""),
+        "started_at": "", "finished_at": "", "error": "", "report_path": "",
+    }
+    job_id = str(job["id"])
+    with _FINAL_REVIEW_JOBS_LOCK:
+        _FINAL_REVIEW_JOBS[job_id] = job
+    _atomic_write_json_file(_project_paths(project)["final_review_job_status"], job)
+    return dict(job)
+
+
+def _get_final_review_job(job_id: str) -> dict | None:
+    return get_job(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_JOBS, job_id)
+
+
+def _update_final_review_job(job_id: str, **updates) -> dict | None:
+    snapshot = update_job(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_JOBS, job_id, updates)
+    if snapshot:
+        _atomic_write_json_file(_project_paths(snapshot["project"])["final_review_job_status"], snapshot)
+    return snapshot
+
+
+def _run_final_review_job(
+    *, job_id: str, project: str, audio_path: Path, language: str, backend: str | None,
+    model: str | None, source_sequence: dict,
+) -> None:
+    usage_callback = _make_openrouter_usage_callback(
+        project, stage="assembly", operation="final_review_asr", job_id=job_id
+    )
+    try:
+        paths = _project_paths(project)
+        manifest = _read_json_safe(paths["assembly_manifest"])
+        validate_assembly_manifest(
+            manifest,
+            timeline_path=paths["timeline"],
+            scenario_path=paths["normalized"],
+            audio_path=audio_path,
+        )
+        _update_final_review_job(job_id, status="running", message="Transcribing rendered timeline", started_at=_utc_now_iso())
+        result = transcribe_audio(audio_path, backend=backend, model=model, language=language)
+        result_backend_metadata = result.get("backend_metadata") or {}
+        if str(result.get("backend") or backend or "") == "cloud-audio":
+            usage_callback(
+                {
+                    "event_id": f"final-review-asr:{job_id}",
+                    "model": str(result.get("model") or model or ""),
+                    "cost_usd": result_backend_metadata.get("cost_usd"),
+                }
+            )
+        validate_assembly_manifest(
+            manifest,
+            timeline_path=paths["timeline"],
+            scenario_path=paths["normalized"],
+            audio_path=audio_path,
+        )
+        index = ingest_word_index(result, "final-render", model=str(result.get("model") or model or ""), language=str(result.get("language") or language))
+        save_word_index(paths["final_review_words"], index)
+        timeline_data = _read_json_safe(paths["work"] / "full_timeline.json")
+        timeline = FullTimeline.from_dict(timeline_data)
+        report = review_rendered_timeline(timeline, index)
+        report.update({
+            "project": project, "job_id": job_id, "created_at": _utc_now_iso(),
+            "audio_path": str(audio_path.relative_to(paths["root"])), "source_sequence": source_sequence,
+            "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
+            "assembly_manifest_id": str(manifest.get("manifest_id") or ""),
+            "assembly_summary": dict(manifest.get("summary") or {}),
+            "assembly_findings": list(manifest.get("findings") or []),
+        })
+        _atomic_write_json_file(paths["final_review_report"], report)
+        _update_final_review_job(job_id, status="completed", message="Final review completed", finished_at=_utc_now_iso(), report_path=str(paths["final_review_report"].relative_to(paths["root"])))
+    except Exception as exc:
+        failed_cost = getattr(exc, "cost_usd", None)
+        if failed_cost is not None:
+            usage_callback(
+                {
+                    "event_id": f"final-review-asr:{job_id}",
+                    "model": str(model or ""),
+                    "cost_usd": failed_cost,
+                }
+            )
+        _update_final_review_job(job_id, status="failed", message="Final review failed", error=str(exc), finished_at=_utc_now_iso())
+    finally:
+        _release_final_review_project(project)
+
+
+def _record_final_review_iteration(project: str, job: dict, corrections: list[dict]) -> dict:
+    paths = _project_paths(project)
+    history = _read_json_safe(paths["final_review_iterations"])
+    items = list(history.get("iterations") or [])
+    iteration = {
+        "id": f"iteration_{len(items) + 1:04d}", "review_job_id": job["id"],
+        "source_sequence": dict(job.get("source_sequence") or {}), "corrections": corrections,
+        "status": "prepared", "created_at": _utc_now_iso(),
+    }
+    items.append(iteration)
+    _atomic_write_json_file(paths["final_review_iterations"], {"iterations": items})
+    return iteration
+
+
 register_stage2_routes(app, sys.modules[__name__])
+register_final_review_routes(app, sys.modules[__name__])
 _expose_registered_views(
     "stage2_sync_sources",
     "stage2_sync_source_audio",

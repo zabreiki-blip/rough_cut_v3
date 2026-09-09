@@ -13,6 +13,7 @@ from typing import Any, Callable, Sequence
 
 import requests
 
+from openrouter_usage import report_json_usage
 from stage1.config import Settings, get_settings
 
 
@@ -55,6 +56,7 @@ def review_candidates_with_llm(
     candidates: Sequence[SemanticCandidate],
     settings: Settings | None = None,
     request_fn: Callable[..., Any] | None = None,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
     timeout_seconds: float = 45.0,
 ) -> SemanticDecision | None:
     """Choose a semantic match from verified transcript candidates.
@@ -110,6 +112,7 @@ def review_candidates_with_llm(
     )
     response.raise_for_status()
     body = response.json()
+    report_json_usage(usage_callback, body, model=config.openrouter_model)
     content = body["choices"][0]["message"]["content"]
     decision = _json_object(content)
     try:

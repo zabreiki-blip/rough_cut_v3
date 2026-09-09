@@ -46,8 +46,10 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage1/normalization/memory": {"GET", "POST"},
         "/stage1/normalization/memory/<int:rule_id>": {"DELETE", "PATCH"},
         "/stage1/normalization/reset": {"POST"},
+        "/stage1/openrouter-usage": {"GET"},
         "/stage1/status": {"GET"},
         "/stage1/tts": {"POST"},
+        "/stage1/tts/clear": {"POST"},
         "/stage1/tts-jobs/<job_id>": {"GET"},
         "/stage1/tts-jobs/<job_id>/cancel": {"POST"},
         "/stage1/tts-jobs/start": {"POST"},
@@ -56,6 +58,9 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage1/validate": {"POST"},
         "/stage2/build": {"POST"},
         "/stage2/export/xml": {"GET"},
+        "/stage2/final-review/start": {"POST"},
+        "/stage2/final-review/jobs/<job_id>": {"GET"},
+        "/stage2/final-review/jobs/<job_id>/apply": {"POST"},
         "/stage2/sync-jobs/<job_id>": {"GET"},
         "/stage2/sync-jobs/<job_id>/cancel": {"POST"},
         "/stage2/sync-jobs/start": {"POST"},
@@ -134,6 +139,20 @@ def test_project_collection_response_contract(client) -> None:
     assert deleted.get_json() == {"ok": True, "project": "Монтаж_01"}
 
 
+def test_project_delete_is_rejected_while_a_job_mutates_it(client) -> None:
+    api._ensure_project("busy")
+    with api._NORMALIZATION_JOBS_LOCK:
+        api._NORMALIZATION_ACTIVE_PROJECTS.add("busy")
+    try:
+        response = client.delete("/projects/busy")
+    finally:
+        with api._NORMALIZATION_JOBS_LOCK:
+            api._NORMALIZATION_ACTIVE_PROJECTS.discard("busy")
+
+    assert response.status_code == 409
+    assert (api.PROJECTS_DIR / "busy").is_dir()
+
+
 def test_empty_stage_responses_keep_public_envelopes(client) -> None:
     status = client.get("/stage1/status?project=demo")
     assert status.status_code == 200
@@ -141,6 +160,11 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
     assert status_payload["ok"] is True
     assert status_payload["result"]["project"] == "demo"
     assert set(status_payload) == {"ok", "result"}
+    assert status_payload["result"]["openrouter_usage"]["total_cost_usd"] == 0.0
+
+    usage = client.get("/stage1/openrouter-usage?project=demo")
+    assert usage.status_code == 200
+    assert usage.get_json()["result"]["pending_count"] == 0
 
     sources = client.get("/stage2/sync-sources?project=demo")
     assert sources.status_code == 200
@@ -305,7 +329,7 @@ def test_job_registries_are_visible_from_api_and_stage4_routes_in_priority_order
     import api_stage4_routes
 
     labels = [registry.label for registry in api.iter_job_registries()]
-    assert labels == ["озвучки", "нормализации", "сопоставления СНХ", "подготовки Stage 3"]
+    assert labels == ["озвучки", "нормализации", "сопоставления СНХ", "финальной проверки", "подготовки Stage 3"]
 
     # api_stage4_routes._active_project_job reads registries off the passed-in
     # ``services`` module (here, ``api``) rather than any private module state

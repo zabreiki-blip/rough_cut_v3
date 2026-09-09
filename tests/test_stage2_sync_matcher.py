@@ -9,6 +9,7 @@ from stage2.sync_matcher import (
     MatcherConfig,
     SyncMatcher,
     _candidate_starts,
+    _extract_numbers,
     _length_samples,
     _timed_tokens,
     normalize_text,
@@ -136,7 +137,9 @@ def test_fuzzy_match_tolerates_whisper_insertions_and_word_inflections() -> None
     assert result.source_id == "vasilieva_01"
     assert result.status in {"auto_matched", "needs_review"}
     assert result.confidence >= 0.70
-    assert result.source_in_sec is not None and 1001.0 <= result.source_in_sec <= 1003.0
+    assert result.source_in_sec is not None and 999.0 <= result.source_in_sec <= 1001.0
+    assert result.metadata["speech_in_sec"] == pytest.approx(1002.5)
+    assert result.metadata["speech_out_sec"] > result.metadata["speech_in_sec"]
     assert "энергетическим" in result.matched_text
 
 
@@ -390,6 +393,66 @@ def test_differently_named_speaker_does_not_search_unrelated_interview() -> None
     assert result.strategy == "insufficient_input"
 
 
+def test_speaker_mismatch_records_filtered_source_in_metadata() -> None:
+    phrase = "редкая точная цитата другого героя"
+    result = SyncMatcher(
+        [_source("vasilieva", "Татьяна Васильева")],
+        [_index("vasilieva", phrase, 10.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="other-speaker-metadata",
+            text=phrase,
+            speaker="Александр Ирбе",
+        )
+    )
+    assert result.status == "not_found"
+    filtered = result.metadata["speaker_filtered_sources"]
+    assert filtered == [{"source_id": "vasilieva", "source_speakers": ["Татьяна Васильева"]}]
+
+
+def test_speaker_filtered_sources_absent_when_every_source_is_eligible() -> None:
+    phrase = "эта цитата находится только на мастер секвенции"
+    sources = [
+        _source("master", "", all_speakers=True),
+        _source("dedicated", "Ирина Котова"),
+    ]
+    indexes = [
+        _index("master", phrase, 20.0),
+        _index("dedicated", "совсем другой текст без совпадения", 20.0),
+    ]
+
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="master-any-speaker-metadata",
+            text=phrase,
+            speaker="Ирина Котова",
+        )
+    )
+
+    assert "speaker_filtered_sources" not in result.metadata
+
+
+def test_speaker_filtered_sources_present_on_not_found_with_candidates() -> None:
+    sources = [
+        _source("vasilieva", "Татьяна Васильева"),
+        _source("petrov", "Иван Петров"),
+    ]
+    indexes = [
+        _index("vasilieva", "совсем другой текст без совпадения", 10.0),
+        _index("petrov", "нужная точная цитата героя находится здесь", 10.0),
+    ]
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="snh6-metadata",
+            text="нужная точная цитата героя находится здесь",
+            speaker="Татьяна Васильева",
+        )
+    )
+    assert result.status == "not_found"
+    filtered = result.metadata["speaker_filtered_sources"]
+    assert filtered == [{"source_id": "petrov", "source_speakers": ["Иван Петров"]}]
+
+
 def test_long_queries_bound_candidate_search_without_losing_rare_anchor() -> None:
     words = ["обычное"] * 1500 + ["уникальныйякорь"] + ["обычное"] * 1500
     index = _index("s1", " ".join(words), 0.0, step=0.01)
@@ -512,11 +575,11 @@ def test_display_timecode_and_guide_offset_are_converted_to_sequence_seconds() -
         )
     )
     assert result.strategy == "near_timecode"
-    assert result.source_in_sec == pytest.approx(29.5)
-    assert result.source_out_sec == pytest.approx(34.0)
+    assert result.source_in_sec == pytest.approx(28.0)
+    assert result.source_out_sec == pytest.approx(34.5)
 
 
-def test_tail_padding_is_clamped_to_registered_sequence_duration() -> None:
+def test_speech_past_registered_sequence_duration_is_rejected_even_with_handles() -> None:
     source = _source("s1", duration_sec=3.0)
     index = _index("s1", "короткая точная цитата в самом конце", 1.0)
     result = SyncMatcher([source], [index]).match(
@@ -526,7 +589,8 @@ def test_tail_padding_is_clamped_to_registered_sequence_duration() -> None:
             source_ids=("s1",),
         )
     )
-    assert result.source_out_sec == 3.0
+    assert result.status == "not_found"
+    assert result.source_out_sec is None
 
 
 def test_words_past_registered_duration_cannot_auto_match_zero_length_range() -> None:
@@ -543,3 +607,134 @@ def test_words_past_registered_duration_cannot_auto_match_zero_length_range() ->
     assert result.status == "not_found"
     assert result.source_in_sec is None
     assert result.source_out_sec is None
+
+
+def test_negated_scenario_matched_to_non_negated_transcript_needs_review() -> None:
+    scenario = "Я не согласен с этим решением комиссии"
+    transcript = "Я согласен с этим решением комиссии"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="negation-flip",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "needs_review"
+    assert result.source_id == "s1"
+    assert result.source_in_sec is not None and result.source_out_sec is not None
+    assert result.confidence > 0
+    assert result.metadata["semantic_flags"] == ["negation"]
+
+
+def test_repeated_asr_negation_does_not_create_false_semantic_warning() -> None:
+    scenario = "Она многое мне тогда не рассказывала"
+    transcript = "Она многое мне тогда не не рассказывала"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="asr-stutter",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_joined_and_stuttered_neschastlivy_share_negation_meaning() -> None:
+    scenario = "Когда люди несчастливы, они не рожают детей"
+    transcript = "Когда люди не не счастливы, они не рожают детей"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="joined-negation",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_changed_number_between_scenario_and_transcript_needs_review() -> None:
+    scenario = "Завод в этом квартале произвел 150 новых машин для города"
+    transcript = "Завод в этом квартале произвел 500 новых машин для города"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="number-flip",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "needs_review"
+    assert result.source_id == "s1"
+    assert result.source_in_sec is not None and result.source_out_sec is not None
+    assert result.confidence > 0
+    assert result.metadata["semantic_flags"] == ["number"]
+
+
+def test_number_spelled_out_in_transcript_matches_same_digit_in_scenario() -> None:
+    scenario = "Завод в этом квартале произвел 150 новых машин для города"
+    transcript = "Завод в этом квартале произвел сто пятьдесят новых машин для города"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="number-spelled-out",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_clean_match_without_numbers_or_negation_stays_auto_matched() -> None:
+    phrase = "результаты голосования будут объявлены завтра утром"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", phrase, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="clean-match",
+            text=phrase,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("два-три дня", [2, 3]),
+        ("пять пятьдесят", [5, 50]),
+        ("в 1915 году", [1915]),
+        ("тысяча девятьсот пятнадцатый", [1915]),
+        ("две тысячи двадцать пятый", [2025]),
+        ("сорок пять тысяч", [45000]),
+        ("сто пятьдесят", [150]),
+        ("пять и пять", [5, 5]),
+        ("5 и 5", [5, 5]),
+    ],
+)
+def test_extract_numbers_only_sums_descending_place_values(text: str, expected: list[int]) -> None:
+    assert _extract_numbers(text) == expected

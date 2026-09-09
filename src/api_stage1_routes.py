@@ -8,6 +8,18 @@ from flask import Flask, jsonify, request
 from stage1.normalizer import invalidate_video_cue_seed_cache
 
 
+def _resolve_tts_direction(services: ModuleType, payload: dict, provider: str | None):
+    settings = services.get_settings()
+    effective_provider = str(provider or settings.tts_provider or "openrouter").strip().lower()
+    style = services.normalize_tts_style(payload.get("tts_style"))
+    model = None
+    if effective_provider == "openrouter":
+        model = services.normalize_openrouter_tts_model(
+            payload.get("tts_model"), settings.openrouter_tts_model
+        )
+    return model, style
+
+
 def _stage1_analyze(services: ModuleType):
     payload = request.get_json(silent=True) or {}
 
@@ -47,6 +59,9 @@ def _stage1_analyze(services: ModuleType):
             output_path=output_path,
             raw_output_path=raw_output_path,
             use_llm=bool(payload.get("use_llm", True)),
+            usage_callback=services._make_openrouter_usage_callback(
+                project, stage="normalization", operation="legacy_analyze"
+            ),
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -139,6 +154,19 @@ def _stage1_normalization_job_status(services: ModuleType):
     return jsonify({"ok": True, "result": latest or {}})
 
 
+def _stage1_openrouter_usage(services: ModuleType):
+    try:
+        project = services._resolve_project_name(request.args.get("project"))
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
+    return jsonify(
+        {
+            "ok": True,
+            "result": services._openrouter_usage_summary(project, reconcile=True),
+        }
+    )
+
+
 def _stage1_normalization_generate(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -159,6 +187,9 @@ def _stage1_normalization_generate(services: ModuleType):
             use_llm=bool(payload.get("use_llm", True)),
             hint=str(payload.get("hint") or payload.get("author_hint") or ""),
             llm_preset=llm_preset,
+            usage_callback=services._make_openrouter_usage_callback(
+                project, stage="normalization", operation="normalize"
+            ),
         )
     except Exception as exc:
         return services._normalization_exception(exc)
@@ -397,6 +428,10 @@ def _stage1_tts(services: ModuleType):
     gender = payload.get("gender")
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return services._json_error("gender must be 'female' or 'male'", 400)
+    try:
+        tts_model, tts_style = _resolve_tts_direction(services, payload, provider)
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
 
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
@@ -412,6 +447,16 @@ def _stage1_tts(services: ModuleType):
             voice_name=payload.get("voice_name"),
             gender=gender,
             dry_run=bool(payload.get("dry_run", False)),
+            usage_callback=services._make_openrouter_usage_callback(
+                project,
+                stage="voiceover",
+                operation="tts",
+                revision_id=str(
+                    services._read_json_safe(prepared_path).get("scenario_revision_id") or ""
+                ),
+            ),
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
         services._save_voiceover_revision_assets(project, result)
     except ValueError as exc:
@@ -457,6 +502,10 @@ def _stage1_tts_job_start(services: ModuleType):
     except (TypeError, ValueError):
         return services._json_error("speed must be a number between 0.5 and 1.5", 400)
     speed = max(0.5, min(1.5, speed))
+    try:
+        tts_model, tts_style = _resolve_tts_direction(services, payload, provider)
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
 
     try:
         prepared_path = services._confirmed_prepared_path(payload, paths)
@@ -478,6 +527,8 @@ def _stage1_tts_job_start(services: ModuleType):
             gender=gender,
             dry_run=bool(payload.get("dry_run", False)),
             speed=speed,
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
         worker = services.threading.Thread(
             target=services._run_tts_job,
@@ -491,6 +542,8 @@ def _stage1_tts_job_start(services: ModuleType):
                 "gender": gender,
                 "dry_run": bool(payload.get("dry_run", False)),
                 "speed": speed,
+                "tts_model": tts_model,
+                "tts_style": tts_style,
             },
             daemon=True,
         )
@@ -560,6 +613,68 @@ def _stage1_tts_job_cancel(services: ModuleType, job_id: str):
     return jsonify({"ok": True, "result": snapshot}), 202
 
 
+def _stage1_tts_clear(services: ModuleType):
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = services._resolve_project_name(payload.get("project"))
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
+
+    paths = services._ensure_project(project)
+    if services._project_has_active_mutation(project):
+        return services._json_error(
+            "Нельзя очистить озвучку, пока выполняется фоновая задача проекта", 409
+        )
+
+    removed = 0
+    for pattern in ("zk*.wav", "zk*.wav.meta"):
+        for path in paths["speaker"].glob(pattern):
+            if path.is_file():
+                path.unlink()
+                removed += 1
+
+    validation_manifest = paths["speaker"] / "manifest.json"
+    if validation_manifest.is_file():
+        validation_manifest.unlink()
+        removed += 1
+
+    normalized = services._read_json_safe(paths["normalized"])
+    services._atomic_write_json_file(
+        paths["active_voiceover_manifest"],
+        {
+            "schema_version": 1,
+            "scenario_revision_id": str(normalized.get("scenario_revision_id") or ""),
+            "items": [],
+        },
+    )
+
+    if paths["tts_job_status"].is_file():
+        paths["tts_job_status"].unlink()
+        removed += 1
+    with services._TTS_JOBS_LOCK:
+        stale_job_ids = [
+            job_id
+            for job_id, job in services._TTS_JOBS.items()
+            if job.get("project") == project
+            and job.get("status") not in {"queued", "running", "cancelling"}
+        ]
+        for job_id in stale_job_ids:
+            services._TTS_JOBS.pop(job_id, None)
+            services._TTS_CANCEL_EVENTS.pop(job_id, None)
+
+    return jsonify(
+        {
+            "ok": True,
+            "result": {
+                "project": project,
+                "files_removed": removed,
+                "manifests_reset": 2,
+                "history_preserved": True,
+            },
+        }
+    )
+
+
 def _stage1_tts_phrase(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -583,6 +698,10 @@ def _stage1_tts_phrase(services: ModuleType):
     except (TypeError, ValueError):
         return services._json_error("speed must be a number between 0.5 and 1.5", 400)
     speed = max(0.5, min(1.5, speed))
+    try:
+        tts_model, tts_style = _resolve_tts_direction(services, payload, provider)
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
 
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
@@ -599,6 +718,11 @@ def _stage1_tts_phrase(services: ModuleType):
             file_name=payload.get("file_name"),
             dry_run=bool(payload.get("dry_run", False)),
             speed=speed,
+            usage_callback=services._make_openrouter_usage_callback(
+                project, stage="voiceover", operation="tts_phrase"
+            ),
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -698,6 +822,10 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
     def stage1_normalization_job_status():
         return _stage1_normalization_job_status(services)
 
+    @app.get("/stage1/openrouter-usage")
+    def stage1_openrouter_usage():
+        return _stage1_openrouter_usage(services)
+
     @app.post("/stage1/normalization/generate")
     @serialize_project_mutation
     def stage1_normalization_generate():
@@ -761,6 +889,11 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
     @app.post("/stage1/tts-jobs/<job_id>/cancel")
     def stage1_tts_job_cancel(job_id: str):
         return _stage1_tts_job_cancel(services, job_id)
+
+    @app.post("/stage1/tts/clear")
+    @serialize_project_mutation
+    def stage1_tts_clear():
+        return _stage1_tts_clear(services)
 
     @app.post("/stage1/tts-phrase")
     def stage1_tts_phrase():

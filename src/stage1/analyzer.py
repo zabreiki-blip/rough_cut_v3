@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import Settings, get_settings
 from .io_utils import (
@@ -803,6 +803,7 @@ def analyze_script(
     output_path: Path,
     raw_output_path: Path,
     use_llm: bool = True,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -873,10 +874,21 @@ def analyze_script(
 
                 if pending:
                     with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
-                        futures = {
-                            idx: pool.submit(analyze_with_openrouter, settings, chunks[idx])
-                            for idx in pending
-                        }
+                        if usage_callback is None:
+                            futures = {
+                                idx: pool.submit(analyze_with_openrouter, settings, chunks[idx])
+                                for idx in pending
+                            }
+                        else:
+                            futures = {
+                                idx: pool.submit(
+                                    analyze_with_openrouter,
+                                    settings,
+                                    chunks[idx],
+                                    usage_callback,
+                                )
+                                for idx in pending
+                            }
                         # Consume in source order so output and error reporting stay stable.
                         for idx in pending:
                             try:

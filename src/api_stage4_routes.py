@@ -83,6 +83,11 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
                     input_path=input_path,
                     use_llm=bool(payload.get("use_llm", False)),
                     hint=str(payload.get("hint") or ""),
+                    usage_callback=services._make_openrouter_usage_callback(
+                        project,
+                        stage="normalization",
+                        operation="revision_normalize",
+                    ),
                 )
         except RevisionStateConflictError as exc:
             return services._json_error(str(exc), 409)

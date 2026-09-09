@@ -28,6 +28,7 @@
       </a>
     </nav>
     <div class="sidebar-footer">
+      <span id="openrouter_usage" class="openrouter-usage">OpenRouter: $0.0000</span>
       <span class="version">Stage 1</span>
     </div>
   </aside>
@@ -202,10 +203,18 @@
         <div class="summary-stat"><strong id="norm_count_total">0</strong><span>Всего</span></div>
         <div class="summary-stat"><strong id="norm_count_voiceover">0</strong><span>Закадр</span></div>
         <div class="summary-stat"><strong id="norm_count_sync">0</strong><span>Синхрон</span></div>
+        <div class="summary-stat"><strong id="norm_count_life">0</strong><span>Лайф</span></div>
         <div class="summary-stat"><strong id="norm_count_unknown">0</strong><span>Требует проверки</span></div>
       </div>
 
       <div id="normalization_warnings" class="normalization-warnings" hidden></div>
+
+      <div class="normalization-review-nav panel" aria-label="Навигация по проблемным блокам">
+        <button id="btn_norm_issue_prev" class="btn btn-sm" type="button">← Предыдущая проблема</button>
+        <strong id="norm_issue_position">Проблем нет</strong>
+        <button id="btn_norm_issue_next" class="btn btn-sm" type="button">Следующая проблема →</button>
+        <button id="btn_norm_issue_filter" class="btn btn-sm" type="button" aria-pressed="false">Показать только требующие проверки</button>
+      </div>
 
       <div class="normalization-workspace">
         <section class="normalization-editor panel">
@@ -222,14 +231,14 @@
           <div class="memory-create">
             <input id="memory_alias" type="text" placeholder="Например: голос диктора">
             <select id="memory_type" aria-label="Тип обозначения">
-              <option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="technical">Технический</option><option value="other">Прочее</option>
+              <option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="life">Лайф</option><option value="technical">Технический</option><option value="other">Прочее</option>
             </select>
             <button id="btn_add_memory" class="btn btn-sm" type="button">Запомнить</button>
           </div>
           <input id="memory_search" class="memory-search" type="search" placeholder="Поиск обозначения">
           <div class="memory-filters">
             <select id="memory_filter_type" aria-label="Фильтр по типу">
-              <option value="">Все типы</option><option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="technical">Технический</option><option value="other">Прочее</option>
+              <option value="">Все типы</option><option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="life">Лайф</option><option value="technical">Технический</option><option value="other">Прочее</option>
             </select>
             <select id="memory_filter_status" aria-label="Фильтр по статусу">
               <option value="">Все статусы</option><option value="active">Активные</option><option value="candidate">Кандидаты</option><option value="conflict">Конфликты</option><option value="disabled">Отключённые</option>
@@ -323,8 +332,8 @@
           <label class="field">
             <span>TTS Provider</span>
             <select id="provider">
-              <option value="openrouter" {% if defaults.provider == 'openrouter' %}selected{% endif %}>OpenRouter</option>
-              <option value="gemini" {% if defaults.provider == 'gemini' %}selected{% endif %}>Gemini</option>
+              <option value="microsoft/mai-voice-2" {% if defaults.provider == 'openrouter' and defaults.tts_model == 'microsoft/mai-voice-2' %}selected{% endif %}>OpenRouter · MAI-Voice-2</option>
+              <option value="google/gemini-3.1-flash-tts-preview" {% if defaults.provider == 'openrouter' and defaults.tts_model == 'google/gemini-3.1-flash-tts-preview' %}selected{% endif %}>OpenRouter · Gemini 3.1 Flash TTS</option>
               <option value="macos" {% if defaults.provider == 'macos' %}selected{% endif %}>macOS (say)</option>
             </select>
           </label>
@@ -336,6 +345,12 @@
             </select>
           </label>
         </div>
+
+        <label class="field tts-style-field" id="tts_style_field">
+          <span>Интонация / стиль / формат ролика</span>
+          <textarea id="tts_style" maxlength="1000" rows="3" placeholder="Например: детский развлекательный контент — живо, тепло, с улыбкой и короткими выразительными паузами"></textarea>
+          <small id="tts_style_hint">Для Gemini это режиссёрская инструкция; для MAI описание переводится в ближайший Azure-стиль.</small>
+        </label>
 
         <label class="field">
           <span>Override voice (опционально)</span>
@@ -362,6 +377,9 @@
           </button>
           <button id="btn_tts_cancel" class="btn btn-ghost" type="button" hidden>
             Остановить после текущего блока
+          </button>
+          <button id="btn_tts_clear" class="btn danger" type="button" title="Удалить всю текущую озвучку проекта">
+            Очистить всё
           </button>
           <button id="btn_validate" class="btn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
@@ -555,7 +573,7 @@
                 </select>
               </label>
               <label class="sync-timecode-mode">
-                <span>Модель Whisper</span>
+                <span>Модель Whisper (только локально)</span>
                 <select id="sync_whisper_model">
                   <option value="small" selected>Small — быстро</option>
                   <option value="medium">Medium — точнее</option>
@@ -576,6 +594,7 @@
               </button>
             </div>
           </div>
+          <div id="sync_sources_list" class="sync-sources-list" aria-live="polite"></div>
           <p class="section-copy">Small рекомендуется для первого прохода. Medium точнее, но примерно вдвое медленнее. Готовые индексы Whisper и найденные диапазоны сохраняются. Облачный режим распознавания платный и отправляет аудио во внешний сервис.</p>
 
           <div id="sync_job_progress" class="sync-job-progress" hidden aria-live="polite">
