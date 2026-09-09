@@ -630,6 +630,42 @@ def test_negated_scenario_matched_to_non_negated_transcript_needs_review() -> No
     assert result.metadata["semantic_flags"] == ["negation"]
 
 
+def test_repeated_asr_negation_does_not_create_false_semantic_warning() -> None:
+    scenario = "Она многое мне тогда не рассказывала"
+    transcript = "Она многое мне тогда не не рассказывала"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="asr-stutter",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_joined_and_stuttered_neschastlivy_share_negation_meaning() -> None:
+    scenario = "Когда люди несчастливы, они не рожают детей"
+    transcript = "Когда люди не не счастливы, они не рожают детей"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="joined-negation",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
 def test_changed_number_between_scenario_and_transcript_needs_review() -> None:
     scenario = "Завод в этом квартале произвел 150 новых машин для города"
     transcript = "Завод в этом квартале произвел 500 новых машин для города"

@@ -165,11 +165,23 @@ _NEGATION_MARKERS = {
     "никак",
     "нельзя",
 }
+_NEGATED_WORD_PREFIXES = ("несчастлив",)
 
 
 def _count_negations(text: str) -> int:
     tokens = _TOKEN_RE.findall(unicodedata.normalize("NFKC", text).replace("ё", "е").casefold())
-    return sum(1 for token in tokens if token in _NEGATION_MARKERS)
+    # Cloud ASR can stutter a token (``не не рассказывала``). Treat an
+    # immediately repeated negation as one utterance, while preserving real
+    # constructions such as ``не видел и не слышал``.
+    return sum(
+        1
+        for index, token in enumerate(tokens)
+        if (
+            token in _NEGATION_MARKERS
+            and (index == 0 or tokens[index - 1] != token)
+        )
+        or any(token.startswith(prefix) for prefix in _NEGATED_WORD_PREFIXES)
+    )
 
 
 # Cardinal and (within reason) ordinal word forms for Russian numerals. Keys

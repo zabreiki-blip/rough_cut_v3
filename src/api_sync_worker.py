@@ -218,14 +218,15 @@ def run_sync_job(
                         save_word_index(index_path, cached_index)
 
                 if cached_index is not None:
-                    backend_name = str(cached_index.metadata.get("backend") or "").lower()
-                    precision = str(cached_index.metadata.get("timestamp_precision") or "").lower()
-                    if backend_name == "cloud-audio" and precision == "interpolated":
-                        scale = rescale_stretched_word_index(
-                            cached_index, float(source.duration_sec or 0.0)
-                        )
-                        if scale is not None:
-                            save_word_index(index_path, cached_index)
+                    # A word index is always relative to its guide media, so
+                    # it cannot legitimately extend materially past ffprobe
+                    # duration regardless of which backend originally wrote
+                    # it. Repair old cloud caches as well as imported indexes.
+                    scale = rescale_stretched_word_index(
+                        cached_index, float(source.duration_sec or 0.0)
+                    )
+                    if scale is not None:
+                        save_word_index(index_path, cached_index)
 
                 cache_matches_audio = bool(
                     cached_index is not None

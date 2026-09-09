@@ -440,6 +440,25 @@ class NormalizerTests(unittest.TestCase):
                 self.assertEqual(block["role"], "")
                 self.assertEqual(block["source_description"], description)
 
+    def test_song_playback_and_clip_transition_are_life_not_sync(self) -> None:
+        cases = (
+            "(звучит песня в компе:)49.45 полчаса до полета, время есть у пилота",
+            "СКЛ и переход на клип Пилот на припев:01.32 От винта полетели",
+        )
+        for original in cases:
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "scenario.txt"
+                source.write_text(original, encoding="utf-8")
+                block = generate_normalization(
+                    source, root / "out.json",
+                    memory_path=root / "memory.sqlite3", use_llm=False,
+                )["blocks"][0]
+
+                self.assertEqual(block["type"], "life")
+                self.assertEqual(block["text_for_tts"], "")
+                self.assertEqual(block["speaker"], "")
+
     def test_explicit_snh_preserves_speech_before_inline_timecodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

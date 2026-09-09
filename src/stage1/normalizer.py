@@ -132,6 +132,10 @@ _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"{_TIMECODE_TOKEN}",
     re.DOTALL,
 )
+_PLAYBACK_LIFE_CUE = re.compile(
+    r"(?:\bзвучит\s+песня\b|\bпереход\s+на\s+клип\b|\bклип\b.{0,60}\bна\s+припев\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _VOICEOVER_ZK_PREFIX = re.compile(
     r"^\s*(?P<label>з\s*\.?\s*[кК]\.?)"
     r"(?:(?=\s)|(?<=\.)(?=[А-ЯЁA-Z«(])|\s*[:\-–—]\s*|$)"
@@ -1339,6 +1343,7 @@ def _classify_by_rules(
     video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
 ) -> None:
     marker = normalize_marker(block.original_label)
+    stripped = block.original_text.strip()
     if marker:
         exact = memory.resolve_exact(marker)
         if exact and exact.get("conflict"):
@@ -1350,6 +1355,9 @@ def _classify_by_rules(
                 _apply_type(block, rule["target_type"], DecisionSource.MEMORY.value, 1.0)
                 block.memory_rule_id = int(rule["id"])
                 return
+        if marker not in _BUILTIN_MARKERS and _PLAYBACK_LIFE_CUE.search(stripped):
+            _apply_type(block, BlockType.LIFE.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+            return
         if marker in _BUILTIN_MARKERS:
             _apply_type(block, _BUILTIN_MARKERS[marker], DecisionSource.BUILTIN_RULE.value, 1.0)
             return
@@ -1370,7 +1378,9 @@ def _classify_by_rules(
             block.warnings.append(
                 f"Possible learned alias '{block.suggested_label}' ({suggestion['score']:.0%})"
             )
-    stripped = block.original_text.strip()
+    if not marker and _PLAYBACK_LIFE_CUE.search(stripped):
+        _apply_type(block, BlockType.LIFE.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+        return
     _label, content = _split_label(block.original_text)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
     if _EXPLICIT_SYNC_LABEL.match(block.original_label):
