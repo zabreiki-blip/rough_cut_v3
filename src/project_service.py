@@ -55,6 +55,7 @@ def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
         "final_review_iterations": work / "final_review_iterations.json",
         "normalization_job_status": work / "normalization_job_status.json",
         "tts_job_status": work / "tts_job_status.json",
+        "openrouter_usage": work / "openrouter_usage.json",
         "active_voiceover_manifest": work / "voiceover_manifest.json",
         "sync_audio": work / "sync_audio",
         "sync_transcripts": work / "transcripts",

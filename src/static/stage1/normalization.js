@@ -7,6 +7,7 @@ import {
   blockTypeLabels, sourceLabels, setStepState, updateActionAvailability,
   assertRequiredPath, safely,
 } from "./core.js";
+import { renderOpenRouterUsage } from "./usage.js";
 
 let memoryRules = [];
 let normalizationEditGeneration = 0;
@@ -514,6 +515,7 @@ async function deleteMemoryRule(ruleId) {
 }
 
 export function applyStatus(status) {
+  renderOpenRouterUsage(status.openrouter_usage || {});
   const prepared = Number(status.prepared_items_count || 0);
   const wav = Number(status.speaker_files_count || 0);
   const missing = Array.isArray(status.missing_ids) ? status.missing_ids.length : 0;

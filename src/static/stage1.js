@@ -10,6 +10,7 @@ import { renderLive, restoreTtsJob } from "./stage1/tts.js";
 import { loadSyncWorkspace } from "./stage1/sync.js";
 import { scanStage3MediaOnce } from "./stage1/stage3.js";
 import { loadRevisionsScreen } from "./stage1/revisions.js";
+import { startOpenRouterUsagePolling } from "./stage1/usage.js";
 
 document.querySelectorAll(".workspace-tab").forEach((tab) => {
   tab.addEventListener("click", () => {
@@ -39,6 +40,7 @@ ids.dry_run.checked = false;
 ids.provider.value = defaults.provider || "openrouter";
 ids.gender.value = defaults.gender || "female";
 applyStatus(initialStatus);
+startOpenRouterUsagePolling();
 renderLive();
 appendLog(`UI ready. project=${project}`);
 loadReadiness().catch((err) => appendLog(`Readiness init: ${err.message || err}`, "warn"));

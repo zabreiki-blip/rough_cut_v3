@@ -48,6 +48,7 @@ class OpenRouterTtsTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.closed = False
                 self.content = b"\\x01\\x02" * 24
+                self.headers = {"X-Generation-Id": "gen-voice-1"}
 
             def close(self) -> None:
                 self.closed = True
@@ -61,10 +62,13 @@ class OpenRouterTtsTests(unittest.TestCase):
             openrouter_tts_sample_rate=24000,
         )
 
+        usage: list[dict] = []
         with patch.dict(sys.modules, {"requests": requests_module}):
-            wav = _synthesize_openrouter_wav("text", settings, "voice")
+            wav = _synthesize_openrouter_wav("text", settings, "voice", usage.append)
 
         self.assertTrue(response.closed)
+        self.assertEqual(usage[0]["generation_id"], "gen-voice-1")
+        self.assertTrue(usage[0]["pending"])
         self.assertTrue(wav.startswith(b"RIFF"))
 
     def test_dry_run_never_populates_production_cache(self) -> None:

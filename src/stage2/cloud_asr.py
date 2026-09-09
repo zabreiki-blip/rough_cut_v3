@@ -1528,4 +1528,5 @@ def transcribe_cloud(
         "backend": result.backend,
         "duration_sec": result.duration_sec,
         "cost_usd": result.cost_usd,
+        "base_url": str(result.params.get("base_url") or ""),
     }

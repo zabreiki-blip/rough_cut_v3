@@ -240,7 +240,12 @@ def _write_meta_fingerprint(wav_path: Path, fingerprint: str) -> None:
     )
 
 
-def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
+def _synthesize_openrouter_wav(
+    text: str,
+    settings,
+    voice: str,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> bytes:
     """Synthesize through OpenRouter's dedicated OpenAI-compatible TTS endpoint."""
     try:
         import requests
@@ -278,6 +283,17 @@ def _synthesize_openrouter_wav(text: str, settings, voice: str) -> bytes:
             raise error
 
         audio_bytes = response.content
+        response_headers = getattr(response, "headers", {})
+        generation_id = str(response_headers.get("X-Generation-Id") or "").strip()
+        if usage_callback is not None and generation_id:
+            usage_callback(
+                {
+                    "generation_id": generation_id,
+                    "model": settings.openrouter_tts_model,
+                    "pending": True,
+                    "base_url": settings.openrouter_base_url,
+                }
+            )
     finally:
         response.close()
 
@@ -510,9 +526,17 @@ def _build_tts_client(provider: str, settings):
     return client, types
 
 
-def _synthesize_wav_bytes(provider: str, text: str, settings, voice: str, client, types) -> bytes:
+def _synthesize_wav_bytes(
+    provider: str,
+    text: str,
+    settings,
+    voice: str,
+    client,
+    types,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> bytes:
     if provider == "openrouter":
-        return _synthesize_openrouter_wav(text, settings, voice)
+        return _synthesize_openrouter_wav(text, settings, voice, usage_callback)
     if provider == "macos":
         if shutil.which("say") is None:
             return _synthesize_macos_connector_wav(text, settings, voice)
@@ -749,6 +773,7 @@ def _synthesize_with_retry(
     voice: str,
     speed: float,
     cancel_check: Callable[[], bool] | None,
+    usage_callback: Callable[[dict[str, Any]], None] | None,
 ) -> tuple[bytes | None, int, list[str], Exception | None]:
     attempts = 0
     retry_errors: list[str] = []
@@ -760,7 +785,13 @@ def _synthesize_with_retry(
             # bounded task its own client; HTTP providers do not create one.
             worker_client, worker_types = _build_tts_client(provider, settings)
             wav_bytes = _synthesize_wav_bytes(
-                provider, text, settings, voice, worker_client, worker_types
+                provider,
+                text,
+                settings,
+                voice,
+                worker_client,
+                worker_types,
+                usage_callback,
             )
             _raise_if_cancelled(cancel_check)
             return _apply_tempo(wav_bytes, speed), attempts, retry_errors, None
@@ -849,6 +880,7 @@ def synthesize_tts(
     progress_callback: Callable[[dict], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     speed: float = 1.0,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     payload = read_json(prepared_path)
     items = payload.get("items", [])
@@ -921,6 +953,7 @@ def synthesize_tts(
                     voice,
                     speed,
                     cancel_check,
+                    usage_callback,
                 )
                 for index, _, _, text, _, _, _, _ in pending
             }
@@ -1035,6 +1068,7 @@ def synthesize_phrase(
     file_name: str | None = None,
     dry_run: bool = False,
     speed: float = 1.0,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     phrase = (text or "").strip()
     if not phrase:
@@ -1091,7 +1125,9 @@ def synthesize_phrase(
     while True:
         attempts += 1
         try:
-            wav_bytes = _synthesize_wav_bytes(provider, phrase, settings, voice, client, types)
+            wav_bytes = _synthesize_wav_bytes(
+                provider, phrase, settings, voice, client, types, usage_callback
+            )
             wav_bytes = _apply_tempo(wav_bytes, speed)
             _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)
             break

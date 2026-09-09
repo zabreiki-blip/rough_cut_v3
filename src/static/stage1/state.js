@@ -11,6 +11,7 @@ export const ids = {
   readiness_panel: el("readiness_panel"),
   readiness_summary_badge: el("readiness_summary_badge"),
   readiness_list: el("readiness_list"),
+  openrouter_usage: el("openrouter_usage"),
   input_path: el("input_path"),
   prepared_path: el("prepared_path"),
   raw_output_path: el("raw_output_path"),

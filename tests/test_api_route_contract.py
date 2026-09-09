@@ -46,6 +46,7 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage1/normalization/memory": {"GET", "POST"},
         "/stage1/normalization/memory/<int:rule_id>": {"DELETE", "PATCH"},
         "/stage1/normalization/reset": {"POST"},
+        "/stage1/openrouter-usage": {"GET"},
         "/stage1/status": {"GET"},
         "/stage1/tts": {"POST"},
         "/stage1/tts/clear": {"POST"},
@@ -159,6 +160,11 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
     assert status_payload["ok"] is True
     assert status_payload["result"]["project"] == "demo"
     assert set(status_payload) == {"ok", "result"}
+    assert status_payload["result"]["openrouter_usage"]["total_cost_usd"] == 0.0
+
+    usage = client.get("/stage1/openrouter-usage?project=demo")
+    assert usage.status_code == 200
+    assert usage.get_json()["result"]["pending_count"] == 0
 
     sources = client.get("/stage2/sync-sources?project=demo")
     assert sources.status_code == 200

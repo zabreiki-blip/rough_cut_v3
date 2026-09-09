@@ -296,6 +296,13 @@ def run_tts_job(
             progress_callback=progress_callback,
             cancel_check=(cancel_event.is_set if cancel_event is not None else None),
             speed=speed,
+            usage_callback=services._make_openrouter_usage_callback(
+                project,
+                stage="voiceover",
+                operation="tts",
+                job_id=job_id,
+                revision_id=tts_revision_id,
+            ),
         )
         services._save_voiceover_revision_assets(project, result)
         total = int(result.get("items_total") or 0)
@@ -492,6 +499,12 @@ def run_normalization_job(
             use_llm=use_llm,
             hint=hint,
             llm_preset=llm_preset,
+            usage_callback=services._make_openrouter_usage_callback(
+                project,
+                stage="normalization",
+                operation="normalize",
+                job_id=job_id,
+            ),
         )
         services._update_normalization_job(
             job_id,

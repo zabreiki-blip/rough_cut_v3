@@ -98,6 +98,12 @@ def run_sync_job(
     _SYNC_JOBS_LOCK = services._SYNC_JOBS_LOCK
     _SYNC_CANCEL_EVENTS = services._SYNC_CANCEL_EVENTS
     paths = _project_paths(project)
+    asr_usage_callback = services._make_openrouter_usage_callback(
+        project, stage="assembly", operation="sync_asr", job_id=job_id
+    )
+    semantic_usage_callback = services._make_openrouter_usage_callback(
+        project, stage="assembly", operation="sync_llm_review", job_id=job_id
+    )
     source_store, match_store = _sync_stores(paths)
     cancel_event = _sync_cancel_event(job_id)
     progress_persist_lock = threading.Lock()
@@ -306,12 +312,20 @@ def run_sync_job(
                         cancel_event=cancel_event,
                         timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
                     )
+                    result_backend_metadata = result.get("backend_metadata") or {}
+                    if str(result.get("backend") or backend or "") == "cloud-audio":
+                        asr_usage_callback(
+                            {
+                                "event_id": f"sync-asr:{job_id}:{source.id}",
+                                "model": str(result.get("model") or model or ""),
+                                "cost_usd": result_backend_metadata.get("cost_usd"),
+                            }
+                        )
                     transcription_wall_sec = time.monotonic() - transcription_started_at
                     if _audio_cache_signature(audio_path) != input_audio_signature:
                         raise RuntimeError(
                             f"audio guide changed during transcription: {audio_path.name}"
                         )
-                    result_backend_metadata = result.get("backend_metadata") or {}
                     asr_metrics["transcription_wall_sec_total"] += transcription_wall_sec
                     asr_metrics["asr_backend_used"] = str(result.get("backend") or backend or "")
                     asr_metrics["asr_cost_usd_total"] += float(
@@ -336,6 +350,15 @@ def run_sync_job(
                     transcribed += 1
                 indexes.append(index)
             except Exception as exc:
+                failed_cost = getattr(exc, "cost_usd", None)
+                if failed_cost is not None:
+                    asr_usage_callback(
+                        {
+                            "event_id": f"sync-asr:{job_id}:{source.id}",
+                            "model": str(model or ""),
+                            "cost_usd": failed_cost,
+                        }
+                    )
                 if isinstance(exc, WhisperCancelledError) or (
                     cancel_event is not None and cancel_event.is_set()
                 ):
@@ -574,6 +597,7 @@ def run_sync_job(
                             speaker=match.speaker,
                             candidates=semantic_candidates,
                             settings=settings,
+                            usage_callback=semantic_usage_callback,
                         )
                         llm_reviewed += 1
                         if decision is not None:

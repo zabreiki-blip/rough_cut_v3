@@ -206,6 +206,14 @@ def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None
     assert '"интерполированные"' in STAGE1_JS
 
 
+def test_sidebar_reports_cumulative_openrouter_usage() -> None:
+    assert 'id="openrouter_usage"' in PROJECT_HTML
+    usage_js = (ROOT / "src" / "static" / "stage1" / "usage.js").read_text(encoding="utf-8")
+    assert "/stage1/openrouter-usage" in usage_js
+    assert "уточняется" in usage_js
+    assert "toFixed(4)" in usage_js
+
+
 def test_stage1_entry_point_is_loaded_as_module_without_native_confirm() -> None:
     # Regression guard for the U7 ES-module split: the template must load the
     # thin entry point as `type="module"` (so its `import` statements work),

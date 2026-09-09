@@ -35,6 +35,7 @@ from api_stage4_routes import register_stage4_routes
 from api_sync_worker import run_sync_job
 from atomic_io import atomic_write_json
 from job_runtime import JobRegistry, get_job, release_project, reserve_project, update_job
+from openrouter_usage import make_usage_callback, reconcile_pending, usage_summary
 from inbox_service import discover_project_inbox
 from logging_config import configure_logging
 from project_service import (
@@ -314,6 +315,43 @@ def _project_paths(project: str) -> dict[str, Path]:
     return build_project_paths(project, PROJECTS_DIR)
 
 
+def _make_openrouter_usage_callback(
+    project: str,
+    *,
+    stage: str,
+    operation: str,
+    job_id: str = "",
+    revision_id: str = "",
+):
+    paths = _ensure_project(project)
+    settings = get_settings()
+    return make_usage_callback(
+        paths["openrouter_usage"],
+        stage=stage,
+        operation=operation,
+        job_id=job_id,
+        revision_id=revision_id,
+        base_url=settings.openrouter_base_url,
+    )
+
+
+def _openrouter_usage_summary(project: str, *, reconcile: bool = False) -> dict:
+    paths = _ensure_project(project)
+    if reconcile:
+        try:
+            import requests
+
+            settings = get_settings()
+            reconcile_pending(
+                paths["openrouter_usage"],
+                api_key=settings.openrouter_api_key,
+                request_fn=requests.get,
+            )
+        except Exception:
+            app.logger.exception("Could not reconcile OpenRouter TTS usage")
+    return usage_summary(paths["openrouter_usage"])
+
+
 def _save_voiceover_revision_assets(project: str, result: dict) -> dict:
     return save_voiceover_tts_manifest(_ensure_project(project), result)
 
@@ -522,6 +560,7 @@ def _build_status(project: str) -> dict:
             and confirmed_normalization
             and timeline.get("normalization_revision") == confirmed_normalization.get("revision")
         ),
+        "openrouter_usage": _openrouter_usage_summary(project),
     }
 
 
@@ -793,6 +832,7 @@ _expose_registered_views(
     "stage1_normalization_job_start",
     "stage1_normalization_job_get",
     "stage1_normalization_job_status",
+    "stage1_openrouter_usage",
     "stage1_normalization_generate",
     "stage1_normalization_get",
     "stage1_normalization_save",
@@ -1586,6 +1626,9 @@ def _run_final_review_job(
     *, job_id: str, project: str, audio_path: Path, language: str, backend: str | None,
     model: str | None, source_sequence: dict,
 ) -> None:
+    usage_callback = _make_openrouter_usage_callback(
+        project, stage="assembly", operation="final_review_asr", job_id=job_id
+    )
     try:
         paths = _project_paths(project)
         manifest = _read_json_safe(paths["assembly_manifest"])
@@ -1597,6 +1640,15 @@ def _run_final_review_job(
         )
         _update_final_review_job(job_id, status="running", message="Transcribing rendered timeline", started_at=_utc_now_iso())
         result = transcribe_audio(audio_path, backend=backend, model=model, language=language)
+        result_backend_metadata = result.get("backend_metadata") or {}
+        if str(result.get("backend") or backend or "") == "cloud-audio":
+            usage_callback(
+                {
+                    "event_id": f"final-review-asr:{job_id}",
+                    "model": str(result.get("model") or model or ""),
+                    "cost_usd": result_backend_metadata.get("cost_usd"),
+                }
+            )
         validate_assembly_manifest(
             manifest,
             timeline_path=paths["timeline"],
@@ -1619,6 +1671,15 @@ def _run_final_review_job(
         _atomic_write_json_file(paths["final_review_report"], report)
         _update_final_review_job(job_id, status="completed", message="Final review completed", finished_at=_utc_now_iso(), report_path=str(paths["final_review_report"].relative_to(paths["root"])))
     except Exception as exc:
+        failed_cost = getattr(exc, "cost_usd", None)
+        if failed_cost is not None:
+            usage_callback(
+                {
+                    "event_id": f"final-review-asr:{job_id}",
+                    "model": str(model or ""),
+                    "cost_usd": failed_cost,
+                }
+            )
         _update_final_review_job(job_id, status="failed", message="Final review failed", error=str(exc), finished_at=_utc_now_iso())
     finally:
         _release_final_review_project(project)

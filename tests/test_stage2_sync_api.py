@@ -2296,3 +2296,5 @@ def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
     assert job["asr_cost_usd_total"] == pytest.approx(0.02)
     assert job["asr_timestamp_precision"] == "interpolated"
     assert job["transcription_wall_sec_total"] >= 0.0
+    usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
+    assert usage["total_cost_usd"] == pytest.approx(0.02)

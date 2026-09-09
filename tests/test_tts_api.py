@@ -325,6 +325,7 @@ class TtsManifestSyncTests(unittest.TestCase):
             progress_callback,
             cancel_check,
             speed=1.0,
+            usage_callback=None,
         ):
             # Resynthesize zk1 exactly like stage1.gemini_tts does: write the
             # content-addressed asset, materialize the mutable alias and its

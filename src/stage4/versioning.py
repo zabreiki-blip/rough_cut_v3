@@ -802,6 +802,7 @@ def import_revision(
     input_path: Path | None = None,
     use_llm: bool = False,
     hint: str = "",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     baseline = ensure_baseline(project, project_paths)
     integrity = inspect_revision_state(project_paths)
@@ -854,6 +855,7 @@ def import_revision(
         memory_path=memory_path,
         use_llm=use_llm,
         hint=hint,
+        usage_callback=usage_callback,
     )
     parent_normalized = _read_json(storage["scenarios"] / str(parent["normalized_snapshot"]))
     old_blocks = list(parent_normalized.get("blocks", []))

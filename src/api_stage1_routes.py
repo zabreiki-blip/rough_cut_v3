@@ -47,6 +47,9 @@ def _stage1_analyze(services: ModuleType):
             output_path=output_path,
             raw_output_path=raw_output_path,
             use_llm=bool(payload.get("use_llm", True)),
+            usage_callback=services._make_openrouter_usage_callback(
+                project, stage="normalization", operation="legacy_analyze"
+            ),
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -139,6 +142,19 @@ def _stage1_normalization_job_status(services: ModuleType):
     return jsonify({"ok": True, "result": latest or {}})
 
 
+def _stage1_openrouter_usage(services: ModuleType):
+    try:
+        project = services._resolve_project_name(request.args.get("project"))
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
+    return jsonify(
+        {
+            "ok": True,
+            "result": services._openrouter_usage_summary(project, reconcile=True),
+        }
+    )
+
+
 def _stage1_normalization_generate(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -159,6 +175,9 @@ def _stage1_normalization_generate(services: ModuleType):
             use_llm=bool(payload.get("use_llm", True)),
             hint=str(payload.get("hint") or payload.get("author_hint") or ""),
             llm_preset=llm_preset,
+            usage_callback=services._make_openrouter_usage_callback(
+                project, stage="normalization", operation="normalize"
+            ),
         )
     except Exception as exc:
         return services._normalization_exception(exc)
@@ -412,6 +431,14 @@ def _stage1_tts(services: ModuleType):
             voice_name=payload.get("voice_name"),
             gender=gender,
             dry_run=bool(payload.get("dry_run", False)),
+            usage_callback=services._make_openrouter_usage_callback(
+                project,
+                stage="voiceover",
+                operation="tts",
+                revision_id=str(
+                    services._read_json_safe(prepared_path).get("scenario_revision_id") or ""
+                ),
+            ),
         )
         services._save_voiceover_revision_assets(project, result)
     except ValueError as exc:
@@ -661,6 +688,9 @@ def _stage1_tts_phrase(services: ModuleType):
             file_name=payload.get("file_name"),
             dry_run=bool(payload.get("dry_run", False)),
             speed=speed,
+            usage_callback=services._make_openrouter_usage_callback(
+                project, stage="voiceover", operation="tts_phrase"
+            ),
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -759,6 +789,10 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
     @app.get("/stage1/normalization-jobs/status")
     def stage1_normalization_job_status():
         return _stage1_normalization_job_status(services)
+
+    @app.get("/stage1/openrouter-usage")
+    def stage1_openrouter_usage():
+        return _stage1_openrouter_usage(services)
 
     @app.post("/stage1/normalization/generate")
     @serialize_project_mutation

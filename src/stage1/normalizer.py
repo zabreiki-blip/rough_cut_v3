@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from atomic_io import atomic_write_json as _atomic_write_json
 from atomic_io import atomic_write_text as _atomic_write_text
+from openrouter_usage import report_json_usage
 
 from .config import get_settings
 from .io_utils import extract_paragraphs, read_json
@@ -354,6 +355,7 @@ def generate_normalization(
     hint: str = "",
     classifier: LLMClassifier | None = None,
     llm_preset: str = "standard",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     llm_preset = normalize_llm_preset(llm_preset)
     with _path_lock(output_path):
@@ -365,6 +367,7 @@ def generate_normalization(
             hint=hint,
             classifier=classifier,
             llm_preset=llm_preset,
+            usage_callback=usage_callback,
         )
 
 
@@ -377,6 +380,7 @@ def _generate_normalization_unlocked(
     hint: str = "",
     classifier: LLMClassifier | None = None,
     llm_preset: str = "standard",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Create and persist a complete, ordered normalization draft."""
     input_path = Path(input_path)
@@ -445,13 +449,20 @@ def _generate_normalization_unlocked(
         if unresolved and use_llm:
             if classifier is not None:
                 llm = classifier
-            elif llm_preset == "standard":
+            elif llm_preset == "standard" and usage_callback is None:
                 # Keep the legacy call shape: integrations and tests may patch
                 # this classifier with a two-argument callable.
                 llm = _openrouter_classifier
-            else:
+            elif usage_callback is None:
                 llm = lambda batch, author_hint: _openrouter_classifier(
                     batch, author_hint, llm_preset=llm_preset
+                )
+            else:
+                llm = lambda batch, author_hint: _openrouter_classifier(
+                    batch,
+                    author_hint,
+                    llm_preset=llm_preset,
+                    usage_callback=usage_callback,
                 )
             batches = _llm_batches(unresolved)
             payloads = [[_llm_input(block) for block in batch] for batch in batches]
@@ -1932,7 +1943,11 @@ def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
 
 
 def _openrouter_classifier(
-    blocks: list[dict[str, Any]], hint: str, *, llm_preset: str = "standard"
+    blocks: list[dict[str, Any]],
+    hint: str,
+    *,
+    llm_preset: str = "standard",
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     llm_preset = normalize_llm_preset(llm_preset)
     settings = get_settings()
@@ -1980,7 +1995,9 @@ def _openrouter_classifier(
         time.sleep(2**attempt)
     assert response is not None
     response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+    body = response.json()
+    report_json_usage(usage_callback, body, model=settings.openrouter_model)
+    content = body["choices"][0]["message"]["content"]
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
     content = content.strip()
