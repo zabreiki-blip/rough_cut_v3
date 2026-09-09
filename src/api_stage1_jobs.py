@@ -98,6 +98,8 @@ def create_tts_job(
     gender: str | None = None,
     dry_run: bool = False,
     speed: float = 1.0,
+    tts_model: str | None = None,
+    tts_style: str = "",
 ) -> dict:
     job_id = services.uuid.uuid4().hex
     now = services._utc_now_iso()
@@ -122,6 +124,8 @@ def create_tts_job(
         "gender": (gender or "").strip().lower(),
         "dry_run": bool(dry_run),
         "speed": float(speed),
+        "tts_model": (tts_model or "").strip(),
+        "tts_style": (tts_style or "").strip(),
         "resolved_voice": "",
         "error": "",
         "created_at": now,
@@ -185,6 +189,8 @@ def run_tts_job(
     gender: str | None,
     dry_run: bool,
     speed: float = 1.0,
+    tts_model: str | None = None,
+    tts_style: str = "",
 ) -> None:
     cancel_event = services._tts_cancel_event(job_id)
     project_paths = services._project_paths(project)
@@ -282,6 +288,8 @@ def run_tts_job(
             started_at=services._utc_now_iso(),
             provider=(provider or "").strip().lower(),
             dry_run=bool(dry_run),
+            tts_model=(tts_model or "").strip(),
+            tts_style=(tts_style or "").strip(),
             attempts=0,
             retry_count=0,
             last_error="",
@@ -303,6 +311,8 @@ def run_tts_job(
                 job_id=job_id,
                 revision_id=tts_revision_id,
             ),
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
         services._save_voiceover_revision_assets(project, result)
         total = int(result.get("items_total") or 0)
@@ -323,6 +333,8 @@ def run_tts_job(
             last_error="",
             finished_at=services._utc_now_iso(),
             provider=str(result.get("provider", "")),
+            tts_model=str(result.get("model", "")),
+            tts_style=str(result.get("style", "")),
             resolved_voice=str(result.get("voice", "")),
             gender=str(result.get("gender", "")),
             dry_run=bool(result.get("dry_run", False)),

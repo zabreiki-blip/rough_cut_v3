@@ -376,6 +376,7 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
             "speaker_dir": f"projects/{project}/speaker",
             "manifest_path": f"projects/{project}/speaker/manifest.json",
             "provider": settings.tts_provider,
+            "tts_model": settings.openrouter_tts_model,
             "gender": settings.tts_gender,
         }
         return render_template("project.html", defaults=defaults, status=status)

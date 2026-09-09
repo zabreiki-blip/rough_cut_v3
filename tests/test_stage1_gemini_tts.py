@@ -13,7 +13,9 @@ from unittest.mock import patch
 from stage1.gemini_tts import (
     _apply_tempo,
     _is_retryable_tts_error,
+    _synthesis_fingerprint,
     _synthesize_openrouter_wav,
+    _synthesize_with_retry,
     _write_silence_wav,
     synthesize_tts,
 )
@@ -70,6 +72,116 @@ class OpenRouterTtsTests(unittest.TestCase):
         self.assertEqual(usage[0]["generation_id"], "gen-voice-1")
         self.assertTrue(usage[0]["pending"])
         self.assertTrue(wav.startswith(b"RIFF"))
+
+    def test_gemini_model_receives_director_notes_and_selected_model(self) -> None:
+        captured = {}
+
+        class Response:
+            status_code = 200
+            content = b"\\x01\\x02" * 24
+            headers = {}
+
+            def close(self) -> None:
+                pass
+
+        def post(*_args, **kwargs):
+            captured.update(kwargs["json"])
+            return Response()
+
+        settings = SimpleNamespace(
+            openrouter_tts_model="microsoft/mai-voice-2",
+            openrouter_api_key="key",
+            openrouter_base_url="https://example.invalid",
+            openrouter_tts_sample_rate=24000,
+        )
+        with patch.dict(sys.modules, {"requests": SimpleNamespace(post=post)}):
+            _synthesize_openrouter_wav(
+                "Текст ролика",
+                settings,
+                "Aoede",
+                tts_model="google/gemini-3.1-flash-tts-preview",
+                tts_style="Серьёзное документальное кино",
+            )
+
+        self.assertEqual(captured["model"], "google/gemini-3.1-flash-tts-preview")
+        self.assertIn("# DIRECTOR'S NOTES", captured["input"])
+        self.assertIn("Серьёзное документальное кино", captured["input"])
+        self.assertIn("# TRANSCRIPT\nТекст ролика", captured["input"])
+        self.assertIn("Read the TRANSCRIPT aloud verbatim", captured["input"])
+
+    def test_empty_gemini_audio_retries_with_plain_transcript(self) -> None:
+        calls = []
+
+        def synthesize(*_args, **kwargs):
+            calls.append(kwargs.get("tts_style"))
+            if len(calls) == 1:
+                exc = RuntimeError("Provider returned an empty audio stream after returning HTTP 200")
+                exc.status_code = 502  # type: ignore[attr-defined]
+                raise exc
+            return b"wav"
+
+        with (
+            patch("stage1.gemini_tts._synthesize_wav_bytes", side_effect=synthesize),
+            patch("stage1.gemini_tts.time.sleep"),
+        ):
+            audio, attempts, errors, final_error = _synthesize_with_retry(
+                "openrouter",
+                "На экране возникает текст",
+                SimpleNamespace(),
+                "Aoede",
+                1.0,
+                None,
+                None,
+                "google/gemini-3.1-flash-tts-preview",
+                "документальное кино",
+            )
+
+        self.assertEqual(audio, b"wav")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(calls, ["документальное кино", ""])
+        self.assertEqual(len(errors), 1)
+        self.assertIsNone(final_error)
+
+    def test_mai_direction_maps_to_azure_style(self) -> None:
+        captured = {}
+
+        class Response:
+            status_code = 200
+            content = b"\\x01\\x02" * 24
+            headers = {}
+
+            def close(self) -> None:
+                pass
+
+        def post(*_args, **kwargs):
+            captured.update(kwargs["json"])
+            return Response()
+
+        settings = SimpleNamespace(
+            openrouter_tts_model="microsoft/mai-voice-2",
+            openrouter_api_key="key",
+            openrouter_base_url="https://example.invalid",
+            openrouter_tts_sample_rate=24000,
+        )
+        with patch.dict(sys.modules, {"requests": SimpleNamespace(post=post)}):
+            _synthesize_openrouter_wav(
+                "Текст ролика",
+                settings,
+                "ru-RU-Masha:MAI-Voice-2",
+                tts_model="microsoft/mai-voice-2",
+                tts_style="Детский развлекательный контент",
+            )
+
+        azure = captured["provider"]["options"]["azure"]
+        self.assertEqual(azure["style"], "cheerful")
+        self.assertEqual(azure["styledegree"], 1.2)
+        self.assertEqual(captured["input"], "Текст ролика")
+
+    def test_style_is_part_of_tts_cache_fingerprint(self) -> None:
+        common = ("Текст", "openrouter", "Aoede", "female", 1.0)
+        first = _synthesis_fingerprint(*common, model="model", style="детский")
+        second = _synthesis_fingerprint(*common, model="model", style="документальный")
+        self.assertNotEqual(first, second)
 
     def test_dry_run_never_populates_production_cache(self) -> None:
         from stage1 import gemini_tts as tts

@@ -6,6 +6,7 @@ import {
   toast, appendLog, setStepState, formData, assertRequiredPath,
   postJSON, getJSON, isTransientPollingError, pollingBackoffMs,
   optionalRequestJSON, renderEtaCells, updateActionAvailability, confirmDialog, safely,
+  syncTtsStyleAvailability,
 } from "./core.js";
 import { refreshStatus } from "./normalization.js";
 
@@ -91,12 +92,14 @@ async function doTTS() {
     status: "queued", event: "queued",
     current: "—", retries: 0, done: 0, total: 0, error: "",
   });
-  appendLog(`TTS job: provider=${f.provider}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
+  appendLog(`TTS job: provider=${f.provider}, model=${f.tts_model || "local"}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
   const start = await postJSON("/stage1/tts-jobs/start", {
     project,
     prepared_path: f.prepared_path,
     speaker_dir: f.speaker_dir,
     provider: f.provider,
+    tts_model: f.tts_model || null,
+    tts_style: f.tts_style,
     gender: f.gender,
     voice_name: f.voice_name || null,
     dry_run: f.dry_run,
@@ -247,7 +250,15 @@ function restoreTtsControls(state) {
   if (!state || typeof state !== "object") return;
   if (state.prepared_path) ids.prepared_path.value = String(state.prepared_path);
   if (state.speaker_dir) ids.speaker_dir.value = String(state.speaker_dir);
-  if (state.provider) ids.provider.value = String(state.provider);
+  if (state.provider === "macos") {
+    ids.provider.value = "macos";
+  } else if (state.tts_model) {
+    ids.provider.value = String(state.tts_model);
+  }
+  if (Object.prototype.hasOwnProperty.call(state, "tts_style") && ids.tts_style) {
+    ids.tts_style.value = String(state.tts_style || "");
+  }
+  syncTtsStyleAvailability();
   if (state.gender) ids.gender.value = String(state.gender);
   if (Object.prototype.hasOwnProperty.call(state, "voice")) {
     ids.voice_name.value = String(state.voice || "");
@@ -337,12 +348,14 @@ async function doPhraseTTS() {
     ids.phrase_text.focus();
     return;
   }
-  appendLog(`Phrase TTS: provider=${f.provider}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
+  appendLog(`Phrase TTS: provider=${f.provider}, model=${f.tts_model || "local"}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
   const result = await postJSON("/stage1/tts-phrase", {
     project,
     text: phrase,
     speaker_dir: f.speaker_dir,
     provider: f.provider,
+    tts_model: f.tts_model || null,
+    tts_style: f.tts_style,
     gender: f.gender,
     voice_name: f.voice_name || null,
     file_name: f.phrase_file_name || null,
@@ -417,6 +430,7 @@ export async function doBuildTimeline() {
 
 if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
 ids.btn_tts.addEventListener("click", () => safely(doTTS));
+ids.provider.addEventListener("change", syncTtsStyleAvailability);
 if (ids.btn_tts_cancel) ids.btn_tts_cancel.addEventListener("click", cancelTTSJob);
 if (ids.btn_tts_clear) ids.btn_tts_clear.addEventListener("click", () => safely(clearTTS));
 ids.btn_phrase_tts.addEventListener("click", () => safely(doPhraseTTS));

@@ -123,13 +123,17 @@ export function updateActionAvailability() {
 }
 
 export function formData() {
+  const ttsSelection = ids.provider.value.trim();
+  const isOpenRouter = ttsSelection !== "macos";
   return {
     input_path: ids.input_path.value.trim(),
     prepared_path: ids.prepared_path.value.trim(),
     raw_output_path: ids.raw_output_path.value.trim(),
     speaker_dir: ids.speaker_dir.value.trim(),
     manifest_path: ids.manifest_path.value.trim(),
-    provider: ids.provider.value.trim(),
+    provider: isOpenRouter ? "openrouter" : "macos",
+    tts_model: isOpenRouter ? ttsSelection : "",
+    tts_style: ids.tts_style && isOpenRouter ? ids.tts_style.value.trim() : "",
     gender: ids.gender.value.trim(),
     voice_name: ids.voice_name.value.trim(),
     phrase_text: ids.phrase_text.value,
@@ -138,6 +142,21 @@ export function formData() {
     dry_run: ids.dry_run.checked,
     speed: parseFloat(ids.speed.value),
   };
+}
+
+export function syncTtsStyleAvailability() {
+  if (!ids.provider || !ids.tts_style) return;
+  const enabled = ids.provider.value !== "macos";
+  ids.tts_style.disabled = !enabled;
+  if (ids.tts_style_field) ids.tts_style_field.classList.toggle("is-disabled", !enabled);
+  if (ids.tts_style_hint) {
+    const isMai = ids.provider.value === "microsoft/mai-voice-2";
+    ids.tts_style_hint.textContent = !enabled
+      ? "Локальный macOS TTS не поддерживает режиссёрские инструкции."
+      : isMai
+        ? "MAI переводит описание в ближайший Azure-стиль; можно явно указать style:cheerful."
+        : "Gemini получает описание как режиссёрскую инструкцию к каждому блоку."
+  }
 }
 
 export function isLikelySafePath(pathValue) {

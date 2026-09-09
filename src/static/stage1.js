@@ -3,7 +3,7 @@
 // cross-cutting initialization that touches more than one domain.
 
 import { ids, project, defaults, initialStatus } from "./stage1/state.js";
-import { appendLog, openTab, safely } from "./stage1/core.js";
+import { appendLog, openTab, safely, syncTtsStyleAvailability } from "./stage1/core.js";
 import { applyStatus, loadNormalization, loadMemory, hasUnsavedChanges, refreshStatus } from "./stage1/normalization.js";
 import { loadReadiness } from "./stage1/readiness.js";
 import { renderLive, restoreTtsJob } from "./stage1/tts.js";
@@ -37,7 +37,11 @@ ids.btn_clear_log.addEventListener("click", () => {
 
 if (ids.use_llm) ids.use_llm.checked = false;
 ids.dry_run.checked = false;
-ids.provider.value = defaults.provider || "openrouter";
+ids.provider.value = defaults.provider === "macos"
+  ? "macos"
+  : (defaults.tts_model || "microsoft/mai-voice-2");
+if (!ids.provider.value) ids.provider.value = "microsoft/mai-voice-2";
+syncTtsStyleAvailability();
 ids.gender.value = defaults.gender || "female";
 applyStatus(initialStatus);
 startOpenRouterUsagePolling();

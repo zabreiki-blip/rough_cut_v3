@@ -8,6 +8,18 @@ from flask import Flask, jsonify, request
 from stage1.normalizer import invalidate_video_cue_seed_cache
 
 
+def _resolve_tts_direction(services: ModuleType, payload: dict, provider: str | None):
+    settings = services.get_settings()
+    effective_provider = str(provider or settings.tts_provider or "openrouter").strip().lower()
+    style = services.normalize_tts_style(payload.get("tts_style"))
+    model = None
+    if effective_provider == "openrouter":
+        model = services.normalize_openrouter_tts_model(
+            payload.get("tts_model"), settings.openrouter_tts_model
+        )
+    return model, style
+
+
 def _stage1_analyze(services: ModuleType):
     payload = request.get_json(silent=True) or {}
 
@@ -416,6 +428,10 @@ def _stage1_tts(services: ModuleType):
     gender = payload.get("gender")
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return services._json_error("gender must be 'female' or 'male'", 400)
+    try:
+        tts_model, tts_style = _resolve_tts_direction(services, payload, provider)
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
 
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
@@ -439,6 +455,8 @@ def _stage1_tts(services: ModuleType):
                     services._read_json_safe(prepared_path).get("scenario_revision_id") or ""
                 ),
             ),
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
         services._save_voiceover_revision_assets(project, result)
     except ValueError as exc:
@@ -484,6 +502,10 @@ def _stage1_tts_job_start(services: ModuleType):
     except (TypeError, ValueError):
         return services._json_error("speed must be a number between 0.5 and 1.5", 400)
     speed = max(0.5, min(1.5, speed))
+    try:
+        tts_model, tts_style = _resolve_tts_direction(services, payload, provider)
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
 
     try:
         prepared_path = services._confirmed_prepared_path(payload, paths)
@@ -505,6 +527,8 @@ def _stage1_tts_job_start(services: ModuleType):
             gender=gender,
             dry_run=bool(payload.get("dry_run", False)),
             speed=speed,
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
         worker = services.threading.Thread(
             target=services._run_tts_job,
@@ -518,6 +542,8 @@ def _stage1_tts_job_start(services: ModuleType):
                 "gender": gender,
                 "dry_run": bool(payload.get("dry_run", False)),
                 "speed": speed,
+                "tts_model": tts_model,
+                "tts_style": tts_style,
             },
             daemon=True,
         )
@@ -672,6 +698,10 @@ def _stage1_tts_phrase(services: ModuleType):
     except (TypeError, ValueError):
         return services._json_error("speed must be a number between 0.5 and 1.5", 400)
     speed = max(0.5, min(1.5, speed))
+    try:
+        tts_model, tts_style = _resolve_tts_direction(services, payload, provider)
+    except ValueError as exc:
+        return services._json_error(str(exc), 400)
 
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
@@ -691,6 +721,8 @@ def _stage1_tts_phrase(services: ModuleType):
             usage_callback=services._make_openrouter_usage_callback(
                 project, stage="voiceover", operation="tts_phrase"
             ),
+            tts_model=tts_model,
+            tts_style=tts_style,
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)

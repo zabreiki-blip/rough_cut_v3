@@ -55,7 +55,13 @@ from project_service import (
 # ``api``, so they are intentionally retained without direct local references.
 from stage1.analyzer import analyze_script
 from stage1.config import get_settings, validate_env
-from stage1.gemini_tts import TtsCancelledError, synthesize_phrase, synthesize_tts
+from stage1.gemini_tts import (
+    TtsCancelledError,
+    normalize_openrouter_tts_model,
+    normalize_tts_style,
+    synthesize_phrase,
+    synthesize_tts,
+)
 from stage1.normalizer import (
     NormalizationMemory,
     NormalizationError,
@@ -619,6 +625,8 @@ def _create_tts_job(
     gender: str | None = None,
     dry_run: bool = False,
     speed: float = 1.0,
+    tts_model: str | None = None,
+    tts_style: str = "",
 ) -> dict:
     return stage1_jobs.create_tts_job(
         _stage1_job_services(),
@@ -630,6 +638,8 @@ def _create_tts_job(
         gender=gender,
         dry_run=dry_run,
         speed=speed,
+        tts_model=tts_model,
+        tts_style=tts_style,
     )
 
 
@@ -666,6 +676,8 @@ def _run_tts_job(
     gender: str | None,
     dry_run: bool,
     speed: float = 1.0,
+    tts_model: str | None = None,
+    tts_style: str = "",
 ) -> None:
     stage1_jobs.run_tts_job(
         _stage1_job_services(),
@@ -678,6 +690,8 @@ def _run_tts_job(
         gender=gender,
         dry_run=dry_run,
         speed=speed,
+        tts_model=tts_model,
+        tts_style=tts_style,
     )
 
 

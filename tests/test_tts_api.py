@@ -159,8 +159,10 @@ class TtsCoordinationTests(unittest.TestCase):
             "project": "demo",
             "prepared_path": str(prepared),
             "speaker_dir": str(speaker),
-            "provider": "gemini",
-            "voice_name": "Kore",
+            "provider": "openrouter",
+            "tts_model": "google/gemini-3.1-flash-tts-preview",
+            "tts_style": "Серьёзное документальное кино",
+            "voice_name": "Aoede",
             "gender": "female",
             "dry_run": True,
             "speed": 1.25,
@@ -180,8 +182,10 @@ class TtsCoordinationTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job["prepared_path"], str(prepared))
         self.assertEqual(job["speaker_dir"], str(speaker))
-        self.assertEqual(job["provider"], "gemini")
-        self.assertEqual(job["voice"], "Kore")
+        self.assertEqual(job["provider"], "openrouter")
+        self.assertEqual(job["tts_model"], "google/gemini-3.1-flash-tts-preview")
+        self.assertEqual(job["tts_style"], "Серьёзное документальное кино")
+        self.assertEqual(job["voice"], "Aoede")
         self.assertEqual(job["gender"], "female")
         self.assertTrue(job["dry_run"])
         self.assertEqual(job["speed"], 1.25)
@@ -326,6 +330,8 @@ class TtsManifestSyncTests(unittest.TestCase):
             cancel_check,
             speed=1.0,
             usage_callback=None,
+            tts_model=None,
+            tts_style="",
         ):
             # Resynthesize zk1 exactly like stage1.gemini_tts does: write the
             # content-addressed asset, materialize the mutable alias and its

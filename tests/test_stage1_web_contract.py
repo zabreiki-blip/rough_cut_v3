@@ -18,11 +18,24 @@ def test_restored_tts_job_rehydrates_every_resume_control() -> None:
     assert "state.prepared_path" in STAGE1_JS
     assert "state.speaker_dir" in STAGE1_JS
     assert "state.provider" in STAGE1_JS
+    assert "state.tts_model" in STAGE1_JS
+    assert "state.tts_style" in STAGE1_JS
     assert "state.voice" in STAGE1_JS
     assert "state.gender" in STAGE1_JS
     assert 'hasOwnProperty.call(state, "dry_run")' in STAGE1_JS
     assert "Number(state.speed)" in STAGE1_JS
     assert "restoreTtsControls(response.result);" in STAGE1_JS
+
+
+def test_tts_menu_uses_openrouter_models_and_style_direction() -> None:
+    assert '<option value="gemini"' not in PROJECT_HTML
+    assert "OpenRouter · MAI-Voice-2" in PROJECT_HTML
+    assert "Gemini 2.5 Flash TTS" not in PROJECT_HTML
+    assert "OpenRouter · Gemini 3.1 Flash TTS" in PROJECT_HTML
+    assert 'id="tts_style"' in PROJECT_HTML
+    assert "tts_model: f.tts_model || null" in STAGE1_JS
+    assert "tts_style: f.tts_style" in STAGE1_JS
+    assert 'ids.provider.addEventListener("change", syncTtsStyleAvailability)' in STAGE1_JS
 
 
 def test_voiceover_can_be_cleared_with_explicit_confirmation() -> None:

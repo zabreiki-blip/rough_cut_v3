@@ -332,8 +332,8 @@
           <label class="field">
             <span>TTS Provider</span>
             <select id="provider">
-              <option value="openrouter" {% if defaults.provider == 'openrouter' %}selected{% endif %}>OpenRouter</option>
-              <option value="gemini" {% if defaults.provider == 'gemini' %}selected{% endif %}>Gemini</option>
+              <option value="microsoft/mai-voice-2" {% if defaults.provider == 'openrouter' and defaults.tts_model == 'microsoft/mai-voice-2' %}selected{% endif %}>OpenRouter · MAI-Voice-2</option>
+              <option value="google/gemini-3.1-flash-tts-preview" {% if defaults.provider == 'openrouter' and defaults.tts_model == 'google/gemini-3.1-flash-tts-preview' %}selected{% endif %}>OpenRouter · Gemini 3.1 Flash TTS</option>
               <option value="macos" {% if defaults.provider == 'macos' %}selected{% endif %}>macOS (say)</option>
             </select>
           </label>
@@ -345,6 +345,12 @@
             </select>
           </label>
         </div>
+
+        <label class="field tts-style-field" id="tts_style_field">
+          <span>Интонация / стиль / формат ролика</span>
+          <textarea id="tts_style" maxlength="1000" rows="3" placeholder="Например: детский развлекательный контент — живо, тепло, с улыбкой и короткими выразительными паузами"></textarea>
+          <small id="tts_style_hint">Для Gemini это режиссёрская инструкция; для MAI описание переводится в ближайший Azure-стиль.</small>
+        </label>
 
         <label class="field">
           <span>Override voice (опционально)</span>
