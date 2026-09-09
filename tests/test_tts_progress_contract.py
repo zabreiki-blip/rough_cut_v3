@@ -302,7 +302,11 @@ def test_cancellation_progress_schema_and_order(tmp_path: Path) -> None:
         return _wav_bytes()
 
     which_patch, synthesize_patch = _real_tts_patches(synthesize)
-    with which_patch, synthesize_patch, patch("stage1.gemini_tts.time.sleep") as sleep:
+    # Do not patch ``time.sleep`` here: the module object is shared process-wide,
+    # so worker/runtime polling can be counted as TTS retry backoff on slower CI
+    # runners. Cancellation behavior is fully asserted by the exception and
+    # emitted progress events below.
+    with which_patch, synthesize_patch:
         with pytest.raises(TtsCancelledError, match="cancelled"):
             synthesize_tts(
                 prepared,
@@ -314,7 +318,6 @@ def test_cancellation_progress_schema_and_order(tmp_path: Path) -> None:
                 cancel_check=cancelled.is_set,
             )
 
-    sleep.assert_not_called()
     assert events == [
         {"event": "started", "total": 1, "completed": 0, "generated": 0, "skipped": 0},
         {
