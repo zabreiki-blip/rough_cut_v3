@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import TypedDict
 
+from api_service_contracts import SyncWorkerServices
+
 
 def _parse_iso_datetime(value: object) -> datetime | None:
     """Parse an ISO-8601 timestamp, tolerating a bare ``Z`` suffix.
@@ -42,7 +44,7 @@ class _AsrMetrics(TypedDict):
 
 
 def run_sync_job(
-    services,
+    services: SyncWorkerServices,
     *,
     job_id: str,
     project: str,
@@ -216,7 +218,8 @@ def run_sync_job(
                         cache_metadata.get("audio") if isinstance(cache_metadata, dict) else None
                     )
                     if (
-                        isinstance(stored_audio, dict)
+                        isinstance(cache_metadata, dict)
+                        and isinstance(stored_audio, dict)
                         and not stored_audio.get("sample_sha256")
                         and stored_audio == _audio_stat_signature(audio_path)
                     ):

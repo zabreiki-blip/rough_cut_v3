@@ -278,19 +278,21 @@ def test_scan_api_keeps_legacy_source_when_inbox_media_is_added(client) -> None:
             "directory": directory,
             "relative_directory": relative,
             "recursive": False,
-            "sources": [{
-                "source_id": source_id,
-                "fingerprint": source_id,
-                "name": f"{source_id}.wav",
-                "relative_path": f"{relative}/{source_id}.wav",
-                "container_path": f"/tmp/{source_id}.wav",
-                "duration_sec": 1.0,
-                "fps": None,
-                "width": None,
-                "height": None,
-                "media_kind": "audio",
-                "has_audio": True,
-            }],
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "fingerprint": source_id,
+                    "name": f"{source_id}.wav",
+                    "relative_path": f"{relative}/{source_id}.wav",
+                    "container_path": f"/tmp/{source_id}.wav",
+                    "duration_sec": 1.0,
+                    "fps": None,
+                    "width": None,
+                    "height": None,
+                    "media_kind": "audio",
+                    "has_audio": True,
+                }
+            ],
         }
 
     monkeypatch.setattr(api_stage3_routes, "scan_media_directory", fake_scan)

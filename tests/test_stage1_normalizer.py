@@ -430,8 +430,10 @@ class NormalizerTests(unittest.TestCase):
                 source = root / "scenario.txt"
                 source.write_text(original, encoding="utf-8")
                 block = generate_normalization(
-                    source, root / "out.json",
-                    memory_path=root / "memory.sqlite3", use_llm=False,
+                    source,
+                    root / "out.json",
+                    memory_path=root / "memory.sqlite3",
+                    use_llm=False,
                 )["blocks"][0]
                 self.assertEqual(block["type"], "life")
                 self.assertEqual(block["original_label"].casefold(), "лайф")
@@ -451,8 +453,10 @@ class NormalizerTests(unittest.TestCase):
                 source = root / "scenario.txt"
                 source.write_text(original, encoding="utf-8")
                 block = generate_normalization(
-                    source, root / "out.json",
-                    memory_path=root / "memory.sqlite3", use_llm=False,
+                    source,
+                    root / "out.json",
+                    memory_path=root / "memory.sqlite3",
+                    use_llm=False,
                 )["blocks"][0]
 
                 self.assertEqual(block["type"], "life")
@@ -471,8 +475,10 @@ class NormalizerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             block = generate_normalization(
-                source, root / "out.json",
-                memory_path=root / "memory.sqlite3", use_llm=False,
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                use_llm=False,
             )["blocks"][0]
             self.assertEqual(block["type"], "sync")
             self.assertEqual(block["speaker"], "Харута")
@@ -497,8 +503,10 @@ class NormalizerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             block = generate_normalization(
-                source, root / "out.json",
-                memory_path=root / "memory.sqlite3", use_llm=False,
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                use_llm=False,
             )["blocks"][0]
             self.assertEqual(block["type"], "sync")
             self.assertEqual(block["original_label"], "СНХ, отец")
@@ -517,8 +525,10 @@ class NormalizerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             block = generate_normalization(
-                source, root / "out.json",
-                memory_path=root / "memory.sqlite3", use_llm=False,
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                use_llm=False,
             )["blocks"][0]
 
             self.assertEqual(

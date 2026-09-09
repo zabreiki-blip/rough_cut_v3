@@ -185,7 +185,10 @@ matches и таймлайн. Озвучка привязана к стабиль
   - поле «Интонация / стиль / формат ролика» передаёт Gemini режиссёрский prompt,
     а для MAI сопоставляет описание с Azure style; изменение поля инвалидирует TTS-кэш
 - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
-  - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`
+  - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`, `MACOS_CONNECTOR_PORT`;
+    LaunchAgent автоматически задаёт `MACOS_CONNECTOR_ENV_FILE` как путь к
+    отдельному файлу настроек с правами `0600`, поэтому эту переменную не нужно
+    добавлять в проектный `.env`
 - для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper`,
   `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
 - параметры faster-whisper: `SYNC_WHISPER_BEAM_SIZE` и
@@ -203,6 +206,8 @@ matches и таймлайн. Озвучка привязана к стабиль
   модели бесконечно занимать RAM во время долгой открытой сессии Premiere.
 - `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV
   (по умолчанию 4 ГБ), работающий и без `Content-Length`
+- `SYNC_CLOUD_ASR_OVERLAP_SEC` — перекрытие соседних фрагментов облачного ASR
+  в секундах (по умолчанию `60`)
 - `SYNC_LLM_REVIEW_ENABLED=1` включает смысловую проверку блоков с низким
   совпадением; `SYNC_LLM_REVIEW_THRESHOLD` задаёт порог (по умолчанию `0.80`),
   а `SYNC_LLM_REVIEW_MAX_BLOCKS` ограничивает число LLM-проверок за запуск.
@@ -210,6 +215,8 @@ matches и таймлайн. Озвучка привязана к стабиль
   требует ручного подтверждения в браузере
 - `ROUGH_CUT_CEP_CORS=1` — разрешить аутентифицированные запросы только из
   локального Premiere CEP file origin
+- `ROUGH_CUT_HOST_PROJECTS_ROOT` — необязательный путь к корню проектов на
+  host-машине для преобразования контейнерных путей, возвращаемых в CEP
 
 ### macOS Connector (для Docker backend)
 
@@ -478,8 +485,8 @@ docker compose config --quiet
 Каждый тест выполняется с глобальным таймаутом 120 секунд для предотвращения зависаний.
 
 Те же проверки автоматически выполняются в GitHub Actions. Корректностные
-правила Ruff запускаются командой `ruff check src tests`; форматтер доступен
-как `ruff format src tests` и может вводиться постепенно без массового diff.
+правила Ruff запускаются командой `ruff check src tests`, а форматирование
+блокирующе проверяется командой `ruff format --check src tests`.
 
 `requirements-lock.txt` — полная фиксация версий прямых и транзитивных зависимостей (сгенерирован на Python 3.11 через `pip freeze` после установки `requirements-dev.txt` и `requirements-whisper.txt`). Источник истины для версий — `requirements*.txt`; lock-файл используется для воспроизводимости и диагностики, обновляйте его после любых изменений `requirements-*.txt`.
 
@@ -487,7 +494,8 @@ docker compose config --quiet
 
 Установка один раз: `pip install pre-commit && pre-commit install`. Локально
 хуки проверяют только то, что уже обязательно и в CI — `ruff check`,
-`gitleaks` и базовую гигиену файлов (trailing whitespace, EOF, YAML/TOML/JSON).
+`ruff format`, `gitleaks` и базовую гигиену файлов (trailing whitespace, EOF,
+YAML/TOML/JSON).
 `mypy` и `eslint` пока намеренно не входят в pre-commit из-за накопленного
 технического долга, но оба остаются обязательными шагами CI.
 

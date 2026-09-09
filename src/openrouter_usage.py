@@ -174,9 +174,7 @@ def record_usage(
     with _lock_for(path):
         ledger = _load(path, create=False)
         events = ledger["events"]
-        existing = next(
-            (item for item in events if str(item.get("event_id")) == event_id), None
-        )
+        existing = next((item for item in events if str(item.get("event_id")) == event_id), None)
         if existing is not None:
             if cost is not None and existing.get("cost_usd") is None:
                 existing["cost_usd"] = str(cost)

@@ -115,7 +115,9 @@ class OpenRouterTtsTests(unittest.TestCase):
         def synthesize(*_args, **kwargs):
             calls.append(kwargs.get("tts_style"))
             if len(calls) == 1:
-                exc = RuntimeError("Provider returned an empty audio stream after returning HTTP 200")
+                exc = RuntimeError(
+                    "Provider returned an empty audio stream after returning HTTP 200"
+                )
                 exc.status_code = 502  # type: ignore[attr-defined]
                 raise exc
             return b"wav"
@@ -189,7 +191,15 @@ class OpenRouterTtsTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
             settings = SimpleNamespace(gemini_tts_model="model")
-            args = ([("zk1", "versioned-uid", "text")], base, "gemini", "voice", "female", 1.0, settings)
+            args = (
+                [("zk1", "versioned-uid", "text")],
+                base,
+                "gemini",
+                "voice",
+                "female",
+                1.0,
+                settings,
+            )
             dry = tts._plan_tts_items(*args, True, None)
             tts._publish_local_item(dry[0], 1, [], [], None)
             real = tts._plan_tts_items(*args, False, None)

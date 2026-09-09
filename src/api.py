@@ -13,7 +13,7 @@ import re
 import sys
 import threading
 import time
-from typing import BinaryIO
+from typing import BinaryIO, cast
 import uuid
 
 try:
@@ -26,7 +26,14 @@ except ImportError:
 from flask import Flask, jsonify, request
 
 from api_core_routes import register_core_routes
+import api_final_review_jobs as final_review_jobs
 import api_stage1_jobs as stage1_jobs
+from api_service_contracts import (
+    FinalReviewJobServices,
+    NormalizationJobServices,
+    SyncWorkerServices,
+    TtsJobServices,
+)
 from api_stage1_routes import register_stage1_routes
 from api_stage2_routes import register_stage2_routes
 from api_final_review_routes import register_final_review_routes
@@ -587,32 +594,37 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _stage1_job_services():
+def _tts_job_services() -> TtsJobServices:
     """Resolve dependencies at call time so legacy API patches keep working."""
-    return sys.modules[__name__]
+
+    return cast(TtsJobServices, sys.modules[__name__])
+
+
+def _normalization_job_services() -> NormalizationJobServices:
+    return cast(NormalizationJobServices, sys.modules[__name__])
 
 
 def _persist_tts_job(job: dict) -> None:
-    stage1_jobs.persist_tts_job(_stage1_job_services(), job)
+    stage1_jobs.persist_tts_job(_tts_job_services(), job)
 
 
 def _load_persisted_tts_job(project: str) -> dict | None:
-    return stage1_jobs.load_persisted_tts_job(_stage1_job_services(), project)
+    return stage1_jobs.load_persisted_tts_job(_tts_job_services(), project)
 
 
 def _trim_tts_jobs_locked() -> None:
-    stage1_jobs.trim_tts_jobs_locked(_stage1_job_services())
+    stage1_jobs.trim_tts_jobs_locked(_tts_job_services())
 
 
 def _reserve_tts_project(project: str) -> bool:
     with _project_transition_lock(project):
         if _project_has_active_mutation(project):
             return False
-        return stage1_jobs.reserve_tts_project(_stage1_job_services(), project)
+        return stage1_jobs.reserve_tts_project(_tts_job_services(), project)
 
 
 def _release_tts_project(project: str) -> None:
-    stage1_jobs.release_tts_project(_stage1_job_services(), project)
+    stage1_jobs.release_tts_project(_tts_job_services(), project)
 
 
 def _create_tts_job(
@@ -629,7 +641,7 @@ def _create_tts_job(
     tts_style: str = "",
 ) -> dict:
     return stage1_jobs.create_tts_job(
-        _stage1_job_services(),
+        _tts_job_services(),
         project,
         prepared_path=prepared_path,
         speaker_dir=speaker_dir,
@@ -650,7 +662,7 @@ def _update_tts_job(
     **updates,
 ) -> dict | None:
     return stage1_jobs.update_tts_job(
-        _stage1_job_services(),
+        _tts_job_services(),
         job_id,
         persist=persist,
         **updates,
@@ -658,11 +670,11 @@ def _update_tts_job(
 
 
 def _get_tts_job(job_id: str) -> dict | None:
-    return stage1_jobs.get_tts_job(_stage1_job_services(), job_id)
+    return stage1_jobs.get_tts_job(_tts_job_services(), job_id)
 
 
 def _tts_cancel_event(job_id: str) -> threading.Event | None:
-    return stage1_jobs.tts_cancel_event(_stage1_job_services(), job_id)
+    return stage1_jobs.tts_cancel_event(_tts_job_services(), job_id)
 
 
 def _run_tts_job(
@@ -680,7 +692,7 @@ def _run_tts_job(
     tts_style: str = "",
 ) -> None:
     stage1_jobs.run_tts_job(
-        _stage1_job_services(),
+        _tts_job_services(),
         job_id=job_id,
         project=project,
         prepared_path=prepared_path,
@@ -750,7 +762,7 @@ def _normalization_payload_for_save(payload: dict, normalized_path: Path) -> dic
 
 
 def _persist_normalization_job(job: dict) -> None:
-    stage1_jobs.persist_normalization_job(_stage1_job_services(), job)
+    stage1_jobs.persist_normalization_job(_normalization_job_services(), job)
 
 
 def _create_normalization_job(
@@ -762,7 +774,7 @@ def _create_normalization_job(
     llm_preset: str,
 ) -> dict:
     return stage1_jobs.create_normalization_job(
-        _stage1_job_services(),
+        _normalization_job_services(),
         project,
         input_path=input_path,
         use_llm=use_llm,
@@ -773,14 +785,14 @@ def _create_normalization_job(
 
 def _update_normalization_job(job_id: str, **updates) -> dict | None:
     return stage1_jobs.update_normalization_job(
-        _stage1_job_services(),
+        _normalization_job_services(),
         job_id,
         **updates,
     )
 
 
 def _get_normalization_job(job_id: str) -> dict | None:
-    return stage1_jobs.get_normalization_job(_stage1_job_services(), job_id)
+    return stage1_jobs.get_normalization_job(_normalization_job_services(), job_id)
 
 
 def _reserve_normalization_project(project: str) -> bool:
@@ -788,21 +800,21 @@ def _reserve_normalization_project(project: str) -> bool:
         if _project_has_active_mutation(project):
             return False
         return stage1_jobs.reserve_normalization_project(
-            _stage1_job_services(),
+            _normalization_job_services(),
             project,
         )
 
 
 def _release_normalization_project(project: str) -> None:
     stage1_jobs.release_normalization_project(
-        _stage1_job_services(),
+        _normalization_job_services(),
         project,
     )
 
 
 def _load_persisted_normalization_job(project: str) -> dict | None:
     return stage1_jobs.load_persisted_normalization_job(
-        _stage1_job_services(),
+        _normalization_job_services(),
         project,
     )
 
@@ -818,7 +830,7 @@ def _run_normalization_job(
     llm_preset: str,
 ) -> None:
     stage1_jobs.run_normalization_job(
-        _stage1_job_services(),
+        _normalization_job_services(),
         job_id=job_id,
         project=project,
         input_path=input_path,
@@ -978,9 +990,7 @@ def _transcription_config(
         or "<backend-default>"
     )
     cloud_timestamp_mapping = (
-        "2"
-        if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"}
-        else ""
+        "2" if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"} else ""
     )
     return {
         "backend": configured_backend.lower(),
@@ -1180,8 +1190,7 @@ def _matching_speaker(
         candidate = re.sub(r"(?:\s+\d{1,2})+$", "", candidate).strip()
         candidate_tokens = tuple(normalize_text(candidate))
         if source_speakers is None or any(
-            candidate_tokens
-            and set(candidate_tokens).issubset(source_tokens)
+            candidate_tokens and set(candidate_tokens).issubset(source_tokens)
             for source_tokens in source_speakers
         ):
             return candidate
@@ -1555,6 +1564,10 @@ def _sync_cancel_event(job_id: str) -> threading.Event | None:
         return _SYNC_CANCEL_EVENTS.get(job_id)
 
 
+def _sync_worker_services() -> SyncWorkerServices:
+    return cast(SyncWorkerServices, sys.modules[__name__])
+
+
 def _reserve_sync_project(project: str) -> bool:
     with _project_transition_lock(project):
         if _project_has_active_mutation(project):
@@ -1582,7 +1595,7 @@ def _run_sync_job(
     search_window_sec: float,
 ) -> None:
     run_sync_job(
-        sys.modules[__name__],
+        _sync_worker_services(),
         job_id=job_id,
         project=project,
         backend=backend,
@@ -1598,119 +1611,62 @@ def _run_sync_job(
     )
 
 
+def _final_review_job_services() -> FinalReviewJobServices:
+    """Resolve dependencies late while exposing a typed worker boundary."""
+
+    return cast(FinalReviewJobServices, sys.modules[__name__])
+
+
 def _reserve_final_review_project(project: str) -> bool:
-    with _project_transition_lock(project):
-        if _project_has_active_mutation(project):
-            return False
-        return reserve_project(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS, project)
+    return final_review_jobs.reserve_final_review_project(_final_review_job_services(), project)
 
 
 def _release_final_review_project(project: str) -> None:
-    release_project(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS, project)
+    final_review_jobs.release_final_review_project(_final_review_job_services(), project)
 
 
 def _create_final_review_job(project: str, audio_path: Path, payload: dict) -> dict:
-    now = _utc_now_iso()
-    job = {
-        "id": uuid.uuid4().hex, "project": project, "status": "queued", "message": "Queued",
-        "audio_path": str(audio_path.relative_to(_project_paths(project)["root"])),
-        "source_sequence": dict(payload.get("source_sequence") or {}), "created_at": now,
-        "assembly_manifest_id": str(payload.get("assembly_manifest_id") or ""),
-        "started_at": "", "finished_at": "", "error": "", "report_path": "",
-    }
-    job_id = str(job["id"])
-    with _FINAL_REVIEW_JOBS_LOCK:
-        _FINAL_REVIEW_JOBS[job_id] = job
-    _atomic_write_json_file(_project_paths(project)["final_review_job_status"], job)
-    return dict(job)
+    return final_review_jobs.create_final_review_job(
+        _final_review_job_services(), project, audio_path, payload
+    )
 
 
 def _get_final_review_job(job_id: str) -> dict | None:
-    return get_job(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_JOBS, job_id)
+    return final_review_jobs.get_final_review_job(_final_review_job_services(), job_id)
 
 
 def _update_final_review_job(job_id: str, **updates) -> dict | None:
-    snapshot = update_job(_FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_JOBS, job_id, updates)
-    if snapshot:
-        _atomic_write_json_file(_project_paths(snapshot["project"])["final_review_job_status"], snapshot)
-    return snapshot
+    return final_review_jobs.update_final_review_job(
+        _final_review_job_services(), job_id, **updates
+    )
 
 
 def _run_final_review_job(
-    *, job_id: str, project: str, audio_path: Path, language: str, backend: str | None,
-    model: str | None, source_sequence: dict,
+    *,
+    job_id: str,
+    project: str,
+    audio_path: Path,
+    language: str,
+    backend: str | None,
+    model: str | None,
+    source_sequence: dict,
 ) -> None:
-    usage_callback = _make_openrouter_usage_callback(
-        project, stage="assembly", operation="final_review_asr", job_id=job_id
+    final_review_jobs.run_final_review_job(
+        _final_review_job_services(),
+        job_id=job_id,
+        project=project,
+        audio_path=audio_path,
+        language=language,
+        backend=backend,
+        model=model,
+        source_sequence=source_sequence,
     )
-    try:
-        paths = _project_paths(project)
-        manifest = _read_json_safe(paths["assembly_manifest"])
-        validate_assembly_manifest(
-            manifest,
-            timeline_path=paths["timeline"],
-            scenario_path=paths["normalized"],
-            audio_path=audio_path,
-        )
-        _update_final_review_job(job_id, status="running", message="Transcribing rendered timeline", started_at=_utc_now_iso())
-        result = transcribe_audio(audio_path, backend=backend, model=model, language=language)
-        result_backend_metadata = result.get("backend_metadata") or {}
-        if str(result.get("backend") or backend or "") == "cloud-audio":
-            usage_callback(
-                {
-                    "event_id": f"final-review-asr:{job_id}",
-                    "model": str(result.get("model") or model or ""),
-                    "cost_usd": result_backend_metadata.get("cost_usd"),
-                }
-            )
-        validate_assembly_manifest(
-            manifest,
-            timeline_path=paths["timeline"],
-            scenario_path=paths["normalized"],
-            audio_path=audio_path,
-        )
-        index = ingest_word_index(result, "final-render", model=str(result.get("model") or model or ""), language=str(result.get("language") or language))
-        save_word_index(paths["final_review_words"], index)
-        timeline_data = _read_json_safe(paths["work"] / "full_timeline.json")
-        timeline = FullTimeline.from_dict(timeline_data)
-        report = review_rendered_timeline(timeline, index)
-        report.update({
-            "project": project, "job_id": job_id, "created_at": _utc_now_iso(),
-            "audio_path": str(audio_path.relative_to(paths["root"])), "source_sequence": source_sequence,
-            "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
-            "assembly_manifest_id": str(manifest.get("manifest_id") or ""),
-            "assembly_summary": dict(manifest.get("summary") or {}),
-            "assembly_findings": list(manifest.get("findings") or []),
-        })
-        _atomic_write_json_file(paths["final_review_report"], report)
-        _update_final_review_job(job_id, status="completed", message="Final review completed", finished_at=_utc_now_iso(), report_path=str(paths["final_review_report"].relative_to(paths["root"])))
-    except Exception as exc:
-        failed_cost = getattr(exc, "cost_usd", None)
-        if failed_cost is not None:
-            usage_callback(
-                {
-                    "event_id": f"final-review-asr:{job_id}",
-                    "model": str(model or ""),
-                    "cost_usd": failed_cost,
-                }
-            )
-        _update_final_review_job(job_id, status="failed", message="Final review failed", error=str(exc), finished_at=_utc_now_iso())
-    finally:
-        _release_final_review_project(project)
 
 
 def _record_final_review_iteration(project: str, job: dict, corrections: list[dict]) -> dict:
-    paths = _project_paths(project)
-    history = _read_json_safe(paths["final_review_iterations"])
-    items = list(history.get("iterations") or [])
-    iteration = {
-        "id": f"iteration_{len(items) + 1:04d}", "review_job_id": job["id"],
-        "source_sequence": dict(job.get("source_sequence") or {}), "corrections": corrections,
-        "status": "prepared", "created_at": _utc_now_iso(),
-    }
-    items.append(iteration)
-    _atomic_write_json_file(paths["final_review_iterations"], {"iterations": items})
-    return iteration
+    return final_review_jobs.record_final_review_iteration(
+        _final_review_job_services(), project, job, corrections
+    )
 
 
 register_stage2_routes(app, sys.modules[__name__])

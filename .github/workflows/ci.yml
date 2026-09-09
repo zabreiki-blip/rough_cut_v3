@@ -44,6 +44,9 @@ jobs:
       - name: Ruff correctness checks
         run: ruff check src tests
 
+      - name: Ruff formatting check
+        run: ruff format --check src tests
+
       - name: Mypy type check (baseline clean, type regressions block CI)
         run: mypy src
 

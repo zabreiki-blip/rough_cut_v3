@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from api_service_contracts import NormalizationJobServices, TtsJobServices
 from stage4.revision_assets import merge_voiceover_manifest_item
 
 
-def persist_tts_job(services: Any, job: dict) -> None:
+def persist_tts_job(services: TtsJobServices, job: dict) -> None:
     """Best-effort atomic snapshot of the latest TTS job for one project."""
     try:
         project = services._normalize_project_name(str(job.get("project") or ""))
@@ -16,7 +17,7 @@ def persist_tts_job(services: Any, job: dict) -> None:
         services.app.logger.exception("Could not persist TTS job status")
 
 
-def load_persisted_tts_job(services: Any, project: str) -> dict | None:
+def load_persisted_tts_job(services: TtsJobServices, project: str) -> dict | None:
     payload = services._read_json_safe(services._project_paths(project)["tts_job_status"])
     if not isinstance(payload, dict):
         return None
@@ -35,7 +36,7 @@ def load_persisted_tts_job(services: Any, project: str) -> dict | None:
     return restored
 
 
-def trim_tts_jobs_locked(services: Any) -> None:
+def trim_tts_jobs_locked(services: TtsJobServices) -> None:
     now = services.datetime.now(services.UTC)
     terminal_ids = [
         job_id
@@ -71,7 +72,7 @@ def trim_tts_jobs_locked(services: Any) -> None:
         services._TTS_JOBS.pop(job_id, None)
 
 
-def reserve_tts_project(services: Any, project: str) -> bool:
+def reserve_tts_project(services: TtsJobServices, project: str) -> bool:
     return services.reserve_project(
         services._TTS_JOBS_LOCK,
         services._TTS_ACTIVE_PROJECTS,
@@ -79,7 +80,7 @@ def reserve_tts_project(services: Any, project: str) -> bool:
     )
 
 
-def release_tts_project(services: Any, project: str) -> None:
+def release_tts_project(services: TtsJobServices, project: str) -> None:
     services.release_project(
         services._TTS_JOBS_LOCK,
         services._TTS_ACTIVE_PROJECTS,
@@ -88,7 +89,7 @@ def release_tts_project(services: Any, project: str) -> None:
 
 
 def create_tts_job(
-    services: Any,
+    services: TtsJobServices,
     project: str,
     *,
     prepared_path: Path | None = None,
@@ -143,7 +144,7 @@ def create_tts_job(
 
 
 def update_tts_job(
-    services: Any,
+    services: TtsJobServices,
     job_id: str,
     *,
     persist: bool = True,
@@ -164,7 +165,7 @@ def update_tts_job(
     return snapshot
 
 
-def get_tts_job(services: Any, job_id: str) -> dict | None:
+def get_tts_job(services: TtsJobServices, job_id: str) -> dict | None:
     return services.get_job(
         services._TTS_JOBS_LOCK,
         services._TTS_JOBS,
@@ -172,13 +173,13 @@ def get_tts_job(services: Any, job_id: str) -> dict | None:
     )
 
 
-def tts_cancel_event(services: Any, job_id: str):
+def tts_cancel_event(services: TtsJobServices, job_id: str):
     with services._TTS_JOBS_LOCK:
         return services._TTS_CANCEL_EVENTS.get(job_id)
 
 
 def run_tts_job(
-    services: Any,
+    services: TtsJobServices,
     *,
     job_id: str,
     project: str,
@@ -372,7 +373,7 @@ def run_tts_job(
             services._TTS_CANCEL_EVENTS.pop(job_id, None)
 
 
-def persist_normalization_job(services: Any, job: dict) -> None:
+def persist_normalization_job(services: NormalizationJobServices, job: dict) -> None:
     try:
         project = services._normalize_project_name(str(job.get("project") or ""))
         services._atomic_write_json_file(
@@ -384,7 +385,7 @@ def persist_normalization_job(services: Any, job: dict) -> None:
 
 
 def create_normalization_job(
-    services: Any,
+    services: NormalizationJobServices,
     project: str,
     *,
     input_path: Path,
@@ -430,7 +431,7 @@ def create_normalization_job(
 
 
 def update_normalization_job(
-    services: Any,
+    services: NormalizationJobServices,
     job_id: str,
     **updates: Any,
 ) -> dict | None:
@@ -446,7 +447,7 @@ def update_normalization_job(
     return snapshot
 
 
-def get_normalization_job(services: Any, job_id: str) -> dict | None:
+def get_normalization_job(services: NormalizationJobServices, job_id: str) -> dict | None:
     return services.get_job(
         services._NORMALIZATION_JOBS_LOCK,
         services._NORMALIZATION_JOBS,
@@ -454,7 +455,7 @@ def get_normalization_job(services: Any, job_id: str) -> dict | None:
     )
 
 
-def reserve_normalization_project(services: Any, project: str) -> bool:
+def reserve_normalization_project(services: NormalizationJobServices, project: str) -> bool:
     return services.reserve_project(
         services._NORMALIZATION_JOBS_LOCK,
         services._NORMALIZATION_ACTIVE_PROJECTS,
@@ -462,7 +463,7 @@ def reserve_normalization_project(services: Any, project: str) -> bool:
     )
 
 
-def release_normalization_project(services: Any, project: str) -> None:
+def release_normalization_project(services: NormalizationJobServices, project: str) -> None:
     services.release_project(
         services._NORMALIZATION_JOBS_LOCK,
         services._NORMALIZATION_ACTIVE_PROJECTS,
@@ -470,7 +471,9 @@ def release_normalization_project(services: Any, project: str) -> None:
     )
 
 
-def load_persisted_normalization_job(services: Any, project: str) -> dict | None:
+def load_persisted_normalization_job(
+    services: NormalizationJobServices, project: str
+) -> dict | None:
     payload = services._read_json_safe(services._project_paths(project)["normalization_job_status"])
     if not isinstance(payload, dict) or payload.get("project") != project:
         return None
@@ -487,7 +490,7 @@ def load_persisted_normalization_job(services: Any, project: str) -> dict | None
 
 
 def run_normalization_job(
-    services: Any,
+    services: NormalizationJobServices,
     *,
     job_id: str,
     project: str,

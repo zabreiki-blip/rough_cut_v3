@@ -109,9 +109,7 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
     r"(?P<speaker>[^:\n]{1,80}?)\s*:\s*[,;]?\s*(?P<content>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
-_EXPLICIT_SYNC_LABEL = re.compile(
-    r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE
-)
+_EXPLICIT_SYNC_LABEL = re.compile(r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE)
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
     r"\[?\d{1,2}[:.]\d{2}\]?|\[?\d{1,2}-\d{2}\]?)"
@@ -332,8 +330,8 @@ _OPENROUTER_INSTRUCTIONS = (
     "certain -- use unknown only for text that is empty or unreadable. "
     "A line that is a URL/link to source footage, a bulleted or dashed list "
     "item (a song/film title, a name, a credit), a section heading (e.g. "
-    "\"Клипы\", \"Хроника\"), or a production note telling the editor what "
-    "to insert/show (e.g. \"Вставить синхрон\", \"Показать фото\") is "
+    '"Клипы", "Хроника"), or a production note telling the editor what '
+    'to insert/show (e.g. "Вставить синхрон", "Показать фото") is '
     "type=technical, not unknown. Do not rewrite original content. "
     "A paragraph beginning with ЛАЙФ or LIFE is always type=life, even when "
     "it contains a title, colon, quote text, or timecode; it is source sound "
@@ -1143,9 +1141,7 @@ _SECTION_HEADING_KEYWORDS = (
 )
 _SECTION_HEADING_KEYWORD_RE = re.compile(
     r"\b(?:"
-    + "|".join(
-        re.escape(word) for word in sorted(_SECTION_HEADING_KEYWORDS, key=len, reverse=True)
-    )
+    + "|".join(re.escape(word) for word in sorted(_SECTION_HEADING_KEYWORDS, key=len, reverse=True))
     + r")\b",
     re.IGNORECASE,
 )
@@ -1426,8 +1422,10 @@ def _classify_by_rules(
         or not block.original_label
     ) and _looks_like_video_cue(stripped, video_cue_re):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
-    elif block.order == 1 and not block.original_label and (
-        _looks_like_scenario_title(stripped) or _looks_like_scenario_heading(stripped)
+    elif (
+        block.order == 1
+        and not block.original_label
+        and (_looks_like_scenario_title(stripped) or _looks_like_scenario_heading(stripped))
     ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif stripped.startswith("(") and stripped.endswith(")"):
@@ -1511,7 +1509,9 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     if not fragments:
         return
     block.sync_fragments = fragments
-    first_timed = next((fragment for fragment in fragments if fragment.timecode_start), fragments[0])
+    first_timed = next(
+        (fragment for fragment in fragments if fragment.timecode_start), fragments[0]
+    )
     block.timecode_start = first_timed.timecode_start
     block.timecode_end = first_timed.timecode_end
     block.normalized_text = " ".join(fragment.text for fragment in fragments if fragment.text)
@@ -1584,9 +1584,7 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
     expanded: list[SyncFragment] = []
     for fragment in fragments:
         parts = []
-        for raw_part in re.split(
-            r"\b(?:СКЛ|СКЛЕЙКА)\b", fragment.text, flags=re.IGNORECASE
-        ):
+        for raw_part in re.split(r"\b(?:СКЛ|СКЛЕЙКА)\b", fragment.text, flags=re.IGNORECASE):
             # Remove only separators adjacent to the splice marker. Sentence
             # punctuation at the far end of each fragment belongs to speech.
             part = raw_part.strip(" \t\r\n–—-").lstrip(",.;:")
@@ -1641,9 +1639,7 @@ def _apply_llm_results(
             # already tried them once, but some are gated by label/position
             # there to avoid ever preempting a sync/voiceover marker, and a
             # block that reaches the LLM has no such marker to protect.
-            fallback_confidence = _technical_heuristic_confidence(
-                block.original_text, video_cue_re
-            )
+            fallback_confidence = _technical_heuristic_confidence(block.original_text, video_cue_re)
             if fallback_confidence is not None:
                 _apply_type(
                     block,

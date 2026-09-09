@@ -323,23 +323,17 @@ class NormalizationApiTest(unittest.TestCase):
     def test_tts_clear_removes_current_outputs_but_preserves_versioned_assets(self) -> None:
         paths = api._ensure_project("demo")
         (paths["speaker"] / "zk1.wav").write_bytes(b"current wav")
-        (paths["speaker"] / "zk1.wav.meta").write_text(
-            '{"fingerprint":"old"}', encoding="utf-8"
-        )
+        (paths["speaker"] / "zk1.wav.meta").write_text('{"fingerprint":"old"}', encoding="utf-8")
         (paths["speaker"] / "manifest.json").write_text('{"items":[]}', encoding="utf-8")
         historic = paths["voiceover_assets"] / "uid-1" / "old.wav"
         historic.parent.mkdir(parents=True, exist_ok=True)
         historic.write_bytes(b"historic wav")
-        paths["normalized"].write_text(
-            '{"scenario_revision_id":"rev_7"}', encoding="utf-8"
-        )
+        paths["normalized"].write_text('{"scenario_revision_id":"rev_7"}', encoding="utf-8")
         paths["tts_job_status"].write_text(
             '{"id":"old-job","project":"demo","status":"completed"}', encoding="utf-8"
         )
         with api._TTS_JOBS_LOCK:
-            api._TTS_JOBS["old-job"] = {
-                "id": "old-job", "project": "demo", "status": "completed"
-            }
+            api._TTS_JOBS["old-job"] = {"id": "old-job", "project": "demo", "status": "completed"}
 
         response = self.client.post("/stage1/tts/clear", json={"project": "demo"})
 

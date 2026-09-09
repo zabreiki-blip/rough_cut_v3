@@ -350,5 +350,10 @@ scripts/run-macos-connector
 | `GEMINI_TTS_VOICE_MALE` | `Kore` | Мужской голос Gemini |
 | `MACOS_TTS_RATE` | `175` | Скорость macOS TTS (wpm) |
 | `MACOS_CONNECTOR_URL` | — | URL коннектора для macOS в Docker |
+| `MACOS_CONNECTOR_PORT` | `8001` | Локальный порт коннектора macOS |
 | `VALIDATE_MIN_WAV_DURATION_MS` | `350` | Минимум длительности WAV (warning) |
 | `VALIDATE_SILENCE_RMS_THRESHOLD` | `120` | Порог тишины (warning) |
+
+При установке LaunchAgent скрипт автоматически задаёт
+`MACOS_CONNECTOR_ENV_FILE` как путь к отдельному env-файлу с правами `0600`.
+В проектный `.env` эту служебную переменную добавлять не требуется.

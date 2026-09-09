@@ -3,16 +3,22 @@ import { ids, initialStatus, project } from "./state.js";
 
 export function renderOpenRouterUsage(summary) {
   if (!ids.openrouter_usage) return;
+  const totalElement = ids.openrouter_usage.querySelector(".openrouter-usage-total");
+  const pendingElement = ids.openrouter_usage.querySelector(".openrouter-usage-pending");
+  if (!totalElement || !pendingElement) return;
   if (!summary || summary.status === "unavailable") {
     ids.openrouter_usage.dataset.state = "unavailable";
-    ids.openrouter_usage.textContent = "OpenRouter: учёт недоступен";
+    totalElement.textContent = "OpenRouter: учёт недоступен";
+    pendingElement.textContent = "";
+    pendingElement.hidden = true;
     return;
   }
   ids.openrouter_usage.dataset.state = "ok";
   const total = Number(summary.total_cost_usd || 0);
   const pending = Math.max(0, Number(summary.pending_count || 0));
-  ids.openrouter_usage.textContent = `OpenRouter: $${total.toFixed(4)}`
-    + (pending > 0 ? ` · уточняется ${pending}` : "");
+  totalElement.textContent = `OpenRouter: $${total.toFixed(4)}`;
+  pendingElement.textContent = pending > 0 ? `уточняется ${pending}` : "";
+  pendingElement.hidden = pending <= 0;
 }
 
 

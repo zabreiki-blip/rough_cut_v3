@@ -137,17 +137,19 @@ def test_voiceover_and_unmatched_placeholder_are_preserved() -> None:
 
 def test_life_block_is_exported_as_graphic_placeholder_without_audio() -> None:
     timeline = _timeline()
-    timeline.segments.append(TimelineSegment(
-        id="life1",
-        type="life",
-        text="А на море белый песок",
-        duration_sec=10,
-        start_sec=10,
-        block_uid="life-block",
-        speaker="ЛАЙФ",
-        role="концерт Фриске",
-        placeholder_path="/tmp/life-card.png",
-    ))
+    timeline.segments.append(
+        TimelineSegment(
+            id="life1",
+            type="life",
+            text="А на море белый песок",
+            duration_sec=10,
+            start_sec=10,
+            block_uid="life-block",
+            speaker="ЛАЙФ",
+            role="концерт Фриске",
+            placeholder_path="/tmp/life-card.png",
+        )
+    )
 
     root = _root(build_nested_xml(timeline, _catalog()))
     final = root.find("./project/children/sequence")

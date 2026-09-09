@@ -13,6 +13,7 @@ from stage2.sync_matcher import (
     _length_samples,
     _timed_tokens,
     normalize_text,
+    normalize_token,
     parse_timecode,
 )
 from stage2.sync_models import AlignmentRequest, SyncSource, WordIndex, WordTimestamp
@@ -45,6 +46,32 @@ def _source(
 def test_russian_normalization_handles_case_yo_punctuation_and_inflections() -> None:
     assert normalize_text("Ёлкой, ЁЛКАМИ!") == ["елк", "елк"]
     assert normalize_text("энергетический вампир") == normalize_text("энергетическим вампиром")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("ПЁТР", "петр"),
+        ("Ｐетр", "pетр"),
+        ("AI", "ai"),
+        ("Ли", "ли"),
+    ],
+)
+def test_normalize_token_applies_only_safe_folding_to_short_or_latin_tokens(
+    value: str,
+    expected: str,
+) -> None:
+    assert normalize_token(value) == expected
+
+
+def test_speaker_filter_matches_yo_and_case_variants() -> None:
+    phrase = "точная цитата героя для синхронизации"
+    result = SyncMatcher(
+        [_source("petr", "Пётр Иванов")],
+        [_index("petr", phrase, 10.0)],
+    ).match(AlignmentRequest(segment_id="yo-name", text=phrase, speaker="ПЕТРА ИВАНОВА"))
+
+    assert result.source_id == "petr"
 
 
 def test_transcript_tokens_are_built_once_per_matcher() -> None:

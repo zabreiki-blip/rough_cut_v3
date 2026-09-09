@@ -82,8 +82,11 @@ nav { display: grid; gap: 4px; }
 }
 .openrouter-usage {
   font-size: 11px; color: var(--ink); font-family: "JetBrains Mono", monospace;
-  white-space: nowrap;
+  display: grid; gap: 3px; min-width: 0;
 }
+.openrouter-usage-total,
+.openrouter-usage-pending { overflow-wrap: anywhere; }
+.openrouter-usage-pending { color: var(--muted); }
 .openrouter-usage[data-state="unavailable"] { color: var(--danger); }
 .version { font-size: 11px; color: var(--muted); font-family: "JetBrains Mono", monospace; }
 
