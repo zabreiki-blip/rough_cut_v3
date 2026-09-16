@@ -76,6 +76,13 @@ def test_readiness_does_not_show_unused_gemini_key(client) -> None:
     assert "gemini_key" not in {check["id"] for check in response.get_json()["checks"]}
 
 
+def test_static_modules_are_revalidated_after_deploy(client) -> None:
+    response = client.get("/static/stage1/revisions.js")
+
+    assert response.status_code == 200
+    assert "max-age=0" in response.headers["Cache-Control"]
+
+
 def test_readiness_degrades_gracefully_without_ffmpeg(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
