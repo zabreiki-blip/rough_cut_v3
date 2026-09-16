@@ -183,10 +183,15 @@ function renderRevisionList(revisions) {
   ids.versioning_status.dataset.state = items.length ? "confirmed" : "empty";
   ids.versioning_status.textContent = items.length ? `${items.length} редакц.` : "нет версий";
   ids.revision_list.innerHTML = items.length ? items.slice().reverse().map((item) => {
-    const activationBlocked = revisionsState.integrity?.status === "active_work_mismatch";
-    const canActivate = !item.active && !activationBlocked;
+    // Any blocking integrity state makes normal activation unsafe.  In
+    // particular, an active_revision.json that no longer points to a
+    // manifest in history cannot be corrected by activate_revision(): the
+    // current work projection must first be backed up and a known revision
+    // restored through reconcileRevision().
+    const recoveryRequired = revisionsState.integrity?.blocking === true;
+    const canActivate = !item.active && !recoveryRequired;
     const date = revisionDate(item);
-    const action = activationBlocked
+    const action = recoveryRequired
       ? `<button class="btn btn-sm" data-action="reconcile-revision" data-revision-id="${escaped(item.revision_id)}">Восстановить</button>`
       : (item.active
         ? '<span class="status-badge" data-state="confirmed">активна</span>'

@@ -172,8 +172,27 @@ export function assertRequiredPath(pathValue, label) {
   if (!isLikelySafePath(value)) throw new Error(`${label} looks invalid: ${value}`);
 }
 
+export const FETCH_TIMEOUT_MS = 30000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const timeout = new Error("Превышено время ожидания ответа сервера");
+      timeout.status = 408;
+      throw timeout;
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export async function postJSON(url, payload) {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -186,7 +205,7 @@ export async function postJSON(url, payload) {
 }
 
 export async function getJSON(url) {
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url);
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok === false) {
     const error = new Error(data.error || JSON.stringify(data));
@@ -199,7 +218,7 @@ export async function getJSON(url) {
 export async function requestJSON(url, method, payload) {
   const options = { method, headers: { "Content-Type": "application/json" } };
   if (payload !== undefined) options.body = JSON.stringify(payload);
-  const response = await fetch(url, options);
+  const response = await fetchWithTimeout(url, options);
   const raw = await response.text();
   let data = {};
   try {
@@ -221,7 +240,7 @@ export async function requestJSON(url, method, payload) {
 export async function optionalRequestJSON(url, method, payload) {
   const options = { method: method || "GET", headers: { "Content-Type": "application/json" } };
   if (payload !== undefined) options.body = JSON.stringify(payload);
-  const response = await fetch(url, options);
+  const response = await fetchWithTimeout(url, options);
   if (response.status === 404) return { available: false, result: null };
   const raw = await response.text();
   let data = {};

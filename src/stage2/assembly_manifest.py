@@ -20,7 +20,7 @@ _PREMIERE_SOURCE_PREFIX = "RC_SRC_"
 def _normalized_source_name(value: object) -> str:
     name = str(value or "").strip()
     if name.upper().startswith(_PREMIERE_SOURCE_PREFIX):
-        name = name[len(_PREMIERE_SOURCE_PREFIX):].strip()
+        name = name[len(_PREMIERE_SOURCE_PREFIX) :].strip()
     return re.sub(r"[_\s]+", " ", name).strip().casefold()
 
 
@@ -63,8 +63,11 @@ def _block_snapshot(segment: TimelineSegment, clips: list[dict[str, Any]]) -> di
     positive = [item for item in overlaps if item[1] > 0]
     expected_name = _normalized_source_name(segment.sequence_name)
     named = [
-        item for item in positive
-        if expected_name and expected_name in {
+        item
+        for item in positive
+        if expected_name
+        and expected_name
+        in {
             _normalized_source_name(item[0].get("name")),
             _normalized_source_name(item[0].get("projectItemName")),
         }
@@ -101,12 +104,14 @@ def _manifest_findings(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
 
     def add(block: dict[str, Any], kind: str, detail: str) -> None:
-        findings.append({
-            "segment_id": block["segment_id"],
-            "block_uid": block["block_uid"],
-            "kind": kind,
-            "detail": detail,
-        })
+        findings.append(
+            {
+                "segment_id": block["segment_id"],
+                "block_uid": block["block_uid"],
+                "kind": kind,
+                "detail": detail,
+            }
+        )
 
     for block in blocks:
         if not block["eligible_for_review"]:

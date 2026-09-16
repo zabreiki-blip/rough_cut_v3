@@ -163,7 +163,12 @@ class NormalizationApiTest(unittest.TestCase):
         timeline_result = timeline_response.get_json()["result"]
         self.assertEqual(timeline_result["zk"], 1)
         self.assertEqual(timeline_result["snh"], 1)
-        self.assertEqual(self.client.get("/stage2/export/xml?project=demo").status_code, 200)
+        exported = self.client.get("/stage2/export/xml?project=demo")
+        self.assertEqual(exported.status_code, 200)
+        self.assertRegex(
+            exported.headers["Content-Disposition"],
+            r'filename="demo_V\d+_\d{8}_\d{6}\.xml"',
+        )
         timeline_path = self.projects / "demo" / "work" / "full_timeline.json"
         timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
         self.assertEqual(timeline_payload["schema_version"], 1)
@@ -323,23 +328,17 @@ class NormalizationApiTest(unittest.TestCase):
     def test_tts_clear_removes_current_outputs_but_preserves_versioned_assets(self) -> None:
         paths = api._ensure_project("demo")
         (paths["speaker"] / "zk1.wav").write_bytes(b"current wav")
-        (paths["speaker"] / "zk1.wav.meta").write_text(
-            '{"fingerprint":"old"}', encoding="utf-8"
-        )
+        (paths["speaker"] / "zk1.wav.meta").write_text('{"fingerprint":"old"}', encoding="utf-8")
         (paths["speaker"] / "manifest.json").write_text('{"items":[]}', encoding="utf-8")
         historic = paths["voiceover_assets"] / "uid-1" / "old.wav"
         historic.parent.mkdir(parents=True, exist_ok=True)
         historic.write_bytes(b"historic wav")
-        paths["normalized"].write_text(
-            '{"scenario_revision_id":"rev_7"}', encoding="utf-8"
-        )
+        paths["normalized"].write_text('{"scenario_revision_id":"rev_7"}', encoding="utf-8")
         paths["tts_job_status"].write_text(
             '{"id":"old-job","project":"demo","status":"completed"}', encoding="utf-8"
         )
         with api._TTS_JOBS_LOCK:
-            api._TTS_JOBS["old-job"] = {
-                "id": "old-job", "project": "demo", "status": "completed"
-            }
+            api._TTS_JOBS["old-job"] = {"id": "old-job", "project": "demo", "status": "completed"}
 
         response = self.client.post("/stage1/tts/clear", json={"project": "demo"})
 

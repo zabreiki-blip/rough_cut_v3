@@ -142,9 +142,7 @@ def get_settings() -> Settings:
             "OPENROUTER_TTS_MODEL",
             "microsoft/mai-voice-2",
         ).strip(),
-        openrouter_tts_voice=os.getenv(
-            "OPENROUTER_TTS_VOICE", "ru-RU-Masha:MAI-Voice-2"
-        ).strip(),
+        openrouter_tts_voice=os.getenv("OPENROUTER_TTS_VOICE", "ru-RU-Masha:MAI-Voice-2").strip(),
         openrouter_tts_voice_female=os.getenv(
             "OPENROUTER_TTS_VOICE_FEMALE",
             "ru-RU-Masha:MAI-Voice-2",

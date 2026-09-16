@@ -120,9 +120,7 @@ def _unload_after_job() -> bool:
         return False
     if raw in {"1", "true", "yes", "on"}:
         return True
-    raise ValueError(
-        f"{_UNLOAD_AFTER_JOB_ENV} must be one of: 1, true, yes, on, 0, false, no, off"
-    )
+    raise ValueError(f"{_UNLOAD_AFTER_JOB_ENV} must be one of: 1, true, yes, on, 0, false, no, off")
 
 
 def _transcribe_worker(connection: Connection) -> None:

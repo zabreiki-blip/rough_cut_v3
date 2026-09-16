@@ -20,7 +20,9 @@ def _project_audio_path(services: ModuleType, paths: dict[str, Path], value: obj
     if not raw:
         return paths["final_review_audio"]
     candidate = Path(raw)
-    resolved = candidate.resolve() if candidate.is_absolute() else (paths["root"] / candidate).resolve()
+    resolved = (
+        candidate.resolve() if candidate.is_absolute() else (paths["root"] / candidate).resolve()
+    )
     if not resolved.is_relative_to(paths["root"].resolve()) or resolved.suffix.lower() != ".wav":
         raise ValueError("audio_path must be a WAV inside the project directory")
     return resolved
@@ -70,9 +72,7 @@ def _start(services: ModuleType):
     try:
         wav_duration = _wav_duration(audio_path)
         sequence = dict(payload.get("source_sequence") or {})
-        expected_duration = float(
-            sequence.get("durationSeconds") or timeline.total_duration_sec
-        )
+        expected_duration = float(sequence.get("durationSeconds") or timeline.total_duration_sec)
     except (TypeError, ValueError) as exc:
         return services._json_error(str(exc), 400)
     duration_tolerance = max(1.0, expected_duration * 0.002)
@@ -87,9 +87,7 @@ def _start(services: ModuleType):
     try:
         manifest = services.build_assembly_manifest(
             project=project,
-            timeline=services.FullTimeline.from_dict(
-                services._read_json_safe(timeline_path)
-            ),
+            timeline=services.FullTimeline.from_dict(services._read_json_safe(timeline_path)),
             timeline_path=timeline_path,
             scenario_path=paths["normalized"],
             audio_path=audio_path,
@@ -102,11 +100,15 @@ def _start(services: ModuleType):
         job = services._create_final_review_job(project, audio_path, payload)
         worker = services.threading.Thread(
             target=services._run_final_review_job,
-            kwargs={"job_id": job["id"], "project": project, "audio_path": audio_path,
-                    "language": str(payload.get("language") or "ru"),
-                    "backend": str(payload.get("backend") or "") or None,
-                    "model": str(payload.get("model") or "") or None,
-                    "source_sequence": dict(payload.get("source_sequence") or {})},
+            kwargs={
+                "job_id": job["id"],
+                "project": project,
+                "audio_path": audio_path,
+                "language": str(payload.get("language") or "ru"),
+                "backend": str(payload.get("backend") or "") or None,
+                "model": str(payload.get("model") or "") or None,
+                "source_sequence": dict(payload.get("source_sequence") or {}),
+            },
             daemon=True,
         )
         worker.start()
@@ -116,7 +118,17 @@ def _start(services: ModuleType):
     except Exception:
         services._release_final_review_project(project)
         raise
-    return jsonify({"ok": True, "result": {"project": project, "job_id": job["id"], "status": "queued", "status_url": f"/stage2/final-review/jobs/{job['id']}"}}), 202
+    return jsonify(
+        {
+            "ok": True,
+            "result": {
+                "project": project,
+                "job_id": job["id"],
+                "status": "queued",
+                "status_url": f"/stage2/final-review/jobs/{job['id']}",
+            },
+        }
+    ), 202
 
 
 def _status(services: ModuleType, job_id: str):
@@ -144,20 +156,20 @@ def _apply(services: ModuleType, job_id: str):
         return services._json_error("final review report does not belong to this job", 409)
     if str(report.get("project") or "") != project:
         return services._json_error("final review report does not belong to this project", 409)
-    if str(report.get("assembly_manifest_id") or "") != str(
-        job.get("assembly_manifest_id") or ""
-    ):
+    if str(report.get("assembly_manifest_id") or "") != str(job.get("assembly_manifest_id") or ""):
         return services._json_error("final review assembly snapshot changed", 409)
     report_sequence = dict(report.get("source_sequence") or {})
     job_sequence = dict(job.get("source_sequence") or {})
-    if (
-        str(report_sequence.get("sequenceId") or "")
-        != str(job_sequence.get("sequenceId") or "")
-    ):
+    if str(report_sequence.get("sequenceId") or "") != str(job_sequence.get("sequenceId") or ""):
         return services._json_error("final review sequence identity changed", 409)
     corrections = report.get("corrections") if isinstance(report.get("corrections"), list) else []
     iteration = services._record_final_review_iteration(project, job, corrections)
-    return jsonify({"ok": True, "result": {"project": project, "iteration": iteration, "corrections": corrections}})
+    return jsonify(
+        {
+            "ok": True,
+            "result": {"project": project, "iteration": iteration, "corrections": corrections},
+        }
+    )
 
 
 def register_final_review_routes(app: Flask, services: ModuleType) -> None:

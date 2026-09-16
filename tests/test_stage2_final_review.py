@@ -6,7 +6,9 @@ from stage2.sync_models import WordIndex, WordTimestamp
 def _index(text: str) -> WordIndex:
     return WordIndex(
         source_id="render",
-        words=[WordTimestamp(word, number, number + 0.4) for number, word in enumerate(text.split())],
+        words=[
+            WordTimestamp(word, number, number + 0.4) for number, word in enumerate(text.split())
+        ],
     )
 
 
@@ -26,12 +28,21 @@ def test_rendered_review_detects_missing_scenario_block() -> None:
 def test_rendered_review_proposes_safe_sync_handle_expansion() -> None:
     timeline = FullTimeline(
         project="DEMO",
-        segments=[TimelineSegment(
-            "snh1", "snh", "важное начало длинной реплики", 4.0,
-            block_uid="sync-1", source_in_sec=10.0, source_out_sec=14.0,
-            sequence_id="source-1", sequence_name="SYNC", start_sec=0.0,
-            match_status="confirmed",
-        )],
+        segments=[
+            TimelineSegment(
+                "snh1",
+                "snh",
+                "важное начало длинной реплики",
+                4.0,
+                block_uid="sync-1",
+                source_in_sec=10.0,
+                source_out_sec=14.0,
+                sequence_id="source-1",
+                sequence_name="SYNC",
+                start_sec=0.0,
+                match_status="confirmed",
+            )
+        ],
     )
     report = review_rendered_timeline(timeline, _index("начало длинной реплики"))
     assert report["summary"]["truncated"] == 1
@@ -57,12 +68,20 @@ def test_rendered_review_excludes_unavailable_sync_sources() -> None:
         segments=[
             TimelineSegment("zk1", "zk", "готовый закадр", 2.0),
             TimelineSegment(
-                "snh1", "snh", "ненайденная реплика", 10.0,
-                match_status="not_found", start_sec=2.0,
+                "snh1",
+                "snh",
+                "ненайденная реплика",
+                10.0,
+                match_status="not_found",
+                start_sec=2.0,
             ),
             TimelineSegment(
-                "snh2", "snh", "сомнительная реплика", 10.0,
-                match_status="needs_review", start_sec=12.0,
+                "snh2",
+                "snh",
+                "сомнительная реплика",
+                10.0,
+                match_status="needs_review",
+                start_sec=12.0,
             ),
         ],
     )
@@ -75,11 +94,16 @@ def test_rendered_review_excludes_unavailable_sync_sources() -> None:
 def test_rendered_review_removes_cues_timecodes_and_tracks_splices() -> None:
     timeline = FullTimeline(
         project="DEMO",
-        segments=[TimelineSegment(
-            "snh1", "snh",
-            "СНХ, Маликов: первая часть СКЛ вторая часть 00:08:44",
-            4.0, speaker="Маликов", match_status="confirmed",
-        )],
+        segments=[
+            TimelineSegment(
+                "snh1",
+                "snh",
+                "СНХ, Маликов: первая часть СКЛ вторая часть 00:08:44",
+                4.0,
+                speaker="Маликов",
+                match_status="confirmed",
+            )
+        ],
     )
     report = review_rendered_timeline(timeline, _index("первая часть вторая часть"))
     assert report["summary"]["findings"] == 0
@@ -100,13 +124,16 @@ def test_rendered_review_keeps_successful_checks_in_report() -> None:
 def test_rendered_review_removes_life_song_title_cue() -> None:
     timeline = FullTimeline(
         project="DEMO",
-        segments=[TimelineSegment(
-            "zk1", "zk", "ЛАЙФ, «Где-то летом» Где-то летом звёзды нам пели песни", 4.0,
-        )],
+        segments=[
+            TimelineSegment(
+                "zk1",
+                "zk",
+                "ЛАЙФ, «Где-то летом» Где-то летом звёзды нам пели песни",
+                4.0,
+            )
+        ],
     )
-    report = review_rendered_timeline(
-        timeline, _index("Где-то летом звёзды нам пели песни")
-    )
+    report = review_rendered_timeline(timeline, _index("Где-то летом звёзды нам пели песни"))
     assert report["checks"][0]["spoken_text"] == "Где-то летом звёзды нам пели песни"
     assert report["checks"][0]["status"] == "ok"
 

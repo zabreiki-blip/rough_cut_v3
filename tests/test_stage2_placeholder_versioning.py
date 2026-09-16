@@ -8,6 +8,7 @@ from stage2.placeholder import (
     placeholder_asset_key,
     placeholder_asset_path,
 )
+from api_stage2_routes import _revision_placeholder_dir
 
 
 def _key(**changes: Any) -> str:
@@ -60,6 +61,16 @@ def test_asset_path_is_safe_and_stays_inside_requested_directory() -> None:
     assert path.suffix == ".png"
     assert ".." not in path.name
     assert path.name.startswith("placeholder-v1-")
+
+
+def test_revision_placeholder_directory_is_isolated_from_other_revisions(tmp_path: Path) -> None:
+    paths = {"work": tmp_path / "work"}
+
+    assert (
+        _revision_placeholder_dir(paths, "rev_0002")
+        == tmp_path / "work" / "placeholders" / "rev_0002"
+    )
+    assert _revision_placeholder_dir(paths, "") == tmp_path / "work" / "placeholders"
 
 
 def test_versioned_generator_keeps_old_asset_when_content_changes(tmp_path: Path) -> None:

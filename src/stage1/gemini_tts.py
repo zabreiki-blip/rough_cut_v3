@@ -791,9 +791,7 @@ def _plan_tts_items(
     tts_model: str | None = None,
     tts_style: str = "",
 ) -> list[tuple[int, str, str, str, Path, Path, str, str]]:
-    fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(
-        provider, settings, tts_model
-    )
+    fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(provider, settings, tts_model)
     plan: list[tuple[int, str, str, str, Path, Path, str, str]] = []
 
     for index, (block_id, block_uid, text) in enumerate(prepared_items, start=1):
@@ -815,7 +813,9 @@ def _plan_tts_items(
             # its fingerprint distinct too: the legacy positional alias may
             # be the only file present on older projects.
             fingerprint = hashlib.sha256(f"dry-run\\n{fingerprint}".encode()).hexdigest()
-            asset_file = speaker_dir / "dry-run" / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
+            asset_file = (
+                speaker_dir / "dry-run" / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
+            )
         else:
             asset_file = speaker_dir / "assets" / _asset_uid(block_uid) / f"{fingerprint}.wav"
         legacy_cache_hit = (
@@ -1019,13 +1019,9 @@ def synthesize_tts(
     provider = _normalize_provider(provider, settings.tts_provider)
     resolved_model = ""
     if provider == "openrouter":
-        resolved_model = normalize_openrouter_tts_model(
-            tts_model, settings.openrouter_tts_model
-        )
+        resolved_model = normalize_openrouter_tts_model(tts_model, settings.openrouter_tts_model)
     resolved_style = normalize_tts_style(tts_style)
-    voice, resolved_gender = _pick_voice(
-        settings, provider, voice_name, gender, resolved_model
-    )
+    voice, resolved_gender = _pick_voice(settings, provider, voice_name, gender, resolved_model)
     speaker_dir.mkdir(parents=True, exist_ok=True)
 
     generated: list[str] = []
@@ -1222,13 +1218,9 @@ def synthesize_phrase(
     provider = _normalize_provider(provider, settings.tts_provider)
     resolved_model = ""
     if provider == "openrouter":
-        resolved_model = normalize_openrouter_tts_model(
-            tts_model, settings.openrouter_tts_model
-        )
+        resolved_model = normalize_openrouter_tts_model(tts_model, settings.openrouter_tts_model)
     resolved_style = normalize_tts_style(tts_style)
-    voice, resolved_gender = _pick_voice(
-        settings, provider, voice_name, gender, resolved_model
-    )
+    voice, resolved_gender = _pick_voice(settings, provider, voice_name, gender, resolved_model)
     speaker_dir.mkdir(parents=True, exist_ok=True)
 
     if not dry_run and provider == "gemini" and not settings.gemini_api_key:

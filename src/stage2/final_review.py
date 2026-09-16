@@ -144,8 +144,7 @@ def _uses_interpolated_timestamps(index: WordIndex) -> bool:
         backend_metadata = {}
     return (
         str(metadata.get("backend") or "").strip().lower() == "cloud-audio"
-        or str(backend_metadata.get("timestamp_precision") or "").strip().lower()
-        == "interpolated"
+        or str(backend_metadata.get("timestamp_precision") or "").strip().lower() == "interpolated"
     )
 
 
@@ -212,9 +211,7 @@ def review_rendered_timeline(timeline: FullTimeline, index: WordIndex) -> dict[s
             )
             continue
         if not spoken_text:
-            findings.append(
-                _finding(segment, "technical_cue", "info", "", reason="no spoken text")
-            )
+            findings.append(_finding(segment, "technical_cue", "info", "", reason="no spoken text"))
             continue
         reviewed.append(segment)
         expected = normalize_text(spoken_text)
@@ -263,16 +260,33 @@ def review_rendered_timeline(timeline: FullTimeline, index: WordIndex) -> dict[s
         if kind:
             findings.append(
                 _finding(
-                    segment, kind, "error", spoken_text, actual_text,
-                    actual_start, actual_end, score, prefix, suffix, reason,
+                    segment,
+                    kind,
+                    "error",
+                    spoken_text,
+                    actual_text,
+                    actual_start,
+                    actual_end,
+                    score,
+                    prefix,
+                    suffix,
+                    reason,
                 )
             )
         elif prefix < 0.55 or suffix < 0.55:
             kind = "truncated_start" if prefix <= suffix else "truncated_end"
             findings.append(
                 _finding(
-                    segment, kind, "warning", spoken_text, actual_text,
-                    actual_start, actual_end, score, prefix, suffix,
+                    segment,
+                    kind,
+                    "warning",
+                    spoken_text,
+                    actual_text,
+                    actual_start,
+                    actual_end,
+                    score,
+                    prefix,
+                    suffix,
                     "expected prefix or suffix is not covered",
                 )
             )
@@ -283,10 +297,22 @@ def review_rendered_timeline(timeline: FullTimeline, index: WordIndex) -> dict[s
                 gap = words[gap_left:gap_right]
                 findings.append(
                     ReviewFinding(
-                        "", "", "extra_speech", "warning", "", "",
-                        " ".join(word.word for word in gap), segment.start_sec,
-                        segment.end_sec, gap[0].start, gap[-1].end, 0.0, 0.0,
-                        0.0, "", "speech between approved blocks",
+                        "",
+                        "",
+                        "extra_speech",
+                        "warning",
+                        "",
+                        "",
+                        " ".join(word.word for word in gap),
+                        segment.start_sec,
+                        segment.end_sec,
+                        gap[0].start,
+                        gap[-1].end,
+                        0.0,
+                        0.0,
+                        0.0,
+                        "",
+                        "speech between approved blocks",
                     )
                 )
         if local_match:

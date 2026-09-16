@@ -248,6 +248,26 @@ def test_reconcile_speakers_merges_same_person_by_name() -> None:
     assert merged[0].speaker == merged[1].speaker == speakers[0]
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("мужской голос (Пётр Иванов)", "МУЖСКОЙ ГОЛОС (Петра Иванова)"),
+        ("женский голос (Анна-Мария)", "ЖЕНСКИЙ ГОЛОС (АННА-МАРИЯ)"),
+    ],
+)
+def test_reconcile_speakers_folds_russian_name_variants(first: str, second: str) -> None:
+    segments = [
+        _seg("Первая реплика", 0.0, 5.0, "ГОЛОС 1"),
+        _seg("Вторая реплика", 100.0, 105.0, "ГОЛОС 2"),
+    ]
+    merged, speakers, _ = _reconcile_speakers(
+        segments,
+        speaker_descriptions={"ГОЛОС 1": first, "ГОЛОС 2": second},
+    )
+    assert len(speakers) == 1
+    assert merged[0].speaker == merged[1].speaker
+
+
 def test_reconcile_speakers_keeps_different_people_separate() -> None:
     segments = [
         _seg("A", 0.0, 5.0, "ГОЛОС 1"),

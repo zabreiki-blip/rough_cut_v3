@@ -25,7 +25,8 @@ CI measures branch coverage for `src/` and enforces a 79% floor. The initial
 measured baseline on 2026-08-04 was 77.5%. New work should raise the floor
 gradually rather than introducing a large unreviewed test rewrite.
 
-Ruff currently enforces correctness rules only. Formatting and static typing
-are separate staged initiatives: `ruff format`/additional lint families and a
-scoped type-check baseline should be adopted only with dedicated cleanup
-changes, not mixed into functional refactors.
+Ruff enforces correctness rules and the repository-wide formatting baseline.
+Both pre-commit and CI run `ruff check src tests`; pre-commit formats the same
+trees with `ruff format`, while CI verifies them with
+`ruff format --check src tests`. Additional lint families remain separate
+staged initiatives and should be adopted only with dedicated cleanup changes.

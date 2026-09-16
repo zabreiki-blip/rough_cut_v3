@@ -19,6 +19,7 @@ from .sync_models import (
     WordIndex,
     WordTimestamp,
 )
+from .text_normalization import fold_russian_text
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 _RUSSIAN_ENDINGS = tuple(
@@ -136,7 +137,7 @@ _DUPLICATE_MIN_OVERLAP_RATIO = 0.65
 def normalize_token(token: str) -> str:
     """Normalize a token and apply a deliberately conservative Russian stem."""
 
-    value = unicodedata.normalize("NFKC", token).casefold().replace("ё", "е")
+    value = fold_russian_text(token)
     value = "".join(char for char in value if char.isalnum())
     if len(value) <= 3 or not any("а" <= char <= "я" for char in value):
         return value
@@ -176,10 +177,7 @@ def _count_negations(text: str) -> int:
     return sum(
         1
         for index, token in enumerate(tokens)
-        if (
-            token in _NEGATION_MARKERS
-            and (index == 0 or tokens[index - 1] != token)
-        )
+        if (token in _NEGATION_MARKERS and (index == 0 or tokens[index - 1] != token))
         or any(token.startswith(prefix) for prefix in _NEGATED_WORD_PREFIXES)
     )
 

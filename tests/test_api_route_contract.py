@@ -329,7 +329,13 @@ def test_job_registries_are_visible_from_api_and_stage4_routes_in_priority_order
     import api_stage4_routes
 
     labels = [registry.label for registry in api.iter_job_registries()]
-    assert labels == ["озвучки", "нормализации", "сопоставления СНХ", "финальной проверки", "подготовки Stage 3"]
+    assert labels == [
+        "озвучки",
+        "нормализации",
+        "сопоставления СНХ",
+        "финальной проверки",
+        "подготовки Stage 3",
+    ]
 
     # api_stage4_routes._active_project_job reads registries off the passed-in
     # ``services`` module (here, ``api``) rather than any private module state

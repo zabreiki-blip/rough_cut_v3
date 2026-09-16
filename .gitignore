@@ -30,3 +30,6 @@ projects/*/ЗАГРУЗИТЬ/
 # Local runtime scratch space (may contain real user project data)
 artifacts/
 .env.bak.*
+
+# Local CEP debug configuration
+cep/.debug

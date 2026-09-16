@@ -4,6 +4,7 @@ from functools import wraps
 import json
 import os
 from pathlib import Path
+import re
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 import uuid
@@ -11,10 +12,25 @@ import wave
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
+from export_naming import xml_export_filename
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
 if TYPE_CHECKING:
     from stage2.sync_models import SyncMatch
+
+
+def _revision_placeholder_dir(paths: dict[str, Path], revision_id: object) -> Path:
+    """Keep generated speaker cards owned by the scenario revision.
+
+    Work from projects created before Stage 4 has no revision identity, so it
+    intentionally keeps the legacy directory.  Once a valid ``rev_NNNN`` is
+    present, a V2 build must never rewrite cards that V1's timeline still
+    references.
+    """
+    value = str(revision_id or "")
+    if re.fullmatch(r"rev_\d+", value):
+        return paths["work"] / "placeholders" / value
+    return paths["work"] / "placeholders"
 
 
 def _stage2_sync_sources(services: ModuleType):
@@ -618,13 +634,6 @@ def _stage2_build(services: ModuleType):
     if gate:
         return gate
     try:
-        speaker_dir = services._abs_path(
-            payload.get("speaker_dir", ""), paths["speaker"], paths["root"]
-        )
-    except ValueError as exc:
-        return services._json_error(str(exc), 400)
-    placeholder_dir = paths["work"] / "placeholders"
-    try:
         fps = int(payload.get("fps", 25))
     except (TypeError, ValueError):
         return services._json_error("fps must be an integer", 400)
@@ -639,6 +648,17 @@ def _stage2_build(services: ModuleType):
             else {"repaired": False, "reason": "service_unavailable"}
         )
         normalization = services.load_normalization(paths["normalized"])
+        requested_speaker_dir = services._abs_path(
+            payload.get("speaker_dir", ""), paths["speaker"], paths["root"]
+        )
+        speaker_dir = (
+            services._revision_speaker_dir(paths, normalization.get("scenario_revision_id"))
+            if requested_speaker_dir.resolve() == paths["speaker"].resolve()
+            else requested_speaker_dir
+        )
+        placeholder_dir = _revision_placeholder_dir(
+            paths, normalization.get("scenario_revision_id")
+        )
         source_store, match_store = services._sync_stores(paths)
         sources = source_store.list()
         stored_matches = match_store.list()
@@ -816,7 +836,12 @@ def _stage2_export_xml(services: ModuleType):
     return Response(
         xml_str,
         mimetype="application/xml",
-        headers={"Content-Disposition": f'attachment; filename="{project}_timeline.xml"'},
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="'
+                f'{xml_export_filename(project, data.get("scenario_revision_id"))}"'
+            )
+        },
     )
 
 

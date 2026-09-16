@@ -68,6 +68,7 @@ from typing import Any, Callable
 import httpx
 
 from .asr_contract import AsrProgress, AsrRunResult, AsrSegment
+from .text_normalization import fold_russian_text
 
 logger = logging.getLogger(__name__)
 
@@ -518,7 +519,7 @@ def parse_speaker_legend(text: str | None) -> dict[str, str]:
 
 
 def _normalize_text(value: str) -> str:
-    value = value.lower()
+    value = fold_russian_text(value)
     value = re.sub(r"[^\w\s]", "", value, flags=re.UNICODE)
     value = re.sub(r"\s+", " ", value).strip()
     return value
@@ -543,7 +544,7 @@ def _name_stem(word: str) -> str:
     после этого остаётся не короче 3 символов (см. _NAME_CASE_SUFFIXES).
     «ё» приводится к «е» — одно и то же имя может встретиться в ответах
     модели написанным по-разному («Пётр» / «Петр»)."""
-    low = word.lower().replace("ё", "е")
+    low = fold_russian_text(word)
     for suffix in _NAME_CASE_SUFFIXES:
         if low.endswith(suffix) and len(low) - len(suffix) >= 3:
             return low[: -len(suffix)]

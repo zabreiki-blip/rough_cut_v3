@@ -411,14 +411,16 @@ class NormalizedTimelineTest(unittest.TestCase):
             timeline = parse_normalized_timeline(
                 {
                     "status": "confirmed",
-                    "blocks": [{
-                        "uid": "life-block",
-                        "order": 1,
-                        "type": "life",
-                        "normalized_text": "01.10 Подойду к тебе, шепну на ушко",
-                        "source_description": "концерт Фриске",
-                        "timecode_start": "01.10",
-                    }],
+                    "blocks": [
+                        {
+                            "uid": "life-block",
+                            "order": 1,
+                            "type": "life",
+                            "normalized_text": "01.10 Подойду к тебе, шепну на ушко",
+                            "source_description": "концерт Фриске",
+                            "timecode_start": "01.10",
+                        }
+                    ],
                 },
                 base,
                 base,

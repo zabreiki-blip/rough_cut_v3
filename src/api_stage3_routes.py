@@ -14,6 +14,7 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from atomic_io import atomic_write_json, atomic_write_text
+from export_naming import xml_export_filename
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
@@ -343,6 +344,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _nested_timeline_filename(project: str, scenario_revision_id: object) -> str:
+    """Build the on-disk name for a freshly prepared nested XML."""
+
+    return xml_export_filename(project, scenario_revision_id)
+
+
+def _persisted_nested_timeline_filename(project: str, mapping_data: dict) -> str:
+    """Read a server-generated export name, falling back for legacy mappings."""
+
+    filename = str(mapping_data.get("nested_timeline_filename") or "").strip()
+    if not filename:
+        return f"{project}_nested_timeline.xml"
+    if Path(filename).name != filename or not filename.endswith(".xml"):
+        raise ValueError("invalid nested timeline filename in stage3 source mapping")
+    return filename
+
+
 def _scan_project_media(
     project: str, paths: dict, services: ModuleType, *, recursive: bool = False
 ) -> dict:
@@ -433,7 +451,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         return {
             "project": project,
             "format": "legacy",
-            "filename": f"{project}_timeline.xml",
+            "filename": xml_export_filename(project, timeline_data.get("scenario_revision_id")),
             "download_url": f"/stage2/export/xml?project={project}",
             "media_count": 0,
             "audio_count": 0,
@@ -474,11 +492,19 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     if progress:
         progress(80, "Генерация nested XML")
     xml_text = build_nested_xml(export_timeline, export_catalog)
-    filename = f"{project}_nested_timeline.xml"
-    atomic_write_text(paths["work"] / filename, xml_text)
+    filename = _nested_timeline_filename(project, timeline_data.get("scenario_revision_id"))
+    output_path = paths["work"] / filename
+    filename_stem = output_path.stem
+    collision = 2
+    while output_path.exists():
+        filename = f"{filename_stem}_{collision}.xml"
+        output_path = paths["work"] / filename
+        collision += 1
+    atomic_write_text(output_path, xml_text)
     mapping_payload = mapping.to_dict()
     mapping_payload["normalization_revision"] = timeline_data.get("normalization_revision")
     mapping_payload["scenario_revision_id"] = str(timeline_data.get("scenario_revision_id") or "")
+    mapping_payload["nested_timeline_filename"] = filename
     atomic_write_json(paths["work"] / "stage3_source_mapping.json", mapping_payload)
     mapped = [
         source_id
@@ -675,7 +701,7 @@ def _start_job(
                 "job_id": job["id"],
                 "kind": kind,
                 "status": "queued",
-                "status_url": f"/stage3/jobs/{job['id']}",
+                "status_url": f"/stage3/jobs/{job['id']}?project={project}",
             },
         }
     )
@@ -701,6 +727,27 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
     def stage3_job_status(job_id: str):
         with jobs_lock:
             job = dict(jobs[job_id]) if job_id in jobs else None
+        if job is None:
+            try:
+                project = services._resolve_project_name(request.args.get("project"))
+            except ValueError as exc:
+                return services._json_error(str(exc), 400)
+            path = _job_status_path(project, services)
+            try:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                persisted = None
+            if isinstance(persisted, dict) and str(persisted.get("id") or "") == job_id:
+                job = persisted
+                if job.get("status") in {"queued", "running"}:
+                    job.update(
+                        {
+                            "status": "interrupted",
+                            "message": "Stage 3 был прерван перезапуском сервера",
+                            "finished_at": _now_iso(),
+                        }
+                    )
+                    _persist_job(job, services)
         if job is None:
             return services._json_error("job not found", 404)
         return jsonify({"ok": True, "result": job})
@@ -801,9 +848,6 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             paths = services._project_paths(project)
         except ValueError as exc:
             return services._json_error(str(exc), 400)
-        filename = f"{project}_nested_timeline.xml"
-        if not (paths["work"] / filename).is_file():
-            return services._json_error("nested timeline not found — prepare Stage 3 first", 404)
         timeline_path = paths["work"] / "full_timeline.json"
         try:
             timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
@@ -827,6 +871,12 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             mapping_data = {}
         except (OSError, json.JSONDecodeError) as exc:
             return services._json_error(f"invalid stage3_source_mapping.json: {exc}", 500)
+        try:
+            filename = _persisted_nested_timeline_filename(project, mapping_data)
+        except ValueError as exc:
+            return services._json_error(str(exc), 500)
+        if not (paths["work"] / filename).is_file():
+            return services._json_error("nested timeline not found — prepare Stage 3 first", 404)
         mapping_normalization_revision = mapping_data.get("normalization_revision")
         if (
             mapping_normalization_revision not in (None, "")
@@ -840,5 +890,9 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 409,
             )
         return send_from_directory(
-            paths["work"], filename, as_attachment=True, mimetype="application/xml"
+            paths["work"],
+            filename,
+            as_attachment=True,
+            download_name=xml_export_filename(project, timeline_data.get("scenario_revision_id")),
+            mimetype="application/xml",
         )

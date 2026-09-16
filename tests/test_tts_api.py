@@ -12,6 +12,7 @@ from unittest.mock import patch
 import api as api_module
 from atomic_io import atomic_write_json
 from project_service import ensure_project
+from stage4.revision_assets import revision_speaker_alias_dir
 from stage4.versioning import ensure_baseline, inspect_revision_state
 
 
@@ -362,7 +363,7 @@ class TtsManifestSyncTests(unittest.TestCase):
                 job_id=job["id"],
                 project="demo",
                 prepared_path=self.paths["prepared"],
-                speaker_dir=self.paths["speaker"],
+                speaker_dir=revision_speaker_alias_dir(self.paths, "rev_0001"),
                 provider=None,
                 voice_name=None,
                 gender=None,

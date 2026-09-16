@@ -85,7 +85,9 @@ class ManualCorrectionLearningTests(unittest.TestCase):
                 "Разные детские воспоминания о том дальнем прекрасном крае",
             )
             with NormalizationMemory(memory_path) as memory:
-                markers = {rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")}
+                markers = {
+                    rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")
+                }
             self.assertEqual(markers, _builtin_video_cue_markers())
 
     def test_url_and_bullet_lines_do_not_learn_keywords(self) -> None:
@@ -102,7 +104,9 @@ class ManualCorrectionLearningTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            draft = generate_normalization(source, normalized, memory_path=memory_path, use_llm=False)
+            draft = generate_normalization(
+                source, normalized, memory_path=memory_path, use_llm=False
+            )
             self.assertEqual(draft["blocks"][0]["original_label"], "")
             self.assertEqual(draft["blocks"][1]["original_label"], "")
             self.assertEqual(draft["blocks"][0]["type"], "technical")
@@ -120,7 +124,9 @@ class ManualCorrectionLearningTests(unittest.TestCase):
             )
 
             with NormalizationMemory(memory_path) as memory:
-                markers = {rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")}
+                markers = {
+                    rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")
+                }
             self.assertEqual(markers, _builtin_video_cue_markers())
 
     def test_labeled_block_manual_technical_change_does_not_learn_video_cue_keywords(self) -> None:
@@ -133,7 +139,9 @@ class ManualCorrectionLearningTests(unittest.TestCase):
             memory_path = root / "memory.sqlite3"
             source.write_text("МАРИЯ: Сольные номера прошли отлично\n", encoding="utf-8")
 
-            draft = generate_normalization(source, normalized, memory_path=memory_path, use_llm=False)
+            draft = generate_normalization(
+                source, normalized, memory_path=memory_path, use_llm=False
+            )
             self.assertEqual(draft["blocks"][0]["original_label"], "МАРИЯ")
 
             draft["blocks"][0]["type"] = "technical"
@@ -149,7 +157,9 @@ class ManualCorrectionLearningTests(unittest.TestCase):
             )
 
             with NormalizationMemory(memory_path) as memory:
-                markers = {rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")}
+                markers = {
+                    rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")
+                }
             self.assertEqual(markers, _builtin_video_cue_markers())
 
     def test_learning_a_video_cue_keyword_invalidates_the_seed_cache(self) -> None:

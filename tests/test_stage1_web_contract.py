@@ -46,6 +46,10 @@ def test_voiceover_can_be_cleared_with_explicit_confirmation() -> None:
 
 
 def test_tts_and_sync_polling_retry_transient_errors_with_bounded_backoff() -> None:
+    assert "export const FETCH_TIMEOUT_MS = 30000;" in STAGE1_JS
+    assert "new AbortController()" in STAGE1_JS
+    assert "timeout.status = 408;" in STAGE1_JS
+    assert STAGE1_JS.count("fetchWithTimeout(") >= 5
     assert "const MAX_POLL_BACKOFF_MS = 10000;" in STAGE1_JS
     assert "function isTransientPollingError(error)" in STAGE1_JS
     assert "function pollingBackoffMs(failures, baseDelay)" in STAGE1_JS
@@ -117,7 +121,10 @@ def test_headless_whisper_model_and_source_scope_controls() -> None:
     assert 'id="sync_whisper_model"' in PROJECT_HTML
     assert '<option value="small" selected>Small — быстро</option>' in PROJECT_HTML
     assert '<option value="medium">Medium — точнее</option>' in PROJECT_HTML
-    assert 'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined' in STAGE1_JS
+    assert (
+        'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined'
+        in STAGE1_JS
+    )
     # `stage3MediaCount` moved from a module-level `let` to a shared `appState`
     # property so the sync/stage3 modules can read and mutate it across files.
     assert 'source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all"' in STAGE1_JS
@@ -155,6 +162,8 @@ def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     assert "let selectedDiffRequest = 0;" in STAGE1_JS
     assert "if (requestId !== selectedDiffRequest) return;" in STAGE1_JS
     assert "Активная редакция не определена" in STAGE1_JS
+    assert "const recoveryRequired = revisionsState.integrity?.blocking === true;" in STAGE1_JS
+    assert 'data-action="reconcile-revision"' in STAGE1_JS
     assert "use_llm: Boolean(ids.normalization_use_llm?.checked)" in STAGE1_JS
 
 
@@ -164,7 +173,10 @@ def test_asr_engine_selector_defaults_to_local_and_is_wired_to_request() -> None
     assert '<option value="cloud">Облако (быстро, ~2¢/час, платно)</option>' in PROJECT_HTML
     assert 'sync_asr_engine: el("sync_asr_engine")' in STAGE1_JS
     assert 'const asrEngine = ids.sync_asr_engine?.value || "local";' in STAGE1_JS
-    assert 'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined' in STAGE1_JS
+    assert (
+        'model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined'
+        in STAGE1_JS
+    )
     assert "asr_engine: asrEngine" in STAGE1_JS
     assert "function updateSyncAsrControls()" in STAGE1_JS
     assert "ids.sync_whisper_model.disabled = isCloud;" in STAGE1_JS
@@ -221,10 +233,17 @@ def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None
 
 def test_sidebar_reports_cumulative_openrouter_usage() -> None:
     assert 'id="openrouter_usage"' in PROJECT_HTML
+    assert 'class="openrouter-usage-total"' in PROJECT_HTML
+    assert 'class="openrouter-usage-pending" hidden' in PROJECT_HTML
     usage_js = (ROOT / "src" / "static" / "stage1" / "usage.js").read_text(encoding="utf-8")
+    usage_css = (ROOT / "src" / "static" / "stage1.css").read_text(encoding="utf-8")
     assert "/stage1/openrouter-usage" in usage_js
     assert "уточняется" in usage_js
     assert "toFixed(4)" in usage_js
+    assert "pendingElement.hidden = pending <= 0" in usage_js
+    assert "· уточняется" not in usage_js
+    assert ".openrouter-usage-pending" in usage_css
+    assert "display: grid" in usage_css
 
 
 def test_stage1_entry_point_is_loaded_as_module_without_native_confirm() -> None:
