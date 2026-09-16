@@ -119,7 +119,10 @@ from stage2.whisper_process import (
     transcribe_audio_in_process as transcribe_audio,
 )
 from stage2.xml_export import build_xml
-from stage4.revision_assets import save_tts_manifest as save_voiceover_tts_manifest
+from stage4.revision_assets import (
+    revision_speaker_alias_dir,
+    save_tts_manifest as save_voiceover_tts_manifest,
+)
 from stage4.versioning import inspect_revision_state, repair_active_revision_metadata
 
 
@@ -369,6 +372,14 @@ def _save_voiceover_revision_assets(project: str, result: dict) -> dict:
     return save_voiceover_tts_manifest(_ensure_project(project), result)
 
 
+def _revision_speaker_dir(paths: dict[str, Path], revision_id: object) -> Path:
+    """Return the version-local TTS alias directory, with legacy fallback."""
+    try:
+        return revision_speaker_alias_dir(paths, str(revision_id or ""))
+    except ValueError:
+        return paths["speaker"]
+
+
 def _discover_project_inbox(project: str) -> dict:
     return discover_project_inbox(_ensure_project(project)["root"])
 
@@ -519,7 +530,7 @@ def _discover_input_files(input_dir: Path, project: str) -> list[str]:
 def _build_status(project: str) -> dict:
     paths = _project_paths(project)
     prepared_path = paths["work"] / "scenario_prepared.json"
-    manifest_path = paths["speaker"] / "manifest.json"
+    manifest_path = paths["active_voiceover_manifest"]
 
     prepared = _read_json_safe(prepared_path)
     manifest = _read_json_safe(manifest_path)
@@ -538,7 +549,10 @@ def _build_status(project: str) -> dict:
     prepared_items = prepared.get("items", []) if isinstance(prepared, dict) else []
     manifest_items = manifest.get("items", []) if isinstance(manifest, dict) else []
 
-    wav_paths = [p for p in paths["speaker"].glob("zk*.wav") if p.is_file()]
+    active_speaker_dir = _revision_speaker_dir(
+        paths, normalization.get("scenario_revision_id")
+    )
+    wav_paths = [p for p in active_speaker_dir.glob("zk*.wav") if p.is_file()]
     wav_files = sorted(p.name for p in wav_paths)
 
     missing_ids: list[str] = []

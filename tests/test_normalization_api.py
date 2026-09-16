@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import json
+import re
 import unittest
 
 import api
@@ -163,7 +164,12 @@ class NormalizationApiTest(unittest.TestCase):
         timeline_result = timeline_response.get_json()["result"]
         self.assertEqual(timeline_result["zk"], 1)
         self.assertEqual(timeline_result["snh"], 1)
-        self.assertEqual(self.client.get("/stage2/export/xml?project=demo").status_code, 200)
+        exported = self.client.get("/stage2/export/xml?project=demo")
+        self.assertEqual(exported.status_code, 200)
+        self.assertRegex(
+            exported.headers["Content-Disposition"],
+            r'filename="demo_V\d+_\d{8}_\d{6}\.xml"',
+        )
         timeline_path = self.projects / "demo" / "work" / "full_timeline.json"
         timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
         self.assertEqual(timeline_payload["schema_version"], 1)

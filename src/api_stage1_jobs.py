@@ -252,7 +252,7 @@ def run_tts_job(
             # finish. A batch that is later cancelled or fails partway
             # through must not leave already-resynthesized blocks recorded
             # with a stale fingerprint (see merge_voiceover_manifest_item).
-            meta = services._read_json_safe(project_paths["speaker"] / f"{current_id}.wav.meta")
+            meta = services._read_json_safe(speaker_dir / f"{current_id}.wav.meta")
             fingerprint = str(meta.get("fingerprint") or "") if isinstance(meta, dict) else ""
             if fingerprint:
                 merge_voiceover_manifest_item(

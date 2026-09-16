@@ -8,10 +8,12 @@ import wave
 from api_core_routes import _active_revision_input_path
 from atomic_io import atomic_write_json
 from project_service import ensure_project
+from stage4.revision_assets import revision_speaker_alias_dir
 from stage4.versioning import (
     RevisionStateConflictError,
     _detect_revision_state,
     _inherit_blocks,
+    _restore_exact_auto_classifications,
     activate_revision,
     compare_blocks,
     ensure_baseline,
@@ -75,6 +77,42 @@ def test_exact_text_downstream_change_is_not_reused_or_overwritten() -> None:
     assert diff["changes"][0]["status"] == "edited"
     assert diff["changes"][0]["downstream_changed_fields"] == ["text_for_tts"]
     assert new[0]["text_for_tts"] == "Новое произношение"
+
+
+def test_exact_text_unknown_in_new_revision_inherits_confirmed_classification() -> None:
+    old = [_block("stable", "Неизменённый закадр", "voiceover", "Диктор")]
+    new = [_block("imported", "Неизменённый закадр", "unknown", "")]
+    new[0].update({"source": "llm", "text_for_tts": "", "role": ""})
+
+    _restore_exact_auto_classifications(old, new)
+    diff = compare_blocks(old, new)
+
+    assert new[0]["type"] == "voiceover"
+    assert new[0]["text_for_tts"] == "Неизменённый закадр"
+    assert diff["summary"] == {"unchanged": 1}
+
+
+def test_exact_text_llm_metadata_drift_inherits_confirmed_classification() -> None:
+    old = [_block("stable", "Неизменённый закадр", "voiceover", "unknown")]
+    old[0].update({"original_label": "", "role": "narrator", "source": "llm"})
+    new = [_block("imported", "Неизменённый закадр", "voiceover", "narrator")]
+    new[0].update({"original_label": "", "role": "narrator", "source": "llm"})
+
+    _restore_exact_auto_classifications(old, new)
+    diff = compare_blocks(old, new)
+
+    assert new[0]["speaker"] == "unknown"
+    assert diff["summary"] == {"unchanged": 1}
+
+
+def test_speaker_title_spelling_variant_is_not_a_speaker_change() -> None:
+    old = [_block("stable", "Текст синхрона", "sync", "ПРОТОИЕРЕЙ ИВАН ИВАНОВ")]
+    new = [_block("imported", "Текст синхрона", "sync", "ПРОТОИЕРЕЙ ИВАН ИВАНОВ")]
+
+    diff = compare_blocks(old, new)
+
+    assert diff["summary"] == {"unchanged": 1}
+    assert diff["changes"][0]["downstream_changed_fields"] == []
 
 
 def test_import_snapshots_baseline_and_inherits_stable_uid(tmp_path: Path) -> None:
@@ -511,7 +549,7 @@ def test_activation_interrupted_mid_asset_rename_is_detected(
     import pytest
     from unittest.mock import patch
 
-    speaker_dir = paths["speaker"]
+    speaker_dir = revision_speaker_alias_dir(paths, "rev_0002")
     real_replace = Path.replace
     rename_calls = {"count": 0}
 
@@ -644,7 +682,7 @@ def test_activation_recovery_reports_when_it_cannot_finish(tmp_path: Path) -> No
     import pytest
     from unittest.mock import patch
 
-    speaker_dir = paths["speaker"]
+    speaker_dir = revision_speaker_alias_dir(paths, "rev_0002")
     real_replace = Path.replace
     rename_calls = {"count": 0}
 

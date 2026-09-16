@@ -740,6 +740,30 @@ class NormalizerTests(unittest.TestCase):
                 [block["timecode_start"] for block in blocks], ["00:31:16", "01:25:03"]
             )
 
+    def test_bare_timecode_after_sync_credit_inherits_speaker_and_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "АНДРЕЙ КЛЮЕВ, ИСТОРИК: 00:13:35. Первая реплика.\n"
+                "00:18:14. Следующая реплика того же спикера.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            continuation = blocks[1]
+            self.assertEqual(continuation["type"], "sync")
+            self.assertEqual(continuation["speaker"], "АНДРЕЙ КЛЮЕВ")
+            self.assertEqual(continuation["role"], "ИСТОРИК")
+            self.assertEqual(continuation["timecode_start"], "00:18:14")
+            self.assertEqual(
+                continuation["sync_fragments"],
+                [{"text": "Следующая реплика того же спикера.", "timecode_start": "00:18:14"}],
+            )
+
     def test_known_voiceover_marker_precedes_generic_dash_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

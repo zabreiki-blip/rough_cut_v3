@@ -418,4 +418,12 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
             abort(404)
 
         paths = services._project_paths(project)
+        normalized = services._read_json_safe(paths["normalized"])
+        active_speaker_dir = services._revision_speaker_dir(
+            paths, normalized.get("scenario_revision_id")
+        )
+        if (active_speaker_dir / filename).is_file():
+            return send_from_directory(active_speaker_dir, filename, as_attachment=False)
+        # Legacy projects created before revision-local aliases retain their
+        # old playback path until a baseline is created.
         return send_from_directory(paths["speaker"], filename, as_attachment=False)

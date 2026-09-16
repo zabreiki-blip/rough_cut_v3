@@ -9,6 +9,7 @@ from atomic_io import atomic_write_json
 from project_service import ensure_project
 from stage4.revision_assets import (
     merge_voiceover_manifest_item,
+    revision_speaker_alias_dir,
     save_tts_manifest,
     snapshot_revision_assets,
 )
@@ -155,7 +156,9 @@ def test_inserting_voiceover_before_existing_keeps_old_audio_by_block_uid(
     old_mapping = _entry_for_uid(active_manifest, "voice-stable")
     assert old_mapping["id"] == "zk2"
     assert _asset_path(old_mapping, paths["root"]).read_bytes() == old_audio
-    assert (paths["speaker"] / "zk2.wav").read_bytes() == old_audio
+    assert (
+        revision_speaker_alias_dir(paths, "rev_0002") / "zk2.wav"
+    ).read_bytes() == old_audio
 
 
 def test_activating_old_revision_restores_prepared_and_audio_mapping(
@@ -179,8 +182,12 @@ def test_activating_old_revision_restores_prepared_and_audio_mapping(
         }
     )
     atomic_write_json(paths["active_voiceover_manifest"], active_manifest)
-    (paths["speaker"] / "zk1.wav").write_bytes(new_audio)
+    (revision_speaker_alias_dir(paths, "rev_0002") / "zk1.wav").write_bytes(new_audio)
     atomic_write_json(paths["timeline"], {"revision": "rev_0002", "segments": []})
+    atomic_write_json(
+        paths["work"] / "stage3_source_mapping.json",
+        {"scenario_revision_id": "rev_0002", "nested_timeline_filename": "demo_V2.xml"},
+    )
     atomic_write_json(
         paths["sync_matches"],
         {
@@ -199,7 +206,9 @@ def test_activating_old_revision_restores_prepared_and_audio_mapping(
     assert [entry["block_uid"] for entry in _manifest_entries(restored_manifest)] == [
         "voice-stable"
     ]
-    assert (paths["speaker"] / "zk1.wav").read_bytes() == old_audio
+    assert (
+        revision_speaker_alias_dir(paths, "rev_0001") / "zk1.wav"
+    ).read_bytes() == old_audio
 
     rev2 = _read_json(paths["scenario_versions"] / "rev_0002.json")
     saved_rev2_manifest = _read_json(
@@ -211,6 +220,7 @@ def test_activating_old_revision_restores_prepared_and_audio_mapping(
     activate_revision("rev_0002", paths)
     assert _read_json(paths["timeline"])["revision"] == "rev_0002"
     assert _read_json(paths["sync_matches"])["matches"][0]["segment_id"] == "new-import-uid"
+    assert _read_json(paths["work"] / "stage3_source_mapping.json")["scenario_revision_id"] == "rev_0002"
 
 
 def test_legacy_zk_audio_is_migrated_once_and_reused_as_immutable_asset(
@@ -317,7 +327,7 @@ def test_edited_voiceover_does_not_inherit_old_audio_before_resynthesis(
     )
     assert _manifest_entries(manifest) == []
     activate_revision("rev_0002", paths)
-    assert not (paths["speaker"] / "zk1.wav").exists()
+    assert not (revision_speaker_alias_dir(paths, "rev_0002") / "zk1.wav").exists()
 
 
 def test_inspect_revision_state_detects_stale_voiceover_asset_fingerprint(
@@ -335,9 +345,10 @@ def test_inspect_revision_state_detects_stale_voiceover_asset_fingerprint(
     manifest = _read_json(paths["active_voiceover_manifest"])
     fingerprint = _entry_for_uid(manifest, "voice-stable")["fingerprint"]
     assert fingerprint.startswith("legacy-")
-    recorded = json.loads((paths["speaker"] / "zk1.wav.meta").read_text(encoding="utf-8"))
+    alias = revision_speaker_alias_dir(paths, "rev_0001") / "zk1.wav"
+    recorded = json.loads(alias.with_suffix(".wav.meta").read_text(encoding="utf-8"))
     assert recorded["fingerprint"] == fingerprint
-    (paths["speaker"] / "zk1.wav.meta").write_text(
+    alias.with_suffix(".wav.meta").write_text(
         json.dumps({"fingerprint": "legacy-tampered"}), encoding="utf-8"
     )
 
@@ -363,9 +374,41 @@ def test_restore_revision_assets_records_sidecar_for_legacy_fingerprint(
 
     activate_revision("rev_0002", paths)
 
-    meta = json.loads((paths["speaker"] / "zk2.wav.meta").read_text(encoding="utf-8"))
+    alias = revision_speaker_alias_dir(paths, "rev_0002") / "zk2.wav"
+    meta = json.loads(alias.with_suffix(".wav.meta").read_text(encoding="utf-8"))
     assert meta["fingerprint"] == expected_fingerprint
-    assert (paths["speaker"] / "zk2.wav").read_bytes() == old_audio
+    assert alias.read_bytes() == old_audio
+
+
+def test_revision_alias_projections_coexist_and_restore_without_overwriting(tmp_path: Path) -> None:
+    paths, _source, old_audio = _prepare_legacy_baseline(tmp_path)
+    _import_with_voiceover_insert(tmp_path, paths)
+    activate_revision("rev_0002", paths)
+
+    v2_alias_dir = revision_speaker_alias_dir(paths, "rev_0002")
+    new_asset = paths["voiceover_assets"] / "new-import-uid" / "new-fingerprint.wav"
+    new_audio = _write_wav(new_asset, 202)
+    active_manifest = _read_json(paths["active_voiceover_manifest"])
+    _manifest_entries(active_manifest).append(
+        {
+            "id": "zk1",
+            "block_uid": "new-import-uid",
+            "fingerprint": "new-fingerprint",
+            "asset": str(new_asset.relative_to(paths["root"])),
+        }
+    )
+    atomic_write_json(paths["active_voiceover_manifest"], active_manifest)
+    (v2_alias_dir / "zk1.wav").write_bytes(new_audio)
+
+    activate_revision("rev_0001", paths)
+    v1_alias_dir = revision_speaker_alias_dir(paths, "rev_0001")
+    assert (v1_alias_dir / "zk1.wav").read_bytes() == old_audio
+    assert (v2_alias_dir / "zk1.wav").read_bytes() == new_audio
+    assert (v2_alias_dir / "zk2.wav").read_bytes() == old_audio
+
+    activate_revision("rev_0002", paths)
+    assert (v2_alias_dir / "zk1.wav").read_bytes() == new_audio
+    assert (v1_alias_dir / "zk1.wav").read_bytes() == old_audio
 
 
 def test_stale_tts_result_is_saved_to_its_revision_not_the_active_one(
@@ -425,12 +468,13 @@ def test_merge_voiceover_manifest_item_records_resynthesis_without_full_batch(
     assert inspect_revision_state(paths)["status"] == "ok"
 
     # Mimic what stage1.gemini_tts does when a block is resynthesized: the
-    # content-addressed asset and the mutable speaker/zk1.wav alias (with its
+    # content-addressed asset and the revision-local zk1.wav alias (with its
     # sidecar) are updated to a new fingerprint.
-    new_asset = paths["speaker"] / "assets" / "voice-stable" / "new-fingerprint.wav"
+    speaker_dir = revision_speaker_alias_dir(paths, "rev_0001")
+    new_asset = speaker_dir / "assets" / "voice-stable" / "new-fingerprint.wav"
     new_audio = _write_wav(new_asset, 909)
-    (paths["speaker"] / "zk1.wav").write_bytes(new_audio)
-    atomic_write_json(paths["speaker"] / "zk1.wav.meta", {"fingerprint": "new-fingerprint"})
+    (speaker_dir / "zk1.wav").write_bytes(new_audio)
+    atomic_write_json(speaker_dir / "zk1.wav.meta", {"fingerprint": "new-fingerprint"})
 
     merge_voiceover_manifest_item(
         paths,
@@ -438,7 +482,7 @@ def test_merge_voiceover_manifest_item_records_resynthesis_without_full_batch(
         block_id="zk1",
         block_uid="voice-stable",
         fingerprint="new-fingerprint",
-        speaker_dir=paths["speaker"],
+        speaker_dir=speaker_dir,
     )
 
     manifest = _read_json(paths["active_voiceover_manifest"])

@@ -75,6 +75,21 @@ def activation_intent_path(project_paths: dict[str, Path]) -> Path:
     return project_paths["work"] / _ACTIVATION_INTENT_FILENAME
 
 
+def revision_speaker_alias_dir(project_paths: dict[str, Path], revision_id: str) -> Path:
+    """Return the mutable speaker alias projection for one revision.
+
+    Canonical assets remain under ``speaker/assets``.  Positional ``zkN``
+    names are deliberately revision-local so activating or synthesizing V2
+    cannot overwrite the aliases kept for V1 (or any later revision).
+    ``capture_legacy_voiceover_manifest`` continues to read the historical
+    top-level ``speaker/zkN.wav`` aliases while migrating pre-versioning
+    projects.
+    """
+    if not re.fullmatch(r"rev_\d+", revision_id):
+        raise ValueError("invalid revision id")
+    return project_paths["speaker"] / "revisions" / revision_id
+
+
 def prepared_from_normalized(normalized: dict[str, Any]) -> dict[str, Any]:
     blocks = [
         block
@@ -234,6 +249,11 @@ def snapshot_revision_assets(revision_id: str, project_paths: dict[str, Path]) -
         matches_snapshot = project_paths["timeline_versions"] / f"{revision_id}.sync_matches.json"
         _atomic_copy(project_paths["sync_matches"], matches_snapshot)
         revision["sync_matches_snapshot"] = matches_snapshot.name
+    stage3_mapping = project_paths["work"] / "stage3_source_mapping.json"
+    if stage3_mapping.is_file():
+        mapping_snapshot = project_paths["timeline_versions"] / f"{revision_id}.stage3_mapping.json"
+        _atomic_copy(stage3_mapping, mapping_snapshot)
+        revision["stage3_mapping_snapshot"] = mapping_snapshot.name
     atomic_write_json(manifest_path, revision)
     return revision
 
@@ -487,10 +507,14 @@ def restore_revision_assets(
             raise FileNotFoundError(f"Voiceover asset not found for {block_id}")
         desired[block_id] = (source, str(item.get("fingerprint") or ""))
 
-    # Validate and stage every target before changing the currently active set.
+    # Validate and stage every target before changing this revision's alias
+    # projection.  Never publish positional aliases into speaker/ itself:
+    # that legacy shared directory made opening V2 overwrite V1's zkN.wav.
+    alias_dir = revision_speaker_alias_dir(project_paths, revision_id)
+    alias_dir.mkdir(parents=True, exist_ok=True)
     staged: dict[str, Path] = {}
     for block_id, (source, _fingerprint) in desired.items():
-        destination = project_paths["speaker"] / f".{block_id}.revision.tmp"
+        destination = alias_dir / f".{block_id}.revision.tmp"
         _atomic_copy(source, destination)
         staged[block_id] = destination
 
@@ -514,7 +538,7 @@ def restore_revision_assets(
                 {
                     "block_id": block_id,
                     "staged": staged_path.resolve().relative_to(root).as_posix(),
-                    "alias": (project_paths["speaker"] / f"{block_id}.wav")
+                    "alias": (alias_dir / f"{block_id}.wav")
                     .resolve()
                     .relative_to(root)
                     .as_posix(),
@@ -528,7 +552,7 @@ def restore_revision_assets(
     atomic_write_json(project_paths["prepared"], prepared_payload)
     atomic_write_json(project_paths["active_voiceover_manifest"], manifest)
     for block_id, staged_path in staged.items():
-        alias = project_paths["speaker"] / f"{block_id}.wav"
+        alias = alias_dir / f"{block_id}.wav"
         staged_path.replace(alias)
         fingerprint = desired[block_id][1]
         if fingerprint:
@@ -542,7 +566,7 @@ def restore_revision_assets(
             atomic_write_json(alias.with_suffix(".wav.meta"), {"fingerprint": fingerprint})
         else:
             alias.with_suffix(".wav.meta").unlink(missing_ok=True)
-    for alias in project_paths["speaker"].iterdir():
+    for alias in alias_dir.iterdir():
         if (
             alias.is_file()
             and _VOICEOVER_ALIAS_RE.fullmatch(alias.name)

@@ -20,6 +20,24 @@ def _resolve_tts_direction(services: ModuleType, payload: dict, provider: str | 
     return model, style
 
 
+def _revision_speaker_dir(
+    services: ModuleType,
+    payload: dict,
+    paths: dict,
+    revision_id: object,
+):
+    """Route the default speaker directory into the active revision.
+
+    A caller can still provide an explicit project-local directory for a
+    one-off operation.  The UI's historical default (``speaker/``) is
+    redirected so V2 never publishes positional aliases into V1's folder.
+    """
+    requested = services._abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
+    if requested.resolve() == paths["speaker"].resolve():
+        return services._revision_speaker_dir(paths, revision_id)
+    return requested
+
+
 def _stage1_analyze(services: ModuleType):
     payload = request.get_json(silent=True) or {}
 
@@ -437,8 +455,11 @@ def _stage1_tts(services: ModuleType):
         return services._json_error(f"TTS already active for project {project}", 409)
     try:
         prepared_path = services._confirmed_prepared_path(payload, paths)
-        speaker_dir = services._abs_path(
-            payload.get("speaker_dir", ""), paths["speaker"], paths["root"]
+        speaker_dir = _revision_speaker_dir(
+            services,
+            payload,
+            paths,
+            services._read_json_safe(prepared_path).get("scenario_revision_id"),
         )
         result = services.synthesize_tts(
             prepared_path=prepared_path,
@@ -509,8 +530,11 @@ def _stage1_tts_job_start(services: ModuleType):
 
     try:
         prepared_path = services._confirmed_prepared_path(payload, paths)
-        speaker_dir = services._abs_path(
-            payload.get("speaker_dir", ""), paths["speaker"], paths["root"]
+        speaker_dir = _revision_speaker_dir(
+            services,
+            payload,
+            paths,
+            services._read_json_safe(prepared_path).get("scenario_revision_id"),
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -627,18 +651,26 @@ def _stage1_tts_clear(services: ModuleType):
         )
 
     removed = 0
-    for pattern in ("zk*.wav", "zk*.wav.meta"):
-        for path in paths["speaker"].glob(pattern):
-            if path.is_file():
-                path.unlink()
-                removed += 1
+    normalized = services._read_json_safe(paths["normalized"])
+    speaker_dir = services._revision_speaker_dir(paths, normalized.get("scenario_revision_id"))
+    projection_dirs = [speaker_dir]
+    if speaker_dir.resolve() != paths["speaker"].resolve():
+        # Clean stale pre-versioning aliases too.  They are never canonical
+        # revision assets and keeping them would make a legacy UI appear to
+        # retain audio after the user explicitly cleared it.
+        projection_dirs.append(paths["speaker"])
+    for directory in projection_dirs:
+        for pattern in ("zk*.wav", "zk*.wav.meta"):
+            for path in directory.glob(pattern):
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
 
     validation_manifest = paths["speaker"] / "manifest.json"
     if validation_manifest.is_file():
         validation_manifest.unlink()
         removed += 1
 
-    normalized = services._read_json_safe(paths["normalized"])
     services._atomic_write_json_file(
         paths["active_voiceover_manifest"],
         {
@@ -706,8 +738,9 @@ def _stage1_tts_phrase(services: ModuleType):
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
     try:
-        speaker_dir = services._abs_path(
-            payload.get("speaker_dir", ""), paths["speaker"], paths["root"]
+        normalized = services._read_json_safe(paths["normalized"])
+        speaker_dir = _revision_speaker_dir(
+            services, payload, paths, normalized.get("scenario_revision_id")
         )
         result = services.synthesize_phrase(
             text=str(payload.get("text", "")),
@@ -735,9 +768,12 @@ def _stage1_tts_phrase(services: ModuleType):
 
     result["project"] = project
     out_file = services.Path(result.get("file", ""))
+    active_speaker_dir = services._revision_speaker_dir(
+        paths, normalized.get("scenario_revision_id")
+    )
     if (
         out_file.suffix.lower() == ".wav"
-        and out_file.parent.resolve() == paths["speaker"].resolve()
+        and out_file.parent.resolve() == active_speaker_dir.resolve()
     ):
         result["playback_url"] = f"/speaker/{project}/{out_file.name}"
     return jsonify({"ok": True, "result": result})
@@ -759,8 +795,11 @@ def _stage1_validate(services: ModuleType):
         return projection_gate
     try:
         prepared_path = services._confirmed_prepared_path(payload, paths)
-        speaker_dir = services._abs_path(
-            payload.get("speaker_dir", ""), paths["speaker"], paths["root"]
+        speaker_dir = _revision_speaker_dir(
+            services,
+            payload,
+            paths,
+            services._read_json_safe(prepared_path).get("scenario_revision_id"),
         )
         manifest_path = services._abs_path(
             payload.get("manifest_path", ""),

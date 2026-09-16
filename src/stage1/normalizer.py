@@ -443,6 +443,16 @@ def _generate_normalization_unlocked(
             blocks.append(block)
 
         _annotate_continuation_context(blocks, video_cue_re)
+        # Continuation context can supply a speaker only after the first
+        # metadata pass.  Re-extract its fragments now so a bare timecoded
+        # continuation remains independently searchable in Stage 2.
+        for block in blocks:
+            if (
+                block.type == BlockType.SYNC.value
+                and block.continuation_of_type == BlockType.SYNC.value
+                and not block.sync_fragments
+            ):
+                _extract_block_metadata(block)
         unresolved = [block for block in blocks if block.type == BlockType.UNKNOWN.value]
         if unresolved and use_llm:
             if classifier is not None:
@@ -1488,6 +1498,14 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
             has_sync_metadata = True
         elif name_only_match and _TIMECODE.match(fragment_source):
             block.speaker = block.original_label.strip()
+            has_sync_metadata = True
+        elif (
+            block.continuation_of_type == BlockType.SYNC.value
+            and block.speaker
+            and _starts_with_unambiguous_timecode(fragment_source)
+        ):
+            # The preceding labelled sync supplied the interviewee.  Keep a
+            # bare timecoded paragraph as its own searchable source range.
             has_sync_metadata = True
         elif (
             block.original_label

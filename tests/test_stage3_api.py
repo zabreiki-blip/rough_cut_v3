@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import re
 import threading
 
 from flask import Flask, jsonify
@@ -178,7 +179,12 @@ def test_stage3_export_rejects_other_revision_and_accepts_legacy_identity(client
         ),
         encoding="utf-8",
     )
-    assert http.get("/stage3/export/xml?project=BRIK").status_code == 200
+    exported = http.get("/stage3/export/xml?project=BRIK")
+    assert exported.status_code == 200
+    assert re.search(
+        r'filename="?BRIK_V0_\d{8}_\d{6}\.xml"?',
+        exported.headers["Content-Disposition"],
+    )
 
     timeline_path.write_text(
         json.dumps(
@@ -200,6 +206,65 @@ def test_stage3_export_rejects_other_revision_and_accepts_legacy_identity(client
         encoding="utf-8",
     )
     assert http.get("/stage3/export/xml?project=BRIK").status_code == 409
+
+
+def test_prepare_versioned_nested_export_persists_its_filename_for_download(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    services._confirmed_normalization = lambda _project: (
+        {"revision": "norm-1", "scenario_revision_id": "rev_0002"},
+        "",
+    )
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "normalization_revision": "norm-1",
+                "scenario_revision_id": "rev_0002",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "_scan_project_media",
+        lambda *_a, **_k: {
+            "sources": [
+                {
+                    "source_id": "review-1",
+                    "name": "review.mp4",
+                    "relative_path": "media/reviews/review.mp4",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a: "<xml/>")
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "map_catalog_to_timeline",
+        lambda *_a: SimpleNamespace(
+            catalog={}, details={}, unmapped_source_ids=[], to_dict=lambda: {}
+        ),
+    )
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    filename = response.get_json()["result"]["filename"]
+    assert re.fullmatch(r"BRIK_V2_\d{8}_\d{6}\.xml", filename)
+    assert (paths["work"] / filename).read_text(encoding="utf-8") == "<xml/>"
+    mapping = json.loads((paths["work"] / "stage3_source_mapping.json").read_text())
+    assert mapping["nested_timeline_filename"] == filename
+    downloaded = http.get("/stage3/export/xml?project=BRIK")
+    assert downloaded.status_code == 200
+    assert downloaded.data == b"<xml/>"
+    assert re.search(
+        r'filename="?BRIK_V2_\d{8}_\d{6}\.xml"?',
+        downloaded.headers["Content-Disposition"],
+    )
 
 
 def test_scan_api_uses_project_review_directory_automatically(client) -> None:

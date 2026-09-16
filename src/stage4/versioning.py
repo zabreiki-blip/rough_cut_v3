@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
@@ -18,6 +19,7 @@ from atomic_io import atomic_write_json
 from stage4.revision_assets import (
     activation_intent_path,
     create_revision_asset_snapshots,
+    revision_speaker_alias_dir,
     restore_revision_assets,
     snapshot_revision_assets,
     validate_revision_assets,
@@ -53,6 +55,12 @@ _DOWNSTREAM_FIELDS = (
     "timecode_end",
     "sync_fragments",
 )
+# Spelling variants of a title do not identify a different interviewee.  Keep
+# this deliberately small: broad fuzzy matching of names would risk merging
+# genuinely different people.
+_SPEAKER_TOKEN_ALIASES = {
+    "протоирей": "протоиерей",
+}
 _PROJECT_LOCKS: dict[str, RLock] = {}
 _PROJECT_LOCKS_GUARD = Lock()
 
@@ -109,7 +117,8 @@ def _normalize(value: object) -> str:
 
 
 def _speaker(block: dict[str, Any]) -> str:
-    return _normalize(block.get("speaker") or block.get("original_label"))
+    value = _normalize(block.get("speaker") or block.get("original_label"))
+    return " ".join(_SPEAKER_TOKEN_ALIASES.get(token, token) for token in value.split())
 
 
 def _block_text(block: dict[str, Any]) -> str:
@@ -126,12 +135,44 @@ def _downstream_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
         if field == "sync_fragments":
             old_value = old.get(field) if isinstance(old.get(field), list) else []
             new_value = new.get(field) if isinstance(new.get(field), list) else []
+        elif field == "speaker":
+            old_value = _speaker(old)
+            new_value = _speaker(new)
         else:
             old_value = str(old.get(field) or "")
             new_value = str(new.get(field) or "")
         if old_value != new_value:
             changed.append(field)
     return changed
+
+
+def _restore_exact_auto_classifications(
+    old_blocks: list[dict], new_blocks: list[dict]
+) -> None:
+    """Keep a confirmed classification when auto-classification changes it.
+
+    An unmarked paragraph can receive a different LLM label on two runs, or
+    be left unresolved after an unavailable/uncertain response.  A new
+    revision must not turn an exactly unchanged, already-confirmed block into
+    a different speaker/type or silently drop its TTS/sync metadata. Only
+    exact one-to-one text matches with no new explicit label qualify; a
+    manual classification or textual edit remains authoritative.
+    """
+    pairs, _, _ = _exact_pairs(old_blocks, new_blocks)
+    inherited_fields = (*_CLASSIFICATION_FIELDS, "timecode_start", "timecode_end", "sync_fragments")
+    for old_index, new_index, _status in pairs:
+        old = old_blocks[old_index]
+        new = new_blocks[new_index]
+        automatically_classified = str(new.get("source") or "") in {"llm", "unknown"}
+        if (
+            old.get("type") in {"", "unknown"}
+            or not automatically_classified
+            or new.get("original_label")
+        ):
+            continue
+        for field in inherited_fields:
+            if field in old:
+                new[field] = deepcopy(old[field])
 
 
 def _paths(project_paths: dict[str, Path]) -> dict[str, Path]:
@@ -200,7 +241,7 @@ def _asset_projection_mismatches(project_paths: dict[str, Path], active_id: str)
         return mismatches
 
     items = manifest.get("items")
-    speaker = project_paths["speaker"]
+    speaker = revision_speaker_alias_dir(project_paths, active_id)
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
@@ -474,7 +515,12 @@ def ensure_baseline(project: str, project_paths: dict[str, Path]) -> dict[str, A
         project_paths["work"] / "active_revision.json",
         {"revision_id": revision_id, "activated_at": _utcnow()},
     )
-    return snapshot_revision_assets(revision_id, project_paths) or manifest
+    snapshotted = snapshot_revision_assets(revision_id, project_paths) or manifest
+    # Migrate the baseline's legacy top-level zkN aliases into its own
+    # projection immediately.  Future integrity checks and Stage 2 builds
+    # must never depend on the shared pre-versioning speaker directory.
+    restore_revision_assets(revision_id, snapshotted, normalized, project_paths)
+    return snapshotted
 
 
 def _exact_pairs(
@@ -860,6 +906,7 @@ def import_revision(
     parent_normalized = _read_json(storage["scenarios"] / str(parent["normalized_snapshot"]))
     old_blocks = list(parent_normalized.get("blocks", []))
     new_blocks = list(generated.get("blocks", []))
+    _restore_exact_auto_classifications(old_blocks, new_blocks)
     diff = compare_blocks(old_blocks, new_blocks)
     _inherit_blocks(old_blocks, new_blocks, diff)
     generated["blocks"] = new_blocks
@@ -1026,6 +1073,11 @@ def activate_revision(
         if timeline_snapshot != f"{revision_id}.full_timeline.json":
             raise ValueError("invalid timeline snapshot")
         _read_json(storage["timelines"] / timeline_snapshot)
+    stage3_mapping_snapshot = str(manifest.get("stage3_mapping_snapshot") or "")
+    if stage3_mapping_snapshot:
+        if stage3_mapping_snapshot != f"{revision_id}.stage3_mapping.json":
+            raise ValueError("invalid Stage 3 mapping snapshot")
+        _read_json(storage["timelines"] / stage3_mapping_snapshot)
     diff: dict[str, Any] = {}
     diff_file = str(manifest.get("diff_file") or "")
     if diff_file:
@@ -1049,6 +1101,19 @@ def activate_revision(
         )
     else:
         project_paths["timeline"].unlink(missing_ok=True)
+    stage3_mapping_snapshot = str(manifest.get("stage3_mapping_snapshot") or "")
+    if stage3_mapping_snapshot:
+        expected_mapping_snapshot = f"{revision_id}.stage3_mapping.json"
+        if stage3_mapping_snapshot != expected_mapping_snapshot:
+            raise ValueError("invalid Stage 3 mapping snapshot")
+        _snapshot_file(
+            storage["timelines"] / stage3_mapping_snapshot,
+            project_paths["work"] / "stage3_source_mapping.json",
+        )
+    else:
+        # A mapping from another revision could point export at its XML even
+        # though the active timeline was restored correctly.
+        (project_paths["work"] / "stage3_source_mapping.json").unlink(missing_ok=True)
     atomic_write_json(
         project_paths["work"] / "active_revision.json",
         {"revision_id": revision_id, "activated_at": _utcnow()},
@@ -1081,6 +1146,7 @@ def reconcile_revision_state(
         project_paths["prepared"],
         project_paths["sync_matches"],
         project_paths["timeline"],
+        project_paths["work"] / "stage3_source_mapping.json",
         project_paths["active_voiceover_manifest"],
         project_paths["work"] / "active_revision.json",
     )
