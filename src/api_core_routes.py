@@ -271,12 +271,6 @@ def _build_readiness(settings: Any) -> dict[str, Any]:
             has_key=bool(settings.openrouter_api_key),
             hint="Нужен для LLM-анализа сценария и OpenRouter TTS.",
         ),
-        _check_api_key(
-            item_id="gemini_key",
-            label="GEMINI_API_KEY",
-            has_key=bool(settings.gemini_api_key),
-            hint="Нужен для Gemini TTS.",
-        ),
     ]
     overall = min(
         (check["status"] for check in checks),
