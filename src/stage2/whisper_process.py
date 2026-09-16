@@ -1,4 +1,5 @@
 """Process-isolated Whisper execution with progress forwarding and a hard timeout."""
+
 from __future__ import annotations
 
 import atexit
@@ -16,6 +17,16 @@ from .whisper_runner import transcribe_audio
 
 ProgressCallback = Callable[[float, float, int], None]
 DEFAULT_TIMEOUT_SECONDS = 4 * 60 * 60
+DEFAULT_IDLE_TIMEOUT_SECONDS = 15 * 60
+_UNLOAD_AFTER_JOB_ENV = "SYNC_WHISPER_UNLOAD_AFTER_JOB"
+_IDLE_TIMEOUT_ENV = "SYNC_WHISPER_IDLE_TIMEOUT_SECONDS"
+# Watchdog poll interval bounds. The watchdog sleeps for an interval computed
+# from the configured idle timeout (idle_timeout / 10) to balance responsiveness
+# against battery drain: idle workers are checked frequently when timeouts are
+# short (responding to recently-lowered limits), but infrequently when disabled
+# or timeouts are long. The interval is clamped to [0.02, 1.0] seconds.
+_WATCHDOG_MIN_POLL_SECONDS = 0.02
+_WATCHDOG_MAX_POLL_SECONDS = 1.0
 
 
 class WhisperProcessError(RuntimeError):
@@ -41,17 +52,30 @@ _worker_lock = threading.Lock()
 _worker: _Worker | None = None
 _worker_owner_pid = os.getpid()
 _request_number = 0
+# Monotonic timestamp of the last time the cached worker finished a request,
+# or None while no worker is cached / one is currently in flight.
+_worker_last_active: float | None = None
+# Idle timeout the watchdog thread currently applies, refreshed on every
+# request (see `_configured_idle_timeout`) rather than cached at import time.
+_worker_idle_timeout_seconds = float(DEFAULT_IDLE_TIMEOUT_SECONDS)
+_watchdog_thread: threading.Thread | None = None
 
 
 def _after_fork_child() -> None:
     """Drop parent-owned IPC state after an application process forks."""
     global _request_number, _worker, _worker_lock, _worker_owner_pid
+    global _worker_last_active, _watchdog_thread
     if _worker is not None:
         _worker.connection.close()
     _worker = None
     _worker_lock = threading.Lock()
     _worker_owner_pid = os.getpid()
     _request_number = 0
+    _worker_last_active = None
+    # The watchdog thread object does not survive a fork as a running OS
+    # thread (only the calling thread does); forget it so the next worker
+    # lazily starts a fresh watchdog scoped to this child process.
+    _watchdog_thread = None
 
 
 if hasattr(os, "register_at_fork"):
@@ -59,9 +83,11 @@ if hasattr(os, "register_at_fork"):
 
 
 def _configured_timeout(value: float | None) -> float:
-    raw = value
-    if raw is None:
-        raw = os.getenv("SYNC_WHISPER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))
+    raw: float | str = (
+        value
+        if value is not None
+        else os.getenv("SYNC_WHISPER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))
+    )
     try:
         timeout = float(raw)
     except (TypeError, ValueError) as exc:
@@ -69,6 +95,32 @@ def _configured_timeout(value: float | None) -> float:
     if timeout <= 0:
         raise ValueError("SYNC_WHISPER_TIMEOUT_SECONDS must be a positive number")
     return timeout
+
+
+def _configured_idle_timeout() -> float:
+    raw = os.getenv(_IDLE_TIMEOUT_ENV, str(DEFAULT_IDLE_TIMEOUT_SECONDS))
+    try:
+        idle_timeout = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{_IDLE_TIMEOUT_ENV} must be a non-negative number") from exc
+    if idle_timeout < 0:
+        raise ValueError(f"{_IDLE_TIMEOUT_ENV} must be a non-negative number")
+    return idle_timeout
+
+
+def _unload_after_job() -> bool:
+    """Return whether a successful request should release the cached model process.
+
+    Keeping the worker alive is the historical default: it makes later requests
+    faster because the model stays loaded.  Local installations that prefer
+    memory over warm-start speed can opt in to retiring it after each success.
+    """
+    raw = os.getenv(_UNLOAD_AFTER_JOB_ENV, "").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    raise ValueError(f"{_UNLOAD_AFTER_JOB_ENV} must be one of: 1, true, yes, on, 0, false, no, off")
 
 
 def _transcribe_worker(connection: Connection) -> None:
@@ -113,7 +165,13 @@ def _transcribe_worker(connection: Connection) -> None:
             except BaseException as exc:
                 try:
                     connection.send(
-                        ("error", request_id, type(exc).__name__, str(exc))
+                        (
+                            "error",
+                            request_id,
+                            type(exc).__name__,
+                            str(exc),
+                            getattr(exc, "cost_usd", None),
+                        )
                     )
                 except (BrokenPipeError, EOFError, OSError):
                     pass
@@ -152,10 +210,70 @@ def _retire_worker(worker: _Worker, *, graceful: bool = False) -> None:
 
 
 def _discard_worker_locked(worker: _Worker, *, graceful: bool = False) -> None:
-    global _worker
+    global _worker, _worker_last_active
     if _worker is worker:
         _worker = None
+        _worker_last_active = None
     _retire_worker(worker, graceful=graceful)
+
+
+def _watchdog_loop(owner_pid: int) -> None:
+    """Retire the cached worker once it has sat idle past the configured timeout.
+
+    A single daemon thread per process runs this loop for the whole process
+    lifetime. It never fights an active transcription for the worker: the
+    lock is acquired with a short timeout, so a busy worker is simply left
+    alone until the next poll.
+    """
+    while True:
+        idle_timeout = _worker_idle_timeout_seconds
+        # Compute adaptive poll interval from the configured idle timeout to
+        # balance responsiveness (short sleeps for short timeouts) against
+        # battery drain (long sleeps when timeouts are long or disabled).
+        if idle_timeout > 0:
+            poll_interval = max(
+                _WATCHDOG_MIN_POLL_SECONDS,
+                min(_WATCHDOG_MAX_POLL_SECONDS, idle_timeout / 10),
+            )
+        else:
+            # When auto-unload is disabled (idle_timeout <= 0), sleep longer
+            # but keep polling in case the setting changes.
+            poll_interval = _WATCHDOG_MAX_POLL_SECONDS
+        time.sleep(poll_interval)
+        if os.getpid() != owner_pid:
+            # This process forked; the OS thread backing this loop no longer
+            # exists in the child, and `_after_fork_child` already started a
+            # fresh watchdog for it. Stop pretending to be alive here.
+            return
+        if idle_timeout <= 0:
+            continue  # 0 disables auto-unload; keep polling in case it changes
+        acquired = _worker_lock.acquire(timeout=0.05)
+        if not acquired:
+            continue  # an active transcription owns the lock; do not disturb it
+        try:
+            worker = _worker
+            last_active = _worker_last_active
+            if worker is None or last_active is None:
+                continue
+            if time.monotonic() - last_active >= idle_timeout:
+                _discard_worker_locked(worker, graceful=True)
+        finally:
+            _worker_lock.release()
+
+
+def _ensure_watchdog_started_locked() -> None:
+    """Lazily start the one-per-process idle watchdog when a worker is created."""
+    global _watchdog_thread
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return
+    thread = threading.Thread(
+        target=_watchdog_loop,
+        args=(os.getpid(),),
+        daemon=True,
+        name="whisper-idle-watchdog",
+    )
+    _watchdog_thread = thread
+    thread.start()
 
 
 def _start_worker_locked(
@@ -163,7 +281,9 @@ def _start_worker_locked(
 ) -> _Worker:
     context = multiprocessing.get_context(key[-1])
     parent_connection, child_connection = context.Pipe(duplex=True)
-    process = context.Process(
+    # typeshed's get_context(str) return type is BaseContext, which omits the
+    # Process attribute that all concrete context subclasses actually provide.
+    process = context.Process(  # type: ignore[attr-defined]
         target=_transcribe_worker,
         args=(child_connection,),
         daemon=True,
@@ -175,6 +295,9 @@ def _start_worker_locked(
         child_connection.close()
         raise
     child_connection.close()
+    # Lazily ensure the idle watchdog is running before handing back a worker
+    # that may otherwise sit warm and unattended for the rest of the session.
+    _ensure_watchdog_started_locked()
     return _Worker(process=process, connection=parent_connection, key=key)
 
 
@@ -182,9 +305,7 @@ def _get_worker_locked(
     key: tuple[str, ...],
 ) -> _Worker:
     global _worker
-    if _worker is not None and (
-        _worker.key != key or not _worker.process.is_alive()
-    ):
+    if _worker is not None and (_worker.key != key or not _worker.process.is_alive()):
         _discard_worker_locked(_worker, graceful=_worker.process.is_alive())
     if _worker is None:
         _worker = _start_worker_locked(key)
@@ -193,7 +314,7 @@ def _get_worker_locked(
 
 def _shutdown_worker() -> None:
     """Stop the cached worker (also used by tests and interpreter cleanup)."""
-    global _worker
+    global _worker, _worker_last_active
 
     # A forked child can inherit the parent's bookkeeping, but does not own its
     # Process object or pipe endpoint.
@@ -206,6 +327,7 @@ def _shutdown_worker() -> None:
     try:
         worker = _worker
         _worker = None
+        _worker_last_active = None
         if worker is not None:
             _retire_worker(worker, graceful=acquired)
     finally:
@@ -232,6 +354,7 @@ def _worker_key(
         os.getenv("SYNC_WHISPER_BEAM_SIZE", "5").strip(),
         os.getenv("SYNC_WHISPER_BEST_OF", "5").strip(),
         os.getenv("SYNC_WHISPER_BATCH_SIZE", "0").strip(),
+        os.getenv("SYNC_WHISPER_CPU_THREADS", "0").strip(),
         start_method,
     )
 
@@ -251,10 +374,17 @@ def transcribe_audio_in_process(
 
     Sequential requests with the same backend/model/language/start-method share
     one process, allowing ``whisper_runner``'s in-process model cache to work.
+    Set ``SYNC_WHISPER_UNLOAD_AFTER_JOB=1`` to trade that warm cache for
+    releasing the worker (and its loaded model) after every successful request.
+    Otherwise a background watchdog releases the worker on its own once it has
+    sat idle past ``SYNC_WHISPER_IDLE_TIMEOUT_SECONDS`` (default 900s, 0
+    disables it), so long-lived sessions do not hold the model in RAM forever.
     """
-    global _request_number
+    global _request_number, _worker_last_active, _worker_idle_timeout_seconds
 
     timeout = _configured_timeout(timeout_seconds)
+    unload_after_job = _unload_after_job()
+    idle_timeout = _configured_idle_timeout()
     key = _worker_key(backend, model, language, _start_method)
 
     # One pipe carries one request at a time. Holding the lock until the result
@@ -263,6 +393,9 @@ def transcribe_audio_in_process(
         # Queueing behind another project is not inference time. Start the hard
         # deadline only after this request owns the worker slot.
         deadline = time.monotonic() + timeout
+        # Read fresh on every request rather than cached at import, matching
+        # the other per-request settings above; the watchdog polls this value.
+        _worker_idle_timeout_seconds = idle_timeout
         worker = _get_worker_locked(key)
         _request_number += 1
         request_id = _request_number
@@ -288,9 +421,7 @@ def transcribe_audio_in_process(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _discard_worker_locked(worker)
-                raise WhisperTimeoutError(
-                    f"Whisper transcription exceeded {timeout:g} seconds"
-                )
+                raise WhisperTimeoutError(f"Whisper transcription exceeded {timeout:g} seconds")
             try:
                 response_ready = worker.connection.poll(min(0.25, remaining))
             except (EOFError, OSError):
@@ -304,17 +435,14 @@ def transcribe_audio_in_process(
                     exitcode = worker.process.exitcode
                     _discard_worker_locked(worker)
                     raise WhisperProcessError(
-                        "Whisper worker exited without a result "
-                        f"(exit code {exitcode})"
+                        f"Whisper worker exited without a result (exit code {exitcode})"
                     )
 
                 kind = message[0]
                 message_request_id = message[1]
                 if message_request_id != request_id:
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError(
-                        "Whisper worker returned an unexpected response"
-                    )
+                    raise WhisperProcessError("Whisper worker returned an unexpected response")
                 if kind == "progress":
                     if progress_callback is not None:
                         try:
@@ -326,11 +454,21 @@ def transcribe_audio_in_process(
                         except Exception:
                             pass
                 elif kind == "result":
-                    return message[2]
+                    result = message[2]
+                    if unload_after_job:
+                        _discard_worker_locked(worker, graceful=True)
+                    else:
+                        # Mark the worker idle as of now; the watchdog decides
+                        # later whether it has sat unused long enough to retire.
+                        _worker_last_active = time.monotonic()
+                    return result
                 elif kind == "error":
                     worker_error = f"{message[2]}: {message[3]}"
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError(worker_error)
+                    error = WhisperProcessError(worker_error)
+                    if len(message) > 4:
+                        error.cost_usd = message[4]  # type: ignore[attr-defined]
+                    raise error
                 else:
                     _discard_worker_locked(worker)
                     raise WhisperProcessError(
@@ -340,6 +478,5 @@ def transcribe_audio_in_process(
                 exitcode = worker.process.exitcode
                 _discard_worker_locked(worker)
                 raise WhisperProcessError(
-                    "Whisper worker exited without a result "
-                    f"(exit code {exitcode})"
+                    f"Whisper worker exited without a result (exit code {exitcode})"
                 )

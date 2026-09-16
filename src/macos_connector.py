@@ -3,33 +3,41 @@ from __future__ import annotations
 import os
 import hmac
 from functools import lru_cache
-from pathlib import Path
 import subprocess
-import tempfile
 
 from flask import Flask, Response, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
+
+from env_utils import env_int
+from logging_config import configure_logging
+from stage1.macos_tts_backend import list_macos_voices, run_say_and_convert
 
 
+configure_logging()
 app = Flask(__name__)
 
 _env_file = os.getenv("MACOS_CONNECTOR_ENV_FILE", "").strip()
 if _env_file:
     try:
         from dotenv import load_dotenv
+
         load_dotenv(_env_file, override=False)
     except ImportError:
         pass
 
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
-    raw = os.getenv(name, str(default)).strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        value = default
-    value = max(min_value, value)
-    value = min(max_value, value)
-    return value
+    return env_int(
+        name,
+        default,
+        minimum=min_value,
+        maximum=max_value,
+    )
+
+
+app.config["MAX_CONTENT_LENGTH"] = _env_int(
+    "MACOS_CONNECTOR_MAX_REQUEST_BODY_BYTES", 256 * 1024, 64 * 1024, 4 * 1024 * 1024
+)
 
 
 def _to_int(value, default: int, min_value: int, max_value: int) -> int:
@@ -55,23 +63,16 @@ def _auth_ok() -> bool:
 
 @lru_cache(maxsize=1)
 def _available_voices() -> frozenset[str]:
-    try:
-        proc = subprocess.run(
-            ["say", "-v", "?"],
-            capture_output=True,
-            text=True,
-            check=True,
+    return frozenset(
+        list_macos_voices(
             timeout=15,
+            run=subprocess.run,
+            # The connector endpoint checks command availability before use;
+            # inventory enumeration itself historically always invoked `say`.
+            which=None,
+            logger=app.logger,
         )
-    except Exception as exc:
-        app.logger.warning("Could not enumerate macOS voices: %s", exc)
-        return frozenset()
-    voices: set[str] = set()
-    for line in proc.stdout.splitlines():
-        name = line.strip().split(maxsplit=1)[0] if line.strip() else ""
-        if name:
-            voices.add(name)
-    return frozenset(voices)
+    )
 
 
 def _voice_exists(voice: str) -> bool:
@@ -80,61 +81,15 @@ def _voice_exists(voice: str) -> bool:
 
 def _run_say_and_convert(text: str, voice: str, rate: int, sample_rate: int) -> bytes:
     command_timeout = _env_int("MACOS_COMMAND_TIMEOUT", 900, 30, 7200)
-    with tempfile.TemporaryDirectory() as td:
-        src_text = Path(td) / "tts.txt"
-        src_aiff = Path(td) / "tts.aiff"
-        out_wav = Path(td) / "tts.wav"
-        src_text.write_text(text, encoding="utf-8")
-
-        # Passing text as the final positional argument makes `say` parse a
-        # phrase beginning with `-` (common for screenplay dashes) as an option.
-        # A UTF-8 input file keeps arbitrary multiline text out of argv.
-        say_cmd = [
-            "say", "-r", str(rate), "-o", str(src_aiff), "-f", str(src_text)
-        ]
-        if voice:
-            say_cmd[1:1] = ["-v", voice]
-        try:
-            subprocess.run(
-                say_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=command_timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"say timed out after {command_timeout} seconds"
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            details = (exc.stderr or exc.stdout or "").strip() or "unknown say error"
-            raise RuntimeError(f"say failed: {details}") from exc
-
-        af_cmd = [
-            "afconvert",
-            "-f",
-            "WAVE",
-            "-d",
-            f"LEI16@{sample_rate}",
-            str(src_aiff),
-            str(out_wav),
-        ]
-        try:
-            subprocess.run(
-                af_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=command_timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"afconvert timed out after {command_timeout} seconds"
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            details = (exc.stderr or exc.stdout or "").strip() or "unknown afconvert error"
-            raise RuntimeError(f"afconvert failed: {details}") from exc
-        return out_wav.read_bytes()
+    return run_say_and_convert(
+        text,
+        voice=voice,
+        rate=rate,
+        sample_rate=sample_rate,
+        timeout=command_timeout,
+        run=subprocess.run,
+        command_names=("say", "afconvert"),
+    )
 
 
 @app.get("/health")
@@ -152,6 +107,11 @@ def shutil_which(cmd: str) -> str | None:
     import shutil
 
     return shutil.which(cmd)
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_entity_too_large(_exc: RequestEntityTooLarge):
+    return jsonify({"ok": False, "error": "request body is too large"}), 413
 
 
 @app.post("/synthesize")
@@ -191,7 +151,8 @@ def synthesize():
     try:
         wav = _run_say_and_convert(text=text, voice=voice, rate=rate, sample_rate=sample_rate)
     except RuntimeError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        app.logger.exception("macOS synthesis failed", exc_info=exc)
+        return jsonify({"ok": False, "error": "macOS synthesis failed"}), 500
 
     headers = {"X-Voice-Used": voice or "default"}
     return Response(wav, status=200, mimetype="audio/wav", headers=headers)

@@ -1,4 +1,5 @@
 """Provider-neutral ingestion for word-timestamp transcription output."""
+
 from __future__ import annotations
 
 import json
@@ -100,6 +101,21 @@ def _segment_words(segments: Any) -> tuple[list[WordTimestamp], bool]:
     return result, interpolated
 
 
+def segment_words_interpolated(segments: Any) -> tuple[list[WordTimestamp], bool]:
+    """Public wrapper around :func:`_segment_words` for callers outside this
+    module (see ``stage2.whisper_runner._transcribe_cloud``) that need to turn
+    reply-level ``{"text", "start", "end"}`` segments — with no per-word
+    timestamps of their own, such as the cloud ASR backend's output — into
+    per-word timestamps by linear interpolation over each segment's span.
+
+    Returns the same ``(words, interpolated)`` pair as :func:`_segment_words`;
+    ``interpolated`` is ``True`` whenever a segment contributed more than one
+    token, i.e. whenever the returned timestamps are approximations rather
+    than genuine per-word timing from the source.
+    """
+    return _segment_words(segments)
+
+
 def ingest_word_index(
     payload: Any,
     source_id: str | None = None,
@@ -173,6 +189,35 @@ def load_word_index(
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid transcript JSON in {file_path}: {exc}") from exc
     return ingest_word_index(payload, source_id, model=model, language=language)
+
+
+def rescale_stretched_word_index(index: WordIndex, duration_sec: float) -> float | None:
+    """Repair cached interpolated timestamps that extend past real media.
+
+    Older cloud responses occasionally described a uniformly stretched time
+    axis. Reusing such a cache makes valid quotes near the end of an interview
+    impossible to match because their ranges lie beyond ffprobe duration.
+    """
+    duration = float(duration_sec or 0.0)
+    observed_end = index.duration_sec
+    if duration <= 0 or observed_end <= duration * 1.02:
+        return None
+    scale = duration / observed_end
+    index.words = [
+        WordTimestamp(
+            word=item.word,
+            start=max(0.0, item.start * scale),
+            end=max(0.0, item.end * scale),
+            confidence=item.confidence,
+        )
+        for item in index.words
+    ]
+    index.metadata["timestamp_scale_repair"] = {
+        "observed_end_sec": observed_end,
+        "duration_sec": duration,
+        "scale": scale,
+    }
+    return scale
 
 
 def save_word_index(path: Path | str, index: WordIndex) -> None:

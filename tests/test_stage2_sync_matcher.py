@@ -9,9 +9,11 @@ from stage2.sync_matcher import (
     MatcherConfig,
     SyncMatcher,
     _candidate_starts,
+    _extract_numbers,
     _length_samples,
     _timed_tokens,
     normalize_text,
+    normalize_token,
     parse_timecode,
 )
 from stage2.sync_models import AlignmentRequest, SyncSource, WordIndex, WordTimestamp
@@ -43,9 +45,33 @@ def _source(
 
 def test_russian_normalization_handles_case_yo_punctuation_and_inflections() -> None:
     assert normalize_text("Ёлкой, ЁЛКАМИ!") == ["елк", "елк"]
-    assert normalize_text("энергетический вампир") == normalize_text(
-        "энергетическим вампиром"
-    )
+    assert normalize_text("энергетический вампир") == normalize_text("энергетическим вампиром")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("ПЁТР", "петр"),
+        ("Ｐетр", "pетр"),
+        ("AI", "ai"),
+        ("Ли", "ли"),
+    ],
+)
+def test_normalize_token_applies_only_safe_folding_to_short_or_latin_tokens(
+    value: str,
+    expected: str,
+) -> None:
+    assert normalize_token(value) == expected
+
+
+def test_speaker_filter_matches_yo_and_case_variants() -> None:
+    phrase = "точная цитата героя для синхронизации"
+    result = SyncMatcher(
+        [_source("petr", "Пётр Иванов")],
+        [_index("petr", phrase, 10.0)],
+    ).match(AlignmentRequest(segment_id="yo-name", text=phrase, speaker="ПЕТРА ИВАНОВА"))
+
+    assert result.source_id == "petr"
 
 
 def test_transcript_tokens_are_built_once_per_matcher() -> None:
@@ -57,11 +83,13 @@ def test_transcript_tokens_are_built_once_per_matcher() -> None:
     ) as tokenize:
         matcher = SyncMatcher([_source("s1")], [index])
         for segment_id in ("one", "two"):
-            matcher.match(AlignmentRequest(
-                segment_id=segment_id,
-                text="точная цитата героя",
-                source_ids=("s1",),
-            ))
+            matcher.match(
+                AlignmentRequest(
+                    segment_id=segment_id,
+                    text="точная цитата героя",
+                    source_ids=("s1",),
+                )
+            )
 
     assert tokenize.call_count == 1
 
@@ -73,16 +101,20 @@ def test_teaser_and_full_quote_can_reuse_overlapping_source_range() -> None:
     )
     matcher = SyncMatcher([_source("s1")], [_index("s1", transcript, 120.0)])
 
-    teaser = matcher.match(AlignmentRequest(
-        segment_id="teaser-block",
-        text="это важное решение изменит жизнь всего города",
-        source_ids=("s1",),
-    ))
-    full = matcher.match(AlignmentRequest(
-        segment_id="full-block",
-        text=transcript,
-        source_ids=("s1",),
-    ))
+    teaser = matcher.match(
+        AlignmentRequest(
+            segment_id="teaser-block",
+            text="это важное решение изменит жизнь всего города",
+            source_ids=("s1",),
+        )
+    )
+    full = matcher.match(
+        AlignmentRequest(
+            segment_id="full-block",
+            text=transcript,
+            source_ids=("s1",),
+        )
+    )
 
     assert teaser.segment_id == "teaser-block"
     assert full.segment_id == "full-block"
@@ -132,7 +164,9 @@ def test_fuzzy_match_tolerates_whisper_insertions_and_word_inflections() -> None
     assert result.source_id == "vasilieva_01"
     assert result.status in {"auto_matched", "needs_review"}
     assert result.confidence >= 0.70
-    assert result.source_in_sec is not None and 1001.0 <= result.source_in_sec <= 1003.0
+    assert result.source_in_sec is not None and 999.0 <= result.source_in_sec <= 1001.0
+    assert result.metadata["speech_in_sec"] == pytest.approx(1002.5)
+    assert result.metadata["speech_out_sec"] > result.metadata["speech_in_sec"]
     assert "энергетическим" in result.matched_text
 
 
@@ -258,6 +292,35 @@ def test_speaker_filter_selects_only_matching_registered_sequences() -> None:
     assert result.status == "not_found"
 
 
+def test_rendered_viewing_wins_over_duplicate_legacy_premiere_source() -> None:
+    phrase = "эта переставленная цитата найдена в другом месте интервью"
+    sources = [
+        _source("legacy", "Марк Бартон"),
+        _source(
+            "viewing",
+            "Бартон",
+            source_kind="review_media",
+            media_path="media/reviews/180626_Бартон.mp4",
+        ),
+    ]
+    indexes = [
+        _index("legacy", phrase, 50.0),
+        _index("viewing", phrase, 500.0),
+    ]
+
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="reordered-snh",
+            text=phrase,
+            speaker="Бартон",
+        )
+    )
+
+    assert result.source_id == "viewing"
+    assert result.source_in_sec is not None and result.source_in_sec > 490
+    assert result.metadata["ambiguous"] is False
+
+
 @pytest.mark.parametrize("speaker", ["Ирина Котова", "Алексей Иванов", "Мария Петрова"])
 def test_multi_speaker_source_is_eligible_for_every_registered_speaker(
     speaker: str,
@@ -357,15 +420,147 @@ def test_differently_named_speaker_does_not_search_unrelated_interview() -> None
     assert result.strategy == "insufficient_input"
 
 
+def test_speaker_mismatch_records_filtered_source_in_metadata() -> None:
+    phrase = "редкая точная цитата другого героя"
+    result = SyncMatcher(
+        [_source("vasilieva", "Татьяна Васильева")],
+        [_index("vasilieva", phrase, 10.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="other-speaker-metadata",
+            text=phrase,
+            speaker="Александр Ирбе",
+        )
+    )
+    assert result.status == "not_found"
+    filtered = result.metadata["speaker_filtered_sources"]
+    assert filtered == [{"source_id": "vasilieva", "source_speakers": ["Татьяна Васильева"]}]
+
+
+def test_speaker_filtered_sources_absent_when_every_source_is_eligible() -> None:
+    phrase = "эта цитата находится только на мастер секвенции"
+    sources = [
+        _source("master", "", all_speakers=True),
+        _source("dedicated", "Ирина Котова"),
+    ]
+    indexes = [
+        _index("master", phrase, 20.0),
+        _index("dedicated", "совсем другой текст без совпадения", 20.0),
+    ]
+
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="master-any-speaker-metadata",
+            text=phrase,
+            speaker="Ирина Котова",
+        )
+    )
+
+    assert "speaker_filtered_sources" not in result.metadata
+
+
+def test_speaker_filtered_sources_present_on_not_found_with_candidates() -> None:
+    sources = [
+        _source("vasilieva", "Татьяна Васильева"),
+        _source("petrov", "Иван Петров"),
+    ]
+    indexes = [
+        _index("vasilieva", "совсем другой текст без совпадения", 10.0),
+        _index("petrov", "нужная точная цитата героя находится здесь", 10.0),
+    ]
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(
+            segment_id="snh6-metadata",
+            text="нужная точная цитата героя находится здесь",
+            speaker="Татьяна Васильева",
+        )
+    )
+    assert result.status == "not_found"
+    filtered = result.metadata["speaker_filtered_sources"]
+    assert filtered == [{"source_id": "petrov", "source_speakers": ["Иван Петров"]}]
+
+
 def test_long_queries_bound_candidate_search_without_losing_rare_anchor() -> None:
     words = ["обычное"] * 1500 + ["уникальныйякорь"] + ["обычное"] * 1500
     index = _index("s1", " ".join(words), 0.0, step=0.01)
-    query = normalize_text(
-        " ".join(["обычное"] * 50 + ["уникальныйякорь"] + ["обычное"] * 50)
-    )
+    query = normalize_text(" ".join(["обычное"] * 50 + ["уникальныйякорь"] + ["обычное"] * 50))
     starts = _candidate_starts(query, _timed_tokens(index))
     assert len(starts) <= 240
     assert any(1445 <= start <= 1455 for start in starts)
+
+
+def test_no_anchor_candidate_starts_are_fixed_size_and_deterministic() -> None:
+    index = _index("s1", " ".join(["фоновый"] * 10_000), 0.0, step=0.01)
+    query = normalize_text("совершенно иная короткая реплика")
+    tokens = _timed_tokens(index)
+
+    first = _candidate_starts(query, tokens)
+    second = _candidate_starts(query, tokens)
+
+    assert first == second
+    assert len(first) == 240
+    assert first[0] == 0
+    assert first[-1] == len(tokens) - 1
+
+
+def test_no_exact_anchor_keeps_likely_whisper_spelling_match() -> None:
+    words = ["фоновый"] * 5_000
+    words[3_217:3_220] = ["необычьная", "архитиктурная", "исторея"]
+    index = _index("s1", " ".join(words), 0.0, step=0.01)
+    starts = _candidate_starts(
+        normalize_text("необычная архитектурная история"),
+        _timed_tokens(index),
+    )
+
+    assert len(starts) <= 240
+    assert any(3_215 <= start <= 3_219 for start in starts)
+
+
+def test_low_score_timecode_fallback_shares_bounded_start_budget() -> None:
+    transcript = " ".join(["фоновый"] * 4_000)
+    matcher = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 0.0, step=0.25)],
+        MatcherConfig(search_window_sec=30.0),
+    )
+    original = sync_matcher_module._candidate_starts
+    calls: list[tuple[int, set[int]]] = []
+
+    def recording_candidate_starts(
+        query: list[str],
+        tokens: list[sync_matcher_module._Token],
+        *,
+        max_starts: int = 240,
+        eligible_starts: object = None,
+    ) -> list[int]:
+        starts = original(
+            query,
+            tokens,
+            max_starts=max_starts,
+            eligible_starts=eligible_starts,  # type: ignore[arg-type]
+        )
+        calls.append((max_starts, {round(tokens[start].word.start * 1000) for start in starts}))
+        return starts
+
+    with patch.object(
+        sync_matcher_module,
+        "_candidate_starts",
+        side_effect=recording_candidate_starts,
+    ):
+        matcher.match(
+            AlignmentRequest(
+                segment_id="bounded-fallback",
+                text="совершенно иная короткая реплика",
+                approximate_timecode=500.0,
+                source_ids=("s1",),
+            )
+        )
+
+    assert len(calls) == 2
+    assert sum(len(starts) for _limit, starts in calls) <= 240
+    assert calls[0][0] == 120
+    assert calls[1][0] == 120
+    assert calls[0][1].isdisjoint(calls[1][1])
 
 
 def test_long_length_ranges_are_sampled_then_refined() -> None:
@@ -407,11 +602,11 @@ def test_display_timecode_and_guide_offset_are_converted_to_sequence_seconds() -
         )
     )
     assert result.strategy == "near_timecode"
-    assert result.source_in_sec == pytest.approx(29.5)
-    assert result.source_out_sec == pytest.approx(34.0)
+    assert result.source_in_sec == pytest.approx(28.0)
+    assert result.source_out_sec == pytest.approx(34.5)
 
 
-def test_tail_padding_is_clamped_to_registered_sequence_duration() -> None:
+def test_speech_past_registered_sequence_duration_is_rejected_even_with_handles() -> None:
     source = _source("s1", duration_sec=3.0)
     index = _index("s1", "короткая точная цитата в самом конце", 1.0)
     result = SyncMatcher([source], [index]).match(
@@ -421,7 +616,8 @@ def test_tail_padding_is_clamped_to_registered_sequence_duration() -> None:
             source_ids=("s1",),
         )
     )
-    assert result.source_out_sec == 3.0
+    assert result.status == "not_found"
+    assert result.source_out_sec is None
 
 
 def test_words_past_registered_duration_cannot_auto_match_zero_length_range() -> None:
@@ -438,3 +634,134 @@ def test_words_past_registered_duration_cannot_auto_match_zero_length_range() ->
     assert result.status == "not_found"
     assert result.source_in_sec is None
     assert result.source_out_sec is None
+
+
+def test_negated_scenario_matched_to_non_negated_transcript_needs_review() -> None:
+    scenario = "Я не согласен с этим решением комиссии"
+    transcript = "Я согласен с этим решением комиссии"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="negation-flip",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "needs_review"
+    assert result.source_id == "s1"
+    assert result.source_in_sec is not None and result.source_out_sec is not None
+    assert result.confidence > 0
+    assert result.metadata["semantic_flags"] == ["negation"]
+
+
+def test_repeated_asr_negation_does_not_create_false_semantic_warning() -> None:
+    scenario = "Она многое мне тогда не рассказывала"
+    transcript = "Она многое мне тогда не не рассказывала"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="asr-stutter",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_joined_and_stuttered_neschastlivy_share_negation_meaning() -> None:
+    scenario = "Когда люди несчастливы, они не рожают детей"
+    transcript = "Когда люди не не счастливы, они не рожают детей"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="joined-negation",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_changed_number_between_scenario_and_transcript_needs_review() -> None:
+    scenario = "Завод в этом квартале произвел 150 новых машин для города"
+    transcript = "Завод в этом квартале произвел 500 новых машин для города"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="number-flip",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "needs_review"
+    assert result.source_id == "s1"
+    assert result.source_in_sec is not None and result.source_out_sec is not None
+    assert result.confidence > 0
+    assert result.metadata["semantic_flags"] == ["number"]
+
+
+def test_number_spelled_out_in_transcript_matches_same_digit_in_scenario() -> None:
+    scenario = "Завод в этом квартале произвел 150 новых машин для города"
+    transcript = "Завод в этом квартале произвел сто пятьдесят новых машин для города"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", transcript, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="number-spelled-out",
+            text=scenario,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+def test_clean_match_without_numbers_or_negation_stays_auto_matched() -> None:
+    phrase = "результаты голосования будут объявлены завтра утром"
+    result = SyncMatcher(
+        [_source("s1")],
+        [_index("s1", phrase, 20.0)],
+    ).match(
+        AlignmentRequest(
+            segment_id="clean-match",
+            text=phrase,
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["semantic_flags"] == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("два-три дня", [2, 3]),
+        ("пять пятьдесят", [5, 50]),
+        ("в 1915 году", [1915]),
+        ("тысяча девятьсот пятнадцатый", [1915]),
+        ("две тысячи двадцать пятый", [2025]),
+        ("сорок пять тысяч", [45000]),
+        ("сто пятьдесят", [150]),
+        ("пять и пять", [5, 5]),
+        ("5 и 5", [5, 5]),
+    ],
+)
+def test_extract_numbers_only_sums_descending_place_values(text: str, expected: list[int]) -> None:
+    assert _extract_numbers(text) == expected

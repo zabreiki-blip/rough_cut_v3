@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
-SegmentType = Literal["zk", "snh", "host", "tech"]
+SegmentType = Literal["zk", "snh", "host", "life", "tech"]
 TIMELINE_SCHEMA_VERSION = 1
 
 
@@ -18,6 +18,8 @@ class TimelineSegment:
     block_uid: str = ""
     # Parent normalization block when one speaker block expands into fragments.
     parent_block_uid: str = ""
+    # Scenario-version change status (for example ``added``).
+    revision_status: str = ""
     # SNH-specific
     speaker: str = ""
     role: str = ""
@@ -29,12 +31,20 @@ class TimelineSegment:
     sequence_id: str = ""
     source_in_sec: float = 0.0
     source_out_sec: float = 0.0
+    # Unpadded ASR word boundaries.  ``source_*`` is the range sent to
+    # Premiere; keeping both makes a clipped edit diagnosable later.
+    speech_in_sec: float = 0.0
+    speech_out_sec: float = 0.0
     match_status: str = ""
     match_confidence: float = 0.0
     # ZK-specific
     wav_path: str = ""
     # placeholder PNG (generated for SNH)
     placeholder_path: str = ""
+    # Text that is actually expected in speech recognition. The canonical
+    # scenario text stays intact in ``text``; older timelines fall back to a
+    # deterministic derivation in final_review.
+    spoken_text: str = ""
 
     @property
     def end_sec(self) -> float:
@@ -55,10 +65,15 @@ class TimelineSegment:
         if missing:
             raise ValueError(f"timeline segment is missing: {', '.join(missing)}")
         kwargs = {key: value[key] for key in init_fields if key in value}
-        if kwargs["type"] not in {"zk", "snh", "host", "tech"}:
+        if kwargs["type"] not in {"zk", "snh", "host", "life", "tech"}:
             raise ValueError(f"invalid timeline segment type: {kwargs['type']!r}")
         for key in (
-            "duration_sec", "start_sec", "source_in_sec", "source_out_sec",
+            "duration_sec",
+            "start_sec",
+            "source_in_sec",
+            "source_out_sec",
+            "speech_in_sec",
+            "speech_out_sec",
             "match_confidence",
         ):
             if key in kwargs:

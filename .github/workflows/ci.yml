@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
+  security-events: write
 
 jobs:
   verify:
@@ -14,6 +16,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -27,7 +36,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Python tests
-        run: python -m pytest -q
+        run: python -m pytest -q --cov=src --cov-report=term-missing --cov-report=xml
 
       - name: Python compile check
         run: python -m compileall -q src tests
@@ -35,8 +44,23 @@ jobs:
       - name: Ruff correctness checks
         run: ruff check src tests
 
+      - name: Ruff formatting check
+        run: ruff format --check src tests
+
+      - name: Mypy type check (baseline clean, type regressions block CI)
+        run: mypy src
+
+      - name: Install JS dev dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npx eslint cep tests/cep_behavior_test.cjs
+
       - name: CEP behavior test
         run: node tests/cep_behavior_test.cjs
+
+      - name: Stage 1 UI behavior test
+        run: node tests/stage1_behavior_test.cjs
 
       - name: Docker Compose config
         run: |

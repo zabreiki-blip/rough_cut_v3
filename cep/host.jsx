@@ -4,8 +4,25 @@
  * Public entry points return JSON strings and accept URI-encoded JSON strings.
  * UI and transport live in js/main.js; Premiere-specific work stays here.
  */
+/* exported rcStage2_ping, rcStage2_listProjects, rcStage2_inspectActiveSequence,
+   rcStage2_inspectActiveSequenceLayout, rcStage2_resolveSequence,
+   rcStage2_insertSequenceRange, rcStage2_conformSequenceRanges,
+   rcStage2_exportActiveSequenceAudio, rcStage2_fileInfo -- public host API,
+   invoked from cep/js/main.js via evalScript */
 (function () {
     var TICKS_PER_SECOND = 254016000000;
+    var roughCutSignalCache = [];
+    var ROUGH_CUT_SIGNAL_CACHE_LIMIT = 64;
+    // Marker-name index for a single sequence's marker collection, built by
+    // one full getFirstMarker/getNextMarker scan and reused across the many
+    // exactMarkersNamed() lookups a single conform pass performs against the
+    // same target. Any code path that creates, deletes, or renames a marker
+    // MUST call invalidateMarkerIndexCache() immediately afterwards so the
+    // next lookup rebuilds from a fresh scan instead of serving stale data.
+    // The index is valid only within a single call from the panel; it is reset
+    // on entry to each public operation because external marker edits between
+    // calls are not tracked.
+    var markerIndexCache = null;
 
     function fail(message, details) {
         return stringify({
@@ -30,6 +47,7 @@
                 .replace(/\n/g, "\\n")
                 .replace(/\t/g, "\\t")
                 .replace(/\f/g, "\\f")
+                // eslint-disable-next-line no-control-regex -- backspace control char must be escaped per JSON spec
                 .replace(/\x08/g, "\\b") + '"';
         }
 
@@ -59,7 +77,7 @@
             if (typeof item === "object") {
                 parts = [];
                 for (key in item) {
-                    if (item.hasOwnProperty(key) && typeof item[key] !== "function") {
+                    if (Object.prototype.hasOwnProperty.call(item, key) && typeof item[key] !== "function") {
                         parts.push(quote(key) + ":" + encode(item[key]));
                     }
                 }
@@ -102,7 +120,7 @@
             if (timeValue.ticks !== undefined) {
                 return String(timeValue.ticks);
             }
-        } catch (ignoreTicks) {}
+        } catch (ignoreTicks) { /* .ticks недоступен на этом объекте */ }
         return "";
     }
 
@@ -116,13 +134,13 @@
             if (isFinite(value)) {
                 return value;
             }
-        } catch (ignoreSeconds) {}
+        } catch (ignoreSeconds) { /* .seconds недоступен, пробуем .ticks */ }
         try {
             value = Number(timeValue.ticks) / TICKS_PER_SECOND;
             if (isFinite(value)) {
                 return value;
             }
-        } catch (ignoreTicks) {}
+        } catch (ignoreTicks) { /* .ticks тоже недоступен, используем строковое значение */ }
         // Sequence.end and Sequence.zeroPoint are tick strings, while numeric
         // values passed by this panel are seconds.
         if (typeof timeValue === "string") {
@@ -154,8 +172,8 @@
         if (!sequence) {
             return 0;
         }
-        try { collections.push(sequence.videoTracks); } catch (ignoreVideoTracks) {}
-        try { collections.push(sequence.audioTracks); } catch (ignoreAudioTracks) {}
+        try { collections.push(sequence.videoTracks); } catch (ignoreVideoTracks) { /* videoTracks недоступны для этой последовательности */ }
+        try { collections.push(sequence.audioTracks); } catch (ignoreAudioTracks) { /* audioTracks недоступны для этой последовательности */ }
         for (i = 0; i < collections.length; i++) {
             collection = collections[i];
             if (!collection) {
@@ -170,7 +188,7 @@
                             duration = clipEnd;
                         }
                     }
-                } catch (ignoreTrackEnd) {}
+                } catch (ignoreTrackEnd) { /* клип без валидного end, пропускаем трек */ }
             }
         }
         return isFinite(duration) && duration > 0 ? duration : 0;
@@ -230,14 +248,14 @@
         var displayFormat = null;
         try {
             item = sequence.projectItem;
-        } catch (ignoreItem) {}
+        } catch (ignoreItem) { /* элемент проекта недоступен, пропускаем */ }
         try {
             settings = sequence.getSettings();
             if (settings) {
                 timebaseTicks = ticksOf(settings.videoFrameRate);
                 displayFormat = settings.videoDisplayFormat;
             }
-        } catch (ignoreSettings) {}
+        } catch (ignoreSettings) { /* настройки последовательности недоступны */ }
 
         return {
             sequenceId: asString(sequence.sequenceID),
@@ -252,8 +270,315 @@
             timebaseTicks: timebaseTicks,
             videoDisplayFormat: displayFormat,
             videoTrackCount: sequence.videoTracks ? Number(sequence.videoTracks.numTracks) : 0,
-            audioTrackCount: sequence.audioTracks ? Number(sequence.audioTracks.numTracks) : 0
+            audioTrackCount: sequence.audioTracks ? Number(sequence.audioTracks.numTracks) : 0,
+            roughCutGuard: sequenceRoughCutSignals(sequence)
         };
+    }
+
+    function sequenceRoughCutSignals(sequence) {
+        var result = {
+            inspectionComplete: true,
+            isRoughCutTarget: false,
+            rcBlockClips: 0,
+            rcSyncMarkers: 0
+        };
+        var marker = null;
+        var next = null;
+        var markers = null;
+        var collections = [];
+        var collection;
+        var track;
+        var clip;
+        var label;
+        var i;
+        var j;
+        var k;
+        var trackCount;
+        var clipCount;
+        var scannedMarkers = 0;
+        var sequenceId = "";
+        var structuralSignature = "";
+        var cached = null;
+
+        try { sequenceId = asString(sequence.sequenceID); } catch (ignoreSequenceId) { /* sequenceID недоступен на старых версиях API */ }
+        structuralSignature = sequenceRoughCutStructuralSignature(sequence);
+        if (sequenceId && structuralSignature) {
+            cached = cachedRoughCutSignals(sequenceId, structuralSignature);
+            if (cached) {
+                return cached;
+            }
+        }
+
+        // Montage timelines normally expose an RC_BLOCK clip near the start.
+        // Probe a small prefix before touching Premiere's much slower marker API.
+        try { collections.push(sequence.videoTracks); } catch (ignoreFastVideo) {
+            result.inspectionComplete = false;
+        }
+        try { collections.push(sequence.audioTracks); } catch (ignoreFastAudio) {
+            result.inspectionComplete = false;
+        }
+        for (i = 0; i < collections.length; i++) {
+            collection = collections[i];
+            trackCount = collection ? Number(collection.numTracks) : NaN;
+            if (!collection || !isFinite(trackCount)) {
+                continue;
+            }
+            for (j = 0; j < trackCount; j++) {
+                try {
+                    track = collection[j];
+                    if (!track || !track.clips) {
+                        continue;
+                    }
+                    clipCount = Number(track.clips.numItems);
+                    for (k = 0; k < Math.min(clipCount, 32); k++) {
+                        clip = track.clips[k];
+                        label = asString(clip.name);
+                        if (label.indexOf("RC_BLOCK ") !== 0) {
+                            try {
+                                label = clip.projectItem ?
+                                    asString(clip.projectItem.name) : "";
+                            } catch (ignoreFastProjectItem) {
+                                label = "";
+                            }
+                        }
+                        if (label.indexOf("RC_BLOCK ") === 0) {
+                            result.rcBlockClips = 1;
+                            result.isRoughCutTarget = true;
+                            result.inspectionComplete = true;
+                            cacheRoughCutSignals(
+                                sequenceId,
+                                structuralSignature,
+                                result
+                            );
+                            return result;
+                        }
+                    }
+                } catch (ignoreFastTrack) { /* fast-track недоступен, используем обычный путь */ }
+            }
+        }
+
+        try {
+            markers = sequence.markers;
+            if (!markers || typeof markers.getFirstMarker !== "function" ||
+                    typeof markers.getNextMarker !== "function") {
+                result.inspectionComplete = false;
+            } else {
+                marker = markers.getFirstMarker();
+                while (marker) {
+                    scannedMarkers += 1;
+                    if (scannedMarkers > 10000) {
+                        result.inspectionComplete = false;
+                        break;
+                    }
+                    if (asString(marker.name).indexOf("RC_SYNC ") === 0) {
+                        result.rcSyncMarkers = 1;
+                        result.isRoughCutTarget = true;
+                        result.inspectionComplete = true;
+                        return result;
+                    }
+                    next = markers.getNextMarker(marker);
+                    if (next === marker) {
+                        result.inspectionComplete = false;
+                        break;
+                    }
+                    marker = next;
+                }
+            }
+        } catch (ignoreMarkers) {
+            result.inspectionComplete = false;
+        }
+
+        for (i = 0; i < collections.length; i++) {
+            collection = collections[i];
+            trackCount = collection ? Number(collection.numTracks) : NaN;
+            if (!collection || !isFinite(trackCount) || trackCount > 1000) {
+                result.inspectionComplete = false;
+                continue;
+            }
+            for (j = 0; j < trackCount; j++) {
+                try {
+                    track = collection[j];
+                    clipCount = track && track.clips ?
+                        Number(track.clips.numItems) : NaN;
+                    if (!track || !track.clips || !isFinite(clipCount) ||
+                            clipCount > 100000) {
+                        result.inspectionComplete = false;
+                        continue;
+                    }
+                    for (k = 0; k < clipCount; k++) {
+                        clip = track.clips[k];
+                        label = asString(clip.name);
+                        if (label.indexOf("RC_BLOCK ") === 0) {
+                            result.rcBlockClips = 1;
+                            result.isRoughCutTarget = true;
+                            result.inspectionComplete = true;
+                            return result;
+                        }
+                        try {
+                            label = clip.projectItem ? asString(clip.projectItem.name) : "";
+                        } catch (ignoreProjectItem) {
+                            label = "";
+                        }
+                        if (label.indexOf("RC_BLOCK ") === 0) {
+                            result.rcBlockClips = 1;
+                            result.isRoughCutTarget = true;
+                            result.inspectionComplete = true;
+                            return result;
+                        }
+                    }
+                } catch (ignoreTrack) {
+                    result.inspectionComplete = false;
+                }
+            }
+        }
+        result.isRoughCutTarget = result.rcBlockClips > 0 || result.rcSyncMarkers > 0;
+        if (result.inspectionComplete) {
+            cacheRoughCutSignals(sequenceId, structuralSignature, result);
+        }
+        return result;
+    }
+
+    function sequenceRoughCutStructuralSignature(sequence) {
+        var parts = [];
+        var collections = [];
+        var collection;
+        var track;
+        var clips;
+        var clipCount;
+        var markerCount;
+        var boundaryClip;
+        var i;
+        var j;
+        var k;
+        var trackCount;
+        if (!sequence) {
+            return "";
+        }
+        try { collections.push(sequence.videoTracks); } catch (ignoreVideo) {
+            return "";
+        }
+        try { collections.push(sequence.audioTracks); } catch (ignoreAudio) {
+            return "";
+        }
+        try {
+            markerCount = Number(sequence.markers.numMarkers);
+        } catch (ignoreMarkerCount) {
+            return "";
+        }
+        // Marker-bearing timelines are not cached. Marker names can change
+        // without changing numMarkers, and ExtendScript exposes no revision.
+        if (!isFinite(markerCount) || markerCount !== 0) {
+            return "";
+        }
+        parts.push("m0", ticksOf(sequence.end));
+        for (i = 0; i < collections.length; i++) {
+            collection = collections[i];
+            trackCount = collection ? Number(collection.numTracks) : NaN;
+            if (!collection || !isFinite(trackCount) || trackCount < 0 ||
+                    trackCount > 1000) {
+                return "";
+            }
+            parts.push("c" + i + ":" + trackCount);
+            for (j = 0; j < trackCount; j++) {
+                try {
+                    track = collection[j];
+                    clips = track ? track.clips : null;
+                    clipCount = clips ? Number(clips.numItems) : NaN;
+                    if (!clips || !isFinite(clipCount) || clipCount < 0 ||
+                            clipCount > 100000) {
+                        return "";
+                    }
+                    parts.push("t" + j + ":" + clipCount);
+                    for (k = 0; k < Math.min(clipCount, 32); k++) {
+                        boundaryClip = clips[k];
+                        parts.push(
+                            "p" + k + ":" + asString(boundaryClip.nodeId) + ":" +
+                            asString(boundaryClip.name)
+                        );
+                    }
+                    if (clipCount > 32) {
+                        boundaryClip = clips[clipCount - 1];
+                        parts.push(
+                            "l:" + asString(boundaryClip.nodeId) + ":" +
+                            asString(boundaryClip.name)
+                        );
+                    }
+                } catch (ignoreTrackSignature) {
+                    return "";
+                }
+            }
+        }
+        return parts.join("|");
+    }
+
+    function copyRoughCutSignals(result) {
+        return {
+            inspectionComplete: !!result.inspectionComplete,
+            isRoughCutTarget: !!result.isRoughCutTarget,
+            rcBlockClips: Number(result.rcBlockClips) || 0,
+            rcSyncMarkers: Number(result.rcSyncMarkers) || 0
+        };
+    }
+
+    function cachedRoughCutSignals(sequenceId, structuralSignature) {
+        var i;
+        for (i = roughCutSignalCache.length - 1; i >= 0; i--) {
+            if (roughCutSignalCache[i].sequenceId === sequenceId) {
+                if (roughCutSignalCache[i].signature === structuralSignature) {
+                    return copyRoughCutSignals(roughCutSignalCache[i].result);
+                }
+                // A sequence ID is stable across edits. Discard its old entry
+                // immediately when clip/track counts or boundaries change.
+                roughCutSignalCache.splice(i, 1);
+                return null;
+            }
+        }
+        return null;
+    }
+
+    function cacheRoughCutSignals(sequenceId, structuralSignature, result) {
+        var i;
+        if (!sequenceId || !structuralSignature || !result.inspectionComplete) {
+            return;
+        }
+        for (i = roughCutSignalCache.length - 1; i >= 0; i--) {
+            if (roughCutSignalCache[i].sequenceId === sequenceId) {
+                roughCutSignalCache.splice(i, 1);
+            }
+        }
+        roughCutSignalCache.push({
+            sequenceId: sequenceId,
+            signature: structuralSignature,
+            result: copyRoughCutSignals(result)
+        });
+        if (roughCutSignalCache.length > ROUGH_CUT_SIGNAL_CACHE_LIMIT) {
+            roughCutSignalCache.shift();
+        }
+    }
+
+    function registeredSourceMatch(sequence, guards) {
+        var metadata = sequenceMetadata(sequence);
+        var guard;
+        var i;
+        var targetPath = normalizeFsPath(metadata.projectItemTreePath);
+        var targetProjectPath = normalizeFsPath(metadata.projectPath);
+        if (!(guards instanceof Array)) {
+            throw new Error("Registered sync-source guard list is missing; conform cancelled.");
+        }
+        for (i = 0; i < guards.length; i++) {
+            guard = guards[i] || {};
+            if ((asString(guard.sequenceId) &&
+                    asString(guard.sequenceId) === metadata.sequenceId) ||
+                    (asString(guard.projectItemNodeId) &&
+                    asString(guard.projectItemNodeId) === metadata.projectItemNodeId &&
+                    asString(guard.projectPath) &&
+                    normalizeFsPath(guard.projectPath) === targetProjectPath) ||
+                    (asString(guard.projectItemTreePath) &&
+                    normalizeFsPath(guard.projectItemTreePath) === targetPath)) {
+                return guard;
+            }
+        }
+        return null;
     }
 
     function allSequences() {
@@ -293,7 +618,7 @@
                     if (item && asString(item.nodeId) === wantedNode) {
                         byNode.push(sequence);
                     }
-                } catch (ignoreNode) {}
+                } catch (ignoreNode) { /* узел дерева недоступен, пропускаем */ }
             }
             if (wantedName && asString(sequence.name) === wantedName) {
                 byName.push(sequence);
@@ -344,28 +669,28 @@
     }
 
     function restoreRange(projectItem, state) {
-        try { projectItem.clearInPoint(); } catch (ignoreClearIn) {}
-        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) {}
+        try { projectItem.clearInPoint(); } catch (ignoreClearIn) { /* нет установленной точки in, игнорируем */ }
+        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) { /* нет установленной точки out, игнорируем */ }
         if (state.video.hasIn && state.audio.hasIn &&
                 ticksOf(state.video.inPoint) === ticksOf(state.audio.inPoint)) {
-            try { projectItem.setInPoint(ticksOf(state.video.inPoint), 4); } catch (ignoreSetAllIn) {}
+            try { projectItem.setInPoint(ticksOf(state.video.inPoint), 4); } catch (ignoreSetAllIn) { /* установка общей in-точки не поддерживается для этого клипа */ }
         } else {
             if (state.video.hasIn) {
-                try { projectItem.setInPoint(ticksOf(state.video.inPoint), 1); } catch (ignoreSetVideoIn) {}
+                try { projectItem.setInPoint(ticksOf(state.video.inPoint), 1); } catch (ignoreSetVideoIn) { /* установка video in-точки не поддерживается */ }
             }
             if (state.audio.hasIn) {
-                try { projectItem.setInPoint(ticksOf(state.audio.inPoint), 2); } catch (ignoreSetAudioIn) {}
+                try { projectItem.setInPoint(ticksOf(state.audio.inPoint), 2); } catch (ignoreSetAudioIn) { /* установка audio in-точки не поддерживается */ }
             }
         }
         if (state.video.hasOut && state.audio.hasOut &&
                 ticksOf(state.video.outPoint) === ticksOf(state.audio.outPoint)) {
-            try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 4); } catch (ignoreSetAllOut) {}
+            try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 4); } catch (ignoreSetAllOut) { /* установка общей out-точки не поддерживается */ }
         } else {
             if (state.video.hasOut) {
-                try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 1); } catch (ignoreSetVideoOut) {}
+                try { projectItem.setOutPoint(ticksOf(state.video.outPoint), 1); } catch (ignoreSetVideoOut) { /* установка video out-точки не поддерживается */ }
             }
             if (state.audio.hasOut) {
-                try { projectItem.setOutPoint(ticksOf(state.audio.outPoint), 2); } catch (ignoreSetAudioOut) {}
+                try { projectItem.setOutPoint(ticksOf(state.audio.outPoint), 2); } catch (ignoreSetAudioOut) { /* установка audio out-точки не поддерживается */ }
             }
         }
     }
@@ -378,8 +703,8 @@
         var videoOut;
         var audioIn;
         var audioOut;
-        try { projectItem.clearInPoint(); } catch (ignoreClearIn) {}
-        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) {}
+        try { projectItem.clearInPoint(); } catch (ignoreClearIn) { /* нет установленной точки in, игнорируем */ }
+        try { projectItem.clearOutPoint(); } catch (ignoreClearOut) { /* нет установленной точки out, игнорируем */ }
         inResult = projectItem.setInPoint(secondsToTicks(inSeconds), 4);
         outResult = projectItem.setOutPoint(secondsToTicks(outSeconds), 4);
         videoIn = secondsOf(projectItem.getInPoint(1));
@@ -424,6 +749,8 @@
         var clip;
         var clipItem;
         var clipStart;
+        var match = null;
+        var ambiguous = false;
         var i;
         try {
             expectedNodeId = asString(projectItem.nodeId);
@@ -436,11 +763,21 @@
                 clipItem = clip.projectItem;
                 if (clipItem === projectItem ||
                         (expectedNodeId && clipItem && asString(clipItem.nodeId) === expectedNodeId)) {
-                    return clip;
+                    if (match) {
+                        ambiguous = true;
+                        break;
+                    }
+                    match = clip;
                 }
             }
-        } catch (ignoreScan) {}
-        return null;
+        } catch (ignoreScan) { /* сканирование прервалось, продолжаем с тем что есть */ }
+        if (ambiguous) {
+            throw new Error(
+                "More than one matching source clip exists at " +
+                Number(timelineSeconds).toFixed(3) + "s."
+            );
+        }
+        return match;
     }
 
     function trackItemMetadata(clip) {
@@ -504,6 +841,118 @@
                 audio: audio
             }
         };
+    }
+
+    function staleSourcePairForRepair(
+        videoClip,
+        audioClip,
+        sourceItem,
+        item,
+        ignoreTimelinePosition,
+        maxInDrift,
+        maxOutDrift
+    ) {
+        var video = trackItemMetadata(videoClip);
+        var audio = trackItemMetadata(audioClip);
+        var expectedIn = Number(item.sourceInSeconds);
+        var expectedOut = Number(item.sourceOutSeconds);
+        var expectedStart = Number(item.timelineSeconds);
+        var videoNodeId = video ? asString(videoClip.nodeId) : "";
+        var audioNodeId = audio ? asString(audioClip.nodeId) : "";
+        maxInDrift = isFinite(Number(maxInDrift)) ? Number(maxInDrift) : 0.08;
+        maxOutDrift = isFinite(Number(maxOutDrift)) ? Number(maxOutDrift) : 0.5;
+        if (!video || !audio || !videoNodeId || !audioNodeId) {
+            return null;
+        }
+        if (Math.abs(video.startSeconds - audio.startSeconds) > 0.05 ||
+                (!ignoreTimelinePosition &&
+                    Math.abs(video.startSeconds - expectedStart) > 0.05) ||
+                Math.abs(video.sourceInSeconds - audio.sourceInSeconds) > 0.05 ||
+                Math.abs(video.sourceOutSeconds - audio.sourceOutSeconds) > 0.05 ||
+                Math.abs(video.durationSeconds - audio.durationSeconds) > 0.05 ||
+                Math.abs(video.sourceInSeconds - expectedIn) > maxInDrift ||
+                Math.abs(video.sourceOutSeconds - expectedOut) > maxOutDrift ||
+                video.durationSeconds <= 0) {
+            return null;
+        }
+        return {
+            clip: videoClip,
+            audioClip: audioClip,
+            nodeId: videoNodeId,
+            audioNodeId: audioNodeId,
+            clipName: video.name,
+            projectItemName: asString(sourceItem.name),
+            startSeconds: video.startSeconds,
+            endSeconds: video.endSeconds,
+            durationSeconds: video.durationSeconds,
+            staleInsertion: true,
+            oldSourceInSeconds: video.sourceInSeconds,
+            oldSourceOutSeconds: video.sourceOutSeconds
+        };
+    }
+
+    function uniqueStaleSourcePairAnywhere(target, item, sourceItem) {
+        var videoTrack = target.videoTracks[item.videoTrackIndex];
+        var audioTrack = target.audioTracks[item.audioTrackIndex];
+        var expectedNodeId = asString(sourceItem.nodeId);
+        var expectedIn = Number(item.sourceInSeconds);
+        var expectedOut = Number(item.sourceOutSeconds);
+        var videos = [];
+        var audios = [];
+        var candidates = [];
+        var clip;
+        var clipItem;
+        var metadata;
+        var pair;
+        var i;
+        var j;
+        if (Number(videoTrack.clips.numItems) > 10000 ||
+                Number(audioTrack.clips.numItems) > 10000) {
+            throw new Error("Stale source-pair recovery scan exceeded 10000 clips.");
+        }
+        function collect(track, destination) {
+            var k;
+            for (k = 0; k < track.clips.numItems; k++) {
+                clip = track.clips[k];
+                try { clipItem = clip.projectItem; } catch (ignoreItem) {
+                    clipItem = null;
+                }
+                if (clipItem !== sourceItem &&
+                        (!expectedNodeId || !clipItem ||
+                            asString(clipItem.nodeId) !== expectedNodeId)) {
+                    continue;
+                }
+                metadata = trackItemMetadata(clip);
+                if (metadata && metadata.durationSeconds > 0 &&
+                        Math.abs(metadata.sourceInSeconds - expectedIn) <= 0.08 &&
+                        Math.abs(metadata.sourceOutSeconds - expectedOut) <= 0.5) {
+                    destination.push(clip);
+                }
+            }
+        }
+        collect(videoTrack, videos);
+        collect(audioTrack, audios);
+        for (i = 0; i < videos.length; i++) {
+            for (j = 0; j < audios.length; j++) {
+                pair = staleSourcePairForRepair(
+                    videos[i],
+                    audios[j],
+                    sourceItem,
+                    item,
+                    true
+                );
+                if (pair) {
+                    candidates.push(pair);
+                    if (candidates.length > 1) {
+                        throw new Error(
+                            "More than one compatible stale V/A source pair exists for " +
+                            asString(item.segmentId) + "."
+                        );
+                    }
+                }
+            }
+        }
+        return candidates.length === 1 ? candidates[0] : null;
     }
 
     function placeholderForRipple(target, params) {
@@ -684,7 +1133,6 @@
         var clip;
         var currentStart;
         var expectedStart;
-        var moveResult;
         var i;
         entries.sort(function (left, right) {
             if (deltaSeconds > 0) {
@@ -715,7 +1163,7 @@
                     "s; expected " + entry.originalStartSeconds.toFixed(3) + "s."
                 );
             }
-            moveResult = clip.move(timeFromSeconds(deltaSeconds));
+            clip.move(timeFromSeconds(deltaSeconds));
             clip = findTrackItemByNodeId(track, entry.nodeId);
             if (!clip || Math.abs(secondsOf(clip.start) - expectedStart) > 0.05) {
                 throw new Error(
@@ -1083,7 +1531,7 @@
         }
 
         for (key in excludedNodeIds) {
-            if (excludedNodeIds.hasOwnProperty(key)) {
+            if (Object.prototype.hasOwnProperty.call(excludedNodeIds, key)) {
                 excluded[key] = true;
             }
         }
@@ -1116,7 +1564,6 @@
         var track;
         var clip;
         var currentStart;
-        var moveResult;
         var moved = 0;
         var alreadyMoved = 0;
         var i;
@@ -1157,7 +1604,7 @@
                     ": " + currentStart.toFixed(3) + "s."
                 );
             }
-            moveResult = clip.move(
+            clip.move(
                 timeFromSeconds(entry.finalStartSeconds - currentStart)
             );
             clip = findTrackItemByNodeId(track, entry.nodeId);
@@ -1199,7 +1646,9 @@
     function removeBatchPlaceholders(target, plans) {
         var plan;
         var track;
+        var audioTrack;
         var clip;
+        var audioClip;
         var before;
         var after;
         var removed = 0;
@@ -1229,6 +1678,26 @@
                     plan.placeholder.clipName + "."
                 );
             }
+            if (plan.staleInsertion) {
+                audioTrack = target.audioTracks[plan.item.audioTrackIndex];
+                audioClip = findTrackItemByNodeId(
+                    audioTrack,
+                    plan.placeholder.audioNodeId
+                );
+                if (audioClip) {
+                    audioClip.remove(0, 1);
+                }
+                if (findTrackItemByNodeId(track, plan.placeholder.nodeId) ||
+                        findTrackItemByNodeId(
+                            audioTrack,
+                            plan.placeholder.audioNodeId
+                        )) {
+                    throw new Error(
+                        "Batch could not remove the stale V/A source pair: " +
+                        plan.placeholder.clipName + "."
+                    );
+                }
+            }
             removed++;
         }
         plans.sort(function (left, right) {
@@ -1252,6 +1721,8 @@
         var existingVideo;
         var existingAudio;
         var existingVerification;
+        var recoveredAnywhere;
+        var stalePair;
         var placeholder;
         var placeholderError;
         var preparedGap;
@@ -1270,6 +1741,7 @@
         var removedPlaceholderCount;
         var inserted = [];
         var warnings = [];
+        var staleRepairDetails = [];
         var finalDuration;
         var expectedFinalDuration;
         var i;
@@ -1291,6 +1763,7 @@
                     params.audioTrackIndex : item.audioTrackIndex
             ));
             source = resolveSequence(item);
+            assertSourceIsNotTarget(target, source);
             sourceItem = source.projectItem;
             if (!sourceItem) {
                 throw new Error("Batch source sequence has no project item.");
@@ -1322,16 +1795,97 @@
                 }
                 continue;
             }
-            existingVideo = trackSourceAt(
-                target.videoTracks[item.videoTrackIndex],
-                sourceItem,
-                item.timelineSeconds
-            );
-            existingAudio = trackSourceAt(
-                target.audioTracks[item.audioTrackIndex],
-                sourceItem,
-                item.timelineSeconds
-            );
+            if (markerState.status === "stale_source") {
+                existingVideo = trackSourceAt(
+                    target.videoTracks[item.videoTrackIndex],
+                    sourceItem,
+                    markerState.timelineSeconds
+                );
+                existingAudio = trackSourceAt(
+                    target.audioTracks[item.audioTrackIndex],
+                    sourceItem,
+                    markerState.timelineSeconds
+                );
+                stalePair = staleSourcePairForRepair(
+                    existingVideo,
+                    existingAudio,
+                    sourceItem,
+                    item,
+                    true,
+                    0.5,
+                    0.5
+                );
+                if (!stalePair) {
+                    throw new Error(
+                        "Marker [" + markerState.name +
+                        "] has stale source metadata, but no unique compatible V/A " +
+                        "pair exists at its position; conform cancelled."
+                    );
+                }
+                if (!params.repairStaleInsertions) {
+                    staleRepairDetails.push(
+                        asString(item.segmentId) + " | " +
+                        asString(item.sourceSequenceName) + " | old " +
+                        stalePair.oldSourceInSeconds.toFixed(3) + "–" +
+                        stalePair.oldSourceOutSeconds.toFixed(3) + "s, new " +
+                        item.sourceInSeconds.toFixed(3) + "–" +
+                        item.sourceOutSeconds.toFixed(3) + "s"
+                    );
+                }
+                existingVideo = null;
+                existingAudio = null;
+            }
+            if (markerState.status === "absent") {
+                recoveredAnywhere = uniqueSourcePairAnywhere(
+                    target,
+                    item,
+                    sourceItem
+                );
+                if (recoveredAnywhere) {
+                    item.timelineSeconds = secondsOf(
+                        recoveredAnywhere.videoClip.start
+                    );
+                    markerResult = upsertConformMarker(target, item);
+                    if (!markerResult.ok) {
+                        throw new Error(
+                            "An exact existing V/A source pair was found, but its " +
+                            "RC_SYNC marker could not be recovered: " +
+                            asString(markerResult.error)
+                        );
+                    }
+                    markerState = conformMarkerState(target, item);
+                    skippedPlans.push({
+                        item: item,
+                        source: source,
+                        sourceItem: sourceItem,
+                        markerState: markerState,
+                        verification: recoveredAnywhere,
+                        videoNodeId: asString(recoveredAnywhere.videoClip.nodeId),
+                        audioNodeId: asString(recoveredAnywhere.audioClip.nodeId),
+                        recoveredMissingMarker: true,
+                        recoveredAwayFromExpectedPosition: true
+                    });
+                    if (!skippedPlans[skippedPlans.length - 1].videoNodeId ||
+                            !skippedPlans[skippedPlans.length - 1].audioNodeId) {
+                        throw new Error(
+                            "Recovered source clips have no stable node IDs; conform cancelled."
+                        );
+                    }
+                    continue;
+                }
+            }
+            if (!stalePair) {
+                existingVideo = trackSourceAt(
+                    target.videoTracks[item.videoTrackIndex],
+                    sourceItem,
+                    item.timelineSeconds
+                );
+                existingAudio = trackSourceAt(
+                    target.audioTracks[item.audioTrackIndex],
+                    sourceItem,
+                    item.timelineSeconds
+                );
+            }
             if (existingVideo || existingAudio) {
                 if (!existingVideo || !existingAudio) {
                     throw new Error(
@@ -1346,52 +1900,94 @@
                         item
                     );
                 } catch (orphanVerificationError) {
-                    throw new Error(
-                        "Batch found an existing source insertion without a valid " +
-                        "RC_SYNC marker, but its source range is not exact: " +
-                        orphanVerificationError.message
+                    stalePair = staleSourcePairForRepair(
+                        existingVideo,
+                        existingAudio,
+                        sourceItem,
+                        item
                     );
+                    if (!stalePair) {
+                        throw new Error(
+                            "Batch found an existing source insertion without a valid " +
+                            "RC_SYNC marker, but it is not safe to replace automatically: " +
+                            orphanVerificationError.message
+                        );
+                    }
+                    if (!params.repairStaleInsertions) {
+                        staleRepairDetails.push(
+                            asString(item.segmentId) + " | " +
+                            asString(item.sourceSequenceName) + " | old " +
+                            stalePair.oldSourceInSeconds.toFixed(3) + "–" +
+                            stalePair.oldSourceOutSeconds.toFixed(3) + "s, new " +
+                            item.sourceInSeconds.toFixed(3) + "–" +
+                            item.sourceOutSeconds.toFixed(3) + "s"
+                        );
+                    }
                 }
-                markerResult = upsertConformMarker(target, item);
-                if (!markerResult.ok) {
-                    throw new Error(
-                        "Verified V/A content exists, but its RC_SYNC marker could not " +
-                        "be recovered: " + asString(markerResult.error)
-                    );
+                if (!stalePair) {
+                    markerResult = upsertConformMarker(target, item);
+                    if (!markerResult.ok) {
+                        throw new Error(
+                            "Verified V/A content exists, but its RC_SYNC marker could not " +
+                            "be recovered: " + asString(markerResult.error)
+                        );
+                    }
+                    markerState = conformMarkerState(target, item);
+                    skippedPlans.push({
+                        item: item,
+                        source: source,
+                        sourceItem: sourceItem,
+                        markerState: markerState,
+                        verification: existingVerification,
+                        videoNodeId: asString(existingVerification.videoClip.nodeId),
+                        audioNodeId: asString(existingVerification.audioClip.nodeId),
+                        recoveredMissingMarker: true
+                    });
+                    if (!skippedPlans[skippedPlans.length - 1].videoNodeId ||
+                            !skippedPlans[skippedPlans.length - 1].audioNodeId) {
+                        throw new Error(
+                            "Recovered source clips have no stable node IDs; conform cancelled."
+                        );
+                    }
+                    continue;
                 }
-                markerState = conformMarkerState(target, item);
-                skippedPlans.push({
-                    item: item,
-                    source: source,
-                    sourceItem: sourceItem,
-                    markerState: markerState,
-                    verification: existingVerification,
-                    videoNodeId: asString(existingVerification.videoClip.nodeId),
-                    audioNodeId: asString(existingVerification.audioClip.nodeId),
-                    recoveredMissingMarker: true
-                });
-                if (!skippedPlans[skippedPlans.length - 1].videoNodeId ||
-                        !skippedPlans[skippedPlans.length - 1].audioNodeId) {
-                    throw new Error(
-                        "Recovered source clips have no stable node IDs; conform cancelled."
-                    );
-                }
-                continue;
             }
-            placeholder = null;
+            placeholder = stalePair || null;
             placeholderError = null;
             preparedGap = null;
-            try {
-                placeholder = placeholderAnywhere(target, item);
-            } catch (placeholderLookupError) {
-                if (item.placeholderIdentityRequired &&
-                        asString(item.placeholderIdentity) &&
-                        placeholderLookupError.message.indexOf(
-                            "was not found on V"
-                        ) >= 0) {
-                    placeholderError = placeholderLookupError;
-                } else {
-                    throw placeholderLookupError;
+            if (!placeholder) {
+                try {
+                    placeholder = placeholderAnywhere(target, item);
+                } catch (placeholderLookupError) {
+                    if (item.placeholderIdentityRequired &&
+                            asString(item.placeholderIdentity) &&
+                            placeholderLookupError.message.indexOf(
+                                "was not found on V"
+                            ) >= 0) {
+                        placeholderError = placeholderLookupError;
+                    } else {
+                        throw placeholderLookupError;
+                    }
+                }
+            }
+            if (!placeholder && placeholderError) {
+                stalePair = uniqueStaleSourcePairAnywhere(
+                    target,
+                    item,
+                    sourceItem
+                );
+                if (stalePair) {
+                    placeholder = stalePair;
+                    if (!params.repairStaleInsertions) {
+                        staleRepairDetails.push(
+                            asString(item.segmentId) + " | " +
+                            asString(item.sourceSequenceName) + " | old " +
+                            stalePair.oldSourceInSeconds.toFixed(3) + "–" +
+                            stalePair.oldSourceOutSeconds.toFixed(3) + "s, new " +
+                            item.sourceInSeconds.toFixed(3) + "–" +
+                            item.sourceOutSeconds.toFixed(3) + "s"
+                        );
+                    }
                 }
             }
             if (placeholder) {
@@ -1442,12 +2038,23 @@
                     0 : actualDuration - placeholder.durationSeconds,
                 rangeSupport: rangeSupport,
                 preparedGap: !!preparedGap,
+                staleInsertion: !!stalePair,
                 finalStartSeconds: 0
             };
             if (placeholder.nodeId) {
                 excludedNodeIds[placeholder.nodeId] = true;
             }
+            if (placeholder.audioNodeId) {
+                excludedNodeIds[placeholder.audioNodeId] = true;
+            }
             plans.push(plan);
+            stalePair = null;
+        }
+        if (staleRepairDetails.length && !params.repairStaleInsertions) {
+            throw new Error(
+                "RC_STALE_INSERTION_CONFIRM_REQUIRED: " +
+                staleRepairDetails.join("; ")
+            );
         }
         plans.sort(function (left, right) {
             return left.placeholder.startSeconds - right.placeholder.startSeconds;
@@ -1520,6 +2127,7 @@
                 sourceSequenceName: asString(plan.source.name),
                 timelineSeconds: plan.finalStartSeconds,
                 deltaSeconds: plan.deltaSeconds,
+                repairedStaleInsertion: plan.staleInsertion,
                 placement: placement,
                 verification: verification.report,
                 marker: markerResult
@@ -1560,6 +2168,8 @@
                 timelineSeconds: skippedPosition.timelineSeconds,
                 alreadyConformed: true,
                 recoveredMissingMarker: !!skippedPlan.recoveredMissingMarker,
+                recoveredAwayFromExpectedPosition:
+                    !!skippedPlan.recoveredAwayFromExpectedPosition,
                 verification: skippedPosition.verification.report,
                 marker: markerResult
             });
@@ -1602,6 +2212,16 @@
         };
     }
 
+    function assertSourceIsNotTarget(target, source) {
+        if (target && source && asString(target.sequenceID) &&
+                asString(target.sequenceID) === asString(source.sequenceID)) {
+            throw new Error(
+                "Sync-источник совпадает с активной целевой секвенцией; conform в саму себя запрещён."
+            );
+        }
+        return true;
+    }
+
     function placeRange(target, sourceItem, params) {
         var requestedMode = asString(params.mode || "overwrite");
         var mode = (
@@ -1634,7 +2254,7 @@
             } else {
                 try {
                     previousPlayerTicks = ticksOf(target.getPlayerPosition());
-                } catch (ignorePlayerRead) {}
+                } catch (ignorePlayerRead) { /* позиция плеера недоступна */ }
                 if (typeof target.setPlayerPosition === "function") {
                     target.setPlayerPosition(secondsToTicks(params.timelineSeconds));
                     playerPositionForced = true;
@@ -1675,14 +2295,14 @@
                     if (mode === "overwrite") {
                         audioTrack.overwriteClip(sourceItem, secondsToTicks(params.timelineSeconds));
                     }
-                } catch (ignoreAudioFallback) {}
+                } catch (ignoreAudioFallback) { /* аудио-фолбэк недоступен */ }
             }
         }
 
         videoAfter = trackClipCount(videoTrack);
         audioAfter = trackClipCount(audioTrack);
         if (previousPlayerTicks && typeof target.setPlayerPosition === "function") {
-            try { target.setPlayerPosition(previousPlayerTicks); } catch (ignorePlayerRestore) {}
+            try { target.setPlayerPosition(previousPlayerTicks); } catch (ignorePlayerRestore) { /* восстановление позиции плеера не критично */ }
         }
         return {
             requestedMode: requestedMode,
@@ -1713,6 +2333,7 @@
         };
     }
 
+    // eslint-disable-next-line no-unused-vars -- public host API contract, pinned by tests/test_cep_contract.py
     function insertThenRippleReplace(target, sourceItem, params) {
         var sequenceDurationBefore = sequenceDurationSeconds(target);
         var originalPlaceholder = placeholderForRipple(target, params);
@@ -1818,29 +2439,34 @@
     function markerPositionKey(marker) {
         var start = "";
         var end = "";
-        try { start = ticksOf(marker.start); } catch (ignoreMarkerStart) {}
-        try { end = ticksOf(marker.end); } catch (ignoreMarkerEnd) {}
+        try { start = ticksOf(marker.start); } catch (ignoreMarkerStart) { /* маркер без ticks-начала */ }
+        try { end = ticksOf(marker.end); } catch (ignoreMarkerEnd) { /* маркер без ticks-конца */ }
         if (!start) {
             try { start = Number(secondsOf(marker.start)).toFixed(6); }
-            catch (ignoreMarkerStartSeconds) {}
+            catch (ignoreMarkerStartSeconds) { /* секунды начала маркера недоступны */ }
         }
         if (!end) {
             try { end = Number(secondsOf(marker.end)).toFixed(6); }
-            catch (ignoreMarkerEndSeconds) {}
+            catch (ignoreMarkerEndSeconds) { /* секунды конца маркера недоступны */ }
         }
         return asString(marker.name) + "\n" + start + "\n" + end + "\n" +
             asString(marker.comments);
     }
 
-    function exactMarkersNamed(target, markerName) {
+    function invalidateMarkerIndexCache() {
+        markerIndexCache = null;
+    }
+
+    function buildMarkerIndex(target) {
         var markers;
-        var matches = [];
+        var byName = {};
         var current;
         var next;
         var currentKey;
         var nextKey;
         var visited = 0;
         var maxMarkers = 10000;
+        var key;
         try {
             markers = target.markers;
         } catch (markerAccessError) {
@@ -1862,9 +2488,11 @@
                     " entries; conform cancelled."
                 );
             }
-            if (asString(current.name) === markerName) {
-                matches.push(current);
+            key = "n:" + asString(current.name);
+            if (!Object.prototype.hasOwnProperty.call(byName, key)) {
+                byName[key] = [];
             }
+            byName[key].push(current);
             currentKey = markerPositionKey(current);
             next = markers.getNextMarker(current);
             if (next) {
@@ -1878,7 +2506,20 @@
             }
             current = next;
         }
-        return matches;
+        return { target: target, byName: byName };
+    }
+
+    function exactMarkersNamed(target, markerName) {
+        var key = "n:" + markerName;
+        var bucket;
+        if (!markerIndexCache || markerIndexCache.target !== target) {
+            markerIndexCache = buildMarkerIndex(target);
+        }
+        if (!Object.prototype.hasOwnProperty.call(markerIndexCache.byName, key)) {
+            return [];
+        }
+        bucket = markerIndexCache.byName[key];
+        return bucket.slice();
     }
 
     function conformMarkerState(target, item) {
@@ -1893,6 +2534,9 @@
         var expectedText;
         var expectedSource;
         var markerStart;
+        var sourceMatches;
+        var actualSourceLine;
+        var expectedSourceSequencePrefix;
         var i;
         if (!matches.length) {
             return { status: "absent", name: markerName };
@@ -1918,11 +2562,23 @@
                 sourceLineIndex = i;
             }
         }
-        if (sourceLineIndex === -1 ||
-                normalizeMarkerText(lines[sourceLineIndex]) !== expectedSource) {
+        sourceMatches = sourceLineIndex !== -1 &&
+            normalizeMarkerText(lines[sourceLineIndex]) === expectedSource;
+        if (sourceLineIndex === -1) {
             throw new Error(
                 "Marker [" + markerName +
-                "] Source sequence/range does not match; conform cancelled."
+                "] has no Source metadata; conform cancelled."
+            );
+        }
+        actualSourceLine = normalizeMarkerText(lines[sourceLineIndex]);
+        expectedSourceSequencePrefix = normalizeMarkerText(
+            "Source: " + asString(item.sourceSequenceName) + " ["
+        );
+        if (!sourceMatches &&
+                actualSourceLine.indexOf(expectedSourceSequencePrefix) !== 0) {
+            throw new Error(
+                "Marker [" + markerName +
+                "] Source sequence does not match; conform cancelled."
             );
         }
         actualText = normalizeMarkerText(
@@ -1957,7 +2613,7 @@
             );
         }
         return {
-            status: "valid",
+            status: sourceMatches ? "valid" : "stale_source",
             name: markerName,
             source: expectedSource,
             timelineSeconds: markerStart,
@@ -2213,7 +2869,7 @@
                 marker.start = expectedStart;
                 marker.end = expectedEnd;
             }
-        } catch (ignoreDirectMarkerWrite) {}
+        } catch (ignoreDirectMarkerWrite) { /* прямая запись маркера не удалась, используем запасной путь */ }
         if (!markerTimingMatches(marker, expectedStart, expectedEnd)) {
             try {
                 markers = target.markers;
@@ -2225,11 +2881,13 @@
                     );
                 }
                 temporary = markers.createMarker(expectedStart);
+                invalidateMarkerIndexCache();
                 if (!temporary) {
                     throw new Error("createMarker returned no marker");
                 }
                 temporary.name = "RC_SYNC_REANCHOR_TMP " +
                     asString(item.segmentId);
+                invalidateMarkerIndexCache();
                 temporary.comments = preservedComments;
                 temporary.end = expectedEnd;
                 if (!markerTimingMatches(
@@ -2238,7 +2896,8 @@
                         expectedEnd
                     )) {
                     try { markers.deleteMarker(temporary); }
-                    catch (ignoreTemporaryDelete) {}
+                    catch (ignoreTemporaryDelete) { /* временный элемент уже удалён */ }
+                    invalidateMarkerIndexCache();
                     temporary = null;
                     throw new Error(
                         "temporary marker timing did not verify"
@@ -2246,16 +2905,19 @@
                 }
                 try {
                     deleteResult = markers.deleteMarker(marker);
+                    invalidateMarkerIndexCache();
                     if (deleteResult === false) {
                         throw new Error("deleteMarker returned false");
                     }
                 } catch (oldMarkerDeleteError) {
                     try { markers.deleteMarker(temporary); }
-                    catch (ignoreTemporaryCleanup) {}
+                    catch (ignoreTemporaryCleanup) { /* очистка временных данных не критична */ }
+                    invalidateMarkerIndexCache();
                     temporary = null;
                     throw oldMarkerDeleteError;
                 }
                 temporary.name = preservedName;
+                invalidateMarkerIndexCache();
                 temporary.comments = preservedComments;
                 marker = temporary;
                 exactMatches = exactMarkersNamed(target, preservedName);
@@ -2327,12 +2989,20 @@
                 marker = matches[0];
             } else {
                 marker = markers.createMarker(markerStart);
+                invalidateMarkerIndexCache();
             }
             marker.name = markerName;
+            invalidateMarkerIndexCache();
             marker.comments = markerComments;
             try {
-                marker.end = markerEnd;
-            } catch (ignoreMarkerEnd) {}
+                if (markerStart > secondsOf(marker.end)) {
+                    marker.end = markerEnd;
+                    marker.start = markerStart;
+                } else {
+                    marker.start = markerStart;
+                    marker.end = markerEnd;
+                }
+            } catch (ignoreMarkerTiming) { /* тайминг маркера недоступен */ }
             matches = exactMarkersNamed(target, markerName);
             persistedMarker = matches.length === 1 ? matches[0] : null;
             // Premiere may return a fresh host proxy when the marker
@@ -2371,9 +3041,16 @@
             var clips;
             var i;
             var j;
+            var muted;
+            var enabled;
             for (i = 0; i < collection.numTracks; i++) {
                 track = collection[i];
                 clips = [];
+                muted = null;
+                try {
+                    muted = typeof track.isMuted === "function" ?
+                        (track.isMuted() ? true : false) : null;
+                } catch (ignoreTrackMute) { muted = null; }
                 for (j = 0; j < track.clips.numItems; j++) {
                     clip = track.clips[j];
                     clipStart = secondsOf(clip.start);
@@ -2381,6 +3058,9 @@
                     if (clipEnd < fromSeconds || clipStart > toSeconds) {
                         continue;
                     }
+                    enabled = null;
+                    try { enabled = clip.disabled ? false : true; }
+                    catch (ignoreClipDisabled) { enabled = null; }
                     clips.push({
                         name: asString(clip.name),
                         projectItemName: clip.projectItem ? asString(clip.projectItem.name) : "",
@@ -2389,12 +3069,15 @@
                         endSeconds: clipEnd,
                         durationSeconds: Math.max(0, clipEnd - clipStart),
                         sourceInSeconds: secondsOf(clip.inPoint),
-                        sourceOutSeconds: secondsOf(clip.outPoint)
+                        sourceOutSeconds: secondsOf(clip.outPoint),
+                        enabled: enabled,
+                        hasAudioComponent: prefix === "A"
                     });
                 }
                 destination.push({
                     track: prefix + (i + 1),
                     clipCount: Number(track.clips.numItems),
+                    muted: muted,
                     clips: clips
                 });
             }
@@ -2407,6 +3090,7 @@
 
     $._roughCutStage2 = {
         ping: function () {
+            invalidateMarkerIndexCache();
             if (!app.project) {
                 return fail("No Premiere project is open.");
             }
@@ -2418,6 +3102,7 @@
         },
 
         listProjects: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var root;
             var entries;
@@ -2454,6 +3139,7 @@
         },
 
         inspectActiveSequence: function () {
+            invalidateMarkerIndexCache();
             try {
                 if (!app.project || !app.project.activeSequence) {
                     return fail("Open a sequence and make it active in Premiere.");
@@ -2465,6 +3151,7 @@
         },
 
         inspectActiveSequenceLayout: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var sequence;
             var fromSeconds;
@@ -2490,6 +3177,7 @@
         },
 
         resolveSequence: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             try {
                 return success({ sequence: sequenceMetadata(resolveSequence(parsePayload(encodedPayload))) });
             } catch (error) {
@@ -2498,6 +3186,7 @@
         },
 
         insertSequenceRange: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var source;
             var target;
@@ -2596,9 +3285,11 @@
         },
 
         conformSequenceRanges: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var items;
             var target;
+            var forbiddenSource;
             try {
                 params = parsePayload(encodedPayload);
                 if (!params.enableExplicitTrackShiftBatch) {
@@ -2620,6 +3311,18 @@
                 if (normalizeFsPath(projectPath()) !== normalizeFsPath(params.expectedProjectPath)) {
                     throw new Error("Premiere project changed after inspection; conform cancelled.");
                 }
+                forbiddenSource = registeredSourceMatch(
+                    target,
+                    params.registeredSourceGuards
+                );
+                if (forbiddenSource) {
+                    throw new Error(
+                        "Активная секвенция зарегистрирована как sync-источник [" +
+                        asString(forbiddenSource.id || forbiddenSource.sequenceId ||
+                            forbiddenSource.projectItemNodeId) +
+                        "]; conform в источник запрещён. Откройте отдельную монтажную секвенцию."
+                    );
+                }
                 if (!items.length) {
                     throw new Error("No confirmed sync ranges were supplied.");
                 }
@@ -2632,12 +3335,14 @@
         },
 
         exportActiveSequenceAudio: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var sequence;
             var outputFile;
             var presetPath;
             var presetFile;
             var jobId;
+            var roughCutGuard;
             try {
                 params = parsePayload(encodedPayload);
                 sequence = app.project ? app.project.activeSequence : null;
@@ -2647,6 +3352,17 @@
                 if (params.expectedSequenceId &&
                         asString(sequence.sequenceID) !== asString(params.expectedSequenceId)) {
                     throw new Error("The active sequence changed after registration. Activate the stored sync sequence and retry.");
+                }
+                roughCutGuard = sequenceRoughCutSignals(sequence);
+                if (!roughCutGuard.inspectionComplete) {
+                    throw new Error(
+                        "Не удалось безопасно проверить роль активной секвенции; экспорт для расшифровки отменён."
+                    );
+                }
+                if (roughCutGuard.isRoughCutTarget && !params.allowRoughCutTarget) {
+                    throw new Error(
+                        "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя экспортировать как sync-источник для расшифровки."
+                    );
                 }
                 if (!params.outputPath) {
                     throw new Error("outputPath is required.");
@@ -2706,7 +3422,117 @@
             }
         },
 
+        exportFinalReviewAudio: function (encodedPayload) {
+            var params;
+            var sequence;
+            var outputFile;
+            var presetPath;
+            var presetFile;
+            var jobId;
+            var roughCutGuard;
+            try {
+                params = parsePayload(encodedPayload);
+                sequence = app.project ? app.project.activeSequence : null;
+                if (!sequence) {
+                    throw new Error("Open the assembled target sequence before final review export.");
+                }
+                if (params.expectedSequenceId && asString(sequence.sequenceID) !== asString(params.expectedSequenceId)) {
+                    throw new Error("The active sequence changed after final review started.");
+                }
+                roughCutGuard = sequenceRoughCutSignals(sequence);
+                if (!roughCutGuard.inspectionComplete || !roughCutGuard.isRoughCutTarget) {
+                    throw new Error("Final review requires an assembled Rough Cut target sequence.");
+                }
+                outputFile = new File(asString(params.outputPath));
+                if (!/\.wav$/i.test(outputFile.name)) {
+                    throw new Error("Final review outputPath must end with .wav.");
+                }
+                if (outputFile.exists && !params.overwrite) {
+                    throw new Error("Final review WAV already exists. Enable overwrite and retry.");
+                }
+                if (outputFile.exists && !outputFile.remove()) {
+                    throw new Error("Existing final review WAV could not be removed.");
+                }
+                if (!ensureFolder(outputFile.parent)) {
+                    throw new Error("Cannot create final review output folder: " + outputFile.parent.fsName);
+                }
+                presetPath = asString(params.presetPath) || discoverAudioPreset();
+                presetFile = new File(presetPath);
+                if (!presetFile.exists || !/\.epr$/i.test(presetFile.name)) {
+                    throw new Error("Wave48mono24.epr was not found for final review export.");
+                }
+                if (!app.encoder || !app.encoder.encodeSequence) {
+                    throw new Error("Premiere encoder API is unavailable.");
+                }
+                app.encoder.launchEncoder();
+                jobId = app.encoder.encodeSequence(
+                    sequence,
+                    outputFile.fsName,
+                    presetFile.fsName,
+                    0,
+                    1
+                );
+                if (!jobId || String(jobId) === "0") {
+                    throw new Error("Adobe Media Encoder rejected the final-review export job.");
+                }
+                app.encoder.startBatch();
+                return success({
+                    job: {
+                        jobId: asString(jobId),
+                        outputPath: outputFile.fsName,
+                        presetPath: presetFile.fsName,
+                        sequence: sequenceMetadata(sequence)
+                    }
+                });
+            } catch (error) {
+                return fail(error.message);
+            }
+        },
+
+        cloneActiveSequence: function (encodedPayload) {
+            var params;
+            var source;
+            var known = {};
+            var candidate = null;
+            var i;
+            try {
+                params = parsePayload(encodedPayload);
+                source = app.project ? app.project.activeSequence : null;
+                if (!source) {
+                    throw new Error("Open the assembled target sequence before creating an iteration.");
+                }
+                if (params.expectedSequenceId && asString(source.sequenceID) !== asString(params.expectedSequenceId)) {
+                    throw new Error("The active sequence changed after final review.");
+                }
+                for (i = 0; i < app.project.sequences.numSequences; i++) {
+                    known[asString(app.project.sequences[i].sequenceID)] = true;
+                }
+                if (typeof source.clone !== "function") {
+                    throw new Error("Premiere Sequence.clone is unavailable in this version.");
+                }
+                source.clone();
+                for (i = 0; i < app.project.sequences.numSequences; i++) {
+                    if (!known[asString(app.project.sequences[i].sequenceID)]) {
+                        candidate = app.project.sequences[i];
+                    }
+                }
+                if (!candidate) {
+                    throw new Error("Premiere did not create a draft sequence.");
+                }
+                if (params.nameSuffix) {
+                    candidate.name = asString(source.name) + asString(params.nameSuffix);
+                }
+                if (typeof app.project.openSequence === "function") {
+                    app.project.openSequence(candidate.sequenceID);
+                }
+                return success({ source: sequenceMetadata(source), draft: sequenceMetadata(candidate) });
+            } catch (error) {
+                return fail(error.message);
+            }
+        },
+
         fileInfo: function (encodedPayload) {
+            invalidateMarkerIndexCache();
             var params;
             var file;
             var modified;
@@ -2737,9 +3563,16 @@
             placeholderAnywhere: placeholderAnywhere,
             preparedGapForInsertion: preparedGapForInsertion,
             conformMarkerState: conformMarkerState,
+            exactMarkersNamed: exactMarkersNamed,
             verifyConformMarkerInsertion: verifyConformMarkerInsertion,
+            uniqueSourcePairAnywhere: uniqueSourcePairAnywhere,
+            staleSourcePairForRepair: staleSourcePairForRepair,
+            uniqueStaleSourcePairAnywhere: uniqueStaleSourcePairAnywhere,
             reanchorConformMarker: reanchorConformMarker,
             upsertConformMarker: upsertConformMarker,
+            sequenceRoughCutSignals: sequenceRoughCutSignals,
+            registeredSourceMatch: registeredSourceMatch,
+            assertSourceIsNotTarget: assertSourceIsNotTarget,
             validProjectName: validProjectName
         };
     }
@@ -2761,6 +3594,13 @@ function rcStage2_inspectActiveSequenceLayout(encodedPayload) {
     return $._roughCutStage2.inspectActiveSequenceLayout(encodedPayload);
 }
 
+// Final-review lineage uses the same bounded reader through a production API
+// name; the diagnostic command remains absent from the production panel UI.
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_captureAssemblyLayout(encodedPayload) {
+    return $._roughCutStage2.inspectActiveSequenceLayout(encodedPayload);
+}
+
 function rcStage2_resolveSequence(encodedPayload) {
     return $._roughCutStage2.resolveSequence(encodedPayload);
 }
@@ -2775,6 +3615,16 @@ function rcStage2_conformSequenceRanges(encodedPayload) {
 
 function rcStage2_exportActiveSequenceAudio(encodedPayload) {
     return $._roughCutStage2.exportActiveSequenceAudio(encodedPayload);
+}
+
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_exportFinalReviewAudio(encodedPayload) {
+    return $._roughCutStage2.exportFinalReviewAudio(encodedPayload);
+}
+
+// eslint-disable-next-line no-unused-vars -- public CEP host API
+function rcStage2_cloneActiveSequence(encodedPayload) {
+    return $._roughCutStage2.cloneActiveSequence(encodedPayload);
 }
 
 function rcStage2_fileInfo(encodedPayload) {

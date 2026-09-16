@@ -1,0 +1,13 @@
+{
+  "name": "rough-cut-v3-dev-tooling",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Dev-only tooling (ESLint) for cep/ and tests/*.cjs. Not a runtime package.",
+  "devDependencies": {
+    "eslint": "8.57.1"
+  },
+  "scripts": {
+    "lint:cep": "eslint cep tests/cep_behavior_test.cjs",
+    "test:stage1": "node tests/stage1_behavior_test.cjs"
+  }
+}

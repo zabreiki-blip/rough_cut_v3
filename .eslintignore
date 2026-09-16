@@ -1,0 +1,6 @@
+node_modules/
+.venv/
+.venv-macos-arm64/
+projects/
+data/
+artifacts/

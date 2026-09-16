@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+import stage2.whisper_process as whisper_process
 from stage2.whisper_process import (
     _shutdown_worker,
     WhisperCancelledError,
@@ -52,9 +53,7 @@ def test_process_forwards_progress_and_returns_result() -> None:
             "unused.wav",
             timeout_seconds=2.0,
             _start_method="fork",
-            progress_callback=lambda done, total, words: progress.append(
-                (done, total, words)
-            ),
+            progress_callback=lambda done, total, words: progress.append((done, total, words)),
         )
 
     assert progress == [(5.0, 10.0, 42)]
@@ -65,10 +64,11 @@ def test_process_is_reused_for_matching_configuration() -> None:
     def fake_transcribe(path, **_kwargs):
         return {"path": path, "worker_pid": os.getpid()}
 
-    with patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe):
-        first = transcribe_audio_in_process(
-            "first.wav", timeout_seconds=2.0, _start_method="fork"
-        )
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {}, clear=True),
+    ):
+        first = transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
         second = transcribe_audio_in_process(
             "second.wav", timeout_seconds=2.0, _start_method="fork"
         )
@@ -78,17 +78,103 @@ def test_process_is_reused_for_matching_configuration() -> None:
     assert second["path"].endswith("second.wav")
 
 
+def test_process_is_retired_after_each_success_when_memory_mode_is_enabled() -> None:
+    def fake_transcribe(path, **_kwargs):
+        return {"path": path, "worker_pid": os.getpid()}
+
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {"SYNC_WHISPER_UNLOAD_AFTER_JOB": "1"}, clear=True),
+    ):
+        first = transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
+        second = transcribe_audio_in_process(
+            "second.wav", timeout_seconds=2.0, _start_method="fork"
+        )
+
+    assert first["worker_pid"] != second["worker_pid"]
+
+
+def test_rejects_invalid_unload_after_job_setting() -> None:
+    with patch.dict("os.environ", {"SYNC_WHISPER_UNLOAD_AFTER_JOB": "sometimes"}, clear=True):
+        with pytest.raises(ValueError, match="SYNC_WHISPER_UNLOAD_AFTER_JOB"):
+            transcribe_audio_in_process("unused.wav", timeout_seconds=2.0, _start_method="fork")
+
+
+def test_rejects_invalid_idle_timeout_setting() -> None:
+    with patch.dict("os.environ", {"SYNC_WHISPER_IDLE_TIMEOUT_SECONDS": "-1"}, clear=True):
+        with pytest.raises(ValueError, match="SYNC_WHISPER_IDLE_TIMEOUT_SECONDS"):
+            transcribe_audio_in_process("unused.wav", timeout_seconds=2.0, _start_method="fork")
+
+    with patch.dict("os.environ", {"SYNC_WHISPER_IDLE_TIMEOUT_SECONDS": "soon"}, clear=True):
+        with pytest.raises(ValueError, match="SYNC_WHISPER_IDLE_TIMEOUT_SECONDS"):
+            transcribe_audio_in_process("unused.wav", timeout_seconds=2.0, _start_method="fork")
+
+
+def test_idle_worker_is_retired_after_timeout() -> None:
+    def fake_transcribe(path, **_kwargs):
+        return {"path": path, "worker_pid": os.getpid()}
+
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {"SYNC_WHISPER_IDLE_TIMEOUT_SECONDS": "0.2"}, clear=True),
+    ):
+        transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
+        assert whisper_process._worker is not None
+
+        # Poll in short steps instead of a single long sleep: fast on the
+        # common case, still bounded and deterministic if the watchdog is slow.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and whisper_process._worker is not None:
+            time.sleep(0.02)
+
+    assert whisper_process._worker is None
+
+
+def test_idle_timeout_disabled_keeps_worker_warm() -> None:
+    def fake_transcribe(path, **_kwargs):
+        return {"path": path, "worker_pid": os.getpid()}
+
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {"SYNC_WHISPER_IDLE_TIMEOUT_SECONDS": "0"}, clear=True),
+    ):
+        first = transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
+        # Longer than the watchdog's poll interval: with auto-unload disabled
+        # the worker must still be warm afterwards.
+        time.sleep(0.3)
+        second = transcribe_audio_in_process(
+            "second.wav", timeout_seconds=2.0, _start_method="fork"
+        )
+
+    assert first["worker_pid"] == second["worker_pid"]
+
+
+def test_active_transcription_survives_idle_watchdog() -> None:
+    def hang(_path, **_kwargs):
+        time.sleep(0.3)
+        return {"words": []}
+
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=hang),
+        patch.dict("os.environ", {"SYNC_WHISPER_IDLE_TIMEOUT_SECONDS": "0.05"}, clear=True),
+    ):
+        result = transcribe_audio_in_process(
+            "unused.wav", timeout_seconds=5.0, _start_method="fork"
+        )
+
+    assert result == {"words": []}
+
+
 def test_process_restarts_when_inference_configuration_changes() -> None:
     def fake_transcribe(_path, **_kwargs):
         return {"worker_pid": os.getpid()}
 
-    with patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe):
-        first = transcribe_audio_in_process(
-            "first.wav", timeout_seconds=2.0, _start_method="fork"
-        )
-        with patch.dict(
-            "os.environ", {"SYNC_WHISPER_BEAM_SIZE": "1"}, clear=False
-        ):
+    with (
+        patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe),
+        patch.dict("os.environ", {}, clear=True),
+    ):
+        first = transcribe_audio_in_process("first.wav", timeout_seconds=2.0, _start_method="fork")
+        with patch.dict("os.environ", {"SYNC_WHISPER_CPU_THREADS": "8"}, clear=False):
             second = transcribe_audio_in_process(
                 "second.wav", timeout_seconds=2.0, _start_method="fork"
             )
@@ -117,9 +203,7 @@ def test_worker_restarts_after_error() -> None:
 
     with patch("stage2.whisper_process.transcribe_audio", side_effect=fail_transcription):
         with pytest.raises(WhisperProcessError, match="RuntimeError: model failed") as exc:
-            transcribe_audio_in_process(
-                "unused.wav", timeout_seconds=2.0, _start_method="fork"
-            )
+            transcribe_audio_in_process("unused.wav", timeout_seconds=2.0, _start_method="fork")
     failed_worker_pid = int(str(exc.value).rsplit(" ", 1)[1])
 
     def succeed(_path, **_kwargs):
@@ -189,9 +273,7 @@ def test_worker_restarts_after_timeout() -> None:
                 "unused.wav",
                 timeout_seconds=0.1,
                 _start_method="fork",
-                progress_callback=lambda _done, _total, pid: timed_out_worker_pids.append(
-                    pid
-                ),
+                progress_callback=lambda _done, _total, pid: timed_out_worker_pids.append(pid),
             )
 
     def succeed(_path, **_kwargs):
@@ -206,9 +288,7 @@ def test_worker_restarts_after_timeout() -> None:
     assert result["worker_pid"] != timed_out_worker_pids[0]
 
 
-@pytest.mark.filterwarnings(
-    "ignore:This process.*multi-threaded.*:DeprecationWarning"
-)
+@pytest.mark.filterwarnings("ignore:This process.*multi-threaded.*:DeprecationWarning")
 def test_shutdown_does_not_wait_for_long_running_request() -> None:
     worker_started = threading.Event()
     errors = []

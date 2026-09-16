@@ -1,14 +1,19 @@
 """Atomic JSON stores for Stage 2 sync sources and alignment results."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 from atomic_io import atomic_write_json as _atomic_write_json
 
 from .sync_models import SyncMatch, SyncSource
 
+# Review-media support is an additive extension of the existing schema.  Keep
+# writing version 1 so older clients that ignore unknown source fields continue
+# to accept the document; ``SyncSource.from_dict`` supplies defaults for older
+# records that do not contain them.
 SCHEMA_VERSION = 1
 
 
@@ -39,10 +44,7 @@ class SyncSourceStore:
         self.path = Path(path)
 
     def list(self) -> list[SyncSource]:
-        return [
-            SyncSource.from_dict(item)
-            for item in _items(_read_json(self.path), "sources")
-        ]
+        return [SyncSource.from_dict(item) for item in _items(_read_json(self.path), "sources")]
 
     def get(self, source_id: str) -> SyncSource | None:
         return next((item for item in self.list() if item.id == source_id), None)
@@ -58,7 +60,9 @@ class SyncSourceStore:
         )
         return source
 
-    def replace_all(self, sources: list[SyncSource]) -> None:
+    def replace_all(
+        self, sources: List[SyncSource]
+    ) -> None:  # List not list: class method .list() shadows builtin
         if len({item.id for item in sources}) != len(sources):
             raise ValueError("duplicate sync source id")
         _atomic_write_json(
@@ -83,10 +87,7 @@ class SyncMatchStore:
         self.path = Path(path)
 
     def list(self) -> list[SyncMatch]:
-        return [
-            SyncMatch.from_dict(item)
-            for item in _items(_read_json(self.path), "matches")
-        ]
+        return [SyncMatch.from_dict(item) for item in _items(_read_json(self.path), "matches")]
 
     def get(self, segment_id: str) -> SyncMatch | None:
         return next((item for item in self.list() if item.segment_id == segment_id), None)
@@ -102,7 +103,9 @@ class SyncMatchStore:
         )
         return match
 
-    def replace_all(self, matches: list[SyncMatch]) -> None:
+    def replace_all(
+        self, matches: List[SyncMatch]
+    ) -> None:  # List not list: class method .list() shadows builtin
         if len({item.segment_id for item in matches}) != len(matches):
             raise ValueError("duplicate segment_id in sync matches")
         _atomic_write_json(

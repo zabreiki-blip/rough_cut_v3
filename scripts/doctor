@@ -53,6 +53,54 @@ for warning in validate_env(values):
 PY
 fi
 
+# Ключи LLM/TTS-провайдеров: только факт наличия, значения никогда не печатаем.
+HAS_OPENROUTER_KEY=0
+HAS_GEMINI_KEY=0
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  grep -Eq '^OPENROUTER_API_KEY=.+$' "${ROOT_DIR}/.env" && HAS_OPENROUTER_KEY=1
+  grep -Eq '^GEMINI_API_KEY=.+$' "${ROOT_DIR}/.env" && HAS_GEMINI_KEY=1
+fi
+if [[ "${HAS_OPENROUTER_KEY}" -eq 1 ]]; then
+  ok "OPENROUTER_API_KEY задан"
+else
+  warn "OPENROUTER_API_KEY не задан; LLM-анализ и OpenRouter TTS недоступны"
+fi
+if [[ "${HAS_GEMINI_KEY}" -eq 1 ]]; then
+  ok "GEMINI_API_KEY задан"
+else
+  warn "GEMINI_API_KEY не задан; Gemini TTS недоступен"
+fi
+if [[ "${HAS_OPENROUTER_KEY}" -eq 0 && "${HAS_GEMINI_KEY}" -eq 0 ]]; then
+  warn "Нет облачных ключей; доступен offline-режим: TTS_PROVIDER=macos и --no-llm"
+fi
+
+# Локальный backend распознавания речи Stage 2 (faster-whisper/mlx-whisper).
+if [[ -x "${VENV_DIR}/bin/python" ]]; then
+  HAS_WHISPER_BACKEND=0
+  "${VENV_DIR}/bin/python" -c "import mlx_whisper" >/dev/null 2>&1 && {
+    ok "mlx-whisper установлен"
+    HAS_WHISPER_BACKEND=1
+  }
+  "${VENV_DIR}/bin/python" -c "import faster_whisper" >/dev/null 2>&1 && {
+    ok "faster-whisper установлен"
+    HAS_WHISPER_BACKEND=1
+  }
+  if [[ "${HAS_WHISPER_BACKEND}" -eq 0 ]]; then
+    warn "Нет faster-whisper/mlx-whisper; синхронизация Stage 2 недоступна (pip install -r requirements-whisper.txt, на Apple Silicon — requirements-macos-apple-silicon.txt)"
+  fi
+fi
+
+# Свободное место на диске (модель Whisper ~1.4 ГБ).
+FREE_KB="$(df -Pk "${ROOT_DIR}" 2>/dev/null | awk 'NR==2 {print $4}')"
+if [[ -n "${FREE_KB}" ]]; then
+  FREE_GB=$((FREE_KB / 1024 / 1024))
+  if [[ "${FREE_KB}" -lt 2097152 ]]; then
+    warn "Свободно ~${FREE_GB} ГБ на диске; модели Whisper (~1.4 ГБ) может не хватить места"
+  else
+    ok "Свободно ~${FREE_GB} ГБ на диске"
+  fi
+fi
+
 if [[ "${QUICK}" -eq 0 ]]; then
   if curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then
     ok "Backend отвечает на :8000"

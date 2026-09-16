@@ -28,6 +28,10 @@
       </a>
     </nav>
     <div class="sidebar-footer">
+      <span id="openrouter_usage" class="openrouter-usage">
+        <span class="openrouter-usage-total">OpenRouter: $0.0000</span>
+        <span class="openrouter-usage-pending" hidden></span>
+      </span>
       <span class="version">Stage 1</span>
     </div>
   </aside>
@@ -43,11 +47,120 @@
       </button>
     </header>
 
+    <details id="readiness_panel" class="panel readiness-panel" data-state="ok">
+      <summary class="readiness-summary">
+        <span class="readiness-summary-arrow" aria-hidden="true"></span>
+        <span class="readiness-summary-title">Готовность окружения</span>
+        <span id="readiness_summary_badge" class="status-badge" data-state="empty">проверка…</span>
+      </summary>
+      <ul id="readiness_list" class="readiness-list">
+        <li class="empty-state compact">Проверяем ffmpeg, Whisper, TTS и ключи…</li>
+      </ul>
+    </details>
+
     <nav class="workspace-tabs" aria-label="Этапы проекта">
+      <button class="workspace-tab" data-tab="versions" type="button">Редакции</button>
       <button class="workspace-tab active" data-tab="normalization" type="button">Нормализация</button>
       <button class="workspace-tab" data-tab="voiceover" type="button">Озвучка <span id="voiceover_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
       <button class="workspace-tab" data-tab="assembly" type="button">Сборка <span id="assembly_lock" class="tab-lock" title="Сначала подтвердите нормализацию">&#128274;</span></button>
     </nav>
+
+    <section id="tab_versions" class="workspace-panel" data-tab-panel="versions" hidden>
+      <div class="panel versioning-toolbar">
+        <div>
+          <div class="normalization-title-row">
+            <h2 title="Базовая редакция (baseline) — версия сценария, с которой сравниваются последующие">Редакции сценария</h2>
+            <span id="versioning_status" class="status-badge" data-state="empty">нет версий</span>
+          </div>
+          <p id="revisions_active_line" class="section-copy">Редакции ещё не созданы.</p>
+        </div>
+        <div class="versioning-import-controls">
+          <label class="field">
+            <span>Новая редакция</span>
+            <select id="inbox_scenario_select" aria-label="Новая редакция сценария"><option value="">Файлы не найдены</option></select>
+          </label>
+          <small id="inbox_review_summary" class="section-copy">Просмотровки ещё не проверены.</small>
+          <button id="btn_import_revision" class="btn btn-primary" type="button">Загрузить новую редакцию</button>
+        </div>
+      </div>
+
+      <details class="panel revisions-history">
+        <summary title="Каждая редакция получает порядковый номер сценария (rev_NNNN)">История редакций</summary>
+        <div id="revision_list" class="revision-list"><div class="empty-state compact">Версии ещё не созданы.</div></div>
+      </details>
+
+      <section class="panel revisions-compare">
+        <div class="revisions-compare-heading">
+          <div>
+            <h3 id="revisions_compare_title">Сравнение</h3>
+          </div>
+          <label class="field dashboard-revision-field">
+            <span>Сравнить</span>
+            <select id="dashboard_revision_select" aria-label="Выбор сравнения редакций"></select>
+          </label>
+        </div>
+        <div id="revisions_summary_chips" class="revisions-summary-chips"></div>
+
+        <div class="revisions-mode-switch" role="tablist" aria-label="Режим просмотра изменений">
+          <button type="button" class="mode-tab active" data-mode="list" role="tab" aria-selected="true">Список изменений</button>
+          <button type="button" class="mode-tab" data-mode="map" role="tab" aria-selected="false">Карта перемещений</button>
+        </div>
+
+        <div id="revisions_compare_state" class="revisions-compare-state" hidden>
+          <p id="revisions_compare_state_text"></p>
+          <button id="btn_revisions_compare_retry" class="btn btn-sm" type="button" hidden>Повторить</button>
+        </div>
+
+        <div id="revision_filters_bar" class="revision-toolbar-controls">
+          <div class="revision-filter-bar" role="group" aria-label="Фильтр изменений">
+            <button type="button" class="revision-filter active" data-filter="all" aria-pressed="true">Все</button>
+            <button type="button" class="revision-filter" data-filter="edited" aria-pressed="false">Изменено</button>
+            <button type="button" class="revision-filter" data-filter="added" aria-pressed="false">Добавлено</button>
+            <button type="button" class="revision-filter" data-filter="removed" aria-pressed="false">Удалено</button>
+            <button type="button" class="revision-filter" data-filter="moved" aria-pressed="false">Перемещено</button>
+          </div>
+          <div class="revision-search-nav">
+            <input type="search" id="revision_search" class="revision-search-input" placeholder="Поиск по тексту или спикеру" aria-label="Поиск по тексту или спикеру">
+            <div class="revision-nav-buttons">
+              <button type="button" id="btn_revision_prev" class="btn btn-sm">← Предыдущее</button>
+              <button type="button" id="btn_revision_next" class="btn btn-sm">Следующее →</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="revision_changes_list" class="revision-changes-list"></div>
+
+        <div id="revisions_map_view" class="revisions-map-view" hidden>
+          <div class="dashboard-legend">
+            <span class="dashboard-legend-item" data-status="unchanged"><i></i>Без изменений</span>
+            <span class="dashboard-legend-item" data-status="edited"><i></i>Изменён</span>
+            <span class="dashboard-legend-item" data-status="moved"><i></i>Переставлен</span>
+            <span class="dashboard-legend-item" data-status="added"><i></i>Добавлен</span>
+            <span class="dashboard-legend-item" data-status="removed"><i></i>Удалён</span>
+            <span class="dashboard-legend-item" data-status="type_changed"><i></i>Сменён тип/спикер</span>
+          </div>
+          <div class="dashboard-map-toolbar">
+            <div class="dashboard-map-headers">
+              <span id="dashboard_map_old_label" class="dashboard-map-header">Было</span>
+              <span id="dashboard_map_new_label" class="dashboard-map-header">Стало</span>
+            </div>
+            <button id="btn_dashboard_fit" class="btn btn-sm" type="button">Вписать в экран</button>
+          </div>
+          <div class="dashboard-stage">
+            <div id="dashboard_canvas" class="dashboard-canvas">
+              <svg id="dashboard_svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            </div>
+            <aside id="dashboard_detail" class="dashboard-detail" hidden>
+              <button id="btn_dashboard_detail_close" class="btn-icon btn-sm dashboard-detail-close" type="button" title="Закрыть">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+              <div id="dashboard_detail_body" class="dashboard-detail-body"></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+    </section>
 
     <section id="tab_normalization" class="workspace-panel active" data-tab-panel="normalization">
       <div class="normalization-toolbar panel">
@@ -80,16 +193,31 @@
           <span class="toggle-slider"></span>
           <span>Распознавать нестандартные обозначения с LLM</span>
         </label>
+        <label class="field">
+          <span>Режим OpenRouter</span>
+          <select id="normalization_llm_preset">
+            <option value="fast" selected>Быстро</option>
+            <option value="standard">Стандарт</option>
+          </select>
+        </label>
       </div>
 
       <div id="normalization_summary" class="normalization-summary" aria-live="polite">
         <div class="summary-stat"><strong id="norm_count_total">0</strong><span>Всего</span></div>
         <div class="summary-stat"><strong id="norm_count_voiceover">0</strong><span>Закадр</span></div>
         <div class="summary-stat"><strong id="norm_count_sync">0</strong><span>Синхрон</span></div>
+        <div class="summary-stat"><strong id="norm_count_life">0</strong><span>Лайф</span></div>
         <div class="summary-stat"><strong id="norm_count_unknown">0</strong><span>Требует проверки</span></div>
       </div>
 
       <div id="normalization_warnings" class="normalization-warnings" hidden></div>
+
+      <div class="normalization-review-nav panel" aria-label="Навигация по проблемным блокам">
+        <button id="btn_norm_issue_prev" class="btn btn-sm" type="button">← Предыдущая проблема</button>
+        <strong id="norm_issue_position">Проблем нет</strong>
+        <button id="btn_norm_issue_next" class="btn btn-sm" type="button">Следующая проблема →</button>
+        <button id="btn_norm_issue_filter" class="btn btn-sm" type="button" aria-pressed="false">Показать только требующие проверки</button>
+      </div>
 
       <div class="normalization-workspace">
         <section class="normalization-editor panel">
@@ -106,14 +234,14 @@
           <div class="memory-create">
             <input id="memory_alias" type="text" placeholder="Например: голос диктора">
             <select id="memory_type" aria-label="Тип обозначения">
-              <option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="technical">Технический</option><option value="other">Прочее</option>
+              <option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="life">Лайф</option><option value="technical">Технический</option><option value="other">Прочее</option>
             </select>
             <button id="btn_add_memory" class="btn btn-sm" type="button">Запомнить</button>
           </div>
           <input id="memory_search" class="memory-search" type="search" placeholder="Поиск обозначения">
           <div class="memory-filters">
             <select id="memory_filter_type" aria-label="Фильтр по типу">
-              <option value="">Все типы</option><option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="technical">Технический</option><option value="other">Прочее</option>
+              <option value="">Все типы</option><option value="voiceover">Закадр</option><option value="sync">Синхрон</option><option value="host">Ведущий</option><option value="life">Лайф</option><option value="technical">Технический</option><option value="other">Прочее</option>
             </select>
             <select id="memory_filter_status" aria-label="Фильтр по статусу">
               <option value="">Все статусы</option><option value="active">Активные</option><option value="candidate">Кандидаты</option><option value="conflict">Конфликты</option><option value="disabled">Отключённые</option>
@@ -207,8 +335,8 @@
           <label class="field">
             <span>TTS Provider</span>
             <select id="provider">
-              <option value="openrouter" {% if defaults.provider == 'openrouter' %}selected{% endif %}>OpenRouter</option>
-              <option value="gemini" {% if defaults.provider == 'gemini' %}selected{% endif %}>Gemini</option>
+              <option value="microsoft/mai-voice-2" {% if defaults.provider == 'openrouter' and defaults.tts_model == 'microsoft/mai-voice-2' %}selected{% endif %}>OpenRouter · MAI-Voice-2</option>
+              <option value="google/gemini-3.1-flash-tts-preview" {% if defaults.provider == 'openrouter' and defaults.tts_model == 'google/gemini-3.1-flash-tts-preview' %}selected{% endif %}>OpenRouter · Gemini 3.1 Flash TTS</option>
               <option value="macos" {% if defaults.provider == 'macos' %}selected{% endif %}>macOS (say)</option>
             </select>
           </label>
@@ -220,6 +348,12 @@
             </select>
           </label>
         </div>
+
+        <label class="field tts-style-field" id="tts_style_field">
+          <span>Интонация / стиль / формат ролика</span>
+          <textarea id="tts_style" maxlength="1000" rows="3" placeholder="Например: детский развлекательный контент — живо, тепло, с улыбкой и короткими выразительными паузами"></textarea>
+          <small id="tts_style_hint">Для Gemini это режиссёрская инструкция; для MAI описание переводится в ближайший Azure-стиль.</small>
+        </label>
 
         <label class="field">
           <span>Override voice (опционально)</span>
@@ -246,6 +380,9 @@
           </button>
           <button id="btn_tts_cancel" class="btn btn-ghost" type="button" hidden>
             Остановить после текущего блока
+          </button>
+          <button id="btn_tts_clear" class="btn danger" type="button" title="Удалить всю текущую озвучку проекта">
+            Очистить всё
           </button>
           <button id="btn_validate" class="btn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
@@ -321,6 +458,14 @@
             <span class="live-label">Прогресс</span>
             <span class="live-value" id="live_done">0/0</span>
           </div>
+          <div class="live-cell">
+            <span class="live-label">Прошло</span>
+            <span class="live-value" id="live_job_elapsed">&mdash;</span>
+          </div>
+          <div class="live-cell">
+            <span class="live-label">Осталось примерно</span>
+            <span class="live-value" id="live_job_eta">рассчитывается</span>
+          </div>
         </div>
 
         <p id="live_error" class="live-error">&mdash;</p>
@@ -349,10 +494,68 @@
         <p class="section-copy">Соберите подтверждённый сценарий и готовые WAV-файлы в монтажный таймлайн.</p>
         <div id="assembly_gate_message" class="gate-message">Подтвердите нормализацию сценария, чтобы открыть сборку.</div>
 
+        <section class="stage3-media-workspace" aria-labelledby="stage3_media_title">
+          <div class="stage3-media-heading">
+            <div>
+              <h3 id="stage3_media_title">Просмотровки</h3>
+              <p class="section-copy">Отрендеренные таймлайны берутся из папки проекта автоматически. Сканирование и подготовка выполняются в Docker — Premiere на этом этапе не нужен.</p>
+            </div>
+            <span id="stage3_media_status" class="live-pill" data-state="idle" aria-live="polite">не сканировалось</span>
+          </div>
+
+          <div class="stage3-media-controls">
+            <div class="stage3-media-directory">
+              <span>Папка просмотровок</span>
+              <code id="stage3_media_directory">Определяется настройками проекта…</code>
+            </div>
+            <button id="btn_stage3_media_scan" class="btn btn-accent" type="button">Обновить просмотровки</button>
+          </div>
+          <p class="stage3-media-hint">Папка определяется автоматически. Найденные видео сразу регистрируются как источники Whisper; отдельный экспорт звука из Premiere не нужен.</p>
+
+          <div class="stage3-media-summary">
+            <span>Найдено файлов: <strong id="stage3_media_count">0</strong></span>
+            <span id="stage3_media_message">Откройте вкладку — сканирование начнётся автоматически.</span>
+          </div>
+          <div id="stage3_job_progress" class="sync-job-progress" hidden aria-live="polite">
+            <div class="sync-progress-copy">
+              <span id="stage3_job_message">Подготовка…</span>
+              <span id="stage3_job_numbers">0%</span>
+            </div>
+            <div class="progress-wrap sync-progress-wrap">
+              <div id="stage3_progress_bar" class="progress-bar"></div>
+            </div>
+            <div class="sync-progress-meta">
+              <span>Прошло: <strong id="stage3_job_elapsed">&mdash;</strong></span>
+              <span>Осталось примерно: <strong id="stage3_job_eta">рассчитывается</strong></span>
+            </div>
+          </div>
+          <div id="stage3_media_list" class="stage3-media-list" aria-live="polite">
+            <div class="empty-state compact">Просмотровки ещё не найдены.</div>
+          </div>
+
+          <div class="stage3-flow" aria-label="Как просмотровки превращаются в таймлайн">
+            <span>Просмотровка</span><b>→</b>
+            <span>Звук ffmpeg</span><b>→</b>
+            <span>Whisper</span><b>→</b>
+            <span>In / Out</span><b>→</b>
+            <span>RC_SRC_*</span><b>→</b>
+            <span>ROUGH_CUT_*</span>
+          </div>
+          <div class="stage3-mapping-heading">
+            <h4>Какая просмотровка используется</h4>
+            <span>Сопоставление обновляется после сканирования.</span>
+          </div>
+          <div id="stage3_source_mapping" class="stage3-source-mapping" aria-live="polite">
+            <div class="empty-state compact">Соответствия ещё не рассчитаны.</div>
+          </div>
+
+          <p class="stage3-media-hint" title="СНХ — синхрон, реплика героя из просмотровки">При Export XML найденные и сопоставленные просмотровки подставятся автоматически. Для остальных СНХ останутся плейсхолдеры.</p>
+        </section>
+
         <section class="sync-workspace" aria-labelledby="sync_workspace_title">
           <div class="sync-heading">
             <div>
-              <h3 id="sync_workspace_title">Автоматическое сопоставление СНХ</h3>
+              <h3 id="sync_workspace_title" title="СНХ — синхрон, реплика героя из просмотровки">Автоматическое сопоставление СНХ</h3>
               <p class="section-copy">Распознавание аудиогидов и поиск реплик в зарегистрированных синхронизированных секвенциях.</p>
             </div>
             <span id="sync_job_status" class="live-pill" data-state="idle">не запускалось</span>
@@ -366,13 +569,27 @@
             </div>
             <div class="sync-source-actions">
               <label class="sync-timecode-mode">
+                <span>Движок распознавания</span>
+                <select id="sync_asr_engine">
+                  <option value="local" selected>Локально (бесплатно, медленно)</option>
+                  <option value="cloud">Облако (быстро, ~2¢/час, платно)</option>
+                </select>
+              </label>
+              <label class="sync-timecode-mode">
+                <span>Модель Whisper (только локально)</span>
+                <select id="sync_whisper_model">
+                  <option value="small" selected>Small — быстро</option>
+                  <option value="medium">Medium — точнее</option>
+                </select>
+              </label>
+              <label class="sync-timecode-mode">
                 <span>Таймкоды</span>
                 <select id="sync_timecode_mode">
                   <option value="relative">От начала секвенции</option>
                   <option value="display">Экранный timecode Premiere</option>
                 </select>
               </label>
-              <button id="btn_sync_align" class="btn btn-accent" type="button" disabled>
+              <button id="btn_sync_align" class="btn btn-accent" type="button" disabled title="СНХ — синхрон, реплика героя из просмотровки">
                 Найти СНХ автоматически
               </button>
               <button id="btn_sync_cancel" class="btn btn-ghost" type="button" hidden>
@@ -380,7 +597,8 @@
               </button>
             </div>
           </div>
-          <p class="section-copy">Готовые WAV, индексы Whisper и уже найденные диапазоны сохраняются. После остановки нажмите «Продолжить».</p>
+          <div id="sync_sources_list" class="sync-sources-list" aria-live="polite"></div>
+          <p class="section-copy">Small рекомендуется для первого прохода. Medium точнее, но примерно вдвое медленнее. Готовые индексы Whisper и найденные диапазоны сохраняются. Облачный режим распознавания платный и отправляет аудио во внешний сервис.</p>
 
           <div id="sync_job_progress" class="sync-job-progress" hidden aria-live="polite">
             <div class="sync-progress-copy">
@@ -390,6 +608,19 @@
             <div class="progress-wrap sync-progress-wrap">
               <div id="sync_progress_bar" class="progress-bar"></div>
             </div>
+            <div class="sync-progress-meta">
+              <span>Просмотровка: <strong id="sync_job_current">—</strong></span>
+              <span>Обработано видео: <strong id="sync_job_video_progress">—</strong></span>
+              <span>Прошло: <strong id="sync_job_elapsed">—</strong></span>
+              <span>Осталось примерно: <strong id="sync_job_eta">рассчитывается</strong></span>
+            </div>
+          </div>
+
+          <div id="sync_job_metrics" class="sync-progress-meta" hidden aria-live="polite">
+            <span>Движок: <strong id="sync_metric_backend">—</strong></span>
+            <span>Время распознавания: <strong id="sync_metric_wall_time">—</strong></span>
+            <span>Стоимость: <strong id="sync_metric_cost">—</strong></span>
+            <span>Таймкоды: <strong id="sync_metric_precision">—</strong></span>
           </div>
 
           <div class="sync-stats" aria-label="Статус сопоставления СНХ">
@@ -430,13 +661,13 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="4" rx="1"/><rect x="3" y="10" width="11" height="4" rx="1"/><rect x="3" y="17" width="15" height="4" rx="1"/></svg>
             Build Timeline
           </button>
-          <a id="btn_export_xml" class="btn btn-ghost" style="pointer-events:none;opacity:.4">
+          <button id="btn_export_xml" class="btn btn-ghost" type="button" disabled title="Экспорт готового таймлайна в XML для Premiere">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             Export XML
-          </a>
+          </button>
         </div>
         <div id="timeline_stats" class="timeline-stats" style="display:none">
-          <span>ЗК: <strong id="ts_zk">0</strong></span>
+          <span title="ЗК — закадровый текст диктора">ЗК: <strong id="ts_zk">0</strong></span>
           <span>Спикеры: <strong id="ts_snh">0</strong></span>
           <span>Длит.: <strong id="ts_dur">0:00</strong></span>
         </div>
@@ -455,6 +686,17 @@
     </section>
   </main>
 
+  <dialog id="confirm_dialog" class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm_dialog_title">
+    <div class="confirm-dialog-head">
+      <h2 id="confirm_dialog_title"></h2>
+      <div id="confirm_dialog_message" class="confirm-dialog-message section-copy"></div>
+    </div>
+    <div class="confirm-dialog-actions">
+      <button id="btn_confirm_dialog_cancel" class="btn" type="button">Отмена</button>
+      <button id="btn_confirm_dialog_accept" class="btn btn-accent" type="button">Подтвердить</button>
+    </div>
+  </dialog>
+
   <div id="toast-container"></div>
 
   <script>
@@ -462,6 +704,6 @@
     window.__STAGE1_DEFAULTS__ = {{ defaults | tojson }};
     window.__STAGE1_STATUS__ = {{ status | tojson }};
   </script>
-  <script src="{{ url_for('static', filename='stage1.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='stage1.js') }}"></script>
 </body>
 </html>

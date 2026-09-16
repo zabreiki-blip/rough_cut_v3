@@ -68,6 +68,40 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["project"], "Монтаж_01")
 
+    def test_normalization_job_accepts_fast_preset_and_rejects_unknown_preset(self) -> None:
+        source = self._source()
+        with patch.object(api.threading.Thread, "start"):
+            response = self.client.post(
+                "/stage1/normalization-jobs/start",
+                json={"project": "demo", "input_path": str(source), "llm_preset": "fast"},
+            )
+        self.assertEqual(response.status_code, 202, response.get_json())
+        self.assertEqual(response.get_json()["result"]["llm_preset"], "fast")
+        api._release_normalization_project("demo")
+
+        rejected = self.client.post(
+            "/stage1/normalization-jobs/start",
+            json={"project": "demo", "input_path": str(source), "llm_preset": "anything"},
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("llm_preset", rejected.get_json()["error"])
+
+    def test_normalization_generate_endpoint_rejects_unknown_llm_preset(self) -> None:
+        source = self._source()
+
+        rejected = self.client.post(
+            "/stage1/normalization/generate",
+            json={
+                "project": "demo",
+                "input_path": str(source),
+                "use_llm": False,
+                "llm_preset": "turbo",
+            },
+        )
+
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("llm_preset", rejected.get_json()["error"])
+
     def test_project_name_rejects_path_syntax(self) -> None:
         for project in ("../demo", "demo/test", "demo.test", "имя проекта"):
             with self.subTest(project=project):
@@ -129,7 +163,12 @@ class NormalizationApiTest(unittest.TestCase):
         timeline_result = timeline_response.get_json()["result"]
         self.assertEqual(timeline_result["zk"], 1)
         self.assertEqual(timeline_result["snh"], 1)
-        self.assertEqual(self.client.get("/stage2/export/xml?project=demo").status_code, 200)
+        exported = self.client.get("/stage2/export/xml?project=demo")
+        self.assertEqual(exported.status_code, 200)
+        self.assertRegex(
+            exported.headers["Content-Disposition"],
+            r'filename="demo_V\d+_\d{8}_\d{6}\.xml"',
+        )
         timeline_path = self.projects / "demo" / "work" / "full_timeline.json"
         timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
         self.assertEqual(timeline_payload["schema_version"], 1)
@@ -248,13 +287,23 @@ class NormalizationApiTest(unittest.TestCase):
         source = self._source()
         work = source.parent.parent / "work"
         work.mkdir(parents=True)
-        (work / "scenario_prepared.json").write_text(json.dumps({
-            "source": str(source),
-            "items": [{
-                "id": "zk1", "text_original": "Старый текст",
-                "text_for_tts": "Старый текст", "pause_ms": 300,
-            }],
-        }, ensure_ascii=False), encoding="utf-8")
+        (work / "scenario_prepared.json").write_text(
+            json.dumps(
+                {
+                    "source": str(source),
+                    "items": [
+                        {
+                            "id": "zk1",
+                            "text_original": "Старый текст",
+                            "text_for_tts": "Старый текст",
+                            "pause_ms": 300,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         (work / "scenario_raw.txt").write_text("ЗК1: Старый текст\n", encoding="utf-8")
 
         response = self.client.get("/stage1/normalization?project=demo")
@@ -275,6 +324,47 @@ class NormalizationApiTest(unittest.TestCase):
                 json={"project": "demo", "text": "Проверка", "dry_run": True},
             )
         self.assertEqual(preview.status_code, 200, preview.get_json())
+
+    def test_tts_clear_removes_current_outputs_but_preserves_versioned_assets(self) -> None:
+        paths = api._ensure_project("demo")
+        (paths["speaker"] / "zk1.wav").write_bytes(b"current wav")
+        (paths["speaker"] / "zk1.wav.meta").write_text('{"fingerprint":"old"}', encoding="utf-8")
+        (paths["speaker"] / "manifest.json").write_text('{"items":[]}', encoding="utf-8")
+        historic = paths["voiceover_assets"] / "uid-1" / "old.wav"
+        historic.parent.mkdir(parents=True, exist_ok=True)
+        historic.write_bytes(b"historic wav")
+        paths["normalized"].write_text('{"scenario_revision_id":"rev_7"}', encoding="utf-8")
+        paths["tts_job_status"].write_text(
+            '{"id":"old-job","project":"demo","status":"completed"}', encoding="utf-8"
+        )
+        with api._TTS_JOBS_LOCK:
+            api._TTS_JOBS["old-job"] = {"id": "old-job", "project": "demo", "status": "completed"}
+
+        response = self.client.post("/stage1/tts/clear", json={"project": "demo"})
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertFalse((paths["speaker"] / "zk1.wav").exists())
+        self.assertFalse((paths["speaker"] / "zk1.wav.meta").exists())
+        self.assertFalse((paths["speaker"] / "manifest.json").exists())
+        self.assertFalse(paths["tts_job_status"].exists())
+        self.assertEqual(historic.read_bytes(), b"historic wav")
+        active_manifest = json.loads(paths["active_voiceover_manifest"].read_text(encoding="utf-8"))
+        self.assertEqual(active_manifest["scenario_revision_id"], "rev_7")
+        self.assertEqual(active_manifest["items"], [])
+        with api._TTS_JOBS_LOCK:
+            self.assertNotIn("old-job", api._TTS_JOBS)
+
+    def test_tts_clear_is_rejected_while_project_job_is_active(self) -> None:
+        api._ensure_project("demo")
+        with api._TTS_JOBS_LOCK:
+            api._TTS_ACTIVE_PROJECTS.add("demo")
+        try:
+            response = self.client.post("/stage1/tts/clear", json={"project": "demo"})
+        finally:
+            with api._TTS_JOBS_LOCK:
+                api._TTS_ACTIVE_PROJECTS.discard("demo")
+
+        self.assertEqual(response.status_code, 409, response.get_json())
 
     def test_confirmed_pipeline_is_gated_after_source_changes(self) -> None:
         source = self._source()
@@ -362,15 +452,19 @@ class NormalizationApiTest(unittest.TestCase):
         confirmed = self.client.post(
             "/stage1/normalization/confirm",
             json={
-                "project": "demo", "revision": saved["revision"],
-                "learning_decisions": [{
-                    "candidate_id": candidates[0]["id"], "action": "this_time",
-                }],
+                "project": "demo",
+                "revision": saved["revision"],
+                "learning_decisions": [
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "action": "this_time",
+                    }
+                ],
             },
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
         with NormalizationMemory(self.memory) as memory:
-            self.assertEqual(memory.list_rules(), [])
+            self.assertEqual(memory.list_rules(scope="marker"), [])
 
     def test_confirm_rejects_forged_learning_candidate(self) -> None:
         source = self.projects / "demo" / "input" / "scenario.txt"
@@ -392,15 +486,18 @@ class NormalizationApiTest(unittest.TestCase):
             json={
                 "project": "demo",
                 "revision": saved["revision"],
-                "learning_decisions": [{
-                    "candidate_id": "forged-candidate", "action": "remember",
-                }],
+                "learning_decisions": [
+                    {
+                        "candidate_id": "forged-candidate",
+                        "action": "remember",
+                    }
+                ],
             },
         )
 
         self.assertEqual(response.status_code, 400, response.get_json())
         with NormalizationMemory(self.memory) as memory:
-            self.assertEqual(memory.list_rules(), [])
+            self.assertEqual(memory.list_rules(scope="marker"), [])
 
 
 if __name__ == "__main__":

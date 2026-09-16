@@ -3,12 +3,8 @@ import re
 
 
 HOST = (Path(__file__).parents[1] / "cep" / "host.jsx").read_text(encoding="utf-8")
-PANEL = (Path(__file__).parents[1] / "cep" / "js" / "main.js").read_text(
-    encoding="utf-8"
-)
-HTML = (Path(__file__).parents[1] / "cep" / "index.html").read_text(
-    encoding="utf-8"
-)
+PANEL = (Path(__file__).parents[1] / "cep" / "js" / "main.js").read_text(encoding="utf-8")
+HTML = (Path(__file__).parents[1] / "cep" / "index.html").read_text(encoding="utf-8")
 
 
 def test_project_picker_loads_existing_backend_projects() -> None:
@@ -31,7 +27,7 @@ def test_whisper_job_progress_is_visible_and_polled_without_restarting_backend()
     assert 'id="whisperEta"' in HTML
     assert "function renderWhisperJob(job)" in PANEL
     assert "function etaFromProgress(elapsed, done, total)" in PANEL
-    assert 'job.transcription_processed_sec' in PANEL
+    assert "job.transcription_processed_sec" in PANEL
     assert '"Осталось: ≈ " + formatDuration(etaSeconds)' in PANEL
     assert '"/stage2/sync-jobs/status?project="' in PANEL
     assert "scheduleWhisperPoll(1000)" in PANEL
@@ -55,7 +51,7 @@ def test_premiere_panel_explains_safe_resume_after_an_interruption() -> None:
     assert 'currentWhisperJobStatus === "queued"' in PANEL
     assert 'currentWhisperJobStatus === "interrupted"' in PANEL
     assert "Сначала возобновите сопоставление СНХ в браузере" in PANEL
-    assert 'var changedTimeline = /^Inserted\\s+/i.test(hostError.message);' in PANEL
+    assert "var changedTimeline = /^Inserted\\s+/i.test(hostError.message);" in PANEL
     assert "повторный запуск проверит V/A и восстановит маркер" in PANEL
     assert 'id="resumeWhisper"' in HTML
     assert 'id="cancelWhisper"' in HTML
@@ -86,6 +82,25 @@ def test_batch_conform_requires_inspected_target_guards() -> None:
     assert "expectedProjectPath: target.projectPath" in PANEL
 
 
+def test_sequence_roles_block_self_transcription_and_conform_into_sources() -> None:
+    assert "function sequenceRoughCutSignals(sequence)" in HOST
+    assert 'label.indexOf("RC_BLOCK ") === 0' in HOST
+    assert 'asString(marker.name).indexOf("RC_SYNC ") === 0' in HOST
+    assert "roughCutGuard: sequenceRoughCutSignals(sequence)" in HOST
+    assert "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя экспортировать" in HOST
+    assert "sourceRegistrationBlockReason(activeSource)" in PANEL
+    assert "sequence_role: source.roughCutGuard.isRoughCutTarget" in PANEL
+    assert "function captureSourceOperation(guidePath)" in PANEL
+    assert "function sourceIdentityMatchesSequence(source, sequence)" in PANEL
+    assert '"/stage2/sync-sources?project="' in PANEL
+    assert "registeredSourceGuards: sourceGuards" in PANEL
+    assert "registeredSourceMatch(" in HOST
+    assert "assertSourceIsNotTarget(target, source);" in HOST
+    assert HOST.index("assertSourceIsNotTarget(target, source);") < HOST.index(
+        "markerState = conformMarkerState(target, item);"
+    )
+
+
 def test_source_switch_clears_identity_and_export_poll_retries() -> None:
     assert 'byId("sourceId").value = "";' in PANEL
     assert 'byId("speakerName").value = "";' in PANEL
@@ -101,9 +116,19 @@ def test_source_registration_supports_shared_and_all_speaker_sequences() -> None
     html = (Path(__file__).parents[1] / "cep" / "index.html").read_text(encoding="utf-8")
     assert 'id="allSpeakers"' in html
     assert 'id="speakerName"' in html
-    assert 'speakers: speakerNames.slice(1)' in PANEL
-    assert 'all_speakers: byId("allSpeakers").checked' in PANEL
+    assert "speakers: speakerNames.slice(1)" in PANEL
+    assert "all_speakers: operationContext.allSpeakers" in PANEL
     assert "registeredSpeakers.concat(existing.speakers)" in PANEL
+
+
+def test_final_review_export_is_async_and_waits_for_stable_wav() -> None:
+    assert "exportFinalReviewAudio: function (encodedPayload)" in HOST
+    assert "app.encoder.encodeSequence(" in HOST
+    assert "app.encoder.startBatch();" in HOST
+    assert "sequence.exportAsMediaDirect" not in HOST
+    assert "function pollFinalReviewExport(outputPath, jobId, sequence)" in PANEL
+    assert "pollFinalReviewExport(exported.job.outputPath, exported.job.jobId, sequence)" in PANEL
+    assert "Ожидание final-review экспорта остановлено через 60 минут." in PANEL
 
 
 def test_batch_conform_preserves_editorial_context_as_sequence_markers() -> None:
@@ -117,7 +142,7 @@ def test_batch_conform_preserves_editorial_context_as_sequence_markers() -> None
 def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> None:
     assert "function conformMarkerState(target, item)" in HOST
     assert "Expected exactly one marker [" in HOST
-    assert "Source sequence/range does not match" in HOST
+    assert 'status: sourceMatches ? "valid" : "stale_source"' in HOST
     assert "item text does not match" in HOST
     assert "Sequence marker scan did not advance" in HOST
     assert "Sequence marker scan exceeded " in HOST
@@ -125,7 +150,7 @@ def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> 
     assert "verifySkippedInsertionAfterMove(" in HOST
     assert "findTrackItemByNodeId(" in HOST
     assert "reanchorConformMarker(" in HOST
-    assert "without a valid \" +" in HOST
+    assert 'without a valid " +' in HOST
     assert "source clips have no stable node IDs" in HOST
     marker_check = HOST.index("markerState = conformMarkerState(target, item);")
     placeholder_lookup = HOST.index(
@@ -134,8 +159,17 @@ def test_batch_conform_resumes_only_from_semantically_exact_unique_markers() -> 
     )
     assert marker_check < placeholder_lookup
     assert "recoveredMissingMarker: true" in HOST
+    assert 'markerState.status === "absent"' in HOST
+    assert "recoveredAnywhere = uniqueSourcePairAnywhere(" in HOST
+    assert "recoveredAwayFromExpectedPosition: true" in HOST
     assert "both verified video and audio are required" in HOST
-    assert "its source range is not exact" in HOST
+    assert "RC_STALE_INSERTION_CONFIRM_REQUIRED" in HOST
+    assert "repairStaleInsertions" in PANEL
+    assert "staleSourcePairForRepair(" in HOST
+    assert "uniqueStaleSourcePairAnywhere(" in HOST
+    assert "More than one compatible stale V/A source pair exists" in HOST
+    assert 'markerState.status === "stale_source"' in HOST
+    assert "markerState.timelineSeconds" in HOST
     assert "Premiere did not persist the exact completion marker" in HOST
     assert "Object identity is therefore not a" in HOST
     assert "asString(persistedMarker.name)" in HOST
@@ -168,7 +202,7 @@ def test_ripple_replace_requires_exact_placeholder_then_inserts() -> None:
     assert "shiftDownstreamItems(target, downstream, deltaSeconds)" in HOST
     assert "verifyDownstreamItems(target, downstream, deltaSeconds)" in HOST
     assert "found.clip.remove(0, 1)" in HOST
-    assert "mode: \"overwrite\"" in HOST
+    assert 'mode: "overwrite"' in HOST
     assert "target.setPlayerPosition(secondsToTicks(params.timelineSeconds))" in HOST
     assert "playerPositionForced: playerPositionForced" in HOST
     assert "alreadyConformed: true" in HOST

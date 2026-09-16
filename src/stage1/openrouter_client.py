@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
+
+from openrouter_usage import report_json_usage
 
 try:
     import requests
@@ -100,7 +102,11 @@ def _normalize_blocks(raw_items: list[dict[str, Any]]) -> list[NarrationBlock]:
     return blocks
 
 
-def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[NarrationBlock]:
+def analyze_with_openrouter(
+    settings: Settings,
+    scenario_text: str,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[NarrationBlock]:
     if requests is None:
         raise RuntimeError("requests is not installed. Install dependencies from requirements.txt.")
 
@@ -134,6 +140,7 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
     }
+
     def _do_request():
         resp = requests.post(
             f"{settings.openrouter_base_url}/chat/completions",
@@ -145,10 +152,12 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         return resp
 
     if retry is not None:
+
         def _is_retryable(exc: BaseException) -> bool:
             if isinstance(exc, (ConnectionError, Timeout)):
                 return True
             import requests as _req
+
             if isinstance(exc, _req.HTTPError):
                 code = exc.response.status_code if exc.response is not None else 0
                 return code in (429, 500, 502, 503, 504)
@@ -167,6 +176,7 @@ def analyze_with_openrouter(settings: Settings, scenario_text: str) -> list[Narr
         response = _do_request()
 
     data = response.json()
+    report_json_usage(usage_callback, data, model=settings.openrouter_model)
     content = data["choices"][0]["message"]["content"]
     parsed = _extract_json(content if isinstance(content, str) else json.dumps(content))
     items = parsed.get("items", [])

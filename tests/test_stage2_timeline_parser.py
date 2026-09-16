@@ -1,10 +1,12 @@
 """Tests for Stage 2 timeline_parser ZK ID contract."""
+
 from __future__ import annotations
 
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from stage2.models import TimelineSegment
 from stage2.timeline_parser import parse_normalized_timeline, parse_timeline
 
 
@@ -56,6 +58,64 @@ class ZkIdContractTest(unittest.TestCase):
             self.assertGreater(zk_segs[0].duration_sec, 0, "WAV must be found via canonical ID")
 
 
+class SnhSyntaxContractTest(unittest.TestCase):
+    def test_all_snh_branches_share_segment_and_continuation_contract(self) -> None:
+        cases = [
+            (
+                "prefixed",
+                "СНХ ИВАН ИВАНОВ, эксперт, 00:01:02 Первая строка.\n",
+                "ИВАН ИВАНОВ",
+                "эксперт",
+                "00:01:02",
+            ),
+            (
+                "classic",
+                "ПЕТР ПЕТРОВ, редактор: 00:02:03 Первая строка.\n",
+                "ПЕТР ПЕТРОВ",
+                "редактор",
+                "00:02:03",
+            ),
+            (
+                "flex",
+                "АННА СИДОРОВА (ведущая) 03:04 Первая строка.\n",
+                "АННА СИДОРОВА",
+                "ведущая",
+                "03:04",
+            ),
+            (
+                "name-only",
+                "ОЛЕГ СМИРНОВ (оператор)\n04.05 Первая строка.\n",
+                "ОЛЕГ СМИРНОВ",
+                "оператор",
+                "04.05",
+            ),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for branch, prefix, speaker, role, timecode in cases:
+                with self.subTest(branch=branch):
+                    timeline = parse_timeline(
+                        prefix + "Вторая строка.\nЗК1: Следующий сегмент.\n",
+                        base,
+                        base,
+                        "TEST",
+                    )
+
+                    self.assertEqual([item.type for item in timeline.segments], ["snh", "zk"])
+                    segment = timeline.segments[0]
+                    self.assertEqual(segment.id, "snh1")
+                    self.assertEqual(segment.text, "Первая строка. Вторая строка.")
+                    self.assertEqual(segment.speaker, speaker)
+                    self.assertEqual(segment.role, role)
+                    self.assertEqual(segment.timecode, timecode)
+                    self.assertEqual(segment.duration_sec, 10.0)
+                    self.assertEqual(
+                        segment.placeholder_path,
+                        str(base / "snh1_placeholder.png"),
+                    )
+
+
 class NormalizedTimelineTest(unittest.TestCase):
     def test_confirmed_blocks_build_without_regex_reparse(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -63,7 +123,12 @@ class NormalizedTimelineTest(unittest.TestCase):
             document = {
                 "status": "confirmed",
                 "blocks": [
-                    {"order": 1, "type": "voiceover", "normalized_text": "Закадр"},
+                    {
+                        "order": 1,
+                        "type": "voiceover",
+                        "normalized_text": "Закадр",
+                        "versioning": {"change_status": "added"},
+                    },
                     {
                         "order": 2,
                         "type": "sync",
@@ -85,10 +150,13 @@ class NormalizedTimelineTest(unittest.TestCase):
 
             timeline = parse_normalized_timeline(document, base, base, "TEST")
 
-            self.assertEqual([item.type for item in timeline.segments], ["zk", "snh", "host", "tech"])
+            self.assertEqual(
+                [item.type for item in timeline.segments], ["zk", "snh", "host", "tech"]
+            )
             self.assertEqual(timeline.segments[1].speaker, "Иван Иванов")
             self.assertEqual(timeline.segments[1].timecode, "01:02:03")
             self.assertEqual(timeline.segments[2].id, "host1")
+            self.assertEqual(timeline.segments[0].revision_status, "added")
 
     def test_draft_is_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -201,18 +269,34 @@ class NormalizedTimelineTest(unittest.TestCase):
             }
 
             timeline = parse_normalized_timeline(
-                document, base, base, "TEST", sync_matches=matches,
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=matches,
             )
 
-            self.assertEqual([item.block_uid for item in timeline.segments], [
-                "teaser-block", "full-block",
-            ])
-            self.assertEqual([item.source_in_sec for item in timeline.segments], [
-                120.0, 120.0,
-            ])
-            self.assertEqual([item.source_out_sec for item in timeline.segments], [
-                124.0, 132.0,
-            ])
+            self.assertEqual(
+                [item.block_uid for item in timeline.segments],
+                [
+                    "teaser-block",
+                    "full-block",
+                ],
+            )
+            self.assertEqual(
+                [item.source_in_sec for item in timeline.segments],
+                [
+                    120.0,
+                    120.0,
+                ],
+            )
+            self.assertEqual(
+                [item.source_out_sec for item in timeline.segments],
+                [
+                    124.0,
+                    132.0,
+                ],
+            )
             self.assertEqual([item.start_sec for item in timeline.segments], [0.0, 4.0])
             self.assertEqual([item.duration_sec for item in timeline.segments], [4.0, 12.0])
 
@@ -221,19 +305,21 @@ class NormalizedTimelineTest(unittest.TestCase):
             base = Path(tmp)
             document = {
                 "status": "confirmed",
-                "blocks": [{
-                    "uid": "irina-block",
-                    "order": 1,
-                    "type": "sync",
-                    "speaker": "ИРИНА КОТОВА",
-                    "role": "ИСТОРИК",
-                    "normalized_text": "Первая цитата Вторая цитата Третья цитата",
-                    "sync_fragments": [
-                        {"timecode_start": "01:22:29", "text": "Первая цитата"},
-                        {"timecode_start": "01:23:36", "text": "Вторая цитата"},
-                        {"timecode_start": "01:24:11", "text": "Третья цитата"},
-                    ],
-                }],
+                "blocks": [
+                    {
+                        "uid": "irina-block",
+                        "order": 1,
+                        "type": "sync",
+                        "speaker": "ИРИНА КОТОВА",
+                        "role": "ИСТОРИК",
+                        "normalized_text": "Первая цитата Вторая цитата Третья цитата",
+                        "sync_fragments": [
+                            {"timecode_start": "01:22:29", "text": "Первая цитата"},
+                            {"timecode_start": "01:23:36", "text": "Вторая цитата"},
+                            {"timecode_start": "01:24:11", "text": "Третья цитата"},
+                        ],
+                    }
+                ],
             }
             matches = {
                 f"irina-block::fragment:{index}": {
@@ -253,8 +339,12 @@ class NormalizedTimelineTest(unittest.TestCase):
             }
 
             timeline = parse_normalized_timeline(
-                document, base, base, "TEST",
-                sync_matches=matches, sync_sources=sources,
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=matches,
+                sync_sources=sources,
             )
 
             self.assertEqual([item.id for item in timeline.segments], ["snh1", "snh2", "snh3"])
@@ -266,7 +356,9 @@ class NormalizedTimelineTest(unittest.TestCase):
                     "irina-block::fragment:3",
                 ],
             )
-            self.assertTrue(all(item.parent_block_uid == "irina-block" for item in timeline.segments))
+            self.assertTrue(
+                all(item.parent_block_uid == "irina-block" for item in timeline.segments)
+            )
             self.assertEqual(
                 [item.timecode for item in timeline.segments],
                 ["01:22:29", "01:23:36", "01:24:11"],
@@ -279,16 +371,18 @@ class NormalizedTimelineTest(unittest.TestCase):
             base = Path(tmp)
             document = {
                 "status": "confirmed",
-                "blocks": [{
-                    "uid": "expanded-block",
-                    "order": 1,
-                    "type": "sync",
-                    "normalized_text": "Первая часть Вторая часть",
-                    "sync_fragments": [
-                        {"timecode_start": "00:10", "text": "Первая часть"},
-                        {"timecode_start": "00:20", "text": "Вторая часть"},
-                    ],
-                }],
+                "blocks": [
+                    {
+                        "uid": "expanded-block",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Первая часть Вторая часть",
+                        "sync_fragments": [
+                            {"timecode_start": "00:10", "text": "Первая часть"},
+                            {"timecode_start": "00:20", "text": "Вторая часть"},
+                        ],
+                    }
+                ],
             }
             legacy_matches = {
                 "snh2": {
@@ -301,11 +395,49 @@ class NormalizedTimelineTest(unittest.TestCase):
             }
 
             timeline = parse_normalized_timeline(
-                document, base, base, "TEST", sync_matches=legacy_matches,
+                document,
+                base,
+                base,
+                "TEST",
+                sync_matches=legacy_matches,
             )
 
             self.assertEqual([item.match_status for item in timeline.segments], ["", ""])
             self.assertEqual([item.duration_sec for item in timeline.segments], [10.0, 10.0])
+
+    def test_life_block_becomes_non_speech_graphic_placeholder(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            timeline = parse_normalized_timeline(
+                {
+                    "status": "confirmed",
+                    "blocks": [
+                        {
+                            "uid": "life-block",
+                            "order": 1,
+                            "type": "life",
+                            "normalized_text": "01.10 Подойду к тебе, шепну на ушко",
+                            "source_description": "концерт Фриске",
+                            "timecode_start": "01.10",
+                        }
+                    ],
+                },
+                base,
+                base,
+                "TEST",
+            )
+
+            self.assertEqual(len(timeline.segments), 1)
+            segment = timeline.segments[0]
+            self.assertEqual(segment.id, "life1")
+            self.assertEqual(segment.type, "life")
+            self.assertEqual(segment.speaker, "ЛАЙФ")
+            self.assertEqual(TimelineSegment.from_dict(segment.to_dict()).type, "life")
+            self.assertEqual(segment.role, "концерт Фриске")
+            self.assertEqual(segment.timecode, "01.10")
+            self.assertEqual(segment.duration_sec, 10.0)
+            self.assertTrue(segment.placeholder_path.endswith("life1_placeholder.png"))
+            self.assertEqual(segment.spoken_text, "")
 
 
 if __name__ == "__main__":

@@ -3,16 +3,148 @@
 Пайплайн: нормализация сценария (`.doc/.docx`) → подтверждение блоков →
 синтез TTS → Whisper-сопоставление СНХ → сборка в Premiere.
 
+## Быстрый старт
+
+Минимальный путь до первого результата на macOS, без платных API-ключей
+(используется системный голос `say`).
+
+1. Установи зависимости и создай `.env`:
+
+   ```bash
+   scripts/setup-local
+   ```
+
+   Скрипт создаёт `.venv`, ставит зависимости из `requirements-dev.txt`,
+   копирует `.env.example` в `.env` (с сгенерированным `ROUGH_CUT_API_TOKEN`),
+   создаёт папки `projects/` и `data/`, затем запускает быструю диагностику.
+   В конце выведет `Готово. Запуск API: scripts/run-local`.
+
+2. Открой `.env` и укажи путь без ключей LLM/TTS-провайдеров:
+
+   ```bash
+   TTS_PROVIDER=macos
+   ```
+
+   Ключи `OPENROUTER_API_KEY`/`GEMINI_API_KEY` в этом режиме не нужны.
+
+3. (Опционально) Проверь окружение подробнее:
+
+   ```bash
+   scripts/doctor
+   ```
+
+   Покажет ✅/⚠️/❌ по Python, `ffmpeg`, `.env`, токену, backend на `:8000` и,
+   на macOS, по `say`/`afconvert`.
+
+4. Запусти локальный API:
+
+   ```bash
+   scripts/run-local
+   ```
+
+   Ожидаемый результат: процесс висит в терминале, backend слушает
+   `http://127.0.0.1:8000`. Открой этот адрес в браузере — должна появиться
+   стартовая страница создания/выбора проекта.
+
+5. Пробный прогон без реального синтеза и без LLM (создай проект и положи
+   сценарий в `projects/my_project/input/scenario.docx`, затем):
+
+   ```bash
+   scripts/analyze-script --in projects/my_project/input/scenario.docx --no-llm
+   scripts/synthesize-tts --in projects/my_project/work/scenario_prepared.json --out projects/my_project/speaker --dry-run
+   scripts/validate-stage1 --in projects/my_project/work/scenario_prepared.json --speaker projects/my_project/speaker
+   ```
+
+   Ожидаемый результат: в `projects/my_project/work/` появится
+   `scenario_prepared.json`, в `projects/my_project/speaker/` — WAV-заглушки
+   без реального голоса, а `validate-stage1` выведет отчёт без ошибок.
+
+Дальше — обычный веб-workflow: открой проект в браузере, вкладка
+«Нормализация» → проверка блоков → подтверждение → TTS (уже с
+`TTS_PROVIDER=macos` или платным провайдером) → Stage 2 (Whisper-синхрон) →
+сборка в Premiere. Подробности — в разделах ниже и в
+[`docs/STAGE1_GUIDE.md`](docs/STAGE1_GUIDE.md).
+
+## Оглавление
+
+- [Структура](#структура)
+- [Простая загрузка файлов](#простая-загрузка-файлов)
+  - [Версии сценария](#версии-сценария)
+- [Локальные зависимости](#локальные-зависимости)
+- [Переменные окружения](#переменные-окружения)
+  - [macOS Connector (для Docker backend)](#macos-connector-для-docker-backend)
+- [Локальный запуск (CLI)](#локальный-запуск-cli)
+- [Ручная разметка диктора](#ручная-разметка-диктора)
+- [Dry run (без API-ключей)](#dry-run-без-api-ключей)
+- [API (Flask)](#api-flask)
+- [Stage 2.1: автоматическое подключение синхронов](#stage-21-автоматическое-подключение-синхронов)
+- [Тесты](#тесты)
+  - [pre-commit хуки](#pre-commit-хуки)
+- [Локальная автоматизация](#локальная-автоматизация)
+- [Docker](#docker)
+  - [Быстрое развёртывание на другой машине](#быстрое-развёртывание-на-другой-машине)
+  - [Apple Silicon M1–M4: Metal/MLX](#apple-silicon-m1m4-metalmlx)
+  - [Ручной Docker-запуск](#ручной-docker-запуск)
+- [Документация](#документация)
+
 ## Структура
 
 - `projects/<project>/input/` — исходный сценарий проекта.
 - `projects/<project>/work/` — canonical `scenario_normalized.json` и производные `scenario_raw.txt`/`scenario_prepared.json`.
 - `projects/<project>/speaker/` — файлы озвучки `zk1.wav`, `zk2.wav`, ...
+- `projects/<project>/versions/` — история редакций: сценарии, diff, снимки таймлайна и recovery-копии.
 - `src/stage1/` — core-логика и CLI.
 - `src/stage2/` — таймлайн, sync-источники, Whisper word index и fuzzy matching.
 - `cep/` — панель Premiere для регистрации, экспорта аудиогида и conform.
 - `src/api.py` — Flask API.
 - `scripts/` — shell-обертки для CLI.
+
+## Простая загрузка файлов
+
+После создания проекта приложение автоматически создаёт две пользовательские
+папки:
+
+```text
+projects/<project>/ЗАГРУЗИТЬ/Сценарии/
+projects/<project>/ЗАГРУЗИТЬ/Просмотровки/
+```
+
+- в `Сценарии` кладутся `.doc`, `.docx`, `.txt` или `.md`;
+- в `Просмотровки` кладутся видео и отдельные `.wav`/`.mp3`;
+- видео и отдельный звук с одинаковым именем связываются автоматически;
+- старые `input/` и `media/reviews/` продолжают поддерживаться.
+
+### Версии сценария
+
+История работает одинаково для любого проекта из `projects/`; имя проекта не
+зашито в механизм версий. Рабочий цикл во вкладке «Версии»:
+
+1. Создай, проверь и сохрани исходную нормализацию. При первом импорте она
+   автоматически фиксируется как baseline `rev_0001`.
+2. Положи новый `.doc`, `.docx`, `.txt` или `.md` в
+   `ЗАГРУЗИТЬ/Сценарии`, выбери его и нажми «Загрузить новую редакцию».
+3. Приложение создаст следующий уникальный `rev_NNNN`, сравнит его с активной
+   редакцией и сохранит как отдельный черновик. Импорт сам по себе не меняет
+   активную редакцию.
+4. Проверь diff и нажми «Открыть» у нужной редакции. Несохранённые правки
+   нормализации интерфейс сначала предложит сохранить. После переключения
+   редакцию нужно проверить и подтвердить перед TTS, Stage 2 и Stage 3.
+
+Каждая редакция хранит собственные снимки исходного файла, нормализации,
+подготовленного сценария и карты озвучки; при наличии также сохраняются sync
+matches и таймлайн. Озвучка привязана к стабильному UID блока: `zk1`, `zk2`, …
+остаются позиционными экспортными именами, поэтому WAV неизменившихся или
+перемещённых блоков можно переиспользовать между редакциями.
+
+Перед импортом и переключением API сверяет `work/active_revision.json` с
+`scenario_revision_id` рабочей нормализации. Если они расходятся, операции
+блокируются, а вкладка предлагает «Восстановить». Восстановление сначала
+сохраняет текущее состояние в `versions/recovery/<timestamp>/`, затем разворачивает
+выбранную известную редакцию. Не редактируй файлы в `versions/` вручную.
+
+Импорт, переключение и восстановление также блокируются, пока в этом же проекте
+активна нормализация, TTS, sync или подготовка Stage 3. Задачи других проектов
+могут выполняться независимо.
 
 ## Локальные зависимости
 
@@ -32,29 +164,50 @@
 
 Если используешь только `TTS_PROVIDER=macos`, ключи для TTS не нужны.
 
-Важно для `macos`: backend должен работать локально на macOS, либо через коннектор (ниже).  
+Важно для `macos`: backend должен работать локально на macOS, либо через коннектор (ниже).
 В Docker/Linux команда `say` недоступна напрямую.
 
 Опционально:
 - `MAX_ZK_BLOCKS=40` (верхняя граница количества блоков `zkN` после анализа; по умолчанию `40`)
 - `VALIDATE_MIN_WAV_DURATION_MS=350` (warning, если WAV короче порога; `0` отключает)
 - `VALIDATE_SILENCE_RMS_THRESHOLD=120` (warning, если RMS слишком низкий; `0` отключает)
-- `TTS_PROVIDER=gemini|openrouter|macos` (какой движок синтеза использовать)
+- `TTS_PROVIDER=openrouter|macos` (в веб-интерфейсе OpenRouter-модель выбирается отдельно)
 - `TTS_GENDER=female|male` (пол голоса по умолчанию)
-- для `openrouter`: `OPENROUTER_TTS_MODEL`, `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
+- `TTS_MAX_WORKERS=3` ограничивает параллельные запросы синтеза (`1–4`)
+- `ANALYZER_LLM_WORKERS=4` ограничивает параллельный анализ независимых LLM-чанков (`1–4`)
+- для `openrouter` доступны `microsoft/mai-voice-2` и
+  `google/gemini-3.1-flash-tts-preview` через отдельный TTS endpoint.
+  Русские MAI preset-голоса: `ru-RU-Masha:MAI-Voice-2` и
+  `ru-RU-Lev:MAI-Voice-2`. Их можно сменить через `OPENROUTER_TTS_MODEL`,
+  `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
   - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
+  - поле «Интонация / стиль / формат ролика» передаёт Gemini режиссёрский prompt,
+    а для MAI сопоставляет описание с Azure style; изменение поля инвалидирует TTS-кэш
 - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
-  - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`
+  - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`, `MACOS_CONNECTOR_PORT`;
+    LaunchAgent автоматически задаёт `MACOS_CONNECTOR_ENV_FILE` как путь к
+    отдельному файлу настроек с правами `0600`, поэтому эту переменную не нужно
+    добавлять в проектный `.env`
 - для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper`,
   `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
 - параметры faster-whisper: `SYNC_WHISPER_BEAM_SIZE` и
   `SYNC_WHISPER_BEST_OF` (по умолчанию `5`), `SYNC_WHISPER_BATCH_SIZE`
-  (`0` отключает batching; для CPU начинать с `4` или `8`);
+  (`0` отключает batching; для CPU начинать с `4` или `8`) и
+  `SYNC_WHISPER_CPU_THREADS` (`0` оставляет выбор числа потоков backend-у);
   одна транскрипция выполняется в отдельном процессе с hard timeout
-  `SYNC_WHISPER_TIMEOUT_SECONDS` (по умолчанию 14400 секунд)
+  `SYNC_WHISPER_TIMEOUT_SECONDS` (по умолчанию 14400 секунд); задайте
+  `SYNC_WHISPER_UNLOAD_AFTER_JOB=1`, чтобы выгружать процесс и модель после
+  каждой успешной транскрипции. Это освобождает RAM, но следующая задача снова
+  загрузит модель. По умолчанию воркер вместо этого выгружается сам после
+  простоя `SYNC_WHISPER_IDLE_TIMEOUT_SECONDS` секунд (по умолчанию 900 = 15
+  минут; `0` отключает авто-выгрузку и держит воркер в памяти бессрочно, как
+  раньше) — это не мешает тёплому старту при частых запросах, но не даёт
+  модели бесконечно занимать RAM во время долгой открытой сессии Premiere.
 - `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV
   (по умолчанию 4 ГБ), работающий и без `Content-Length`
+- `SYNC_CLOUD_ASR_OVERLAP_SEC` — перекрытие соседних фрагментов облачного ASR
+  в секундах (по умолчанию `60`)
 - `SYNC_LLM_REVIEW_ENABLED=1` включает смысловую проверку блоков с низким
   совпадением; `SYNC_LLM_REVIEW_THRESHOLD` задаёт порог (по умолчанию `0.80`),
   а `SYNC_LLM_REVIEW_MAX_BLOCKS` ограничивает число LLM-проверок за запуск.
@@ -62,6 +215,8 @@
   требует ручного подтверждения в браузере
 - `ROUGH_CUT_CEP_CORS=1` — разрешить аутентифицированные запросы только из
   локального Premiere CEP file origin
+- `ROUGH_CUT_HOST_PROJECTS_ROOT` — необязательный путь к корню проектов на
+  host-машине для преобразования контейнерных путей, возвращаемых в CEP
 
 ### macOS Connector (для Docker backend)
 
@@ -103,12 +258,14 @@ extra_hosts:
 ## Локальный запуск (CLI)
 
 ```bash
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # заполни API-ключи
 export PYTHONPATH=src
 ```
+
+Используй именно Python 3.11 — на этой версии проверяются CI, Docker-образ и `ruff target-version`; другая локальная версия может незаметно разойтись в поведении с CI.
 
 В основном веб-потоке сначала открой вкладку «Нормализация», проверь типы всех блоков и подтверди сценарий. TTS и Stage 2 недоступны для черновика. Перед подтверждением интерфейс показывает найденные ручные исправления типа блока: каждое можно применить только сейчас или запомнить. Запомненное исправление становится активным правилом после подтверждения в двух сценариях с разными исходниками. Точные совпадения из общей SQLite-памяти применяются автоматически; подтверждённые решения LLM сохраняются отдельными кандидатами и также требуют двух разных исходников для активации.
 
@@ -194,11 +351,17 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 
 Эндпоинты:
 - `GET /` — стартовая страница: создать проект / выбрать проект.
+- `GET|POST /projects` — список и создание проектов.
+- `DELETE /projects/<project>` — удалить проект.
 - `GET /project/<project>` — UI первого этапа для конкретного проекта.
 - `GET /health`
 - `GET /stage1/status?project=<project>`
 - `POST /stage1/normalization/generate`
+- `POST /stage1/normalization/reset`
 - `GET|PUT /stage1/normalization`
+- `POST /stage1/normalization-jobs/start`
+- `GET /stage1/normalization-jobs/<job_id>`
+- `GET /stage1/normalization-jobs/status?project=<project>`
 - `POST /stage1/normalization/confirm/preview` — показать варианты обучения по ручным исправлениям
 - `POST /stage1/normalization/confirm`
 - `GET|POST /stage1/normalization/memory`
@@ -223,6 +386,19 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `GET|PATCH /stage2/sync-matches`
 - `PATCH /stage2/sync-matches/<block_uid>`
 - `GET /stage2/timeline?project=<project>`
+- `POST /stage3/jobs/scan/start`
+- `POST /stage3/jobs/prepare/start`
+- `GET /stage3/jobs/<job_id>`
+- `GET /stage3/jobs/status?project=<project>`
+- `POST /stage3/media/scan` — синхронный fallback сканирования.
+- `POST /stage3/timeline/prepare` — синхронный fallback подготовки.
+- `GET /stage3/export/xml?project=<project>`
+- `GET /stage4/inbox?project=<project>` — найденные сценарии и просмотровки
+- `GET /stage4/revisions?project=<project>` — история и состояние целостности
+- `POST /stage4/revisions/import` — создать редакцию из нового сценария
+- `GET /stage4/diffs/<diff_id>?project=<project>` — получить сохранённый diff
+- `POST /stage4/revisions/<revision_id>/activate` — открыть редакцию
+- `POST /stage4/revisions/<revision_id>/reconcile` — восстановить рассогласованный проект
 
 Последний статус TTS и sync атомарно сохраняется в каталоге `work` проекта.
 После рестарта незавершённая задача показывается как `interrupted`: повторный
@@ -245,6 +421,11 @@ LLM-нормализация сохраняет успешные batch-реше�
 
 Готовые синхронизированные секвенции Premiere являются источником координат.
 Видео остаётся в Premiere и не загружается в backend.
+
+Для headless-монтажа по отрендеренным просмотровкам см.
+[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md): Docker автоматически читает
+`projects/<project>/media/reviews`, создаёт заменяемые `RC_SRC_*` sequences и
+готовый nested XML. Premiere нужен только для импорта результата.
 
 1. Установить development CEP-панель по инструкции в `cep/README.md`.
 2. Открыть sync-секвенцию и нажать «Использовать активную».
@@ -301,9 +482,22 @@ python -m compileall -q src tests
 docker compose config --quiet
 ```
 
+Каждый тест выполняется с глобальным таймаутом 120 секунд для предотвращения зависаний.
+
 Те же проверки автоматически выполняются в GitHub Actions. Корректностные
-правила Ruff запускаются командой `ruff check src tests`; форматтер доступен
-как `ruff format src tests` и может вводиться постепенно без массового diff.
+правила Ruff запускаются командой `ruff check src tests`, а форматирование
+блокирующе проверяется командой `ruff format --check src tests`.
+
+`requirements-lock.txt` — полная фиксация версий прямых и транзитивных зависимостей (сгенерирован на Python 3.11 через `pip freeze` после установки `requirements-dev.txt` и `requirements-whisper.txt`). Источник истины для версий — `requirements*.txt`; lock-файл используется для воспроизводимости и диагностики, обновляйте его после любых изменений `requirements-*.txt`.
+
+### pre-commit хуки
+
+Установка один раз: `pip install pre-commit && pre-commit install`. Локально
+хуки проверяют только то, что уже обязательно и в CI — `ruff check`,
+`ruff format`, `gitleaks` и базовую гигиену файлов (trailing whitespace, EOF,
+YAML/TOML/JSON).
+`mypy` и `eslint` пока намеренно не входят в pre-commit из-за накопленного
+технического долга, но оба остаются обязательными шагами CI.
 
 ## Локальная автоматизация
 
@@ -320,6 +514,12 @@ scripts/pipeline-stage1 --project Демо --input scenario.docx
 confirm → TTS → validate. Для проверки без платного TTS добавьте `--dry-run`.
 
 ## Docker
+
+Контейнер слушает `0.0.0.0:8000` — у приложения нет TLS, только токен
+(`ROUGH_CUT_API_TOKEN`). Не публикуй порт 8000 напрямую в интернет: для
+локальной работы обращайся к нему только с `127.0.0.1` этой же машины, а для
+доступа снаружи ставь перед контейнером reverse proxy с TLS (nginx/Caddy и
+т.п.).
 
 ### Быстрое развёртывание на другой машине
 
@@ -395,3 +595,21 @@ curl -X POST http://localhost:8000/stage1/analyze \
 Новый веб-workflow запускает фоновую задачу через
 `/stage1/normalization-jobs/start`; синхронный `/stage1/normalization/generate`
 сохранён для совместимости и тестовых интеграций.
+
+## Документация
+
+- [`docs/README.md`](docs/README.md) — полный индекс актуальной документации и
+  архивных отчётов.
+- [`docs/STAGE1_GUIDE.md`](docs/STAGE1_GUIDE.md) — подробное руководство по
+  работе со сценарием на Stage 1: разметка диктора, нормализация, TTS.
+- [`docs/E2E_PILOT_CHECKLIST.md`](docs/E2E_PILOT_CHECKLIST.md) — пошаговый
+  чек-лист для сквозного пилота в реальном Premiere Pro (сценарий → озвучка →
+  синхронизация → conform → XML).
+- [`docs/DEPENDENCY_POLICY.md`](docs/DEPENDENCY_POLICY.md) — политика
+  зависимостей и поддерживаемых платформ (Docker, macOS Apple Silicon, CI).
+- [`docs/COMPETITOR_COMPARISON.md`](docs/COMPETITOR_COMPARISON.md) —
+  конкурентный анализ (для контекста продукта, не для эксплуатации).
+- [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — план разработки и roadmap
+  (уже упомянут выше в разделе про Stage 2.1).
+- [`docs/archive/audits/README.md`](docs/archive/audits/README.md) — архив
+  датированных аудитов. Это исторические снимки, а не текущий backlog.

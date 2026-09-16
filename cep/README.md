@@ -8,8 +8,9 @@ backend.
 ## Что уже реализовано
 
 - чтение метаданных активной секвенции;
-- безопасное разрешение секвенции: сохранённый `sequenceID`/`projectItem.nodeId`
-  обязаны совпасть; fallback по имени используется только для legacy-записи без ID;
+- безопасное разрешение секвенции: сохранённый `sequenceID` имеет приоритет;
+  `projectItem.nodeId` используется, когда `sequenceID` отсутствует, а fallback
+  по уникальному имени — только для legacy-записи без обоих ID;
 - `POST /stage2/sync-sources` с метаданными активной секвенции;
 - автоматический export полного guide WAV через Adobe Media Encoder;
 - polling размера/даты WAV до завершения записи, регистрация guide и запуск
@@ -87,9 +88,9 @@ scripts/install-cep-macos
 
 3. Открыть `Window → Extensions → Rough Cut — Синхронизация`.
 
-В текущей development-среде symlink уже установлен, а `PlayerDebugMode` включён
-для CSXS 11/12. После изменения панели достаточно перезапустить Premiere.
-Перед распространением расширение нужно подписать ZXP и поднять bundle version.
+Скрипт включает `PlayerDebugMode` для CSXS 11/12. После изменения панели
+достаточно перезапустить Premiere. Перед распространением расширение нужно
+подписать ZXP и поднять bundle version.
 
 ## Backend contract
 
@@ -98,7 +99,7 @@ scripts/install-cep-macos
 ```text
 POST /stage2/sync-sources
 GET  /stage2/sync-sources?project=<name>
-GET  /stage2/sync-matches?project=<name>
+POST /stage2/sync-jobs/start
 ```
 
 UI использует `GET` для восстановления существующей регистрации и `POST` для
@@ -110,11 +111,17 @@ UI использует `GET` для восстановления существ
 аудиофайл и конфигурация распознавания; matcher использует все уже готовые
 индексы проекта.
 
+Разделение интерфейсов осознанное: браузерный UI владеет просмотром и
+подтверждением `GET|PATCH /stage2/sync-matches`, сборкой timeline и ссылкой на
+`GET /stage2/export/xml`. CEP-панель регистрирует/экспортирует активную
+Premiere sequence, запускает sync job и применяет уже подтверждённые диапазоны
+в Premiere. Поэтому панель не вызывает confirm или XML-export endpoints.
+
 Пример payload регистрации:
 
 ```json
 {
-  "project": "BRIK",
+  "project": "my_project",
   "id": "vasilieva_01",
   "source_id": "vasilieva_01",
   "speaker": "Татьяна Васильева",

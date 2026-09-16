@@ -8,7 +8,6 @@ import pytest
 import atomic_io
 
 from stage2.sync_models import SyncSource, WordIndex
-from stage2 import sync_transcript
 from stage2.sync_transcript import (
     WordIndexGenerator,
     ingest_word_index,
@@ -59,11 +58,7 @@ def test_ingests_openai_top_level_words_and_infers_source() -> None:
 
 def test_hf_chunks_are_tokenized_and_interval_is_interpolated() -> None:
     index = ingest_word_index(
-        {
-            "chunks": [
-                {"text": "энергетическим вампиром", "timestamp": [10.0, 12.0]}
-            ]
-        },
+        {"chunks": [{"text": "энергетическим вампиром", "timestamp": [10.0, 12.0]}]},
         "s1",
     )
     assert [item.word for item in index.words] == ["энергетическим", "вампиром"]
@@ -76,7 +71,12 @@ def test_hf_chunks_are_tokenized_and_interval_is_interpolated() -> None:
 def test_invalid_entries_are_skipped_but_empty_transcript_is_rejected() -> None:
     with pytest.raises(ValueError, match="no valid timed words"):
         ingest_word_index(
-            {"words": [{"word": "", "start": 0, "end": 1}, {"word": "назад", "start": 2, "end": 1}]},
+            {
+                "words": [
+                    {"word": "", "start": 0, "end": 1},
+                    {"word": "назад", "start": 2, "end": 1},
+                ]
+            },
             "s1",
         )
 
@@ -121,10 +121,7 @@ def test_save_word_index_atomically_replaces_existing_file(tmp_path, monkeypatch
         assert source_path.parent == path.parent
         assert destination_path == path
         assert path.read_text(encoding="utf-8") == "previous index\n"
-        assert (
-            json.loads(source_path.read_text(encoding="utf-8"))["source_id"]
-            == "source"
-        )
+        assert json.loads(source_path.read_text(encoding="utf-8"))["source_id"] == "source"
         observed["temporary"] = source_path
         real_replace(source_path, destination_path)
 

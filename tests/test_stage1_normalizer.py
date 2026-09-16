@@ -14,6 +14,7 @@ from stage1.normalization_memory import NormalizationMemory, normalize_marker
 from stage1.normalizer import (
     NormalizationValidationError,
     RevisionConflictError,
+    SourceChangedError,
     confirm_normalization,
     generate_normalization,
     import_legacy_normalization,
@@ -94,6 +95,43 @@ class NormalizationMemoryTests(unittest.TestCase):
 
 
 class NormalizerTests(unittest.TestCase):
+    def test_load_preserves_stage4_block_versioning_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "normalized.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "source": "/tmp/scenario.docx",
+                        "source_hash": "abc",
+                        "blocks": [
+                            {
+                                "uid": "stable-block",
+                                "order": 1,
+                                "original_text": "Изменённый текст",
+                                "normalized_text": "Изменённый текст",
+                                "versioning": {
+                                    "import_uid": "import-block",
+                                    "parent_block_uid": "stable-block",
+                                    "change_status": "edited",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_normalization(path)
+
+            self.assertEqual(
+                loaded["blocks"][0]["versioning"],
+                {
+                    "import_uid": "import-block",
+                    "parent_block_uid": "stable-block",
+                    "change_status": "edited",
+                },
+            )
+
     def test_docx_soft_line_break_stays_inside_voiceover_block(self) -> None:
         from docx import Document
         from docx.enum.text import WD_BREAK
@@ -128,7 +166,9 @@ class NormalizerTests(unittest.TestCase):
             document.save(source)
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )
 
@@ -148,12 +188,31 @@ class NormalizerTests(unittest.TestCase):
             source.write_text("ДИКТОР: Первый абзац\nПродолжение закадра\n", encoding="utf-8")
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 use_llm=False,
             )
-            self.assertEqual([block["type"] for block in result["blocks"]], ["voiceover", "voiceover"])
+            self.assertEqual(
+                [block["type"] for block in result["blocks"]], ["voiceover", "voiceover"]
+            )
             self.assertEqual(result["blocks"][1]["continuation_of_type"], "voiceover")
             self.assertEqual(result["blocks"][1]["text_for_tts"], "Продолжение закадра")
+
+    def test_standalone_voiceover_marker_is_non_tts_cue_for_next_paragraph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("З.к.\nСам закадровый текст.\n", encoding="utf-8")
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["technical", "voiceover"])
+            self.assertEqual(blocks[0]["text_for_tts"], "")
+            self.assertEqual(blocks[0]["notes"], "section_marker_for=voiceover")
+            self.assertEqual(blocks[1]["text_for_tts"], "Сам закадровый текст.")
 
     def test_generate_preserves_every_paragraph_and_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,6 +234,55 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(result["blocks"][3]["type"], "unknown")
             self.assertEqual(result["blocks"][0]["original_text"], "ДИКТОР: Первый закадр")
 
+    def test_regenerate_active_revision_preserves_identity_and_increments_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            output = root / "normalized.json"
+            source.write_text("ДИКТОР: Текст\n", encoding="utf-8")
+            first = generate_normalization(
+                source, output, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            first["scenario_revision_id"] = "rev_0003"
+            first["parent_revision_id"] = "rev_0002"
+            first["blocks"][0]["versioning"] = {"change_status": "unchanged"}
+            output.write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
+
+            regenerated = generate_normalization(
+                source, output, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+
+            self.assertEqual(regenerated["revision"], 2)
+            self.assertEqual(regenerated["scenario_revision_id"], "rev_0003")
+            self.assertEqual(regenerated["parent_revision_id"], "rev_0002")
+            self.assertEqual(regenerated["blocks"][0]["uid"], first["blocks"][0]["uid"])
+            self.assertEqual(
+                regenerated["blocks"][0]["versioning"],
+                {"change_status": "unchanged"},
+            )
+
+    def test_regenerate_active_revision_rejects_another_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source = root / "first.txt"
+            second_source = root / "second.txt"
+            output = root / "normalized.json"
+            first_source.write_text("ДИКТОР: Первый\n", encoding="utf-8")
+            second_source.write_text("ДИКТОР: Второй\n", encoding="utf-8")
+            first = generate_normalization(
+                first_source, output, memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            first["scenario_revision_id"] = "rev_0001"
+            output.write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
+
+            with self.assertRaises(SourceChangedError):
+                generate_normalization(
+                    second_source,
+                    output,
+                    memory_path=root / "memory.sqlite3",
+                    use_llm=False,
+                )
+
     def test_memory_applies_across_scenarios(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -183,7 +291,9 @@ class NormalizerTests(unittest.TestCase):
                 memory.record_manual("Голос автора", "voiceover")
             source = root / "scenario.txt"
             source.write_text("ГОЛОС АВТОРА: Текст\n", encoding="utf-8")
-            result = generate_normalization(source, root / "out.json", memory_path=db, use_llm=False)
+            result = generate_normalization(
+                source, root / "out.json", memory_path=db, use_llm=False
+            )
             self.assertEqual(result["blocks"][0]["type"], "voiceover")
             self.assertEqual(result["blocks"][0]["source"], "memory")
 
@@ -219,11 +329,17 @@ class NormalizerTests(unittest.TestCase):
                 )
                 self.assertEqual(len(candidates), 1)
                 confirm_normalization(
-                    normalized, root / f"prepared-{index}.json", root / f"raw-{index}.txt",
-                    memory_path=db, expected_revision=saved["revision"],
-                    learning_decisions=[{
-                        "candidate_id": candidates[0]["id"], "action": "remember",
-                    }],
+                    normalized,
+                    root / f"prepared-{index}.json",
+                    root / f"raw-{index}.txt",
+                    memory_path=db,
+                    expected_revision=saved["revision"],
+                    learning_decisions=[
+                        {
+                            "candidate_id": candidates[0]["id"],
+                            "action": "remember",
+                        }
+                    ],
                 )
 
             with NormalizationMemory(db) as memory:
@@ -252,11 +368,17 @@ class NormalizerTests(unittest.TestCase):
                 normalized, memory_path=db, expected_revision=saved["revision"]
             )
             confirm_normalization(
-                normalized, root / "never-prepared.json", root / "never-raw.txt",
-                memory_path=db, expected_revision=saved["revision"],
-                learning_decisions=[{
-                    "candidate_id": candidates[0]["id"], "action": "never",
-                }],
+                normalized,
+                root / "never-prepared.json",
+                root / "never-raw.txt",
+                memory_path=db,
+                expected_revision=saved["revision"],
+                learning_decisions=[
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "action": "never",
+                    }
+                ],
             )
             second_path, second = corrected_draft(2)
             self.assertEqual(
@@ -285,10 +407,144 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["role"], "эксперт")
             self.assertEqual(block["timecode_start"], "01.02.03")
             self.assertEqual(block["normalized_text"], "Ответ героя")
-            self.assertEqual(block["sync_fragments"], [{
-                "text": "Ответ героя",
-                "timecode_start": "01.02.03",
-            }])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Ответ героя",
+                        "timecode_start": "01.02.03",
+                    }
+                ],
+            )
+
+    def test_life_markers_are_a_distinct_non_tts_type(self) -> None:
+        cases = (
+            ("ЛАЙФ, «» А я всё летала, но я так и знала", ""),
+            ("ЛАЙФ, «А на море белый песок» А на море белый песок", "А на море белый песок"),
+            ("ЛАЙФ, «Килиманджаро» 00.55", "Килиманджаро"),
+            ("ЛАЙФ, концерт Фриске: 01.10 Подойду к тебе", "концерт Фриске"),
+        )
+        for original, description in cases:
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "scenario.txt"
+                source.write_text(original, encoding="utf-8")
+                block = generate_normalization(
+                    source,
+                    root / "out.json",
+                    memory_path=root / "memory.sqlite3",
+                    use_llm=False,
+                )["blocks"][0]
+                self.assertEqual(block["type"], "life")
+                self.assertEqual(block["original_label"].casefold(), "лайф")
+                self.assertEqual(block["text_for_tts"], "")
+                self.assertEqual(block["speaker"], "")
+                self.assertEqual(block["role"], "")
+                self.assertEqual(block["source_description"], description)
+
+    def test_song_playback_and_clip_transition_are_life_not_sync(self) -> None:
+        cases = (
+            "(звучит песня в компе:)49.45 полчаса до полета, время есть у пилота",
+            "СКЛ и переход на клип Пилот на припев:01.32 От винта полетели",
+        )
+        for original in cases:
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "scenario.txt"
+                source.write_text(original, encoding="utf-8")
+                block = generate_normalization(
+                    source,
+                    root / "out.json",
+                    memory_path=root / "memory.sqlite3",
+                    use_llm=False,
+                )["blocks"][0]
+
+                self.assertEqual(block["type"], "life")
+                self.assertEqual(block["text_for_tts"], "")
+                self.assertEqual(block["speaker"], "")
+
+    def test_explicit_snh_preserves_speech_before_inline_timecodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ, Харута: насколько я знаю, по-моему, ни у кого из российских "
+                "артистов такого не было, когда она выступала на корпоративе, ей "
+                "00.45.07 кричат: «Еще давай!». 00.27.15, потому что она выходила "
+                "на сцену и людям было хорошо.",
+                encoding="utf-8",
+            )
+            block = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                use_llm=False,
+            )["blocks"][0]
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["speaker"], "Харута")
+            self.assertEqual(block["role"], "")
+            self.assertEqual(block["original_label"], "СНХ, Харута")
+            self.assertIn("насколько я знаю", block["normalized_text"])
+            self.assertIn("кричат", block["normalized_text"])
+            self.assertIn("людям было хорошо", block["normalized_text"])
+            self.assertNotIn(". ,", block["normalized_text"])
+            self.assertEqual(
+                [item["timecode_start"] for item in block["sync_fragments"]],
+                ["", "00.45.07", "00.27.15"],
+            )
+
+    def test_explicit_snh_tolerates_colon_comma_and_never_uses_type_as_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ, отец:, когда я первый раз увидел, как ее крутило. СКЛ Я уходил "
+                "оттуда, 00:46:03 Прямо не мог все это смотреть.",
+                encoding="utf-8",
+            )
+            block = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                use_llm=False,
+            )["blocks"][0]
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["original_label"], "СНХ, отец")
+            self.assertEqual(block["speaker"], "отец")
+            self.assertEqual(block["role"], "")
+            self.assertIn("когда я первый раз", block["normalized_text"])
+            self.assertIn("Прямо не мог", block["normalized_text"])
+
+    def test_skl_splits_sync_into_independently_matchable_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ, Киркоров:00:05:43 Жанна принадлежит к роду артиста, "
+                "когда СКЛ ты можешь даже не петь, и глаз оторвать невозможно.",
+                encoding="utf-8",
+            )
+            block = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                use_llm=False,
+            )["blocks"][0]
+
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Жанна принадлежит к роду артиста, когда",
+                        "timecode_start": "00:05:43",
+                    },
+                    {
+                        "text": "ты можешь даже не петь, и глаз оторвать невозможно.",
+                        "timecode_start": "",
+                    },
+                ],
+            )
+            self.assertNotIn("СКЛ", block["normalized_text"])
 
     def test_sync_speaker_block_can_contain_multiple_timecoded_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,23 +568,112 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["role"], "ИСТОРИК")
             self.assertEqual(block["timecode_start"], "01:22:29")
             self.assertEqual(block["timecode_end"], "")
-            self.assertEqual(block["sync_fragments"], [
-                {
-                    "text": (
-                        "Шодэ приехал к нам из Одессы, где его семья жила с середины "
-                        "19-ого века. Образование он получил во Франции художественное."
-                    ),
-                    "timecode_start": "01:22:29",
-                },
-                {
-                    "text": "Был он человеком очень восприимчивым к разным стилям.",
-                    "timecode_start": "01:23:36",
-                },
-                {
-                    "text": "Он строил особняки многофасадные.",
-                    "timecode_start": "01:24:11",
-                },
-            ])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": (
+                            "Шодэ приехал к нам из Одессы, где его семья жила с середины "
+                            "19-ого века. Образование он получил во Франции художественное."
+                        ),
+                        "timecode_start": "01:22:29",
+                    },
+                    {
+                        "text": "Был он человеком очень восприимчивым к разным стилям.",
+                        "timecode_start": "01:23:36",
+                    },
+                    {
+                        "text": "Он строил особняки многофасадные.",
+                        "timecode_start": "01:24:11",
+                    },
+                ],
+            )
+
+    def test_date_inside_sync_quote_stays_in_text_as_single_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, историк, 00:10 Мы встретились 23.05 у музея.\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["timecode_start"], "00:10")
+            self.assertEqual(block["normalized_text"], "Мы встретились 23.05 у музея.")
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Мы встретились 23.05 у музея.",
+                        "timecode_start": "00:10",
+                    }
+                ],
+            )
+
+    def test_date_inside_sync_quote_does_not_break_later_fragment_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, историк, 00:10 Мы встретились 23.05 у музея. "
+                "01:20 Потом пошли гулять.\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["timecode_start"], "00:10")
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Мы встретились 23.05 у музея.",
+                        "timecode_start": "00:10",
+                    },
+                    {
+                        "text": "Потом пошли гулять.",
+                        "timecode_start": "01:20",
+                    },
+                ],
+            )
+
+    def test_ambiguous_dotted_timecode_with_range_is_still_a_timecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СНХ: Иван Иванов, эксперт, 23.05 — 23.40 Ответ героя\n",
+                encoding="utf-8",
+            )
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+            block = result["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["timecode_start"], "23.05")
+            self.assertEqual(block["timecode_end"], "23.40")
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Ответ героя",
+                        "timecode_start": "23.05",
+                        "timecode_end": "23.40",
+                    }
+                ],
+            )
 
     def test_sync_fragments_survive_docx_soft_line_breaks(self) -> None:
         from docx import Document
@@ -338,9 +683,7 @@ class NormalizerTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "scenario.docx"
             document = Document()
-            paragraph = document.add_paragraph(
-                "ИРИНА КОТОВА, ИСТОРИК: 01:22:29. Первый фрагмент"
-            )
+            paragraph = document.add_paragraph("ИРИНА КОТОВА, ИСТОРИК: 01:22:29. Первый фрагмент")
             paragraph.add_run().add_break(WD_BREAK.LINE)
             paragraph.add_run("01:23:36. Второй фрагмент")
             paragraph.add_run().add_break(WD_BREAK.LINE)
@@ -390,8 +733,36 @@ class NormalizerTests(unittest.TestCase):
             )["blocks"]
 
             self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
-            self.assertEqual([block["speaker"] for block in blocks], ["ЕЛЕНА САДОВНИК", "ИРИНА КОТОВА"])
-            self.assertEqual([block["timecode_start"] for block in blocks], ["00:31:16", "01:25:03"])
+            self.assertEqual(
+                [block["speaker"] for block in blocks], ["ЕЛЕНА САДОВНИК", "ИРИНА КОТОВА"]
+            )
+            self.assertEqual(
+                [block["timecode_start"] for block in blocks], ["00:31:16", "01:25:03"]
+            )
+
+    def test_bare_timecode_after_sync_credit_inherits_speaker_and_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "АНДРЕЙ КЛЮЕВ, ИСТОРИК: 00:13:35. Первая реплика.\n"
+                "00:18:14. Следующая реплика того же спикера.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            continuation = blocks[1]
+            self.assertEqual(continuation["type"], "sync")
+            self.assertEqual(continuation["speaker"], "АНДРЕЙ КЛЮЕВ")
+            self.assertEqual(continuation["role"], "ИСТОРИК")
+            self.assertEqual(continuation["timecode_start"], "00:18:14")
+            self.assertEqual(
+                continuation["sync_fragments"],
+                [{"text": "Следующая реплика того же спикера.", "timecode_start": "00:18:14"}],
+            )
 
     def test_known_voiceover_marker_precedes_generic_dash_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,6 +784,144 @@ class NormalizerTests(unittest.TestCase):
                 "Стратегия Лили — Она учится слышать собственный голос.",
             )
             self.assertEqual(block["text_for_tts"], block["normalized_text"])
+
+    def test_dotted_and_glued_voiceover_markers_from_editorial_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "З.к. Первый закадровый абзац.\n"
+                "З.КВ 1915 году произошла встреча.\n"
+                "З. Третий закадровый абзац.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["voiceover"] * 3)
+            self.assertEqual(
+                [block["normalized_text"] for block in blocks],
+                [
+                    "Первый закадровый абзац.",
+                    "В 1915 году произошла встреча.",
+                    "Третий закадровый абзац.",
+                ],
+            )
+
+    def test_prose_number_after_marker_is_not_treated_as_speaker_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("Диктор 1915 год стал переломным.\n", encoding="utf-8")
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "voiceover")
+            self.assertEqual(block["original_label"], "Диктор")
+            self.assertEqual(block["normalized_text"], "1915 год стал переломным.")
+
+    def test_unambiguous_speaker_index_is_still_dropped_from_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Диктор 2: Первая реплика.\nДиктор-2 Вторая реплика.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["voiceover", "voiceover"])
+            self.assertEqual([block["original_label"] for block in blocks], ["Диктор", "Диктор"])
+            self.assertEqual(
+                [block["normalized_text"] for block in blocks],
+                ["Первая реплика.", "Вторая реплика."],
+            )
+
+    def test_speaker_can_be_glued_to_timecode_or_use_spaced_three_part_timecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "СТОРОЖЕВА00:04:00 Первый ответ эксперта о футуристах.\n"
+                "ИРБЕ. 00.28 45 Второй ответ эксперта о семье Брик.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
+            self.assertEqual([block["speaker"] for block in blocks], ["СТОРОЖЕВА", "ИРБЕ"])
+            self.assertEqual(
+                [block["timecode_start"] for block in blocks],
+                ["00:04:00", "00:28:45"],
+            )
+
+    def test_long_all_caps_speaker_prefix_without_timecode_is_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "КРАСНОВА Она объясняет происхождение галстука и подробно описывает экспонат музея.\n",
+                encoding="utf-8",
+            )
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "sync")
+            self.assertEqual(block["speaker"], "КРАСНОВА")
+            self.assertEqual(
+                block["normalized_text"],
+                "Она объясняет происхождение галстука и подробно описывает экспонат музея.",
+            )
+
+    def test_mixed_name_and_glued_period_speaker_prefixes_are_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Мария СМОЛЬНИКОВ Я благодарна Лиле за эту роль, потому что такой героини у меня не было.\n"
+                "КРАСНОЩЕКОВА.Про Маяковского и Бриков всегда очень много сплетничали современники.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync", "sync"])
+            self.assertEqual(
+                [block["speaker"] for block in blocks],
+                ["Мария СМОЛЬНИКОВ", "КРАСНОЩЕКОВА"],
+            )
+
+    def test_structural_heading_is_technical_not_voiceover_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "ЗК Основной текст.\nЧАСТЬ ВТОРАЯ. РЕПЕТИЦИЯ\nЗАСТАВКА МУЗА\n10.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual(
+                [block["type"] for block in blocks],
+                ["voiceover", "technical", "technical", "technical"],
+            )
 
     def test_single_word_speaker_can_precede_timecode_without_colon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -492,10 +1001,15 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["type"], "sync")
             self.assertEqual(block["speaker"], "Шпагин")
             self.assertEqual(block["timecode_start"], "18:35")
-            self.assertEqual(block["sync_fragments"], [{
-                "text": "Это решение изменило дальнейшую работу.",
-                "timecode_start": "18:35",
-            }])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Это решение изменило дальнейшую работу.",
+                        "timecode_start": "18:35",
+                    }
+                ],
+            )
 
     def test_prose_with_em_dash_is_not_split_into_a_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -581,6 +1095,28 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(blocks[1]["continuation_of_type"], "sync")
             self.assertEqual(blocks[1]["speaker"], "Курская")
 
+    def test_bare_snh_marker_inherits_the_previous_named_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Бартон 00:37 — 01:07 Первый выбранный фрагмент.\n"
+                "СНХ: Фраза, вырезанная из другого места интервью.\n"
+                "СНХ: Фраза, которую сценарист переставил раньше исходника.\n",
+                encoding="utf-8",
+            )
+
+            blocks = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"]
+
+            self.assertEqual([block["type"] for block in blocks], ["sync"] * 3)
+            self.assertEqual([block["speaker"] for block in blocks], ["Бартон"] * 3)
+            self.assertEqual(
+                [block["continuation_of_type"] for block in blocks],
+                ["", "sync", "sync"],
+            )
+
     def test_parenthetical_editorial_prefix_before_timecode_is_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -637,9 +1173,26 @@ class NormalizerTests(unittest.TestCase):
                 source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
             )["blocks"]
 
-            self.assertEqual([block["type"] for block in blocks], [
-                "voiceover", "technical", "technical",
-            ])
+            self.assertEqual(
+                [block["type"] for block in blocks],
+                [
+                    "voiceover",
+                    "technical",
+                    "technical",
+                ],
+            )
+
+    def test_plural_titles_marker_is_technical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("ТИТРЫ\n", encoding="utf-8")
+
+            block = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )["blocks"][0]
+
+            self.assertEqual(block["type"], "technical")
 
     def test_sync_fragment_explicit_range_has_optional_end_timecode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -657,11 +1210,16 @@ class NormalizerTests(unittest.TestCase):
 
             self.assertEqual(block["timecode_start"], "01:02:03")
             self.assertEqual(block["timecode_end"], "01:02:08")
-            self.assertEqual(block["sync_fragments"], [{
-                "text": "Ответ героя",
-                "timecode_start": "01:02:03",
-                "timecode_end": "01:02:08",
-            }])
+            self.assertEqual(
+                block["sync_fragments"],
+                [
+                    {
+                        "text": "Ответ героя",
+                        "timecode_start": "01:02:03",
+                        "timecode_end": "01:02:08",
+                    }
+                ],
+            )
 
     def test_llm_classifies_only_unresolved_without_drops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -671,13 +1229,19 @@ class NormalizerTests(unittest.TestCase):
 
             def classifier(items, _hint):
                 self.assertEqual(len(items), 1)
-                return [{
-                    "uid": items[0]["uid"], "type": "voiceover", "confidence": .8,
-                    "label_is_marker": True,
-                }]
+                return [
+                    {
+                        "uid": items[0]["uid"],
+                        "type": "voiceover",
+                        "confidence": 0.8,
+                        "label_is_marker": True,
+                    }
+                ]
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 classifier=classifier,
             )
             self.assertEqual(len(result["blocks"]), 2)
@@ -691,13 +1255,19 @@ class NormalizerTests(unittest.TestCase):
             source.write_text("Москва: сегодня прошёл форум\n", encoding="utf-8")
 
             def classifier(items, _hint):
-                return [{
-                    "uid": items[0]["uid"], "type": "voiceover", "confidence": .9,
-                    "label_is_marker": False,
-                }]
+                return [
+                    {
+                        "uid": items[0]["uid"],
+                        "type": "voiceover",
+                        "confidence": 0.9,
+                        "label_is_marker": False,
+                    }
+                ]
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 classifier=classifier,
             )
 
@@ -744,6 +1314,20 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(result["blocks"][0]["original_label"], "")
             self.assertEqual(result["blocks"][0]["normalized_text"], "00:01:02 Иван говорит")
 
+    def test_prose_leading_date_is_not_classified_as_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("23.05 состоялась премьера\n", encoding="utf-8")
+
+            result = generate_normalization(
+                source, root / "out.json", memory_path=root / "memory.sqlite3", use_llm=False
+            )
+
+            block = result["blocks"][0]
+            self.assertEqual(block["type"], "unknown")
+            self.assertNotEqual(block["confidence"], 0.9)
+
     def test_low_confidence_llm_result_requires_manual_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -751,10 +1335,12 @@ class NormalizerTests(unittest.TestCase):
             source.write_text("Авторский блок\n", encoding="utf-8")
 
             def classifier(items, _hint):
-                return [{"uid": items[0]["uid"], "type": "voiceover", "confidence": .1}]
+                return [{"uid": items[0]["uid"], "type": "voiceover", "confidence": 0.1}]
 
             result = generate_normalization(
-                source, root / "out.json", memory_path=root / "memory.sqlite3",
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
                 classifier=classifier,
             )
             self.assertEqual(result["blocks"][0]["type"], "unknown")
@@ -769,10 +1355,7 @@ class NormalizerTests(unittest.TestCase):
 
             def classifier(items, _hint):
                 calls.append(len(items))
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.7}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.7} for item in items]
 
             result = generate_normalization(
                 source,
@@ -784,6 +1367,35 @@ class NormalizerTests(unittest.TestCase):
             self.assertGreater(len(calls), 1)
             self.assertEqual(len(result["blocks"]), 3)
             self.assertEqual([item["type"] for item in result["blocks"]], ["other"] * 3)
+
+    def test_invalid_confidence_in_one_batch_does_not_abort_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text("\n".join(["А" * 7000, "Б" * 7000, "В" * 7000]), encoding="utf-8")
+
+            def classifier(items, _hint):
+                # Each block above lands in its own batch (see
+                # test_large_scenario_is_classified_in_batches). The "Б" batch
+                # simulates a malformed LLM response with a non-numeric
+                # confidence value; the other batches remain well-formed.
+                if items[0]["original_text"].startswith("Б"):
+                    return [{"uid": items[0]["uid"], "type": "other", "confidence": "high"}]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.7} for item in items]
+
+            result = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                classifier=classifier,
+            )
+
+            self.assertEqual(len(result["blocks"]), 3)
+            by_text = {block["original_text"][0]: block for block in result["blocks"]}
+            self.assertEqual(by_text["А"]["type"], "other")
+            self.assertEqual(by_text["В"]["type"], "other")
+            self.assertNotEqual(by_text["Б"]["type"], "other")
+            self.assertTrue(by_text["Б"]["warnings"])
 
     def test_default_llm_classifier_handles_multiple_compact_batches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -797,10 +1409,7 @@ class NormalizerTests(unittest.TestCase):
             def classifier(items, _hint):
                 self.assertTrue(items)
                 self.assertNotIn("normalized_text", items[0])
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             with patch.object(
                 normalizer_module, "_openrouter_classifier", side_effect=classifier
@@ -835,8 +1444,7 @@ class NormalizerTests(unittest.TestCase):
                         self.failed = True
                         raise RuntimeError("provider interrupted")
                     return [
-                        {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                        for item in items
+                        {"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items
                     ]
 
             classifier = FlakyClassifier()
@@ -891,24 +1499,15 @@ class NormalizerTests(unittest.TestCase):
             def classifier(items, _hint):
                 nonlocal calls
                 calls += 1
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             source.write_text("Авторский абзац", encoding="utf-8")
-            generate_normalization(
-                source, output, memory_path=memory_path, classifier=classifier
-            )
-            generate_normalization(
-                source, output, memory_path=memory_path, classifier=classifier
-            )
+            generate_normalization(source, output, memory_path=memory_path, classifier=classifier)
+            generate_normalization(source, output, memory_path=memory_path, classifier=classifier)
             self.assertEqual(calls, 1)
 
             source.write_text("Изменённый авторский абзац", encoding="utf-8")
-            generate_normalization(
-                source, output, memory_path=memory_path, classifier=classifier
-            )
+            generate_normalization(source, output, memory_path=memory_path, classifier=classifier)
             self.assertEqual(calls, 2)
 
             generate_normalization(
@@ -947,10 +1546,7 @@ class NormalizerTests(unittest.TestCase):
                 )
 
             def classifier(items, _hint):
-                return [
-                    {"uid": item["uid"], "type": "other", "confidence": 0.9}
-                    for item in items
-                ]
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
 
             with (
                 patch.object(normalizer_module, "get_settings", side_effect=settings),
@@ -999,10 +1595,17 @@ class NormalizerTests(unittest.TestCase):
             )
             self.assertEqual(len(candidates), 1)
             confirmed = confirm_normalization(
-                normalized, prepared, raw, memory_path=db, expected_revision=2,
-                learning_decisions=[{
-                    "candidate_id": candidates[0]["id"], "action": "remember",
-                }],
+                normalized,
+                prepared,
+                raw,
+                memory_path=db,
+                expected_revision=2,
+                learning_decisions=[
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "action": "remember",
+                    }
+                ],
             )
             self.assertEqual(confirmed["status"], "confirmed")
             self.assertTrue(is_normalization_confirmed(normalized))
@@ -1040,7 +1643,9 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(reset["hint"], "")
             self.assertEqual(reset["blocks"], [])
             with self.assertRaises(RevisionConflictError):
-                reset_normalization(normalized, expected_revision=saved["revision"], source_root=root)
+                reset_normalization(
+                    normalized, expected_revision=saved["revision"], source_root=root
+                )
 
     def test_unknown_blocks_prevent_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1048,10 +1653,14 @@ class NormalizerTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("Непонятный абзац\n", encoding="utf-8")
             normalized = root / "normalized.json"
-            generate_normalization(source, normalized, memory_path=root / "db.sqlite3", use_llm=False)
+            generate_normalization(
+                source, normalized, memory_path=root / "db.sqlite3", use_llm=False
+            )
             with self.assertRaises(NormalizationValidationError):
                 confirm_normalization(
-                    normalized, root / "prepared.json", root / "raw.txt",
+                    normalized,
+                    root / "prepared.json",
+                    root / "raw.txt",
                     memory_path=root / "db.sqlite3",
                 )
             self.assertFalse((root / "prepared.json").exists())
@@ -1082,10 +1691,17 @@ class NormalizerTests(unittest.TestCase):
             with patch("stage1.normalizer._atomic_write_text", side_effect=fail_raw):
                 with self.assertRaises(OSError):
                     confirm_normalization(
-                        normalized, prepared, raw, memory_path=db, expected_revision=2,
-                        learning_decisions=[{
-                            "candidate_id": candidates[0]["id"], "action": "remember",
-                        }],
+                        normalized,
+                        prepared,
+                        raw,
+                        memory_path=db,
+                        expected_revision=2,
+                        learning_decisions=[
+                            {
+                                "candidate_id": candidates[0]["id"],
+                                "action": "remember",
+                            }
+                        ],
                     )
 
             with NormalizationMemory(db) as memory:
@@ -1097,10 +1713,15 @@ class NormalizerTests(unittest.TestCase):
             source = root / "scenario.txt"
             source.write_text("source", encoding="utf-8")
             prepared = root / "prepared.json"
-            prepared.write_text(json.dumps({
-                "source": str(source),
-                "items": [{"text_original": "Закадр", "text_for_tts": "Закадр"}],
-            }), encoding="utf-8")
+            prepared.write_text(
+                json.dumps(
+                    {
+                        "source": str(source),
+                        "items": [{"text_original": "Закадр", "text_for_tts": "Закадр"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             raw = root / "raw.txt"
             raw.write_text(
                 "ЗК1: Закадр\n\n"
@@ -1109,7 +1730,9 @@ class NormalizerTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = import_legacy_normalization(prepared, raw, root / "normalized.json", source_path=source)
+            result = import_legacy_normalization(
+                prepared, raw, root / "normalized.json", source_path=source
+            )
 
             self.assertEqual(
                 [block["type"] for block in result["blocks"]],
@@ -1122,10 +1745,15 @@ class NormalizerTests(unittest.TestCase):
             prepared = root / "prepared.json"
             raw = root / "raw.txt"
             normalized = root / "normalized.json"
-            prepared.write_text(json.dumps({
-                "source": str(root / "missing.docx"),
-                "items": [{"text_original": "Текст", "text_for_tts": "Текст"}],
-            }), encoding="utf-8")
+            prepared.write_text(
+                json.dumps(
+                    {
+                        "source": str(root / "missing.docx"),
+                        "items": [{"text_original": "Текст", "text_for_tts": "Текст"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             raw.write_text("ЗК1: Текст\n", encoding="utf-8")
             imported = import_legacy_normalization(prepared, raw, normalized)
 
@@ -1186,6 +1814,128 @@ class NormalizerTests(unittest.TestCase):
                 [block["type"] for block in result["blocks"]],
                 ["voiceover", "sync", "technical", "voiceover"],
             )
+
+
+class LlmPresetTests(unittest.TestCase):
+    def test_normalize_llm_preset_accepts_known_values_and_defaults(self) -> None:
+        self.assertEqual(normalizer_module.normalize_llm_preset(None), "standard")
+        self.assertEqual(normalizer_module.normalize_llm_preset(""), "standard")
+        self.assertEqual(normalizer_module.normalize_llm_preset("standard"), "standard")
+        self.assertEqual(normalizer_module.normalize_llm_preset("Fast"), "fast")
+        self.assertEqual(normalizer_module.normalize_llm_preset(" fast "), "fast")
+
+    def test_normalize_llm_preset_rejects_unsupported_value(self) -> None:
+        with self.assertRaises(ValueError):
+            normalizer_module.normalize_llm_preset("turbo")
+
+    def test_openrouter_classifier_fast_preset_requests_throughput_sort(self) -> None:
+        settings = SimpleNamespace(
+            openrouter_api_key="test-key",
+            openrouter_model="model-x",
+            openrouter_base_url="https://example.invalid/api/v1",
+        )
+
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"items": []}'}}]}
+
+        with (
+            patch.object(normalizer_module, "get_settings", return_value=settings),
+            patch("requests.post", return_value=_Response()) as post,
+        ):
+            normalizer_module._openrouter_classifier(
+                [{"uid": "u1", "original_text": "text"}], "hint", llm_preset="fast"
+            )
+
+        self.assertEqual(post.call_args.kwargs["json"]["provider"], {"sort": "throughput"})
+
+    def test_openrouter_classifier_standard_preset_omits_provider_sort(self) -> None:
+        settings = SimpleNamespace(
+            openrouter_api_key="test-key",
+            openrouter_model="model-x",
+            openrouter_base_url="https://example.invalid/api/v1",
+        )
+
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"items": []}'}}]}
+
+        with (
+            patch.object(normalizer_module, "get_settings", return_value=settings),
+            patch("requests.post", return_value=_Response()) as post,
+        ):
+            normalizer_module._openrouter_classifier(
+                [{"uid": "u1", "original_text": "text"}], "hint", llm_preset="standard"
+            )
+
+        self.assertNotIn("provider", post.call_args.kwargs["json"])
+
+    def test_llm_cache_fingerprint_differs_between_fast_and_standard_presets(self) -> None:
+        payload = [{"uid": "u1", "original_text": "text"}]
+        fingerprint_standard = normalizer_module._llm_cache_fingerprint(
+            payload,
+            hint="",
+            classifier=None,
+            rules_signature="sig",
+            llm_preset="standard",
+        )
+        fingerprint_fast = normalizer_module._llm_cache_fingerprint(
+            payload,
+            hint="",
+            classifier=None,
+            rules_signature="sig",
+            llm_preset="fast",
+        )
+        self.assertNotEqual(fingerprint_standard, fingerprint_fast)
+
+    def test_generate_normalization_does_not_reuse_cache_across_presets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            output = root / "normalized.json"
+            memory_path = root / "memory.sqlite3"
+            source.write_text("Авторский абзац", encoding="utf-8")
+
+            def settings():
+                return SimpleNamespace(
+                    openrouter_model="model-a",
+                    openrouter_base_url="https://example.invalid/api/v1",
+                )
+
+            def classifier(items, _hint, llm_preset="standard"):
+                return [{"uid": item["uid"], "type": "other", "confidence": 0.9} for item in items]
+
+            with (
+                patch.object(normalizer_module, "get_settings", side_effect=settings),
+                patch.object(
+                    normalizer_module,
+                    "_openrouter_classifier",
+                    side_effect=classifier,
+                ) as mocked,
+            ):
+                generate_normalization(
+                    source, output, memory_path=memory_path, llm_preset="standard"
+                )
+                generate_normalization(
+                    source, output, memory_path=memory_path, llm_preset="standard"
+                )
+                self.assertEqual(mocked.call_count, 1)
+
+                generate_normalization(source, output, memory_path=memory_path, llm_preset="fast")
+                self.assertEqual(mocked.call_count, 2)
+
+                generate_normalization(source, output, memory_path=memory_path, llm_preset="fast")
+                self.assertEqual(mocked.call_count, 2)
 
 
 if __name__ == "__main__":

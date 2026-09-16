@@ -11,13 +11,62 @@ from typing import Any, Iterator
 from .normalization_models import VALID_BLOCK_TYPES
 
 
-DEFAULT_MEMORY_PATH = Path("data/normalization_memory.sqlite3")
+DEFAULT_MEMORY_PATH = Path(__file__).resolve().parents[2] / "data" / "normalization_memory.sqlite3"
+
+VALID_ALIAS_SCOPES = {"marker", "video_cue"}
+
+# Service-cue prefixes that a speaker index is commonly glued directly to
+# ("тех32", "зк5", "снх12"), as opposed to a person's name ("Сергей1",
+# "Сергей2") where the glued digit is part of what distinguishes two
+# different speakers and must NOT be stripped. Kept in sync (by hand) with
+# `_BUILTIN_MARKERS`/`_TECH_MARKERS` in normalizer.py; duplicated here rather
+# than imported to avoid a circular import between the two modules.
+_GLUED_NUMBER_STRIPPABLE_PREFIXES = frozenset(
+    {
+        "тех",
+        "техн",
+        "зк",
+        "з",
+        "снх",
+        "синхр",
+        "синхрон",
+        "лайф",
+        "вид",
+        "видео",
+        "титр",
+        "vo",
+        "sync",
+    }
+)
+
+
+def _validate_scope(scope: str) -> str:
+    if scope not in VALID_ALIAS_SCOPES:
+        raise ValueError(
+            f"Invalid alias scope: {scope!r}. Expected one of {sorted(VALID_ALIAS_SCOPES)}"
+        )
+    return scope
 
 
 def normalize_marker(marker: str) -> str:
     value = marker.casefold().replace("ё", "е").strip()
     value = re.sub(r"[\s.:;,_/\\|\-–—]+", " ", value)
-    value = re.sub(r"\s+\d+[a-zа-я]?\s*$", "", value)
+    # A speaker index separated by whitespace ("диктор 1") is stripped for
+    # any marker -- this was the original behaviour and is safe because the
+    # letter part alone (before the space) is what gets matched on.
+    spaced_match = re.search(r"\s+\d+[a-zа-я]?\s*$", value)
+    if spaced_match:
+        candidate = value[: spaced_match.start()].strip()
+        if candidate:
+            value = candidate
+    else:
+        # A glued digit ("тех32", "зк5") is only stripped for the closed set
+        # of known service-cue prefixes. Stripping it for arbitrary markers
+        # would merge distinct speakers who happen to share a name prefix
+        # and a trailing index, e.g. "Сергей1" vs "Сергей2".
+        glued_match = re.match(r"^([a-zа-я]+)(\d+[a-zа-я]?)$", value)
+        if glued_match and glued_match.group(1) in _GLUED_NUMBER_STRIPPABLE_PREFIXES:
+            value = glued_match.group(1)
     return value.strip()
 
 
@@ -65,7 +114,8 @@ class NormalizationMemory:
                 confidence REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(normalized_marker, target_type, source)
+                scope TEXT NOT NULL DEFAULT 'marker',
+                UNIQUE(normalized_marker, target_type, source, scope)
             );
             CREATE INDEX IF NOT EXISTS aliases_marker_idx ON aliases(normalized_marker);
             CREATE TABLE IF NOT EXISTS alias_confirmations (
@@ -82,22 +132,90 @@ class NormalizationMemory:
             """
         )
         self._conn.commit()
+        self._migrate_scope_column_if_needed()
+
+    def _migrate_scope_column_if_needed(self) -> None:
+        """Rebuild the ``aliases`` table for databases created before the
+        ``scope`` column existed. Idempotent: no-ops once ``scope`` is present.
+        """
+        columns = [row[1] for row in self._conn.execute("PRAGMA table_info(aliases)")]
+        if "scope" in columns:
+            return
+        before_count = self._conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
+        previous_foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        try:
+            self._conn.execute("PRAGMA foreign_keys = OFF")
+            self._conn.execute("BEGIN")
+            self._conn.execute(
+                """
+                CREATE TABLE aliases_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    marker TEXT NOT NULL,
+                    normalized_marker TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    confirmations INTEGER NOT NULL DEFAULT 0,
+                    corrections INTEGER NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'marker',
+                    UNIQUE(normalized_marker, target_type, source, scope)
+                )
+                """
+            )
+            self._conn.execute(
+                """INSERT INTO aliases_new
+                   (id, marker, normalized_marker, target_type, source, status,
+                    confirmations, corrections, confidence, created_at, updated_at, scope)
+                   SELECT id, marker, normalized_marker, target_type, source, status,
+                          confirmations, corrections, confidence, created_at, updated_at, 'marker'
+                   FROM aliases"""
+            )
+            self._conn.execute("DROP TABLE aliases")
+            self._conn.execute("ALTER TABLE aliases_new RENAME TO aliases")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS aliases_marker_idx ON aliases(normalized_marker)"
+            )
+            after_count = self._conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"Alias migration row count mismatch: before={before_count} after={after_count}"
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute(f"PRAGMA foreign_keys = {'ON' if previous_foreign_keys else 'OFF'}")
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
-    def list_rules(self, *, status: str | None = None) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM aliases"
-        params: tuple[Any, ...] = ()
+    def list_rules(
+        self, *, status: str | None = None, scope: str | None = None
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
         if status:
-            sql += " WHERE status = ?"
-            params = (status,)
+            conditions.append("status = ?")
+            params.append(status)
+        if scope is not None:
+            _validate_scope(scope)
+            conditions.append("scope = ?")
+            params.append(scope)
+        sql = "SELECT * FROM aliases"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY normalized_marker, source, id"
-        return [dict(row) for row in self._conn.execute(sql, params)]
+        return [dict(row) for row in self._conn.execute(sql, tuple(params))]
 
     def get_rule(self, rule_id: int) -> dict[str, Any] | None:
-        return self._row(self._conn.execute("SELECT * FROM aliases WHERE id = ?", (rule_id,)).fetchone())
+        return self._row(
+            self._conn.execute("SELECT * FROM aliases WHERE id = ?", (rule_id,)).fetchone()
+        )
 
     def create_rule(
         self,
@@ -106,7 +224,9 @@ class NormalizationMemory:
         *,
         source: str = "manual",
         status: str | None = None,
+        scope: str = "marker",
     ) -> dict[str, Any]:
+        _validate_scope(scope)
         if target_type not in VALID_BLOCK_TYPES or target_type == "unknown":
             raise ValueError(f"Invalid learned block type: {target_type}")
         normalized = normalize_marker(marker)
@@ -122,9 +242,9 @@ class NormalizationMemory:
             self._conn.execute(
                 """INSERT INTO aliases
                    (marker, normalized_marker, target_type, source, status,
-                    confirmations, corrections, confidence, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-                   ON CONFLICT(normalized_marker, target_type, source) DO UPDATE SET
+                    confirmations, corrections, confidence, created_at, updated_at, scope)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                   ON CONFLICT(normalized_marker, target_type, source, scope) DO UPDATE SET
                      marker=excluded.marker,
                      status=CASE
                        WHEN aliases.status='disabled' THEN 'disabled'
@@ -134,13 +254,23 @@ class NormalizationMemory:
                      END,
                      confidence=MAX(aliases.confidence, excluded.confidence),
                      updated_at=excluded.updated_at""",
-                (marker.strip(), normalized, target_type, source, rule_status,
-                 confirmations, confidence, now, now),
+                (
+                    marker.strip(),
+                    normalized,
+                    target_type,
+                    source,
+                    rule_status,
+                    confirmations,
+                    confidence,
+                    now,
+                    now,
+                    scope,
+                ),
             )
-            self._reconcile_conflicts(normalized)
+            self._reconcile_conflicts(normalized, scope)
         row = self._conn.execute(
-            "SELECT * FROM aliases WHERE normalized_marker=? AND target_type=? AND source=?",
-            (normalized, target_type, source),
+            "SELECT * FROM aliases WHERE normalized_marker=? AND target_type=? AND source=? AND scope=?",
+            (normalized, target_type, source, scope),
         ).fetchone()
         return dict(row)
 
@@ -165,8 +295,8 @@ class NormalizationMemory:
                 "UPDATE aliases SET marker=?, normalized_marker=?, target_type=?, status=?, updated_at=? WHERE id=?",
                 (marker.strip(), normalized, target_type, status, _utcnow(), rule_id),
             )
-            self._reconcile_conflicts(str(current["normalized_marker"]))
-            self._reconcile_conflicts(normalized)
+            self._reconcile_conflicts(str(current["normalized_marker"]), str(current["scope"]))
+            self._reconcile_conflicts(normalized, str(current["scope"]))
         result = self.get_rule(rule_id)
         assert result is not None
         return result
@@ -177,32 +307,35 @@ class NormalizationMemory:
             return False
         with self.transaction():
             cur = self._conn.execute("DELETE FROM aliases WHERE id=?", (rule_id,))
-            self._reconcile_conflicts(str(current["normalized_marker"]))
+            self._reconcile_conflicts(str(current["normalized_marker"]), str(current["scope"]))
         return cur.rowcount > 0
 
-    def record_manual(self, marker: str, target_type: str) -> dict[str, Any]:
-        return self.create_rule(marker, target_type, source="manual", status="active")
+    def record_manual(
+        self, marker: str, target_type: str, *, scope: str = "marker"
+    ) -> dict[str, Any]:
+        return self.create_rule(marker, target_type, source="manual", status="active", scope=scope)
 
     def record_llm_confirmation(
-        self, marker: str, target_type: str, source_hash: str
+        self, marker: str, target_type: str, source_hash: str, *, scope: str = "marker"
     ) -> dict[str, Any]:
         return self.record_candidate_confirmation(
-            marker, target_type, source_hash, source="llm"
+            marker, target_type, source_hash, source="llm", scope=scope
         )
 
     def record_correction_confirmation(
-        self, marker: str, target_type: str, source_hash: str
+        self, marker: str, target_type: str, source_hash: str, *, scope: str = "marker"
     ) -> dict[str, Any]:
         return self.record_candidate_confirmation(
-            marker, target_type, source_hash, source="correction"
+            marker, target_type, source_hash, source="correction", scope=scope
         )
 
     def record_candidate_confirmation(
-        self, marker: str, target_type: str, source_hash: str, *, source: str
+        self, marker: str, target_type: str, source_hash: str, *, source: str, scope: str = "marker"
     ) -> dict[str, Any]:
+        _validate_scope(scope)
         if source not in {"llm", "correction"}:
             raise ValueError("Candidate source must be llm or correction")
-        rule = self.create_rule(marker, target_type, source=source, status="candidate")
+        rule = self.create_rule(marker, target_type, source=source, status="candidate", scope=scope)
         now = _utcnow()
         with self.transaction():
             inserted = self._conn.execute(
@@ -221,7 +354,7 @@ class NormalizationMemory:
                        confidence=?, updated_at=? WHERE id=?""",
                     (count, status, confidence, now, rule["id"]),
                 )
-            self._reconcile_conflicts(normalize_marker(marker))
+            self._reconcile_conflicts(normalize_marker(marker), scope)
         result = self.get_rule(int(rule["id"]))
         assert result is not None
         return result
@@ -261,13 +394,17 @@ class NormalizationMemory:
             raise KeyError(rule_id)
         return result
 
-    def resolve_exact(self, marker: str) -> dict[str, Any] | None:
+    def resolve_exact(self, marker: str, *, scope: str = "marker") -> dict[str, Any] | None:
+        _validate_scope(scope)
         normalized = normalize_marker(marker)
-        rows = [dict(row) for row in self._conn.execute(
-            """SELECT * FROM aliases WHERE normalized_marker=? AND status IN ('active', 'conflict')
+        rows = [
+            dict(row)
+            for row in self._conn.execute(
+                """SELECT * FROM aliases WHERE normalized_marker=? AND scope=? AND status IN ('active', 'conflict')
                ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END, confidence DESC, id""",
-            (normalized,),
-        )]
+                (normalized, scope),
+            )
+        ]
         if not rows:
             return None
         manual = [row for row in rows if row["source"] == "manual"]
@@ -284,12 +421,15 @@ class NormalizationMemory:
             return {"conflict": True, "normalized_marker": normalized, "rules": preferred}
         return {"conflict": False, "rule": preferred[0]}
 
-    def suggest(self, marker: str, *, cutoff: float = 0.82) -> dict[str, Any] | None:
+    def suggest(
+        self, marker: str, *, cutoff: float = 0.82, scope: str = "marker"
+    ) -> dict[str, Any] | None:
+        _validate_scope(scope)
         normalized = normalize_marker(marker)
         if not normalized:
             return None
         best: tuple[float, dict[str, Any]] | None = None
-        for rule in self.list_rules(status="active"):
+        for rule in self.list_rules(status="active", scope=scope):
             if rule["normalized_marker"] == normalized:
                 continue
             score = SequenceMatcher(None, normalized, rule["normalized_marker"]).ratio()
@@ -299,17 +439,19 @@ class NormalizationMemory:
             return None
         return {"score": round(best[0], 3), "rule": best[1]}
 
-    def _reconcile_conflicts(self, normalized_marker: str) -> None:
-        rows = list(self._conn.execute(
-            """SELECT id, target_type, source, status, confirmations
-               FROM aliases WHERE normalized_marker=? AND status != 'disabled'""",
-            (normalized_marker,),
-        ))
+    def _reconcile_conflicts(self, normalized_marker: str, scope: str = "marker") -> None:
+        rows = list(
+            self._conn.execute(
+                """SELECT id, target_type, source, status, confirmations
+               FROM aliases WHERE normalized_marker=? AND scope=? AND status != 'disabled'""",
+                (normalized_marker, scope),
+            )
+        )
         manual_types = {row["target_type"] for row in rows if row["source"] == "manual"}
         if len(manual_types) > 1:
             self._conn.execute(
-                "UPDATE aliases SET status='conflict', updated_at=? WHERE normalized_marker=? AND status!='disabled'",
-                (_utcnow(), normalized_marker),
+                "UPDATE aliases SET status='conflict', updated_at=? WHERE normalized_marker=? AND scope=? AND status!='disabled'",
+                (_utcnow(), normalized_marker, scope),
             )
             return
         if len(manual_types) == 1:
@@ -317,8 +459,8 @@ class NormalizationMemory:
             now = _utcnow()
             self._conn.execute(
                 """UPDATE aliases SET status='active', updated_at=?
-                   WHERE normalized_marker=? AND source='manual'""",
-                (now, normalized_marker),
+                   WHERE normalized_marker=? AND scope=? AND source='manual'""",
+                (now, normalized_marker, scope),
             )
             self._conn.execute(
                 """UPDATE aliases SET status=CASE
@@ -326,22 +468,24 @@ class NormalizationMemory:
                      WHEN confirmations >= 2 THEN 'active'
                      ELSE 'candidate' END,
                    updated_at=?
-                   WHERE normalized_marker=? AND source IN ('llm', 'correction') AND status!='disabled'""",
-                (manual_target, now, normalized_marker),
+                   WHERE normalized_marker=? AND scope=? AND source IN ('llm', 'correction') AND status!='disabled'""",
+                (manual_target, now, normalized_marker, scope),
             )
             return
-        active_types = {row["target_type"] for row in rows if row["status"] in {"active", "conflict"}}
+        active_types = {
+            row["target_type"] for row in rows if row["status"] in {"active", "conflict"}
+        }
         if len(active_types) > 1:
             self._conn.execute(
-                "UPDATE aliases SET status='conflict', updated_at=? WHERE normalized_marker=? AND status!='disabled'",
-                (_utcnow(), normalized_marker),
+                "UPDATE aliases SET status='conflict', updated_at=? WHERE normalized_marker=? AND scope=? AND status!='disabled'",
+                (_utcnow(), normalized_marker, scope),
             )
         elif len(active_types) == 1:
             target = next(iter(active_types))
             self._conn.execute(
                 """UPDATE aliases SET status='active', updated_at=?
-                   WHERE normalized_marker=? AND status='conflict' AND target_type=?""",
-                (_utcnow(), normalized_marker, target),
+                   WHERE normalized_marker=? AND scope=? AND status='conflict' AND target_type=?""",
+                (_utcnow(), normalized_marker, scope, target),
             )
 
 

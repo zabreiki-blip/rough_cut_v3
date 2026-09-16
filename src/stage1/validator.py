@@ -1,26 +1,29 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
 import math
-import os
 from pathlib import Path
 import re
 import struct
 import wave
 
+from env_utils import env_int
+
 from .config import get_settings
 from .io_utils import read_json, write_json
 
 
+logger = logging.getLogger(__name__)
+
+
 def _env_int(name: str, default: int, min_value: int = 0, max_value: int = 10_000_000) -> int:
-    raw = os.getenv(name, str(default)).strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        value = default
-    value = max(min_value, value)
-    value = min(max_value, value)
-    return value
+    return env_int(
+        name,
+        default,
+        minimum=min_value,
+        maximum=max_value,
+    )
 
 
 def _read_pcm_stats(
@@ -48,10 +51,10 @@ def _read_pcm_stats(
             samples = [x - 128 for x in unpacked]
         elif sample_width == 2:
             fmt = f"<{len(raw) // 2}h"
-            samples = struct.unpack(fmt, raw)
+            samples = list(struct.unpack(fmt, raw))
         else:
             fmt = f"<{len(raw) // 4}i"
-            samples = struct.unpack(fmt, raw)
+            samples = list(struct.unpack(fmt, raw))
 
         if n_channels > 1:
             samples = samples[::n_channels]
@@ -89,7 +92,8 @@ def _audio_metrics_wav(path: Path) -> tuple[int, int, int]:
                 n_channels=n_channels,
             )
             return duration_ms, rms, peak
-    except Exception:
+    except (OSError, EOFError, ValueError, wave.Error, struct.error) as exc:
+        logger.warning("Could not read WAV metrics path=%s error=%s", path, exc)
         return 0, 0, 0
 
 

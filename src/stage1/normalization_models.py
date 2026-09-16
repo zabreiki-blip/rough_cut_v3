@@ -9,6 +9,7 @@ class BlockType(str, Enum):
     VOICEOVER = "voiceover"
     SYNC = "sync"
     HOST = "host"
+    LIFE = "life"
     TECHNICAL = "technical"
     OTHER = "other"
     UNKNOWN = "unknown"
@@ -69,6 +70,7 @@ class NormalizedBlock:
     suggested_label: str = ""
     speaker: str = ""
     role: str = ""
+    source_description: str = ""
     timecode_start: str = ""
     timecode_end: str = ""
     sync_fragments: list[SyncFragment] = field(default_factory=list)
@@ -79,21 +81,33 @@ class NormalizedBlock:
     proposed_source: str = ""
     proposed_memory_rule_id: int | None = None
     continuation_of_type: str = ""
+    # Stage 4 attaches the block's relationship to the previous scenario
+    # revision here.  It must survive normalization model round-trips so the
+    # timeline exporter can highlight changed clips in Premiere.
+    versioning: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["sync_fragments"] = [fragment.to_dict() for fragment in self.sync_fragments]
+        if not self.versioning:
+            payload.pop("versioning", None)
         return payload
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NormalizedBlock":
         fields = cls.__dataclass_fields__
-        kwargs = {key: value[key] for key in fields if key in value and key != "sync_fragments"}
+        kwargs = {
+            key: value[key]
+            for key in fields
+            if key in value and key not in {"sync_fragments", "versioning"}
+        }
         kwargs["sync_fragments"] = [
             SyncFragment.from_dict(item)
             for item in (value.get("sync_fragments") or [])
             if isinstance(item, dict)
         ]
+        versioning = value.get("versioning")
+        kwargs["versioning"] = dict(versioning) if isinstance(versioning, dict) else {}
         return cls(**kwargs)
 
 
@@ -110,6 +124,8 @@ class NormalizedScenario:
     updated_at: str = ""
     confirmed_at: str = ""
     warnings: list[str] = field(default_factory=list)
+    scenario_revision_id: str = ""
+    parent_revision_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

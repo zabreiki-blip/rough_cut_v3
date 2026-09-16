@@ -6,20 +6,42 @@
   var guideAudioPath = "";
   var exportPollTimer = null;
   var exportInProgress = false;
+  var exportPollResumeFn = null;
+  var whisperPollWasActive = false;
+  var exportPollWasActive = false;
   var whisperPollTimer = null;
+  // Bumped every time the panel is hidden so in-flight requests started
+  // before the hide can recognise themselves as stale once their callback
+  // finally arrives (see pauseBackgroundPolling/resumeBackgroundPolling).
+  var pollGeneration = 0;
+  // Counts how many times pollExport's terminal (stableChecks >= 3) branch
+  // has actually run for the current panel session. Only ever read by
+  // tests, to prove the visibilitychange race cannot double-fire
+  // registerSequenceWithCallback/startTranscriptionJob.
+  var exportPollTerminalCallCount = 0;
   var currentWhisperJobId = "";
   var currentWhisperReviewCount = 0;
   var currentWhisperJobStatus = "";
+  var currentFinalReviewJobId = "";
+  var currentFinalReviewSequence = null;
   var CONFORM_VIDEO_TRACK_INDEX = 0;
   var CONFORM_AUDIO_TRACK_INDEX = 0;
+  // CEP panels can remain open for an entire editing session. Keep their
+  // diagnostic DOM bounded even when a backend is unavailable or a job polls
+  // for a long time.
+  var MAX_LOG_ENTRY_CHARACTERS = 8000;
+  var MAX_LOG_CHARACTERS = 100000;
   var hostFunctions = {
     ping: "rcStage2_ping",
     projects: "rcStage2_listProjects",
     inspect: "rcStage2_inspectActiveSequence",
+    inspectLayout: "rcStage2_captureAssemblyLayout",
     resolve: "rcStage2_resolveSequence",
     conform: "rcStage2_conformSequenceRanges",
     exportAudio: "rcStage2_exportActiveSequenceAudio",
-    fileInfo: "rcStage2_fileInfo"
+    exportFinalReview: "rcStage2_exportFinalReviewAudio",
+    fileInfo: "rcStage2_fileInfo",
+    clone: "rcStage2_cloneActiveSequence"
   };
 
   function byId(id) {
@@ -31,10 +53,17 @@
     return date.toLocaleTimeString ? date.toLocaleTimeString() : String(date);
   }
 
-  function log(message, data) {
+  // `level` ("error" | "success" | "info") is the source of truth for the
+  // notice styling when the caller knows it (e.g. derived from an HTTP
+  // status or an explicit success/error branch). The Russian-word regex
+  // below is only a last-resort fallback for messages logged without a
+  // known level.
+  function log(message, data, level) {
     var target = byId("log");
     var notice = byId("panelNotice");
     var line = "[" + now() + "] " + message;
+    var retained;
+    var cutoff;
     if (data !== undefined) {
       try {
         line += "\n" + JSON.stringify(data, null, 2);
@@ -42,12 +71,25 @@
         line += "\n" + String(data);
       }
     }
-    target.textContent = target.textContent ? line + "\n\n" + target.textContent : line;
+    if (line.length > MAX_LOG_ENTRY_CHARACTERS) {
+      line = line.slice(0, MAX_LOG_ENTRY_CHARACTERS) + "\n… запись журнала сокращена";
+    }
+    retained = target.textContent ? line + "\n\n" + target.textContent : line;
+    if (retained.length > MAX_LOG_CHARACTERS) {
+      // Do not leave a partial older record: retain complete, newest entries.
+      cutoff = retained.lastIndexOf("\n\n", MAX_LOG_CHARACTERS);
+      retained = cutoff > 0 ? retained.slice(0, cutoff) : retained.slice(0, MAX_LOG_CHARACTERS);
+    }
+    target.textContent = retained;
     if (notice) {
       notice.className = "panel-notice";
-      if (/(ошиб|недоступ|не удалось|не выполн|не запущ|не загруж|не найден|не разреш|нельзя|отклон|остановлен|проверьте|укажите|введите|отмен)/i.test(message)) {
+      if (level === "error") {
         notice.className += " panel-notice-error";
-      } else if (/(готов|заверш|зарегистрирован|сохран|обновл|получен|выбран|поставлен)/i.test(message)) {
+      } else if (level === "success" || level === "ok") {
+        notice.className += " panel-notice-success";
+      } else if (!level && /(ошиб|недоступ|не удалось|не выполн|не запущ|не загруж|не найден|не разреш|нельзя|отклон|остановлен|проверьте|укажите|введите|отмен)/i.test(message)) {
+        notice.className += " panel-notice-error";
+      } else if (!level && /(готов|заверш|зарегистрирован|сохран|обновл|получен|выбран|поставлен)/i.test(message)) {
         notice.className += " panel-notice-success";
       }
       notice.textContent = message;
@@ -113,7 +155,7 @@
       project: byId("projectName").value.trim(),
       apiBaseUrl: normalizeBaseUrl(byId("apiBaseUrl").value),
       token: byId("apiToken").value,
-      projectsRoot: String(byId("projectsRoot").value || "").replace(/[\/\\]+$/, ""),
+      projectsRoot: String(byId("projectsRoot").value || "").replace(/[/\\]+$/, ""),
       transcribePath: byId("transcribePath").value.trim()
     };
   }
@@ -155,17 +197,21 @@
     function loadFromBackend(hostError) {
       if (!current.token) {
         refresh.disabled = false;
-        log("Список проектов не загружен: " + hostError.message);
+        log("Список проектов не загружен: " + hostError.message, undefined, "error");
         return;
       }
       request("GET", "/projects", null, function (error, response) {
         refresh.disabled = false;
         if (error) {
-          log("Список проектов не загружен: " + error.message);
+          log("Список проектов не загружен: " + error.message, undefined, "error");
           return;
         }
         replaceProjectOptions(response.projects || [], selected);
-        log("Список проектов получен из backend: " + (response.projects || []).length + ".");
+        log(
+          "Список проектов получен из backend: " + (response.projects || []).length + ".",
+          undefined,
+          "success"
+        );
       });
     }
 
@@ -180,8 +226,38 @@
       }
       refresh.disabled = false;
       replaceProjectOptions(response.projects || [], selected);
-      log("Список проектов обновлён: " + (response.projects || []).length + ".");
+      log(
+        "Список проектов обновлён: " + (response.projects || []).length + ".",
+        undefined,
+        "success"
+      );
     });
+  }
+
+  function configComplete() {
+    var current = config();
+    return Boolean(current.project && current.apiBaseUrl && current.token && current.projectsRoot);
+  }
+
+  // The token is memory-only (never persisted), so this re-opens the
+  // settings card at the start of every session until the user fills it
+  // in again, and folds it away once the required fields are complete.
+  function syncConfigCardOpenState() {
+    var card = byId("configCard");
+    if (!card) {
+      return;
+    }
+    if (configComplete()) {
+      card.removeAttribute("open");
+    } else {
+      card.setAttribute("open", "");
+    }
+  }
+
+  function checkConnection() {
+    log("Проверяю соединение с backend…", undefined, "info");
+    loadProjects();
+    refreshWhisperStatus();
   }
 
   function saveConfig() {
@@ -192,7 +268,9 @@
     window.localStorage.setItem("roughCutStage2.transcribePath", current.transcribePath);
     // The token intentionally remains memory-only.
     byId("apiBaseUrl").value = current.apiBaseUrl;
-    log("Настройки сохранены. API token не записан на диск.");
+    log("Настройки сохранены. API token не записан на диск.", undefined, "success");
+    syncConfigCardOpenState();
+    hideManualRetry();
     loadProjects();
     refreshWhisperStatus();
   }
@@ -210,14 +288,96 @@
       "/stage2/sync-jobs/start";
   }
 
-  function request(method, path, body, callback) {
+  // Auto-retry delays for idempotent (GET) requests: ~1s, then ~3s — 3
+  // attempts in total. State-changing requests (POST) are never retried
+  // automatically; see offerManualRetry below.
+  var RETRY_DELAYS_MS = [1000, 3000];
+  var pendingManualRetry = null;
+
+  function authHint() {
+    return " Проверьте ключ доступа: он должен совпадать с переменной окружения " +
+      "ROUGH_CUT_API_TOKEN на backend.";
+  }
+
+  function serverErrorHint() {
+    return " Подробности смотрите в «Техническом журнале» ниже и в логах backend.";
+  }
+
+  function offlineHint() {
+    return " Запустите scripts/run-local и проверьте адрес сервера в «Дополнительных настройках».";
+  }
+
+  function showOfflineNotice(show) {
+    var el = byId("offlineNotice");
+    if (el) {
+      el.hidden = !show;
+    }
+  }
+
+  function hideManualRetry() {
+    pendingManualRetry = null;
+    var button = byId("requestRetry");
+    if (button) {
+      button.hidden = true;
+      button.textContent = "Повторить";
+    }
+  }
+
+  // Non-idempotent (POST/PUT/DELETE) requests that failed due to a network
+  // drop or timeout are ambiguous: the backend may have already applied the
+  // change before the response was lost. Warn the user instead of
+  // presenting a plain "Повторить" as if nothing happened.
+  function manualRetryButtonText(pending) {
+    if (pending.method === "GET") {
+      return "Повторить";
+    }
+    if (pending.networkError) {
+      return "Повторить (операция могла уже выполниться — проверьте таймлайн)";
+    }
+    return "Повторить";
+  }
+
+  function offerManualRetry(method, path, body, callback, error) {
+    pendingManualRetry = {
+      method: method,
+      path: path,
+      body: body,
+      callback: callback,
+      networkError: Boolean(error && error.network)
+    };
+    var button = byId("requestRetry");
+    if (button) {
+      button.hidden = false;
+      button.textContent = manualRetryButtonText(pendingManualRetry);
+    }
+  }
+
+  function retryPendingRequest() {
+    if (!pendingManualRetry) {
+      return;
+    }
+    var pending = pendingManualRetry;
+    hideManualRetry();
+    log("Повторяю запрос…", undefined, "info");
+    request(pending.method, pending.path, pending.body, pending.callback);
+  }
+
+  function request(method, path, body, callback, retryState) {
+    // retryState is shared (by reference) across every recursive retry of
+    // the same logical operation, so the "finished" flag it carries
+    // guarantees the external callback fires exactly once no matter how
+    // many attempts are made or in what order the XHR events land.
+    retryState = retryState || {attempt: 0, finished: false};
     var current = config();
-    var finished = false;
     function finish(error, payload) {
-      if (finished) {
+      if (retryState.finished) {
         return;
       }
-      finished = true;
+      retryState.finished = true;
+      if (!error) {
+        showOfflineNotice(false);
+        hideManualRetry();
+      }
       callback(error, payload);
     }
     if (!current.apiBaseUrl) {
@@ -227,6 +387,33 @@
     if (!current.token) {
       finish(new Error("Введите API token."));
       return;
+    }
+
+    var isIdempotent = method === "GET";
+
+    // Only network errors and timeouts are ever retried, and only for
+    // idempotent (GET) requests — retrying a POST (conform/build/insert)
+    // automatically could apply the same state change twice.
+    function retryOrFail(error) {
+      error.network = true;
+      if (isIdempotent && retryState.attempt < RETRY_DELAYS_MS.length) {
+        var delayMs = RETRY_DELAYS_MS[retryState.attempt];
+        log(
+          "Повтор через " + Math.round(delayMs / 1000) + " с… (" + error.message + ")",
+          undefined,
+          "info"
+        );
+        retryState.attempt += 1;
+        window.setTimeout(function () {
+          request(method, path, body, callback, retryState);
+        }, delayMs);
+        return;
+      }
+      showOfflineNotice(true);
+      if (!isIdempotent) {
+        offerManualRetry(method, path, body, callback, error);
+      }
+      finish(error);
     }
 
     var xhr = new XMLHttpRequest();
@@ -239,17 +426,40 @@
     }
     xhr.onreadystatechange = function () {
       var parsed;
+      var message;
       if (xhr.readyState !== 4) {
+        return;
+      }
+      if (xhr.status === 0) {
+        // The connection was dropped/refused before any HTTP response was
+        // received (backend down, DNS failure, aborted request, etc.).
+        // readyState can reach 4 with status 0 *before* onerror/ontimeout
+        // fires; treating that as a successful empty response would report
+        // a false "success" for the outer callback. Ignore it here and let
+        // onerror/ontimeout drive the retry/failure path exactly once.
         return;
       }
       try {
         parsed = xhr.responseText ? JSON.parse(xhr.responseText) : {};
       } catch (error) {
-        finish(new Error("Backend вернул не JSON (HTTP " + xhr.status + ")."));
+        message = "Backend вернул не JSON (HTTP " + xhr.status + ").";
+        if (xhr.status >= 500) {
+          message += serverErrorHint();
+        }
+        finish(new Error(message));
         return;
       }
+      // The HTTP status is the source of truth for success/error, not any
+      // wording in the payload. Only the 2xx range counts as success; the
+      // branches below only add actionable hints for specific status codes.
       if (xhr.status < 200 || xhr.status >= 300) {
-        finish(new Error(parsed.error || parsed.message || ("HTTP " + xhr.status)), parsed);
+        message = parsed.error || parsed.message || ("HTTP " + xhr.status);
+        if (xhr.status === 401 || xhr.status === 403) {
+          message += authHint();
+        } else if (xhr.status >= 500) {
+          message += serverErrorHint();
+        }
+        finish(new Error(message), parsed);
         return;
       }
       if (parsed.ok === false) {
@@ -259,10 +469,10 @@
       finish(null, parsed);
     };
     xhr.onerror = function () {
-      finish(new Error("Backend недоступен или соединение было прервано."));
+      retryOrFail(new Error("Backend недоступен или соединение было прервано." + offlineHint()));
     };
     xhr.ontimeout = function () {
-      finish(new Error("Backend не ответил за 30 секунд."));
+      retryOrFail(new Error("Backend не ответил за 30 секунд." + offlineHint()));
     };
     xhr.send(body === null ? null : JSON.stringify(body));
   }
@@ -468,15 +678,28 @@
     if (!current.project || !current.apiBaseUrl || !current.token) {
       renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
       if (manual) {
-        log("Статус распознавания не обновлён: проверьте проект, адрес сервера и ключ доступа.");
+        log(
+          "Статус распознавания не обновлён: проверьте проект, адрес сервера и ключ доступа.",
+          undefined,
+          "error"
+        );
       }
       return;
     }
     path = requestedJobId
       ? "/stage2/sync-jobs/" + encodeURIComponent(requestedJobId)
       : "/stage2/sync-jobs/status?project=" + encodeURIComponent(current.project);
+    var requestGeneration = pollGeneration;
     request("GET", path, null, function (error, response) {
       var job;
+      // The panel was hidden (or hidden/shown again) while this request was
+      // in flight. Drop the response instead of re-arming a timer: resume
+      // already scheduled (or will schedule) a fresh poll from the current
+      // state, so acting on stale data here would risk a duplicate cycle.
+      if (requestGeneration !== pollGeneration || document.hidden) {
+        whisperPollWasActive = true;
+        return;
+      }
       if (error) {
         if (requestedJobId && error.message === "job not found" && allowProjectFallback) {
           currentWhisperJobId = "";
@@ -492,7 +715,7 @@
           renderWhisperIdle("Статус распознавания недоступен: " + error.message);
         }
         if (manual) {
-          log("Статус распознавания не обновлён: " + error.message);
+          log("Статус распознавания не обновлён: " + error.message, undefined, "error");
         }
         scheduleWhisperPoll(10000);
         return;
@@ -501,12 +724,56 @@
       currentWhisperJobId = job.id || currentWhisperJobId;
       renderWhisperJob(job);
       if (manual) {
-        log("Статус распознавания обновлён.", job);
+        log("Статус распознавания обновлён.", job, "success");
       }
       scheduleWhisperPoll(
         job.status === "queued" || job.status === "running" || job.status === "cancelling" ? 2500 : 10000
       );
     });
+  }
+
+  // CEP panels stay open for an entire editing shift. Polling the backend
+  // while the panel is hidden/minimized just burns requests for nobody to
+  // see, so pause client-side polling on visibilitychange and pick it back
+  // up (with an immediate refresh) once the panel is visible again. This
+  // never cancels the underlying server-side job — only the local timers
+  // that ask about its progress.
+  function pauseBackgroundPolling() {
+    // Requests already in flight (callHost/XHR round-trips) cannot be
+    // cancelled, so bump the generation counter to let their callbacks
+    // detect the pause once they finally resolve.
+    pollGeneration += 1;
+    if (whisperPollTimer) {
+      window.clearTimeout(whisperPollTimer);
+      whisperPollTimer = null;
+      whisperPollWasActive = true;
+    }
+    if (exportPollTimer) {
+      window.clearTimeout(exportPollTimer);
+      exportPollTimer = null;
+      exportPollWasActive = true;
+    }
+  }
+
+  function resumeBackgroundPolling() {
+    if (whisperPollWasActive) {
+      whisperPollWasActive = false;
+      refreshWhisperStatus();
+    }
+    if (exportPollWasActive) {
+      exportPollWasActive = false;
+      if (exportPollResumeFn) {
+        exportPollResumeFn();
+      }
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) {
+      pauseBackgroundPolling();
+    } else {
+      resumeBackgroundPolling();
+    }
   }
 
   function refreshWhisperStatusManually() {
@@ -540,11 +807,13 @@
       "ID " + sequence.sequenceId +
       " · " + sequence.durationSeconds.toFixed(2) + " сек" +
       " · V" + sequence.videoTrackCount + "/A" + sequence.audioTrackCount;
-    byId("registerSequence").disabled = false;
+    byId("registerSequence").disabled = Boolean(sourceRegistrationBlockReason(sequence));
     byId("resolveSequence").disabled = false;
-    byId("exportAndTranscribe").disabled = whisperJobIsActive();
+    byId("exportAndTranscribe").disabled =
+      Boolean(sourceRegistrationBlockReason(sequence)) || whisperJobIsActive();
     if (!byId("sourceId").value.trim()) {
       sourceName = String(sequence.name || "");
+      // eslint-disable-next-line no-control-regex -- \x00-\x7F range intentionally detects non-ASCII source names
       generatedId = /[^\x00-\x7F]/.test(sourceName) ? "" : sourceName
           .toLowerCase()
           .replace(/\s+/g, "_")
@@ -560,9 +829,55 @@
   }
 
   function setSourceActionsDisabled(disabled) {
-    byId("registerSequence").disabled = disabled;
+    var roleBlocked = Boolean(sourceRegistrationBlockReason(activeSource));
+    byId("registerSequence").disabled = disabled || roleBlocked;
     byId("resolveSequence").disabled = disabled;
-    byId("exportAndTranscribe").disabled = disabled || exportInProgress || whisperJobIsActive();
+    byId("exportAndTranscribe").disabled =
+      disabled || roleBlocked || exportInProgress || whisperJobIsActive();
+  }
+
+  function sourceRegistrationBlockReason(sequence) {
+    var guard = sequence && sequence.roughCutGuard;
+    if (!sequence) {
+      return "Сначала считайте активную секвенцию.";
+    }
+    if (!guard || !guard.inspectionComplete) {
+      return "Не удалось безопасно определить роль секвенции. Регистрация и расшифровка запрещены.";
+    }
+    if (guard.isRoughCutTarget) {
+      return "Монтажную секвенцию с RC_BLOCK/RC_SYNC нельзя регистрировать или расшифровывать как sync-источник.";
+    }
+    return "";
+  }
+
+  function normalizedTreePath(value) {
+    return String(value || "").replace(/\\/g, "/");
+  }
+
+  function sourceIdentityMatchesSequence(source, sequence) {
+    var metadata = (source && source.metadata) || {};
+    return Boolean(
+      (source.sequence_id && sequence.sequenceId &&
+        String(source.sequence_id) === String(sequence.sequenceId)) ||
+      (metadata.project_item_node_id && sequence.projectItemNodeId &&
+        String(metadata.project_item_node_id) === String(sequence.projectItemNodeId) &&
+        source.project_path && sequence.projectPath &&
+        normalizedTreePath(source.project_path) === normalizedTreePath(sequence.projectPath)) ||
+      (metadata.project_item_tree_path && sequence.projectItemTreePath &&
+        normalizedTreePath(metadata.project_item_tree_path) ===
+          normalizedTreePath(sequence.projectItemTreePath))
+    );
+  }
+
+  function registeredSourceGuard(source) {
+    var metadata = source.metadata || {};
+    return {
+      id: source.id || source.source_id || "",
+      sequenceId: source.sequence_id || "",
+      projectPath: source.project_path || "",
+      projectItemNodeId: metadata.project_item_node_id || "",
+      projectItemTreePath: metadata.project_item_tree_path || ""
+    };
   }
 
   function absoluteGuidePath(source, current) {
@@ -599,7 +914,7 @@
         }
         setSourceActionsDisabled(false);
         if (error) {
-          log("Не удалось проверить регистрацию sync-источника: " + error.message);
+          log("Не удалось проверить регистрацию sync-источника: " + error.message, undefined, "error");
           return;
         }
         items = (response.result && response.result.sources) || response.sources || [];
@@ -628,7 +943,7 @@
         byId("allSpeakers").checked = Boolean(existing.all_speakers);
         guideAudioPath = absoluteGuidePath(existing, current);
         byId("guideOutputPath").value = guideAudioPath || defaultGuideOutput();
-        log("Найдена существующая регистрация sync-источника.", existing);
+        log("Найдена существующая регистрация sync-источника.", existing, "success");
       }
     );
   }
@@ -651,11 +966,16 @@
     log("Считываю активную секвенцию…");
     callHost("inspect", undefined, function (error, response) {
       if (error) {
-        log("Не удалось считать секвенцию: " + error.message);
+        log("Не удалось считать секвенцию: " + error.message, undefined, "error");
         return;
       }
       renderSource(response.sequence);
-      log("Активная секвенция сохранена как источник.", response.sequence);
+      var blocked = sourceRegistrationBlockReason(response.sequence);
+      if (blocked) {
+        log(blocked, response.sequence, "error");
+      } else {
+        log("Активная секвенция сохранена как источник.", response.sequence, "success");
+      }
     });
   }
 
@@ -673,15 +993,38 @@
     return absolute;
   }
 
-  function registerSequenceWithCallback(callback) {
-    var current = config();
-    var sourceId = byId("sourceId").value.trim();
-    var timebase = Number(activeSource && activeSource.timebaseTicks);
+  function captureSourceOperation(guidePath) {
+    return {
+      current: config(),
+      source: activeSource,
+      sourceId: byId("sourceId").value.trim(),
+      speakerNames: byId("speakerName").value.split(/[,;\n]+/).map(function (value) {
+        return value.trim();
+      }).filter(function (value) {
+        return Boolean(value);
+      }),
+      allSpeakers: byId("allSpeakers").checked,
+      guideAudioPath: guidePath == null ? guideAudioPath : guidePath
+    };
+  }
+
+  function registerSequenceWithCallback(callback, operation) {
+    var operationContext = operation || captureSourceOperation();
+    var current = operationContext.current;
+    var source = operationContext.source;
+    var sourceId = operationContext.sourceId;
+    var timebase = Number(source && source.timebaseTicks);
     var fps = isFinite(timebase) && timebase > 0 ? 254016000000 / timebase : 25;
     var done = callback || function () {};
-    if (!activeSource) {
+    if (!source) {
       log("Сначала считайте активную секвенцию.");
       done(new Error("No active source."));
+      return;
+    }
+    var roleBlock = sourceRegistrationBlockReason(source);
+    if (roleBlock) {
+      log("Регистрация не выполнена: " + roleBlock);
+      done(new Error(roleBlock));
       return;
     }
     if (!current.project) {
@@ -700,48 +1043,48 @@
       return;
     }
 
-    var speakerNames = byId("speakerName").value.split(/[,;\n]+/).map(function (value) {
-      return value.trim();
-    }).filter(function (value) {
-      return Boolean(value);
-    });
+    var speakerNames = operationContext.speakerNames;
     var payload = {
       project: current.project,
       id: sourceId,
       source_id: sourceId,
       speaker: speakerNames[0] || "",
       speakers: speakerNames.slice(1),
-      all_speakers: byId("allSpeakers").checked,
-      premiere_sequence: activeSource.name,
-      sequence_id: activeSource.sequenceId,
-      sequence_name: activeSource.name,
-      sequence_start_tc: secondsToTimecode(activeSource.zeroPointSeconds, fps),
-      project_path: activeSource.projectPath,
+      all_speakers: operationContext.allSpeakers,
+      premiere_sequence: source.name,
+      sequence_id: source.sequenceId,
+      sequence_name: source.name,
+      sequence_start_tc: secondsToTimecode(source.zeroPointSeconds, fps),
+      project_path: source.projectPath,
       fps: fps,
-      duration_sec: activeSource.durationSeconds,
-      guide_audio: guideAudioPath ? guideReference(guideAudioPath, current) : "",
+      duration_sec: source.durationSeconds,
+      guide_audio: operationContext.guideAudioPath ? guideReference(operationContext.guideAudioPath, current) : "",
       guide_offset_sec: 0,
       metadata: {
-        guide_audio_absolute: guideAudioPath,
-        project_item_node_id: activeSource.projectItemNodeId,
-        project_item_tree_path: activeSource.projectItemTreePath,
-        zero_point_sec: activeSource.zeroPointSeconds,
-        zero_point_ticks: activeSource.zeroPointTicks,
-        timebase_ticks: activeSource.timebaseTicks,
-        video_display_format: activeSource.videoDisplayFormat,
-        video_track_count: activeSource.videoTrackCount,
-        audio_track_count: activeSource.audioTrackCount
+        sequence_role: source.roughCutGuard.isRoughCutTarget
+          ? "rough_cut_target"
+          : "sync_source",
+        rough_cut_target: Boolean(source.roughCutGuard.isRoughCutTarget),
+        guide_audio_absolute: operationContext.guideAudioPath,
+        project_item_node_id: source.projectItemNodeId,
+        project_item_tree_path: source.projectItemTreePath,
+        zero_point_sec: source.zeroPointSeconds,
+        zero_point_ticks: source.zeroPointTicks,
+        timebase_ticks: source.timebaseTicks,
+        video_display_format: source.videoDisplayFormat,
+        video_track_count: source.videoTrackCount,
+        audio_track_count: source.audioTrackCount
       }
     };
 
     log("Регистрирую sync-источник…");
     request("POST", "/stage2/sync-sources", payload, function (error, response) {
       if (error) {
-        log("Регистрация не выполнена: " + error.message, response);
+        log("Регистрация не выполнена: " + error.message, response, "error");
         done(error);
         return;
       }
-      log("Sync-источник зарегистрирован.", response);
+      log("Sync-источник зарегистрирован.", response, "success");
       done(null, response);
     });
   }
@@ -755,19 +1098,24 @@
     return current.projectsRoot + "/" + current.project + "/work/sync_audio/" + sourceId + ".wav";
   }
 
-  function startTranscriptionJob() {
-    var current = config();
-    var sourceId = byId("sourceId").value.trim();
+  function startTranscriptionJob(operation) {
+    var operationContext = operation || captureSourceOperation();
+    var current = operationContext.current;
+    var sourceId = operationContext.sourceId;
     var path = current.transcribePath || "/stage2/sync-jobs/start";
     request("POST", path, {
       project: current.project,
       source_ids: [sourceId]
     }, function (error, response) {
       if (error) {
-        log("WAV готов и зарегистрирован, но Whisper job не запущен: " + error.message, response);
+        log(
+          "WAV готов и зарегистрирован, но Whisper job не запущен: " + error.message,
+          response,
+          "error"
+        );
         return;
       }
-      log("Whisper job запущен.", response);
+      log("Whisper job запущен.", response, "success");
       var job = response.result || response;
       currentWhisperJobId = job.job_id || job.id || "";
       renderWhisperJob({
@@ -806,33 +1154,54 @@
       function (error, response) {
         byId("cancelWhisper").disabled = false;
         if (error) {
-          log("Остановка не выполнена: " + error.message, response);
+          log("Остановка не выполнена: " + error.message, response, "error");
           return;
         }
-        log("Остановка запрошена. Индексы и найденные диапазоны сохраняются.", response);
+        log(
+          "Остановка запрошена. Индексы и найденные диапазоны сохраняются.",
+          response,
+          "success"
+        );
         renderWhisperJob(response.result || response);
         scheduleWhisperPoll(500);
       }
     );
   }
 
-  function pollExport(outputPath, jobId) {
+  function pollExport(outputPath, jobId, operation) {
+    operation = operation || captureSourceOperation(outputPath);
     var previousSize = -1;
     var previousModified = -1;
     var stableChecks = 0;
     var attempts = 0;
     var maxAttempts = 900;
+    // Guards the terminal branch below so a stale in-flight response can
+    // never trigger registerSequenceWithCallback/startTranscriptionJob a
+    // second time for this export cycle.
+    var exportFinished = false;
 
     function check() {
       attempts += 1;
+      var requestGeneration = pollGeneration;
       callHost("fileInfo", { path: outputPath }, function (error, response) {
         var file;
+        // Same discard-stale-response rule as refreshWhisperStatus: never
+        // re-arm a timer (or run the terminal branch) for a request that
+        // started before the panel was hidden.
+        if (requestGeneration !== pollGeneration || document.hidden) {
+          exportPollWasActive = true;
+          return;
+        }
+        if (exportFinished) {
+          return;
+        }
         if (error) {
           log("Не удалось проверить guide WAV: " + error.message);
           if (attempts < maxAttempts) {
             exportPollTimer = window.setTimeout(check, 2000);
           } else {
             exportPollTimer = null;
+            exportPollResumeFn = null;
             exportInProgress = false;
             byId("exportAndTranscribe").disabled = whisperJobIsActive();
           }
@@ -849,19 +1218,24 @@
         previousModified = file.modifiedMs;
 
         if (stableChecks >= 3) {
+          exportFinished = true;
           exportPollTimer = null;
+          exportPollResumeFn = null;
           exportInProgress = false;
-          guideAudioPath = file.path || outputPath;
+          operation.guideAudioPath = file.path || outputPath;
+          guideAudioPath = operation.guideAudioPath;
           log("Guide WAV готов: " + file.size + " байт.", file);
+          exportPollTerminalCallCount += 1;
           registerSequenceWithCallback(function (registerError) {
             if (!registerError) {
-              startTranscriptionJob();
+              startTranscriptionJob(operation);
             }
-          });
+          }, operation);
           return;
         }
         if (attempts >= maxAttempts) {
           exportPollTimer = null;
+          exportPollResumeFn = null;
           exportInProgress = false;
           byId("exportAndTranscribe").disabled = whisperJobIsActive();
           log("Ожидание экспорта остановлено через 30 минут. Job ID: " + jobId);
@@ -874,6 +1248,8 @@
     if (exportPollTimer) {
       window.clearTimeout(exportPollTimer);
     }
+    exportPollResumeFn = check;
+    exportPollWasActive = false;
     exportPollTimer = window.setTimeout(check, 1000);
   }
 
@@ -884,6 +1260,11 @@
       log("Сначала считайте активную sync-секвенцию.");
       return;
     }
+    var roleBlock = sourceRegistrationBlockReason(activeSource);
+    if (roleBlock) {
+      log("Экспорт и расшифровка не запущены: " + roleBlock);
+      return;
+    }
     if (!outputPath) {
       log("Укажите Guide WAV или настройте общий каталог projects, проект и Source ID.");
       return;
@@ -892,6 +1273,10 @@
       log("Экспорт уже выполняется.");
       return;
     }
+    // Export may take minutes. Freeze source and project fields before the
+    // asynchronous host request; another inspected sequence must not inherit
+    // this WAV when the export completes.
+    var operation = captureSourceOperation(outputPath);
     exportInProgress = true;
     byId("exportAndTranscribe").disabled = true;
     byId("guideOutputPath").value = outputPath;
@@ -899,7 +1284,7 @@
     callHost("exportAudio", {
       outputPath: outputPath,
       presetPath: presetPath,
-      expectedSequenceId: activeSource.sequenceId,
+      expectedSequenceId: operation.source.sequenceId,
       overwrite: byId("overwriteGuide").checked
     }, function (error, response) {
       if (error) {
@@ -910,7 +1295,7 @@
       }
       guideAudioPath = response.job.outputPath;
       log("Экспорт поставлен в очередь. Ожидаю стабильный WAV…", response.job);
-      pollExport(response.job.outputPath, response.job.jobId);
+      pollExport(response.job.outputPath, response.job.jobId, operation);
     });
   }
 
@@ -1002,12 +1387,43 @@
         return;
       }
       target = inspected.sequence;
-      if (activeSource && String(target.sequenceId) === String(activeSource.sequenceId)) {
-        log("Откройте отдельную монтажную секвенцию: источник нельзя применить к самому себе.");
+      request(
+        "GET",
+        "/stage2/sync-sources?project=" + encodeURIComponent(current.project),
+        null,
+        function (sourcesError, sourcesResponse) {
+      var registeredSources;
+      var sourceGuards;
+      var conflictingSource;
+      if (sourcesError) {
+        log("Conform не запущен: не удалось проверить зарегистрированные sync-источники: " + sourcesError.message);
         setConformBusy(false);
-        setConformStatus("error", "Откройте целевую монтажную секвенцию, а не секвенцию-источник.");
+        setConformStatus("error", "Не удалось безопасно проверить целевую секвенцию.");
         return;
       }
+      registeredSources = (sourcesResponse.result && sourcesResponse.result.sources) ||
+        sourcesResponse.sources;
+      if (!Array.isArray(registeredSources)) {
+        log("Conform не запущен: сервер не вернул список зарегистрированных sync-источников.");
+        setConformBusy(false);
+        setConformStatus("error", "Не удалось безопасно проверить целевую секвенцию.");
+        return;
+      }
+      conflictingSource = registeredSources.filter(function (source) {
+        return sourceIdentityMatchesSequence(source, target);
+      })[0] || null;
+      if (conflictingSource) {
+        log(
+          "Conform не запущен: активная секвенция зарегистрирована как sync-источник [" +
+          String(conflictingSource.id || conflictingSource.source_id ||
+            conflictingSource.sequence_id || "без ID") +
+          "]. Откройте отдельную монтажную секвенцию."
+        );
+        setConformBusy(false);
+        setConformStatus("error", "Нельзя применять СНХ в зарегистрированную секвенцию-источник.");
+        return;
+      }
+      sourceGuards = registeredSources.map(registeredSourceGuard);
       if (!window.confirm(
         "Применить найденные СНХ к секвенции «" + target.name + "»?\n\n" +
         (currentWhisperReviewCount > 0
@@ -1089,7 +1505,7 @@
       }
       setConformStatus("working", "Применяю СНХ: " + items.length + "…");
       log("Начинаю применение " + items.length + " СНХ. Активная секвенция будет изменена…");
-      callHost("conform", {
+      var conformPayload = {
         items: items,
         videoTrackIndex: CONFORM_VIDEO_TRACK_INDEX,
         audioTrackIndex: CONFORM_AUDIO_TRACK_INDEX,
@@ -1097,12 +1513,37 @@
         expectedTargetSequenceName: target.name,
         expectedProjectPath: target.projectPath,
         expectedTimelineDuration: Number(timeline.total_duration_sec),
-        enableExplicitTrackShiftBatch: true
-      }, function (hostError, hostResponse) {
+        registeredSourceGuards: sourceGuards,
+        enableExplicitTrackShiftBatch: true,
+        repairStaleInsertions: false
+      };
+      function submitConform() {
+        callHost("conform", conformPayload, function (hostError, hostResponse) {
         var report;
         var insertedCount;
         var existingCount;
         if (hostError) {
+          if (hostError.message.indexOf("RC_STALE_INSERTION_CONFIRM_REQUIRED: ") === 0 &&
+              !conformPayload.repairStaleInsertions) {
+            var repairDetails = hostError.message.replace(
+              "RC_STALE_INSERTION_CONFIRM_REQUIRED: ",
+              ""
+            );
+            if (window.confirm(
+              "В монтажной секвенции найдена старая вставка без актуального RC_SYNC-маркера:\n\n" +
+              repairDetails +
+              "\n\nЗаменить старую V/A-пару новым диапазоном и сдвинуть последующие клипы на разницу длительности?"
+            )) {
+              conformPayload.repairStaleInsertions = true;
+              setConformStatus("working", "Заменяю устаревшие вставки и применяю СНХ…");
+              log("Подтверждена замена устаревшей V/A-вставки: " + repairDetails);
+              submitConform();
+            } else {
+              setConformBusy(false);
+              setConformStatus("idle", "Замена устаревшей вставки отменена. Секвенция не изменена.");
+            }
+            return;
+          }
           var changedTimeline = /^Inserted\s+/i.test(hostError.message);
           log(
             (changedTimeline
@@ -1139,27 +1580,296 @@
           report
         );
       });
+      }
+      submitConform();
     });
+    });
+    });
+  }
+
+  function finalReviewOutputPath() {
+    var current = config();
+    return current.projectsRoot && current.project
+      ? current.projectsRoot + "/" + current.project + "/work/final_review.wav"
+      : "";
+  }
+
+  function setFinalReviewStatus(message) {
+    byId("finalReviewStatus").textContent = message;
+  }
+
+  function pollFinalReviewJob() {
+    if (!currentFinalReviewJobId) return;
+    request("GET", "/stage2/final-review/jobs/" + encodeURIComponent(currentFinalReviewJobId), null, function (error, response) {
+      var job = response && (response.result || response);
+      if (error) {
+        setFinalReviewStatus("Не удалось получить статус проверки: " + error.message);
+        return;
+      }
+      setFinalReviewStatus(job.message || job.status || "Проверка выполняется…");
+      if (job.status === "completed") {
+        byId("applyFinalReview").disabled = false;
+        log("Финальная проверка завершена. Можно создать черновую итерацию.", job, "success");
+        return;
+      }
+      if (job.status === "failed") {
+        log("Финальная проверка завершилась ошибкой: " + (job.error || ""), job, "error");
+        return;
+      }
+      window.setTimeout(pollFinalReviewJob, 3000);
+    });
+  }
+
+  function submitFinalReview(sequence, layout) {
+    request("POST", "/stage2/final-review/start", {
+      project: config().project,
+      audio_path: "work/final_review.wav",
+      backend: "cloud-audio",
+      model: "google/gemini-3.7-flash",
+      source_sequence: sequence || {},
+      assembly_layout: layout || {}
+    }, function (startError, started) {
+      byId("startFinalReview").disabled = false;
+      byId("startFinalReviewFromWav").disabled = false;
+      if (startError) {
+        log("Финальная проверка не запущена: " + startError.message, started, "error");
+        return;
+      }
+      currentFinalReviewJobId = (started.result || started).job_id;
+      setFinalReviewStatus("Распознаю и сверяю собранный таймлайн…");
+      pollFinalReviewJob();
+    });
+  }
+
+  function inspectFinalReviewLayout(sequence, callback) {
+    var duration = Math.max(0.04, Number(sequence && sequence.durationSeconds || 0));
+    callHost("inspectLayout", {
+      fromSeconds: 0,
+      toSeconds: duration
+    }, function (error, response) {
+      callback(error, response && (response.layout || response));
+    });
+  }
+
+  function pollFinalReviewExport(outputPath, jobId, sequence) {
+    var previousSize = -1;
+    var previousModified = -1;
+    var stableChecks = 0;
+    var attempts = 0;
+    var maxAttempts = 1800;
+    var exportFinished = false;
+
+    function check() {
+      attempts += 1;
+      var requestGeneration = pollGeneration;
+      callHost("fileInfo", { path: outputPath }, function (error, response) {
+        var file;
+        if (requestGeneration !== pollGeneration || document.hidden) {
+          exportPollWasActive = true;
+          return;
+        }
+        if (exportFinished) {
+          return;
+        }
+        if (error) {
+          setFinalReviewStatus("Не удалось проверить WAV: " + error.message);
+        } else {
+          file = response.file;
+          if (file.exists && file.size > 44 &&
+              file.size === previousSize && file.modifiedMs === previousModified) {
+            stableChecks += 1;
+          } else {
+            stableChecks = 0;
+          }
+          previousSize = file.size;
+          previousModified = file.modifiedMs;
+          if (stableChecks >= 3) {
+            exportFinished = true;
+            exportPollTimer = null;
+            exportPollResumeFn = null;
+            setFinalReviewStatus("WAV готов. Создаю manifest таймлайна…");
+            inspectFinalReviewLayout(sequence, function (layoutError, layout) {
+              if (layoutError) {
+                byId("startFinalReview").disabled = false;
+                byId("startFinalReviewFromWav").disabled = false;
+                log("WAV экспортирован, но manifest sequence не создан: " + layoutError.message, layout, "error");
+                return;
+              }
+              submitFinalReview(sequence, layout);
+            });
+            return;
+          }
+        }
+        if (attempts >= maxAttempts) {
+          exportPollTimer = null;
+          exportPollResumeFn = null;
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          setFinalReviewStatus("Ожидание финального WAV остановлено через 60 минут.");
+          log("Ожидание final-review экспорта остановлено через 60 минут. Job ID: " + jobId, response, "error");
+          return;
+        }
+        exportPollTimer = window.setTimeout(check, 2000);
+      });
+    }
+
+    if (exportPollTimer) {
+      window.clearTimeout(exportPollTimer);
+    }
+    exportPollResumeFn = check;
+    exportPollWasActive = false;
+    exportPollTimer = window.setTimeout(check, 1000);
+  }
+
+  function startFinalReviewFromWav() {
+    byId("startFinalReview").disabled = true;
+    byId("startFinalReviewFromWav").disabled = true;
+    byId("applyFinalReview").disabled = true;
+    setFinalReviewStatus("Запускаю проверку из готового WAV…");
+    callHost("inspect", {}, function (inspectError, inspected) {
+      var sequence = inspected && (inspected.sequence || inspected);
+      if (inspectError) {
+        byId("startFinalReview").disabled = false;
+        byId("startFinalReviewFromWav").disabled = false;
+        log("Не удалось прочитать активную sequence: " + inspectError.message, inspected, "error");
+        return;
+      }
+      currentFinalReviewSequence = sequence || null;
+      inspectFinalReviewLayout(sequence, function (layoutError, layout) {
+        if (layoutError) {
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          log("Не удалось создать manifest активной sequence: " + layoutError.message, layout, "error");
+          return;
+        }
+        submitFinalReview(sequence, layout);
+      });
+    });
+  }
+
+  function startFinalReview() {
+    var outputPath = finalReviewOutputPath();
+    if (!outputPath) {
+      log("Укажите каталог projects и проект для финальной проверки.");
+      return;
+    }
+    byId("startFinalReview").disabled = true;
+    byId("startFinalReviewFromWav").disabled = true;
+    byId("applyFinalReview").disabled = true;
+    callHost("inspect", {}, function (inspectError, inspected) {
+      var sequence = inspected && (inspected.sequence || inspected);
+      if (inspectError || !sequence || !sequence.sequenceId) {
+        byId("startFinalReview").disabled = false;
+        byId("startFinalReviewFromWav").disabled = false;
+        log("Не удалось прочитать собранную sequence: " + (inspectError ? inspectError.message : "нет sequence"), inspected, "error");
+        return;
+      }
+      currentFinalReviewSequence = sequence;
+      setFinalReviewStatus("Экспортирую звук собранного таймлайна напрямую из Premiere…");
+      callHost("exportFinalReview", { outputPath: outputPath, expectedSequenceId: sequence.sequenceId, overwrite: true }, function (exportError, exported) {
+        if (exportError) {
+          byId("startFinalReview").disabled = false;
+          byId("startFinalReviewFromWav").disabled = false;
+          log("Не удалось экспортировать финальный WAV: " + exportError.message, exported, "error");
+          return;
+        }
+        log("Экспорт финального WAV поставлен в очередь. Ожидаю стабильный файл…", exported.job);
+        pollFinalReviewExport(exported.job.outputPath, exported.job.jobId, sequence);
+      });
+    });
+  }
+
+  function applyFinalReview() {
+    if (!currentFinalReviewJobId || !currentFinalReviewSequence) return;
+    byId("applyFinalReview").disabled = true;
+    request("POST", "/stage2/final-review/jobs/" + encodeURIComponent(currentFinalReviewJobId) + "/apply", { project: config().project }, function (error, response) {
+      if (error) {
+        byId("applyFinalReview").disabled = false;
+        log("Не удалось подготовить итерацию: " + error.message, response, "error");
+        return;
+      }
+      var result = response.result || response;
+      callHost("clone", { expectedSequenceId: currentFinalReviewSequence.sequenceId, nameSuffix: " · RC iteration " + result.iteration.id }, function (cloneError, cloned) {
+        if (cloneError) {
+          byId("applyFinalReview").disabled = false;
+          log("Черновая sequence не создана: " + cloneError.message, cloned, "error");
+          return;
+        }
+        var corrections = result.corrections || [];
+        if (!corrections.length) {
+          setFinalReviewStatus("Создана черновая sequence «" + cloned.draft.name + "»; автоматических правок нет.");
+          log("Черновая итерация создана; исходная sequence не изменена.", result, "success");
+          return;
+        }
+        var items = corrections.map(function (item) {
+          return {
+            segmentId: item.segment_id,
+            blockUid: item.block_uid,
+            sourceSequenceId: item.source_sequence_id || "",
+            sourceSequenceName: item.source_sequence_name || "",
+            sourceInSeconds: Number(item.source_in_sec),
+            sourceOutSeconds: Number(item.source_out_sec),
+            timelineSeconds: Number(item.timeline_seconds),
+            placeholderIdentity: item.placeholder_identity || ("RC_BLOCK " + item.block_uid),
+            placeholderIdentityRequired: true,
+            placeholderName: "",
+            placeholderNames: []
+          };
+        });
+        callHost("conform", {
+          items: items,
+          videoTrackIndex: CONFORM_VIDEO_TRACK_INDEX,
+          audioTrackIndex: CONFORM_AUDIO_TRACK_INDEX,
+          expectedTargetSequenceId: cloned.draft.sequenceId,
+          expectedTargetSequenceName: cloned.draft.name,
+          expectedProjectPath: cloned.draft.projectPath,
+          expectedTimelineDuration: Number(cloned.draft.durationSeconds || 0),
+          registeredSourceGuards: [],
+          enableExplicitTrackShiftBatch: true,
+          repairStaleInsertions: true
+        }, function (conformError, conformed) {
+          if (conformError) {
+            setFinalReviewStatus("Черновая sequence создана, но правки границ не применены: " + conformError.message);
+            log("Исправления остались подготовленными в отчёте.", conformed, "error");
+            return;
+          }
+          setFinalReviewStatus("Создана и исправлена черновая sequence «" + cloned.draft.name + "».");
+          log("Финальная итерация применена только к черновой sequence.", conformed, "success");
+        });
+      });
     });
   }
 
   function bind() {
     byId("saveConfig").addEventListener("click", saveConfig);
     byId("refreshProjects").addEventListener("click", loadProjects);
+    byId("requestRetry").addEventListener("click", retryPendingRequest);
+    byId("checkConnection").addEventListener("click", checkConnection);
     byId("refreshWhisper").addEventListener("click", refreshWhisperStatusManually);
     byId("resumeWhisper").addEventListener("click", resumeTranscriptionJob);
     byId("cancelWhisper").addEventListener("click", cancelTranscriptionJob);
+    byId("startFinalReview").addEventListener("click", startFinalReview);
+    byId("startFinalReviewFromWav").addEventListener("click", startFinalReviewFromWav);
+    byId("applyFinalReview").addEventListener("click", applyFinalReview);
     byId("apiToken").addEventListener("change", function () {
       loadProjects();
       refreshWhisperStatus();
+      syncConfigCardOpenState();
+      hideManualRetry();
     });
-    byId("projectsRoot").addEventListener("change", loadProjects);
+    byId("projectsRoot").addEventListener("change", function () {
+      loadProjects();
+      syncConfigCardOpenState();
+      hideManualRetry();
+    });
     byId("projectName").addEventListener("change", function () {
       window.localStorage.setItem("roughCutStage2.project", byId("projectName").value);
       currentWhisperJobId = "";
       guideAudioPath = "";
       byId("guideOutputPath").value = defaultGuideOutput();
       refreshWhisperStatus();
+      syncConfigCardOpenState();
+      hideManualRetry();
       if (activeSource) {
         hydrateSourceForm(activeSource);
       }
@@ -1172,22 +1882,24 @@
     byId("clearLog").addEventListener("click", function () {
       byId("log").textContent = "";
     });
+    document.addEventListener("visibilitychange", handleVisibilityChange);
   }
 
   function init() {
     loadConfig();
     bind();
+    syncConfigCardOpenState();
     renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
     loadProjects();
     callHost("ping", undefined, function (error, response) {
       if (error) {
         setHostBadge("error", "Premiere: ошибка");
-        log("Модуль Premiere недоступен: " + error.message);
+        log("Модуль Premiere недоступен: " + error.message, undefined, "error");
         return;
       }
       setHostBadge("ok", response.host || "Premiere");
       byId("log").textContent = "";
-      log("Панель готова.", response);
+      log("Панель готова.", response, "success");
     });
   }
 
@@ -1197,8 +1909,23 @@
       formatDuration: formatDuration,
       refreshWhisperStatus: refreshWhisperStatus,
       refreshWhisperStatusManually: refreshWhisperStatusManually,
+      handleVisibilityChange: handleVisibilityChange,
+      pollExport: pollExport,
       loadFreshTimeline: loadFreshTimeline,
-      renderWhisperJob: renderWhisperJob
+      renderWhisperJob: renderWhisperJob,
+      sourceRegistrationBlockReason: sourceRegistrationBlockReason,
+      sourceIdentityMatchesSequence: sourceIdentityMatchesSequence,
+      registeredSourceGuard: registeredSourceGuard,
+      request: request,
+      log: log,
+      saveConfig: saveConfig,
+      hideManualRetry: hideManualRetry,
+      hasPendingManualRetry: function () {
+        return pendingManualRetry !== null;
+      },
+      getExportPollTerminalCallCount: function () {
+        return exportPollTerminalCallCount;
+      }
     };
   }
 

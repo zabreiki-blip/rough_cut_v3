@@ -4,13 +4,15 @@ from stage1.config import validate_env
 
 
 def test_validate_env_reports_typos_without_echoing_secrets() -> None:
-    warnings = validate_env({
-        "TTS_PROVIDER": "gemni",
-        "TTS_GENDER": "robot",
-        "MAX_ZK_BLOCKS": "forty",
-        "ROUGH_CUT_API_TOKEN": "",
-        "GEMINI_API_KEY": "super-secret",
-    })
+    warnings = validate_env(
+        {
+            "TTS_PROVIDER": "gemni",
+            "TTS_GENDER": "robot",
+            "MAX_ZK_BLOCKS": "forty",
+            "ROUGH_CUT_API_TOKEN": "",
+            "GEMINI_API_KEY": "super-secret",
+        }
+    )
 
     rendered = "\n".join(warnings)
     assert "TTS_PROVIDER" in rendered
@@ -21,13 +23,15 @@ def test_validate_env_reports_typos_without_echoing_secrets() -> None:
 
 
 def test_validate_env_accepts_valid_local_configuration() -> None:
-    warnings = validate_env({
-        "TTS_PROVIDER": "macos",
-        "TTS_GENDER": "female",
-        "ROUGH_CUT_API_TOKEN": "configured",
-        "MAX_ZK_BLOCKS": "40",
-        "MACOS_COMMAND_TIMEOUT": "900",
-        "MACOS_CONNECTOR_URL": "http://127.0.0.1:8001/synthesize",
-    })
+    warnings = validate_env(
+        {
+            "TTS_PROVIDER": "macos",
+            "TTS_GENDER": "female",
+            "ROUGH_CUT_API_TOKEN": "configured",
+            "MAX_ZK_BLOCKS": "40",
+            "MACOS_COMMAND_TIMEOUT": "900",
+            "MACOS_CONNECTOR_URL": "http://127.0.0.1:8001/synthesize",
+        }
+    )
 
     assert warnings == []

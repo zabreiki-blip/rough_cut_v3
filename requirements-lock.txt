@@ -1,0 +1,89 @@
+# Full pinned dependency snapshot (direct + transitive) for reproducibility.
+# Generated on Python 3.11.16 (matches CI/Docker target) with:
+#   python3.11 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements-dev.txt -r requirements-whisper.txt
+#   pip freeze --local > requirements-lock.txt
+#
+# This file is NOT installed directly by CI/Docker (they use
+# requirements.txt / requirements-dev.txt / requirements-whisper.txt,
+# which stay the source of truth for direct dependencies and version
+# ranges). Regenerate this snapshot after changing any requirements-*.txt
+# file, and re-run the full test suite before committing the update.
+# macOS Apple Silicon native mode uses a separate environment
+# (.venv-macos-arm64, requirements-macos-apple-silicon.txt) and is not
+# covered by this snapshot.
+
+annotated-types==0.8.0
+ast_serialize==0.8.0
+anyio==4.14.2
+av==18.1.0
+blinker==1.9.0
+certifi==2026.7.22
+cffi==2.1.1
+cfgv==3.5.0
+charset-normalizer==3.5.0
+click==8.4.2
+coloredlogs==15.0.1
+coverage==7.15.4
+cryptography==50.0.0
+ctranslate2==4.8.1
+distlib==0.4.3
+faster-whisper==1.2.1
+filelock==3.32.3
+Flask==3.0.3
+flatbuffers==25.12.19
+fsspec==2026.7.0
+google-auth==2.56.3
+google-genai==1.14.0
+gunicorn==22.0.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.27.0
+humanfriendly==10.0
+idna==3.18
+identify==2.6.19
+iniconfig==2.3.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+lxml==6.1.1
+librt==0.15.0
+MarkupSafe==3.0.3
+mpmath==1.3.0
+mypy==2.3.1
+mypy_extensions==1.1.0
+nodeenv==1.10.0
+numpy==2.4.6
+onnxruntime==1.19.2
+packaging==26.3
+pathspec==1.1.1
+pillow==12.3.0
+platformdirs==4.11.3
+pluggy==1.6.0
+protobuf==7.35.1
+pre_commit==4.6.2
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pytest==8.3.5
+pytest-cov==7.1.0
+pytest-timeout==2.4.0
+python-docx==1.1.2
+python-dotenv==1.2.2
+python-discovery==1.5.2
+PyYAML==6.0.3
+requests==2.32.3
+ruff==0.16.6
+sympy==1.14.0
+tenacity==8.5.0
+tokenizers==0.23.1
+tqdm==4.70.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.7.0
+virtualenv==21.7.4
+websockets==15.0.1
+Werkzeug==3.1.8

@@ -54,14 +54,17 @@ def _validate_placeholder_identities(timeline: FullTimeline) -> None:
         if seg.type not in {"snh", "host"} or not seg.placeholder_path:
             continue
         if not seg.block_uid or not re.fullmatch(r"[A-Za-z0-9._:-]+", seg.block_uid):
-            raise ValueError(
-                f"{seg.id} has no valid canonical block_uid for XML export"
-            )
+            raise ValueError(f"{seg.id} has no valid canonical block_uid for XML export")
         if seg.block_uid in seen:
-            raise ValueError(
-                f"duplicate placeholder block_uid in XML export: {seg.block_uid}"
-            )
+            raise ValueError(f"duplicate placeholder block_uid in XML export: {seg.block_uid}")
         seen.add(seg.block_uid)
+
+
+def _revision_label(parent: ET.Element, seg: TimelineSegment) -> None:
+    if seg.revision_status not in {"", "unchanged"}:
+        labels = _sub(parent, "labels")
+        # Premiere's built-in red/pink label is named "Rose" in FCP7 XML.
+        _sub(labels, "label2", "Rose")
 
 
 def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
@@ -80,8 +83,9 @@ def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
     _sub(audio, "channelcount", str(channels))
 
 
-def _video_file_el(parent: ET.Element, seg: TimelineSegment, fps: int,
-                   width: int, height: int) -> None:
+def _video_file_el(
+    parent: ET.Element, seg: TimelineSegment, fps: int, width: int, height: int
+) -> None:
     file_el = ET.SubElement(parent, "file")
     file_el.set("id", f"file-{seg.id}")
     _sub(file_el, "name", Path(seg.placeholder_path).name)
@@ -143,11 +147,13 @@ def build_xml(timeline: FullTimeline) -> str:
         if seg.type == "tech":
             continue
 
-        start_f = _frames(seg.start_sec, fps)
-        end_f = _frames(seg.end_sec, fps)
-        dur_f = end_f - start_f
-        if dur_f <= 0:
+        if seg.end_sec <= seg.start_sec:
             continue
+        start_f = _frames(seg.start_sec, fps)
+        # Independently rounded boundaries can collapse a valid sub-frame clip.
+        # Preserve it as the smallest duration representable by FCP XML.
+        end_f = max(_frames(seg.end_sec, fps), start_f + 1)
+        dur_f = end_f - start_f
 
         if seg.type == "zk" and seg.wav_path:
             ci = ET.SubElement(atrack, "clipitem")
@@ -165,6 +171,7 @@ def build_xml(timeline: FullTimeline) -> str:
             _sub(marker, "comment", seg.text[:200])
             _sub(marker, "in", "0")
             _sub(marker, "out", "-1")
+            _revision_label(ci, seg)
             _audio_file_el(ci, seg, fps)
             st = _sub(ci, "sourcetrack")
             _sub(st, "mediatype", "audio")
@@ -187,6 +194,7 @@ def build_xml(timeline: FullTimeline) -> str:
             _sub(marker, "comment", seg.text[:200])
             _sub(marker, "in", "0")
             _sub(marker, "out", "-1")
+            _revision_label(ci, seg)
             _video_file_el(ci, seg, fps, timeline.width, timeline.height)
             clip_idx += 1
 

@@ -43,6 +43,48 @@ def test_sync_source_round_trip_and_legacy_aliases() -> None:
     assert legacy.id == "legacy"
     assert legacy.premiere_sequence == "SYNC_LEGACY"
     assert legacy.guide_audio == "legacy.wav"
+    assert legacy.source_kind == "premiere_sequence"
+
+    # The additive fields must not shift the legacy positional arguments.
+    positional = SyncSource("positional", "Герой", "SYNC_POSITIONAL", ("Гость",))
+    assert positional.speakers == ("Гость",)
+    assert positional.source_kind == "premiere_sequence"
+
+
+def test_review_media_source_round_trip_and_proxy_name_alias() -> None:
+    source = SyncSource.from_dict(
+        {
+            "id": "brick_review_01",
+            "source_kind": "review_media",
+            "media_path": "/Volumes/L_BRICK/DOP/Брик_просмотровки/episode_01.mp4",
+            "media_fingerprint": "sha256:0123456789abcdef",
+            "proxy_sequence_id": "premiere-proxy-01",
+            "proxy_sequence_name": "RC_SRC_EPISODE_01",
+        }
+    )
+
+    assert source.premiere_sequence == "RC_SRC_EPISODE_01"
+    assert source.source_kind == "review_media"
+    assert SyncSource.from_dict(source.to_dict()) == source
+
+
+def test_review_media_source_requires_media_path_and_rejects_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="media_path"):
+        SyncSource.from_dict(
+            {
+                "id": "review",
+                "source_kind": "review_media",
+                "proxy_sequence_name": "RC_SRC_REVIEW",
+            }
+        )
+    with pytest.raises(ValueError, match="source kind"):
+        SyncSource.from_dict(
+            {
+                "id": "future",
+                "source_kind": "future_kind",
+                "premiere_sequence": "SYNC_FUTURE",
+            }
+        )
 
 
 def test_sync_source_round_trip_preserves_multi_speaker_scope() -> None:
@@ -166,6 +208,26 @@ def test_source_store_serializes_multi_speaker_scope_as_json() -> None:
         assert store.get("shared") == source
 
 
+def test_source_store_keeps_schema_v1_for_additive_review_media_fields() -> None:
+    with TemporaryDirectory() as temporary:
+        path = Path(temporary) / "sync_sources.json"
+        source = SyncSource.from_dict(
+            {
+                "id": "review",
+                "source_kind": "review_media",
+                "media_path": "/Volumes/reviews/review.mp4",
+                "proxy_sequence_name": "RC_SRC_REVIEW",
+            }
+        )
+
+        SyncSourceStore(path).save(source)
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == 1
+        assert payload["sources"][0]["source_kind"] == "review_media"
+        assert SyncSourceStore(path).get("review") == source
+
+
 def test_match_store_is_separate_and_preserves_scenario_file() -> None:
     with TemporaryDirectory() as temporary:
         work = Path(temporary)
@@ -182,9 +244,7 @@ def test_match_store_is_separate_and_preserves_scenario_file() -> None:
             source_out_sec=16.0,
             confidence=0.91,
             status="auto_matched",
-            alternatives=[
-                SyncAlternative("vasilieva_02", 40.0, 44.0, 0.61, "похожий текст")
-            ],
+            alternatives=[SyncAlternative("vasilieva_02", 40.0, 44.0, 0.61, "похожий текст")],
         )
         store.save(match)
 
@@ -206,26 +266,28 @@ def test_match_store_is_separate_and_preserves_scenario_file() -> None:
 def test_match_store_keeps_distinct_blocks_with_overlapping_ranges() -> None:
     with TemporaryDirectory() as temporary:
         store = SyncMatchStore(Path(temporary) / "sync_matches.json")
-        store.replace_all([
-            SyncMatch(
-                segment_id="teaser-block",
-                query_text="Короткий анонс",
-                source_id="interview-1",
-                source_in_sec=120.0,
-                source_out_sec=124.0,
-                confidence=0.98,
-                status="confirmed",
-            ),
-            SyncMatch(
-                segment_id="full-block",
-                query_text="Полный ответ героя",
-                source_id="interview-1",
-                source_in_sec=120.0,
-                source_out_sec=132.0,
-                confidence=0.98,
-                status="confirmed",
-            ),
-        ])
+        store.replace_all(
+            [
+                SyncMatch(
+                    segment_id="teaser-block",
+                    query_text="Короткий анонс",
+                    source_id="interview-1",
+                    source_in_sec=120.0,
+                    source_out_sec=124.0,
+                    confidence=0.98,
+                    status="confirmed",
+                ),
+                SyncMatch(
+                    segment_id="full-block",
+                    query_text="Полный ответ героя",
+                    source_id="interview-1",
+                    source_in_sec=120.0,
+                    source_out_sec=132.0,
+                    confidence=0.98,
+                    status="confirmed",
+                ),
+            ]
+        )
 
         restored = store.list()
         assert [item.segment_id for item in restored] == ["teaser-block", "full-block"]

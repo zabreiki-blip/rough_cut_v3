@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import json
 import logging
+import os
 import re
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
-from .config import get_settings
+from .config import Settings, get_settings
 from .io_utils import (
     extract_marked_blocks_from_docx,
     extract_paragraphs_from_docx,
     extract_text,
+    read_json,
     write_json,
 )
 from .models import NarrationBlock
+from .openrouter_client import SYSTEM_PROMPT as _OPENROUTER_SYSTEM_PROMPT
 from .openrouter_client import analyze_with_openrouter
 
 logger = logging.getLogger(__name__)
+
+# --- LLM analysis cache (per scenario chunk) ---
+# Increment when the cached payload shape or the classifier contract changes
+# so stale entries are transparently invalidated instead of misapplied.
+_LLM_CACHE_VERSION = 1
+_LLM_CACHE_MAX_ENTRIES = 2000
 
 # --- Regex patterns ---
 
@@ -59,7 +72,8 @@ SYNC_LINE_RE = re.compile(
 )
 # SNH label line: "СНХ Имя Фамилия, Файл ..."
 SNH_LABEL_RE = re.compile(
-    r"^\s*СНХ\s+\S", flags=re.I,
+    r"^\s*СНХ\s+\S",
+    flags=re.I,
 )
 INTERVIEW_SPEAKER_LINE_RE = re.compile(
     r"^\s*(?:СНХ\s+)?"
@@ -107,7 +121,11 @@ def _is_technical(text: str) -> bool:
     if TECH_PREFIX_RE.match(stripped):
         return True
     # Very short ALL-CAPS lines are likely technical markers
-    if len(stripped) < 50 and stripped == stripped.upper() and _match_narrator_marker_line(stripped) is None:
+    if (
+        len(stripped) < 50
+        and stripped == stripped.upper()
+        and _match_narrator_marker_line(stripped) is None
+    ):
         return True
     return False
 
@@ -149,6 +167,7 @@ def _split_long_text(text: str, max_len: int = 300) -> Iterable[str]:
 
 
 # === Extraction strategies ===
+
 
 def _from_docx_formatting(input_path: Path) -> tuple[list[NarrationBlock], str]:
     """Primary strategy: use bold/formatting from .docx to identify voiceover.
@@ -201,12 +220,14 @@ def _from_docx_formatting(input_path: Path) -> tuple[list[NarrationBlock], str]:
         if not text or len(text) < 10:
             continue
 
-        blocks.append(NarrationBlock(
-            id="",
-            text_original=text,
-            text_for_tts=text,
-            notes="docx_formatting",
-        ))
+        blocks.append(
+            NarrationBlock(
+                id="",
+                text_original=text,
+                text_for_tts=text,
+                notes="docx_formatting",
+            )
+        )
 
     return blocks, "docx_formatting"
 
@@ -234,12 +255,14 @@ def _from_marked_docx(input_path: Path) -> list[NarrationBlock]:
         text = text.strip()
         if not text:
             continue
-        blocks.append(NarrationBlock(
-            id="",
-            text_original=text,
-            text_for_tts=text,
-            notes="manual_highlight",
-        ))
+        blocks.append(
+            NarrationBlock(
+                id="",
+                text_original=text,
+                text_for_tts=text,
+                notes="manual_highlight",
+            )
+        )
     return blocks
 
 
@@ -284,7 +307,11 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
         elif current_start is not None:
             if not stripped:
                 flush_current()
-            elif _is_speaker_or_snh(stripped) or _is_sync_or_interview(stripped) or _is_technical(stripped):
+            elif (
+                _is_speaker_or_snh(stripped)
+                or _is_sync_or_interview(stripped)
+                or _is_technical(stripped)
+            ):
                 flush_current()
             else:
                 current_lines.append(stripped)
@@ -309,6 +336,7 @@ def _extract_manual_narrator_blocks(scenario_text: str) -> list[NarrationBlock]:
 
 
 # === Text cleanup ===
+
 
 def _strip_speaker_cues(text: str) -> str:
     if not text:
@@ -386,18 +414,21 @@ def _cleanup_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
         text_for_tts = _strip_technical_cues(text_for_tts)
         if not text_for_tts or len(text_for_tts) < 5:
             continue
-        cleaned_blocks.append(NarrationBlock(
-            id=block.id,
-            text_original=text_original or text_for_tts,
-            text_for_tts=text_for_tts,
-            pause_ms=block.pause_ms,
-            notes=block.notes,
-            source_spans=list(block.source_spans),
-        ))
+        cleaned_blocks.append(
+            NarrationBlock(
+                id=block.id,
+                text_original=text_original or text_for_tts,
+                text_for_tts=text_for_tts,
+                pause_ms=block.pause_ms,
+                notes=block.notes,
+                source_spans=list(block.source_spans),
+            )
+        )
     return cleaned_blocks
 
 
 # === LLM ===
+
 
 def _chunk_for_llm(scenario_text: str, max_chars: int = 6000) -> list[str]:
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", scenario_text) if p.strip()]
@@ -432,6 +463,7 @@ def _chunk_for_llm(scenario_text: str, max_chars: int = 6000) -> list[str]:
 
 # === Fallback ===
 
+
 def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
     marker_re = re.compile(r"^\s*(zk\d+)\s*[:\-–]\s*(.+?)\s*$", flags=re.I | re.M)
     marker_items = marker_re.findall(scenario_text)
@@ -439,11 +471,13 @@ def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
 
     if marker_items:
         for idx, (_, text) in enumerate(marker_items, start=1):
-            blocks.append(NarrationBlock(
-                id=f"zk{idx}",
-                text_original=text.strip(),
-                text_for_tts=text.strip(),
-            ))
+            blocks.append(
+                NarrationBlock(
+                    id=f"zk{idx}",
+                    text_original=text.strip(),
+                    text_for_tts=text.strip(),
+                )
+            )
         return blocks
 
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", scenario_text) if p.strip()]
@@ -459,16 +493,19 @@ def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
         if _is_sync_or_interview(paragraph):
             continue
         for piece in _split_long_text(paragraph):
-            blocks.append(NarrationBlock(
-                id=f"zk{idx}",
-                text_original=piece,
-                text_for_tts=piece,
-            ))
+            blocks.append(
+                NarrationBlock(
+                    id=f"zk{idx}",
+                    text_original=piece,
+                    text_for_tts=piece,
+                )
+            )
             idx += 1
     return blocks
 
 
 # === Numbering & merging ===
+
 
 def _renumber_blocks(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
     for idx, block in enumerate(blocks, start=1):
@@ -503,7 +540,9 @@ def _merge_adjacent_pair(
 ) -> NarrationBlock:
     return NarrationBlock(
         id="",
-        text_original=_join_block_text(left.text_original, right.text_original, separator=separator),
+        text_original=_join_block_text(
+            left.text_original, right.text_original, separator=separator
+        ),
         text_for_tts=_join_block_text(left.text_for_tts, right.text_for_tts, separator=separator),
         pause_ms=max(left.pause_ms, right.pause_ms),
         notes=_merge_block_notes(left.notes, right.notes),
@@ -639,13 +678,132 @@ def _merge_blocks_to_limit(blocks: list[NarrationBlock], max_blocks: int) -> lis
     return merged
 
 
+def _llm_cache_path(output_path: Path) -> Path:
+    parent = Path(output_path).parent
+    work_dir = parent if parent.name == "work" else parent / "work"
+    return work_dir / "analysis_llm_cache.json"
+
+
+def _load_llm_cache(path: Path) -> dict[str, Any]:
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"version": _LLM_CACHE_VERSION, "entries": {}}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _LLM_CACHE_VERSION
+        or not isinstance(payload.get("entries"), dict)
+    ):
+        return {"version": _LLM_CACHE_VERSION, "entries": {}}
+    return payload
+
+
+def _llm_identity(settings: Settings) -> dict[str, Any]:
+    """Fingerprint of the LLM configuration used for a chunk analysis call.
+
+    Any change to the model/provider/prompt must invalidate previously
+    cached results, so every field ``analyze_with_openrouter`` relies on is
+    represented here explicitly.
+    """
+    return {
+        "kind": "openrouter",
+        "model": settings.openrouter_model,
+        "base_url": settings.openrouter_base_url,
+        "temperature": 0.2,
+        "response_format": "json_object",
+        "system_prompt": _OPENROUTER_SYSTEM_PROMPT,
+    }
+
+
+def _llm_cache_fingerprint(chunk: str, *, identity: dict[str, Any]) -> str:
+    material = {
+        "version": _LLM_CACHE_VERSION,
+        "chunk": chunk,
+        "identity": identity,
+    }
+    return sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _serialize_llm_blocks(blocks: list[NarrationBlock]) -> list[dict[str, Any]] | None:
+    try:
+        payload = [block.to_dict() for block in blocks]
+        json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return payload
+
+
+def _deserialize_llm_blocks(payload: Any) -> list[NarrationBlock] | None:
+    if not isinstance(payload, list):
+        return None
+    blocks: list[NarrationBlock] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            return None
+        try:
+            blocks.append(
+                NarrationBlock(
+                    id=str(item.get("id", "")),
+                    text_original=str(item.get("text_original", "")),
+                    text_for_tts=str(item.get("text_for_tts", "")),
+                    pause_ms=int(item.get("pause_ms", 300)),
+                    notes=str(item.get("notes", "")),
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+    return blocks
+
+
+def _cached_llm_blocks(cache: dict[str, Any], cache_key: str) -> list[NarrationBlock] | None:
+    entry = cache.get("entries", {}).get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    return _deserialize_llm_blocks(entry.get("blocks"))
+
+
+def _cache_llm_blocks(
+    path: Path,
+    cache: dict[str, Any],
+    cache_key: str,
+    blocks: list[NarrationBlock],
+) -> bool:
+    serialized = _serialize_llm_blocks(blocks)
+    if serialized is None:
+        return False
+    entries = cache.setdefault("entries", {})
+    entries[cache_key] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "blocks": serialized,
+    }
+    if len(entries) > _LLM_CACHE_MAX_ENTRIES:
+        oldest = sorted(entries, key=lambda key: str(entries[key].get("created_at") or ""))[
+            : len(entries) - _LLM_CACHE_MAX_ENTRIES
+        ]
+        for key in oldest:
+            entries.pop(key, None)
+    cache["version"] = _LLM_CACHE_VERSION
+    try:
+        write_json(path, cache)
+    except (OSError, TypeError, ValueError):
+        entries.pop(cache_key, None)
+        return False
+    return True
+
+
 # === Main entry point ===
+
 
 def analyze_script(
     input_path: Path,
     output_path: Path,
     raw_output_path: Path,
     use_llm: bool = True,
+    usage_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -692,14 +850,60 @@ def analyze_script(
                 if not chunks:
                     chunks = [scenario_text]
 
-                for idx, chunk in enumerate(chunks, start=1):
-                    try:
-                        chunk_blocks = analyze_with_openrouter(settings, chunk)
-                        llm_blocks.extend(chunk_blocks)
+                try:
+                    configured_workers = int(os.getenv("ANALYZER_LLM_WORKERS", "4"))
+                except ValueError:
+                    configured_workers = 4
+                max_workers = max(1, min(4, configured_workers))
+
+                cache_path = _llm_cache_path(output_path)
+                cache = _load_llm_cache(cache_path)
+                identity = _llm_identity(settings)
+                cache_keys = [_llm_cache_fingerprint(chunk, identity=identity) for chunk in chunks]
+
+                chunk_results: list[list[NarrationBlock] | None] = [None] * len(chunks)
+                chunk_success = [False] * len(chunks)
+                pending: list[int] = []
+                for idx, (chunk, cache_key) in enumerate(zip(chunks, cache_keys)):
+                    cached = _cached_llm_blocks(cache, cache_key)
+                    if cached is None:
+                        pending.append(idx)
+                    else:
+                        chunk_results[idx] = cached
+                        chunk_success[idx] = True
+
+                if pending:
+                    with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
+                        if usage_callback is None:
+                            futures = {
+                                idx: pool.submit(analyze_with_openrouter, settings, chunks[idx])
+                                for idx in pending
+                            }
+                        else:
+                            futures = {
+                                idx: pool.submit(
+                                    analyze_with_openrouter,
+                                    settings,
+                                    chunks[idx],
+                                    usage_callback,
+                                )
+                                for idx in pending
+                            }
+                        # Consume in source order so output and error reporting stay stable.
+                        for idx in pending:
+                            try:
+                                result_blocks = futures[idx].result()
+                                chunk_results[idx] = result_blocks
+                                chunk_success[idx] = True
+                                _cache_llm_blocks(cache_path, cache, cache_keys[idx], result_blocks)
+                            except Exception as exc:
+                                llm_errors.append(f"chunk {idx + 1}: {type(exc).__name__}: {exc}")
+                                chunk_results[idx] = _fallback_blocks(chunks[idx])
+
+                for idx in range(len(chunks)):
+                    llm_blocks.extend(chunk_results[idx] or [])
+                    if chunk_success[idx]:
                         llm_success_chunks += 1
-                    except Exception as exc:
-                        llm_errors.append(f"chunk {idx}: {type(exc).__name__}: {exc}")
-                        llm_blocks.extend(_fallback_blocks(chunk))
 
                 blocks = llm_blocks if llm_blocks else _fallback_blocks(scenario_text)
                 used_llm = llm_success_chunks > 0

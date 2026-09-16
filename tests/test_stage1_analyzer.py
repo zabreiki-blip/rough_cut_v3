@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -183,6 +184,50 @@ class Stage1AnalyzerTests(unittest.TestCase):
             self.assertEqual(result["llm_errors_count"], 1)
             self.assertIn("temporary LLM error", payload["llm_errors"][0])
             self.assertEqual(len(payload["items"]), 1)
+
+    def test_llm_chunks_run_concurrently_but_keep_source_order(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            input_path = tmp / "scenario.txt"
+            output_path = tmp / "scenario_prepared.json"
+            raw_output_path = tmp / "scenario_raw.txt"
+            input_path.write_text("source text", encoding="utf-8")
+            chunks = ["first chunk", "second chunk"]
+            both_started = threading.Event()
+            lock = threading.Lock()
+            started = 0
+
+            def analyze_chunk(_settings, chunk):
+                nonlocal started
+                with lock:
+                    started += 1
+                    if started == 2:
+                        both_started.set()
+                if not both_started.wait(timeout=1):
+                    raise RuntimeError("chunks were processed serially")
+                text = "A" * 60 if chunk == "first chunk" else "B" * 60
+                return [NarrationBlock(id="", text_original=text, text_for_tts=text)]
+
+            with (
+                patch.dict(
+                    os.environ, {"OPENROUTER_API_KEY": "test-key", "ANALYZER_LLM_WORKERS": "2"}
+                ),
+                patch("stage1.analyzer._chunk_for_llm", return_value=chunks),
+                patch("stage1.analyzer.analyze_with_openrouter", side_effect=analyze_chunk),
+            ):
+                result = analyze_script(
+                    input_path=input_path,
+                    output_path=output_path,
+                    raw_output_path=raw_output_path,
+                    use_llm=True,
+                )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["used_llm"])
+            self.assertEqual(
+                [item["text_for_tts"] for item in payload["items"]],
+                ["A" * 60, "B" * 60],
+            )
 
 
 if __name__ == "__main__":

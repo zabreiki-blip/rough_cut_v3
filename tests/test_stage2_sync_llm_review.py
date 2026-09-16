@@ -12,7 +12,11 @@ class _Response:
         return None
 
     def json(self):
-        return {"choices": [{"message": {"content": self.content}}]}
+        return {
+            "id": "gen-review",
+            "usage": {"cost": 0.0011},
+            "choices": [{"message": {"content": self.content}}],
+        }
 
 
 def _settings():
@@ -32,6 +36,7 @@ def _candidates():
 
 def test_llm_can_only_choose_a_supplied_candidate():
     calls = []
+    usage = []
 
     def request(url, **kwargs):
         calls.append((url, kwargs))
@@ -43,12 +48,15 @@ def test_llm_can_only_choose_a_supplied_candidate():
         candidates=_candidates(),
         settings=_settings(),
         request_fn=request,
+        usage_callback=usage.append,
     )
     assert result is not None
     assert result.candidate_index == 1
     assert result.confidence == 0.91
     assert calls[0][0] == "https://example.test/v1/chat/completions"
     assert calls[0][1]["json"]["temperature"] == 0
+    assert usage[0]["generation_id"] == "gen-review"
+    assert usage[0]["cost_usd"] == "0.0011"
 
 
 def test_llm_may_reject_every_candidate():

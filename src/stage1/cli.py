@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 import sys
 
+from logging_config import configure_logging
+from project_service import project_paths
+from stage4.revision_assets import save_tts_manifest
+
 from .analyzer import analyze_script
 from .gemini_tts import synthesize_phrase, synthesize_tts
 from .normalizer import (
@@ -22,6 +26,24 @@ def _print_progress(event: dict) -> None:
     label = str(event.get("event") or "progress")
     suffix = f" {block_id}" if block_id else ""
     print(f"[{completed}/{total}] {label}{suffix}", file=sys.stderr, flush=True)
+
+
+def _save_cli_revision_assets(
+    prepared_path: Path,
+    speaker_dir: Path,
+    result: dict,
+) -> None:
+    """Persist revision metadata when CLI paths use the standard project layout."""
+    prepared = prepared_path.resolve()
+    speaker = speaker_dir.resolve()
+    if prepared.parent.name != "work":
+        return
+    project_root = prepared.parent.parent
+    if speaker != project_root / "speaker":
+        return
+    paths = project_paths(project_root.name, project_root.parent)
+    if paths["normalized"].is_file():
+        save_tts_manifest(paths, result)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -156,6 +178,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_logging()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -170,9 +193,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "synthesize":
+        prepared_path = Path(args.prepared_path)
+        speaker_dir = Path(args.speaker_dir)
         result = synthesize_tts(
-            prepared_path=Path(args.prepared_path),
-            speaker_dir=Path(args.speaker_dir),
+            prepared_path=prepared_path,
+            speaker_dir=speaker_dir,
             provider=args.provider,
             voice_name=args.voice_name,
             gender=args.gender,
@@ -180,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             speed=args.speed,
             progress_callback=_print_progress,
         )
+        _save_cli_revision_assets(prepared_path, speaker_dir, result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
@@ -221,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             speed=args.speed,
             progress_callback=_print_progress,
         )
+        _save_cli_revision_assets(Path(args.prepared), Path(args.speaker), synthesis)
         validation = validate_stage1(
             prepared_path=Path(args.prepared),
             speaker_dir=Path(args.speaker),
