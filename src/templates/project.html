@@ -101,12 +101,36 @@
         </div>
         <div id="revisions_summary_chips" class="revisions-summary-chips"></div>
 
+        <div class="revisions-mode-switch" role="tablist" aria-label="Режим просмотра изменений">
+          <button type="button" class="mode-tab active" data-mode="list" role="tab" aria-selected="true">Список изменений</button>
+          <button type="button" class="mode-tab" data-mode="map" role="tab" aria-selected="false">Карта перемещений</button>
+        </div>
+
         <div id="revisions_compare_state" class="revisions-compare-state" hidden>
           <p id="revisions_compare_state_text"></p>
           <button id="btn_revisions_compare_retry" class="btn btn-sm" type="button" hidden>Повторить</button>
         </div>
 
-        <div id="revisions_map_view" class="revisions-map-view">
+        <div id="revision_filters_bar" class="revision-toolbar-controls">
+          <div class="revision-filter-bar" role="group" aria-label="Фильтр изменений">
+            <button type="button" class="revision-filter active" data-filter="all" aria-pressed="true">Все</button>
+            <button type="button" class="revision-filter" data-filter="edited" aria-pressed="false">Изменено</button>
+            <button type="button" class="revision-filter" data-filter="added" aria-pressed="false">Добавлено</button>
+            <button type="button" class="revision-filter" data-filter="removed" aria-pressed="false">Удалено</button>
+            <button type="button" class="revision-filter" data-filter="moved" aria-pressed="false">Перемещено</button>
+          </div>
+          <div class="revision-search-nav">
+            <input type="search" id="revision_search" class="revision-search-input" placeholder="Поиск по тексту или спикеру" aria-label="Поиск по тексту или спикеру">
+            <div class="revision-nav-buttons">
+              <button type="button" id="btn_revision_prev" class="btn btn-sm">← Предыдущее</button>
+              <button type="button" id="btn_revision_next" class="btn btn-sm">Следующее →</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="revision_changes_list" class="revision-changes-list"></div>
+
+        <div id="revisions_map_view" class="revisions-map-view" hidden>
           <div class="dashboard-legend">
             <span class="dashboard-legend-item" data-status="unchanged"><i></i>Без изменений</span>
             <span class="dashboard-legend-item" data-status="edited"><i></i>Изменён</span>

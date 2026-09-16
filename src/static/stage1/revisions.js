@@ -31,7 +31,7 @@ const revisionFilterLabels = {
 };
 
 const revisionsState = {
-  revisions: [], changes: [], oldLabel: "", newLabel: "",
+  revisions: [], changes: [], mode: "list", oldLabel: "", newLabel: "",
   filter: "all", search: "", activeCardIndex: -1, integrity: null,
 };
 
@@ -879,7 +879,9 @@ function setCompareState(state, message) {
       || (state === "loading" ? "Загружаем сравнение…" : "Не удалось открыть сравнение.");
   }
   if (ids.btn_revisions_compare_retry) ids.btn_revisions_compare_retry.hidden = state !== "error";
-  if (ids.revisions_map_view) ids.revisions_map_view.hidden = isOverlay;
+  if (ids.revision_filters_bar) ids.revision_filters_bar.hidden = isOverlay;
+  if (ids.revision_changes_list) ids.revision_changes_list.hidden = isOverlay ? true : revisionsState.mode !== "list";
+  if (ids.revisions_map_view) ids.revisions_map_view.hidden = isOverlay ? true : revisionsState.mode !== "map";
 }
 
 let selectedDiffRequest = 0;
@@ -902,7 +904,10 @@ async function loadSelectedDiff(diffId) {
     revisionsState.changes = diff.changes || [];
     renderSummaryChips(diff.summary || {});
     setCompareState("idle");
-    renderDashboardGraph(revisionsState.changes);
+    renderChangesList();
+    if (revisionsState.mode === "map") {
+      renderDashboardGraph(revisionsState.changes);
+    }
   } catch (err) {
     if (requestId !== selectedDiffRequest) return;
     setCompareState("error", "Не удалось открыть сравнение.");
@@ -929,6 +934,7 @@ export async function loadRevisionsScreen(quiet) {
       updateCompareHeading(null, null);
       renderSummaryChips({});
       setCompareState("idle");
+      renderChangesList("Загрузите следующую редакцию, чтобы увидеть изменения");
       dashboardShowEmpty("Загрузите следующую редакцию, чтобы увидеть изменения");
       return;
     }
@@ -945,6 +951,34 @@ if (ids.btn_revisions_compare_retry) {
   ids.btn_revisions_compare_retry.addEventListener("click", () => {
     safely(() => loadRevisionsScreen(false));
   });
+}
+
+const dashboardMobileQuery = window.matchMedia("(max-width: 760px)");
+
+function setRevisionsMode(mode) {
+  if (mode === "map" && dashboardMobileQuery.matches) return;
+  revisionsState.mode = mode;
+  document.querySelectorAll(".mode-tab").forEach((btn) => {
+    const active = btn.dataset.mode === mode;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  if (ids.revision_changes_list) ids.revision_changes_list.hidden = mode !== "list";
+  if (ids.revisions_map_view) ids.revisions_map_view.hidden = mode !== "map";
+  if (mode === "map") renderDashboardGraph(revisionsState.changes);
+}
+
+document.querySelectorAll(".mode-tab").forEach((tab) => {
+  tab.addEventListener("click", () => setRevisionsMode(tab.dataset.mode));
+});
+
+function enforceMobileListMode() {
+  if (dashboardMobileQuery.matches && revisionsState.mode === "map") {
+    setRevisionsMode("list");
+  }
+}
+if (typeof dashboardMobileQuery.addEventListener === "function") {
+  dashboardMobileQuery.addEventListener("change", enforceMobileListMode);
 }
 
 if (ids.dashboard_revision_select) {
