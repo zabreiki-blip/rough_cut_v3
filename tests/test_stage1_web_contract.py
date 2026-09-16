@@ -46,6 +46,10 @@ def test_voiceover_can_be_cleared_with_explicit_confirmation() -> None:
 
 
 def test_tts_and_sync_polling_retry_transient_errors_with_bounded_backoff() -> None:
+    assert "export const FETCH_TIMEOUT_MS = 30000;" in STAGE1_JS
+    assert "new AbortController()" in STAGE1_JS
+    assert "timeout.status = 408;" in STAGE1_JS
+    assert STAGE1_JS.count("fetchWithTimeout(") >= 5
     assert "const MAX_POLL_BACKOFF_MS = 10000;" in STAGE1_JS
     assert "function isTransientPollingError(error)" in STAGE1_JS
     assert "function pollingBackoffMs(failures, baseDelay)" in STAGE1_JS
@@ -159,7 +163,7 @@ def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     assert "if (requestId !== selectedDiffRequest) return;" in STAGE1_JS
     assert "Активная редакция не определена" in STAGE1_JS
     assert "const recoveryRequired = revisionsState.integrity?.blocking === true;" in STAGE1_JS
-    assert "data-action=\"reconcile-revision\"" in STAGE1_JS
+    assert 'data-action="reconcile-revision"' in STAGE1_JS
     assert "use_llm: Boolean(ids.normalization_use_llm?.checked)" in STAGE1_JS
 
 

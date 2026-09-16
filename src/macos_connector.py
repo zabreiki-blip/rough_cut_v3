@@ -6,6 +6,7 @@ from functools import lru_cache
 import subprocess
 
 from flask import Flask, Response, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from env_utils import env_int
 from logging_config import configure_logging
@@ -32,6 +33,11 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
         minimum=min_value,
         maximum=max_value,
     )
+
+
+app.config["MAX_CONTENT_LENGTH"] = _env_int(
+    "MACOS_CONNECTOR_MAX_REQUEST_BODY_BYTES", 256 * 1024, 64 * 1024, 4 * 1024 * 1024
+)
 
 
 def _to_int(value, default: int, min_value: int, max_value: int) -> int:
@@ -103,6 +109,11 @@ def shutil_which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
 
+@app.errorhandler(RequestEntityTooLarge)
+def request_entity_too_large(_exc: RequestEntityTooLarge):
+    return jsonify({"ok": False, "error": "request body is too large"}), 413
+
+
 @app.post("/synthesize")
 def synthesize():
     if not os.getenv("MACOS_CONNECTOR_TOKEN", "").strip():
@@ -140,7 +151,8 @@ def synthesize():
     try:
         wav = _run_say_and_convert(text=text, voice=voice, rate=rate, sample_rate=sample_rate)
     except RuntimeError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        app.logger.exception("macOS synthesis failed", exc_info=exc)
+        return jsonify({"ok": False, "error": "macOS synthesis failed"}), 500
 
     headers = {"X-Voice-Used": voice or "default"}
     return Response(wav, status=200, mimetype="audio/wav", headers=headers)

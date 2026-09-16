@@ -156,9 +156,7 @@ def test_inserting_voiceover_before_existing_keeps_old_audio_by_block_uid(
     old_mapping = _entry_for_uid(active_manifest, "voice-stable")
     assert old_mapping["id"] == "zk2"
     assert _asset_path(old_mapping, paths["root"]).read_bytes() == old_audio
-    assert (
-        revision_speaker_alias_dir(paths, "rev_0002") / "zk2.wav"
-    ).read_bytes() == old_audio
+    assert (revision_speaker_alias_dir(paths, "rev_0002") / "zk2.wav").read_bytes() == old_audio
 
 
 def test_activating_old_revision_restores_prepared_and_audio_mapping(
@@ -206,9 +204,7 @@ def test_activating_old_revision_restores_prepared_and_audio_mapping(
     assert [entry["block_uid"] for entry in _manifest_entries(restored_manifest)] == [
         "voice-stable"
     ]
-    assert (
-        revision_speaker_alias_dir(paths, "rev_0001") / "zk1.wav"
-    ).read_bytes() == old_audio
+    assert (revision_speaker_alias_dir(paths, "rev_0001") / "zk1.wav").read_bytes() == old_audio
 
     rev2 = _read_json(paths["scenario_versions"] / "rev_0002.json")
     saved_rev2_manifest = _read_json(
@@ -220,7 +216,10 @@ def test_activating_old_revision_restores_prepared_and_audio_mapping(
     activate_revision("rev_0002", paths)
     assert _read_json(paths["timeline"])["revision"] == "rev_0002"
     assert _read_json(paths["sync_matches"])["matches"][0]["segment_id"] == "new-import-uid"
-    assert _read_json(paths["work"] / "stage3_source_mapping.json")["scenario_revision_id"] == "rev_0002"
+    assert (
+        _read_json(paths["work"] / "stage3_source_mapping.json")["scenario_revision_id"]
+        == "rev_0002"
+    )
 
 
 def test_legacy_zk_audio_is_migrated_once_and_reused_as_immutable_asset(

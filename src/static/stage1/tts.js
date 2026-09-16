@@ -109,6 +109,9 @@ async function doTTS() {
   const jobId = String(start.job_id || "").trim();
   if (!jobId) throw new Error("TTS job start failed: empty job_id");
   currentTtsJobId = jobId;
+  const statusUrl = String(
+    start.status_url || `/stage1/tts-jobs/${encodeURIComponent(jobId)}?project=${encodeURIComponent(project)}`,
+  );
   appState.currentTtsJobStatus = String(start.status || "queued").toLowerCase();
   if (ids.btn_tts_cancel) ids.btn_tts_cancel.hidden = false;
 
@@ -119,7 +122,7 @@ async function doTTS() {
   while (true) {
     let state;
     try {
-      state = await getJSON(`/stage1/tts-jobs/${encodeURIComponent(jobId)}`);
+      state = await getJSON(statusUrl);
       pollFailures = 0;
     } catch (err) {
       if (!isTransientPollingError(err)) throw err;

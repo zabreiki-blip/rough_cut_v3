@@ -149,6 +149,14 @@ def _stage1_normalization_job_start(services: ModuleType):
 def _stage1_normalization_job_get(services: ModuleType, job_id: str):
     job = services._get_normalization_job(job_id)
     if job is None:
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+        except ValueError as exc:
+            return services._json_error(str(exc), 400)
+        persisted = services._load_persisted_normalization_job(project)
+        if persisted and str(persisted.get("id") or "") == job_id:
+            job = persisted
+    if job is None:
         return services._json_error("normalization job not found", 404)
     return jsonify({"ok": True, "result": job})
 
@@ -583,7 +591,7 @@ def _stage1_tts_job_start(services: ModuleType):
                 "project": project,
                 "job_id": job["id"],
                 "status": "queued",
-                "status_url": f"/stage1/tts-jobs/{job['id']}",
+                "status_url": f"/stage1/tts-jobs/{job['id']}?project={project}",
             },
         }
     )
@@ -591,6 +599,14 @@ def _stage1_tts_job_start(services: ModuleType):
 
 def _stage1_tts_job_status(services: ModuleType, job_id: str):
     job = services._get_tts_job(job_id)
+    if not job:
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+        except ValueError as exc:
+            return services._json_error(str(exc), 400)
+        persisted = services._load_persisted_tts_job(project)
+        if persisted and str(persisted.get("id") or "") == job_id:
+            job = persisted
     if not job:
         return services._json_error("job not found", 404)
     return jsonify({"ok": True, "result": job})

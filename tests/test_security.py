@@ -137,6 +137,29 @@ class ApiAuthenticationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["ok"])
 
+    def test_request_body_limit_preserves_audio_limit_plus_multipart_headroom(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SYNC_AUDIO_MAX_BYTES": "1000000",
+                "ROUGH_CUT_MAX_REQUEST_BODY_BYTES": "1",
+            },
+            clear=False,
+        ):
+            limit = api._request_body_limit()
+
+        self.assertEqual(limit, 1000000 + api._REQUEST_BODY_MULTIPART_HEADROOM)
+
+    def test_request_body_limit_returns_json_413(self) -> None:
+        previous = api.app.config["MAX_CONTENT_LENGTH"]
+        self.addCleanup(api.app.config.__setitem__, "MAX_CONTENT_LENGTH", previous)
+        api.app.config["MAX_CONTENT_LENGTH"] = 1
+
+        response = self.client.post("/stage1/analyze", json={"project": "demo"})
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.get_json()["error"], "request body is too large")
+
 
 class MacosConnectorAuthenticationTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -182,6 +205,27 @@ class MacosConnectorAuthenticationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, fake_wav)
         synthesize.assert_called_once()
+
+    def test_synthesis_failure_does_not_expose_raw_connector_error(self) -> None:
+        secret = "connector-internal-secret-123"
+        with (
+            patch.dict(os.environ, {"MACOS_CONNECTOR_TOKEN": "correct-token"}),
+            patch.object(macos_connector, "shutil_which", return_value="/usr/bin/tool"),
+            patch.object(
+                macos_connector,
+                "_run_say_and_convert",
+                side_effect=RuntimeError(f"say failed: {secret}"),
+            ),
+        ):
+            response = self.client.post(
+                "/synthesize",
+                json={"text": "Тест"},
+                headers={"Authorization": "Bearer correct-token"},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["error"], "macOS synthesis failed")
+        self.assertNotIn(secret, response.get_data(as_text=True))
 
     def test_voice_inventory_is_cached_between_blocks(self) -> None:
         result = subprocess.CompletedProcess(

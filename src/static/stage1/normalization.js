@@ -290,7 +290,7 @@ export async function generateNormalization() {
   while (["queued", "running"].includes(String(state.status || "").toLowerCase())) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     state = await requestJSON(
-      `/stage1/normalization-jobs/${encodeURIComponent(jobId)}`,
+      `/stage1/normalization-jobs/${encodeURIComponent(jobId)}?project=${encodeURIComponent(project)}`,
       "GET",
     );
   }

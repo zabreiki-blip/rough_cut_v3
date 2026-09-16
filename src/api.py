@@ -24,6 +24,7 @@ except ImportError:
     pass
 
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from api_core_routes import register_core_routes
 import api_final_review_jobs as final_review_jobs
@@ -126,8 +127,35 @@ from stage4.revision_assets import (
 from stage4.versioning import inspect_revision_state, repair_active_revision_metadata
 
 
+_DEFAULT_SYNC_AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024
+_REQUEST_BODY_MULTIPART_HEADROOM = 16 * 1024 * 1024
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _request_body_limit() -> int:
+    """Return a configurable Flask body limit without breaking large WAV uploads.
+
+    ``SYNC_AUDIO_MAX_BYTES`` limits WAV bytes after multipart parsing. Flask's
+    request limit must leave room for multipart metadata, otherwise a valid
+    maximum-size audio upload would be rejected before the streaming guard.
+    """
+
+    sync_audio_limit = _positive_env_int("SYNC_AUDIO_MAX_BYTES", _DEFAULT_SYNC_AUDIO_MAX_BYTES)
+    minimum = sync_audio_limit + _REQUEST_BODY_MULTIPART_HEADROOM
+    configured = _positive_env_int("ROUGH_CUT_MAX_REQUEST_BODY_BYTES", minimum)
+    return max(configured, minimum)
+
+
 configure_logging()
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = _request_body_limit()
 _CONFIG_WARNINGS = validate_env()
 for _warning in _CONFIG_WARNINGS:
     app.logger.warning("Configuration: %s", _warning)
@@ -316,6 +344,11 @@ def add_cep_cors_headers(response):
 
 def _json_error(message: str, status_code: int = 400):
     return jsonify({"ok": False, "error": message}), status_code
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_entity_too_large(_exc: RequestEntityTooLarge):
+    return _json_error("request body is too large", 413)
 
 
 def _internal_error(exc: Exception):
@@ -549,9 +582,7 @@ def _build_status(project: str) -> dict:
     prepared_items = prepared.get("items", []) if isinstance(prepared, dict) else []
     manifest_items = manifest.get("items", []) if isinstance(manifest, dict) else []
 
-    active_speaker_dir = _revision_speaker_dir(
-        paths, normalization.get("scenario_revision_id")
-    )
+    active_speaker_dir = _revision_speaker_dir(paths, normalization.get("scenario_revision_id"))
     wav_paths = [p for p in active_speaker_dir.glob("zk*.wav") if p.is_file()]
     wav_files = sorted(p.name for p in wav_paths)
 

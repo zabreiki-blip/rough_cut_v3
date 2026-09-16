@@ -146,9 +146,7 @@ def _downstream_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
     return changed
 
 
-def _restore_exact_auto_classifications(
-    old_blocks: list[dict], new_blocks: list[dict]
-) -> None:
+def _restore_exact_auto_classifications(old_blocks: list[dict], new_blocks: list[dict]) -> None:
     """Keep a confirmed classification when auto-classification changes it.
 
     An unmarked paragraph can receive a different LLM label on two runs, or

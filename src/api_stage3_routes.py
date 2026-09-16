@@ -701,7 +701,7 @@ def _start_job(
                 "job_id": job["id"],
                 "kind": kind,
                 "status": "queued",
-                "status_url": f"/stage3/jobs/{job['id']}",
+                "status_url": f"/stage3/jobs/{job['id']}?project={project}",
             },
         }
     )
@@ -727,6 +727,27 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
     def stage3_job_status(job_id: str):
         with jobs_lock:
             job = dict(jobs[job_id]) if job_id in jobs else None
+        if job is None:
+            try:
+                project = services._resolve_project_name(request.args.get("project"))
+            except ValueError as exc:
+                return services._json_error(str(exc), 400)
+            path = _job_status_path(project, services)
+            try:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                persisted = None
+            if isinstance(persisted, dict) and str(persisted.get("id") or "") == job_id:
+                job = persisted
+                if job.get("status") in {"queued", "running"}:
+                    job.update(
+                        {
+                            "status": "interrupted",
+                            "message": "Stage 3 был прерван перезапуском сервера",
+                            "finished_at": _now_iso(),
+                        }
+                    )
+                    _persist_job(job, services)
         if job is None:
             return services._json_error("job not found", 404)
         return jsonify({"ok": True, "result": job})
@@ -872,8 +893,6 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             paths["work"],
             filename,
             as_attachment=True,
-            download_name=xml_export_filename(
-                project, timeline_data.get("scenario_revision_id")
-            ),
+            download_name=xml_export_filename(project, timeline_data.get("scenario_revision_id")),
             mimetype="application/xml",
         )

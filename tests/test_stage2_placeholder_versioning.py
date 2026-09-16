@@ -66,7 +66,10 @@ def test_asset_path_is_safe_and_stays_inside_requested_directory() -> None:
 def test_revision_placeholder_directory_is_isolated_from_other_revisions(tmp_path: Path) -> None:
     paths = {"work": tmp_path / "work"}
 
-    assert _revision_placeholder_dir(paths, "rev_0002") == tmp_path / "work" / "placeholders" / "rev_0002"
+    assert (
+        _revision_placeholder_dir(paths, "rev_0002")
+        == tmp_path / "work" / "placeholders" / "rev_0002"
+    )
     assert _revision_placeholder_dir(paths, "") == tmp_path / "work" / "placeholders"
 
 

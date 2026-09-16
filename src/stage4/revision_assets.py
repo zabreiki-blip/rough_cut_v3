@@ -538,10 +538,7 @@ def restore_revision_assets(
                 {
                     "block_id": block_id,
                     "staged": staged_path.resolve().relative_to(root).as_posix(),
-                    "alias": (alias_dir / f"{block_id}.wav")
-                    .resolve()
-                    .relative_to(root)
-                    .as_posix(),
+                    "alias": (alias_dir / f"{block_id}.wav").resolve().relative_to(root).as_posix(),
                     "fingerprint": desired[block_id][1],
                 }
                 for block_id, staged_path in staged.items()
