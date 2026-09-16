@@ -164,6 +164,7 @@ def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     assert "Активная редакция не определена" in STAGE1_JS
     assert "const recoveryRequired = revisionsState.integrity?.blocking === true;" in STAGE1_JS
     assert 'data-action="reconcile-revision"' in STAGE1_JS
+    assert 'ids.revision_filters_bar.hidden = mode !== "list";' in STAGE1_JS
     assert "use_llm: Boolean(ids.normalization_use_llm?.checked)" in STAGE1_JS
 
 
