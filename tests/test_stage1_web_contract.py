@@ -10,6 +10,7 @@ _STAGE1_SOURCES = [ROOT / "src" / "static" / "stage1.js"] + sorted(
     (ROOT / "src" / "static" / "stage1").glob("*.js")
 )
 STAGE1_JS = "\n".join(path.read_text(encoding="utf-8") for path in _STAGE1_SOURCES)
+STAGE1_CSS = (ROOT / "src" / "static" / "stage1.css").read_text(encoding="utf-8")
 PROJECT_HTML = (ROOT / "src" / "templates" / "project.html").read_text(encoding="utf-8")
 
 
@@ -165,6 +166,7 @@ def test_revision_ui_preserves_edits_and_ignores_stale_diff_responses() -> None:
     assert "const recoveryRequired = revisionsState.integrity?.blocking === true;" in STAGE1_JS
     assert 'data-action="reconcile-revision"' in STAGE1_JS
     assert 'ids.revision_filters_bar.hidden = mode !== "list";' in STAGE1_JS
+    assert ".revision-changes-list[hidden]" in STAGE1_CSS
     assert "use_llm: Boolean(ids.normalization_use_llm?.checked)" in STAGE1_JS
 
 
