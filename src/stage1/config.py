@@ -15,11 +15,9 @@ class Settings:
     openrouter_tts_voice_female: str
     openrouter_tts_voice_male: str
     openrouter_tts_sample_rate: int
-    gemini_api_key: str
-    gemini_tts_model: str
-    gemini_tts_voice: str
-    gemini_tts_voice_female: str
-    gemini_tts_voice_male: str
+    openrouter_gemini_tts_voice: str
+    openrouter_gemini_tts_voice_female: str
+    openrouter_gemini_tts_voice_male: str
     macos_tts_voice: str
     macos_tts_voice_female: str
     macos_tts_voice_male: str
@@ -51,14 +49,12 @@ def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
             range_text = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
             warnings.append(f"{name} must be {range_text}; the value will be adjusted")
 
-    provider = str(env.get("TTS_PROVIDER", "gemini")).strip().lower()
-    if provider not in {"gemini", "openrouter", "macos"}:
-        warnings.append("TTS_PROVIDER must be gemini, openrouter or macos")
+    provider = str(env.get("TTS_PROVIDER", "openrouter")).strip().lower()
+    if provider not in {"openrouter", "macos"}:
+        warnings.append("TTS_PROVIDER must be openrouter or macos")
     gender = str(env.get("TTS_GENDER", "female")).strip().lower()
     if gender not in {"female", "male"}:
         warnings.append("TTS_GENDER must be female or male")
-    if provider == "gemini" and not str(env.get("GEMINI_API_KEY", "")).strip():
-        warnings.append("GEMINI_API_KEY is empty; real Gemini TTS is unavailable")
     if provider == "openrouter" and not str(env.get("OPENROUTER_API_KEY", "")).strip():
         warnings.append("OPENROUTER_API_KEY is empty; OpenRouter analysis/TTS is unavailable")
     if not str(env.get("ROUGH_CUT_API_TOKEN", "")).strip():
@@ -152,14 +148,13 @@ def get_settings() -> Settings:
             "ru-RU-Lev:MAI-Voice-2",
         ).strip(),
         openrouter_tts_sample_rate=sample_rate,
-        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
-        gemini_tts_model=os.getenv(
-            "GEMINI_TTS_MODEL",
-            "gemini-2.5-pro-preview-tts",
+        openrouter_gemini_tts_voice=os.getenv("OPENROUTER_GEMINI_TTS_VOICE", "Aoede").strip(),
+        openrouter_gemini_tts_voice_female=os.getenv(
+            "OPENROUTER_GEMINI_TTS_VOICE_FEMALE", "Aoede"
         ).strip(),
-        gemini_tts_voice=os.getenv("GEMINI_TTS_VOICE", "Kore").strip(),
-        gemini_tts_voice_female=os.getenv("GEMINI_TTS_VOICE_FEMALE", "Sharon").strip(),
-        gemini_tts_voice_male=os.getenv("GEMINI_TTS_VOICE_MALE", "Kore").strip(),
+        openrouter_gemini_tts_voice_male=os.getenv(
+            "OPENROUTER_GEMINI_TTS_VOICE_MALE", "Charon"
+        ).strip(),
         macos_tts_voice=os.getenv("MACOS_TTS_VOICE", "Milena").strip(),
         macos_tts_voice_female=os.getenv("MACOS_TTS_VOICE_FEMALE", "Milena").strip(),
         macos_tts_voice_male=os.getenv("MACOS_TTS_VOICE_MALE", "Yuri").strip(),

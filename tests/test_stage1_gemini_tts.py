@@ -13,6 +13,7 @@ from unittest.mock import patch
 from stage1.gemini_tts import (
     _apply_tempo,
     _is_retryable_tts_error,
+    _pick_voice,
     _synthesis_fingerprint,
     _synthesize_openrouter_wav,
     _synthesize_with_retry,
@@ -26,23 +27,41 @@ class TtsErrorClassificationTests(unittest.TestCase):
         for status in (429, 500, 502, 503):
             exc = RuntimeError("provider error")
             exc.status_code = status  # type: ignore[attr-defined]
-            self.assertTrue(_is_retryable_tts_error("gemini", exc), status)
+            self.assertTrue(_is_retryable_tts_error("openrouter", exc), status)
 
         for status in (400, 401, 403, 404):
             exc = RuntimeError("provider error")
             exc.status_code = status  # type: ignore[attr-defined]
-            self.assertFalse(_is_retryable_tts_error("gemini", exc), status)
+            self.assertFalse(_is_retryable_tts_error("openrouter", exc), status)
 
         self.assertTrue(_is_retryable_tts_error("openrouter", TimeoutError("request timed out")))
         self.assertFalse(
-            _is_retryable_tts_error("gemini", RuntimeError("response blocked by safety policy"))
+            _is_retryable_tts_error("openrouter", RuntimeError("response blocked by safety policy"))
         )
         self.assertFalse(
-            _is_retryable_tts_error("gemini", RuntimeError("unknown permanent failure"))
+            _is_retryable_tts_error("openrouter", RuntimeError("unknown permanent failure"))
         )
 
 
 class OpenRouterTtsTests(unittest.TestCase):
+    def test_gemini_31_uses_openrouter_voice_configuration(self) -> None:
+        settings = SimpleNamespace(
+            tts_gender="female",
+            openrouter_gemini_tts_voice="Default",
+            openrouter_gemini_tts_voice_female="Configured female",
+            openrouter_gemini_tts_voice_male="Configured male",
+        )
+
+        voice, gender = _pick_voice(
+            settings,
+            "openrouter",
+            None,
+            "male",
+            "google/gemini-3.1-flash-tts-preview",
+        )
+
+        self.assertEqual((voice, gender), ("Configured male", "male"))
+
     def test_dedicated_tts_endpoint_wraps_pcm_and_closes_response(self) -> None:
         class Response:
             status_code = 200
@@ -190,11 +209,13 @@ class OpenRouterTtsTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
-            settings = SimpleNamespace(gemini_tts_model="model")
+            settings = SimpleNamespace(
+                openrouter_tts_model="model", openrouter_tts_sample_rate=24000
+            )
             args = (
                 [("zk1", "versioned-uid", "text")],
                 base,
-                "gemini",
+                "openrouter",
                 "voice",
                 "female",
                 1.0,

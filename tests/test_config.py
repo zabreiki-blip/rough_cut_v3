@@ -10,7 +10,7 @@ def test_validate_env_reports_typos_without_echoing_secrets() -> None:
             "TTS_GENDER": "robot",
             "MAX_ZK_BLOCKS": "forty",
             "ROUGH_CUT_API_TOKEN": "",
-            "GEMINI_API_KEY": "super-secret",
+            "OPENROUTER_API_KEY": "super-secret",
         }
     )
 
@@ -35,3 +35,15 @@ def test_validate_env_accepts_valid_local_configuration() -> None:
     )
 
     assert warnings == []
+
+
+def test_validate_env_rejects_removed_direct_gemini_provider() -> None:
+    warnings = validate_env(
+        {
+            "TTS_PROVIDER": "gemini",
+            "TTS_GENDER": "female",
+            "ROUGH_CUT_API_TOKEN": "configured",
+        }
+    )
+
+    assert "TTS_PROVIDER must be openrouter or macos" in warnings

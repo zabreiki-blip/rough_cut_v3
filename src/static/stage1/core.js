@@ -396,7 +396,7 @@ export async function safely(fn) {
     toast(msg, "error");
     appendLog(`ERROR: ${msg}`, true);
     if (msg.includes("macOS TTS unavailable") || msg.includes("command 'say'")) {
-      appendLog("Подсказка: выбери provider=openrouter/gemini или настрой macOS-коннектор.", true);
+      appendLog("Подсказка: выбери provider=openrouter или настрой macOS-коннектор.", true);
     }
   } finally {
     setBusy(false);
