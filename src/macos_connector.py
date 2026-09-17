@@ -9,7 +9,7 @@ from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from env_utils import env_int
-from logging_config import configure_logging
+from logging_config import configure_logging, redact_sensitive_text
 from stage1.macos_tts_backend import list_macos_voices, run_say_and_convert
 
 
@@ -150,8 +150,16 @@ def synthesize():
     voice = requested_voice if _voice_exists(requested_voice) else ""
     try:
         wav = _run_say_and_convert(text=text, voice=voice, rate=rate, sample_rate=sample_rate)
-    except RuntimeError as exc:
-        app.logger.exception("macOS synthesis failed", exc_info=exc)
+    except Exception as exc:
+        # Do not turn subprocess output or an unexpected host error into an API
+        # response.  The log formatter redacts traceback content as a second
+        # line of defence; redact the explicit message before it reaches the
+        # log record as well.
+        app.logger.error(
+            "macOS synthesis failed: %s",
+            redact_sensitive_text(exc),
+            exc_info=True,
+        )
         return jsonify({"ok": False, "error": "macOS synthesis failed"}), 500
 
     headers = {"X-Voice-Used": voice or "default"}

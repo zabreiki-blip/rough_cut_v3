@@ -1600,7 +1600,7 @@
 
   function pollFinalReviewJob() {
     if (!currentFinalReviewJobId) return;
-    request("GET", "/stage2/final-review/jobs/" + encodeURIComponent(currentFinalReviewJobId), null, function (error, response) {
+    request("GET", "/stage2/final-review/jobs/" + encodeURIComponent(currentFinalReviewJobId) + "?project=" + encodeURIComponent(config().project), null, function (error, response) {
       var job = response && (response.result || response);
       if (error) {
         setFinalReviewStatus("Не удалось получить статус проверки: " + error.message);

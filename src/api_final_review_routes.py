@@ -12,7 +12,7 @@ from types import ModuleType
 import time
 import wave
 
-from flask import Flask, jsonify, request
+from flask import Flask, has_request_context, jsonify, request
 
 
 def _project_audio_path(services: ModuleType, paths: dict[str, Path], value: object) -> Path:
@@ -125,7 +125,7 @@ def _start(services: ModuleType):
                 "project": project,
                 "job_id": job["id"],
                 "status": "queued",
-                "status_url": f"/stage2/final-review/jobs/{job['id']}",
+                "status_url": f"/stage2/final-review/jobs/{job['id']}?project={project}",
             },
         }
     ), 202
@@ -133,6 +133,16 @@ def _start(services: ModuleType):
 
 def _status(services: ModuleType, job_id: str):
     job = services._get_final_review_job(job_id)
+    if not job and has_request_context() and request.args.get("project"):
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+        except ValueError as exc:
+            return services._json_error(str(exc), 400)
+        persisted = getattr(services, "_load_persisted_final_review_job", lambda _project: None)(
+            project
+        )
+        if persisted and str(persisted.get("id") or "") == job_id:
+            job = persisted
     if not job:
         return services._json_error("job not found", 404)
     return jsonify({"ok": True, "result": job})
@@ -141,6 +151,16 @@ def _status(services: ModuleType, job_id: str):
 def _apply(services: ModuleType, job_id: str):
     payload = request.get_json(silent=True) or {}
     job = services._get_final_review_job(job_id)
+    if not job:
+        try:
+            project = services._resolve_project_name(payload.get("project"))
+        except ValueError as exc:
+            return services._json_error(str(exc), 400)
+        persisted = getattr(services, "_load_persisted_final_review_job", lambda _project: None)(
+            project
+        )
+        if persisted and str(persisted.get("id") or "") == job_id:
+            job = persisted
     if not job:
         return services._json_error("job not found", 404)
     if job.get("status") != "completed":

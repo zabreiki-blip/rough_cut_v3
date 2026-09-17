@@ -65,6 +65,24 @@ def get_final_review_job(services: FinalReviewJobServices, job_id: str) -> dict[
     )
 
 
+def load_persisted_final_review_job(
+    services: FinalReviewJobServices, project: str
+) -> dict[str, Any] | None:
+    """Restore the latest final-review checkpoint after a process restart."""
+    payload = services._read_json_safe(services._project_paths(project)["final_review_job_status"])
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("project") != project or not str(payload.get("id") or "").strip():
+        return None
+    restored = dict(payload)
+    if str(restored.get("status") or "").lower() in {"queued", "running"}:
+        # The worker thread died with the process. Report a terminal state
+        # rather than allowing the CEP panel to poll a job that cannot advance.
+        restored["status"] = "interrupted"
+        restored["message"] = "Interrupted by restart; start final review again"
+    return restored
+
+
 def update_final_review_job(
     services: FinalReviewJobServices,
     job_id: str,
