@@ -402,9 +402,9 @@ class StaleWavRegenerationTest(unittest.TestCase):
             self.assertEqual(_read_meta_fingerprint(wav), expected_fp)
 
     def test_fingerprint_differs_by_provider_voice_speed(self) -> None:
-        fp1 = _synthesis_fingerprint("Текст", "gemini", "en-US-Wavenet-A", "male", 1.0)
-        fp2 = _synthesis_fingerprint("Текст", "gemini", "en-US-Wavenet-A", "male", 1.2)
-        fp3 = _synthesis_fingerprint("Текст", "openrouter", "en-US-Wavenet-A", "male", 1.0)
+        fp1 = _synthesis_fingerprint("Текст", "openrouter", "en-US-Wavenet-A", "male", 1.0)
+        fp2 = _synthesis_fingerprint("Текст", "openrouter", "en-US-Wavenet-A", "male", 1.2)
+        fp3 = _synthesis_fingerprint("Текст", "macos", "en-US-Wavenet-A", "male", 1.0)
         self.assertNotEqual(fp1, fp2, "Different speed must produce different fingerprint")
         self.assertNotEqual(fp1, fp3, "Different provider must produce different fingerprint")
 

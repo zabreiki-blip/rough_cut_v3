@@ -197,12 +197,11 @@ scripts/validate-stage1 \
 | `macos` | — | Milena / Yuri | Бесплатный, для тестов. В Docker нужен коннектор |
 
 **Переопределение:**
-- `--provider gemini|openrouter|macos` — провайдер
-- `--voice Sharon` — конкретный голос
+- `--provider openrouter|macos` — провайдер
+- `--voice Aoede` — конкретный голос
 - `--gender female|male` — выбор по полу
 
-В веб-интерфейсе прямой Gemini provider скрыт: Gemini TTS вызывается через
-OpenRouter. Поле «Интонация / стиль / формат ролика» активно для всех
+Gemini TTS доступен только через OpenRouter. Поле «Интонация / стиль / формат ролика» активно для всех
 OpenRouter-моделей и сохраняется вместе с checkpoint TTS-задачи.
 
 **Retry:** до 4 попыток; задержки перед повторами — 8с, 16с и 24с.
@@ -341,13 +340,12 @@ scripts/run-macos-connector
 | Переменная | Default | Описание |
 |------------|---------|----------|
 | `OPENROUTER_API_KEY` | — | Ключ для LLM и OpenRouter TTS |
-| `GEMINI_API_KEY` | — | Ключ для legacy direct-Gemini CLI/API; веб-меню использует OpenRouter |
 | `TTS_PROVIDER` | `openrouter` | Провайдер TTS |
 | `TTS_GENDER` | `female` | Пол голоса |
 | `MAX_ZK_BLOCKS` | `40` | Максимум legacy-блоков после объединения |
 | `MACOS_COMMAND_TIMEOUT` | `900` | Таймаут `say`/`afconvert`, секунд |
-| `GEMINI_TTS_VOICE_FEMALE` | `Sharon` | Женский голос Gemini |
-| `GEMINI_TTS_VOICE_MALE` | `Kore` | Мужской голос Gemini |
+| `OPENROUTER_GEMINI_TTS_VOICE_FEMALE` | `Aoede` | Женский голос Gemini через OpenRouter |
+| `OPENROUTER_GEMINI_TTS_VOICE_MALE` | `Charon` | Мужской голос Gemini через OpenRouter |
 | `MACOS_TTS_RATE` | `175` | Скорость macOS TTS (wpm) |
 | `MACOS_CONNECTOR_URL` | — | URL коннектора для macOS в Docker |
 | `MACOS_CONNECTOR_PORT` | `8001` | Локальный порт коннектора macOS |

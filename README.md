@@ -25,7 +25,7 @@
    TTS_PROVIDER=macos
    ```
 
-   Ключи `OPENROUTER_API_KEY`/`GEMINI_API_KEY` в этом режиме не нужны.
+   Ключ `OPENROUTER_API_KEY` в этом режиме не нужен.
 
 3. (Опционально) Проверь окружение подробнее:
 
@@ -160,7 +160,6 @@ matches и таймлайн. Озвучка привязана к стабиль
 Обязательные ключи:
 - `ROUGH_CUT_API_TOKEN` — обязательный токен веб-интерфейса и API
 - `OPENROUTER_API_KEY`
-- `GEMINI_API_KEY`
 
 Если используешь только `TTS_PROVIDER=macos`, ключи для TTS не нужны.
 
@@ -181,7 +180,8 @@ matches и таймлайн. Озвучка привязана к стабиль
   `ru-RU-Lev:MAI-Voice-2`. Их можно сменить через `OPENROUTER_TTS_MODEL`,
   `OPENROUTER_TTS_VOICE`, `OPENROUTER_TTS_SAMPLE_RATE`
   - можно задать пресеты: `OPENROUTER_TTS_VOICE_FEMALE`, `OPENROUTER_TTS_VOICE_MALE`
-  - и для Gemini: `GEMINI_TTS_VOICE_FEMALE`, `GEMINI_TTS_VOICE_MALE`
+  - для Gemini через OpenRouter: `OPENROUTER_GEMINI_TTS_VOICE_FEMALE`,
+    `OPENROUTER_GEMINI_TTS_VOICE_MALE`
   - поле «Интонация / стиль / формат ролика» передаёт Gemini режиссёрский prompt,
     а для MAI сопоставляет описание с Azure style; изменение поля инвалидирует TTS-кэш
 - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)

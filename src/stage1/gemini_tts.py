@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from datetime import datetime, UTC
 import hashlib
 from functools import lru_cache
@@ -162,29 +161,6 @@ def _provider_unavailable_message(provider: str, settings=None) -> str:
     return f"TTS provider '{provider}' is unavailable in this environment."
 
 
-def _extract_audio_payload(response: object) -> tuple[bytes, str]:
-    candidates = getattr(response, "candidates", None) or []
-    for candidate in candidates:
-        content = getattr(candidate, "content", None)
-        if not content:
-            continue
-        parts = getattr(content, "parts", None) or []
-        for part in parts:
-            inline_data = getattr(part, "inline_data", None)
-            if not inline_data:
-                continue
-            mime_type = str(getattr(inline_data, "mime_type", "") or "").strip()
-            data = getattr(inline_data, "data", None)
-            if isinstance(data, bytes):
-                return data, mime_type
-            if isinstance(data, str):
-                try:
-                    return base64.b64decode(data), mime_type
-                except Exception:
-                    return data.encode("utf-8"), mime_type
-    raise RuntimeError("Gemini TTS response does not contain audio bytes")
-
-
 def _build_wav_from_pcm(
     pcm_bytes: bytes,
     sample_rate: int = 24000,
@@ -198,34 +174,6 @@ def _build_wav_from_pcm(
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
-
-
-def _ensure_wav_bytes(audio_bytes: bytes, mime_type: str) -> bytes:
-    if audio_bytes.startswith(b"RIFF"):
-        return audio_bytes
-
-    sample_rate = 24000
-    channels = 1
-    sample_width = 2
-
-    if mime_type:
-        rate_match = re.search(r"rate=(\d+)", mime_type, flags=re.I)
-        channels_match = re.search(r"channels=(\d+)", mime_type, flags=re.I)
-        if rate_match:
-            sample_rate = int(rate_match.group(1))
-        if channels_match:
-            channels = int(channels_match.group(1))
-
-        # Typical Gemini raw payload: audio/L16;rate=24000
-        if "l16" not in mime_type.lower() and "pcm" not in mime_type.lower():
-            return audio_bytes
-
-    return _build_wav_from_pcm(
-        pcm_bytes=audio_bytes,
-        sample_rate=sample_rate,
-        channels=channels,
-        sample_width=sample_width,
-    )
 
 
 def _atomic_write_bytes(path: Path, data: bytes, *, validate_wav: bool = False) -> None:
@@ -401,23 +349,6 @@ def _synthesize_openrouter_wav(
     )
 
 
-def _synthesize_gemini_wav(text: str, settings, voice: str, client, types) -> bytes:
-    response = client.models.generate_content(
-        model=settings.gemini_tts_model,
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-                )
-            ),
-        ),
-    )
-    audio_bytes, mime_type = _extract_audio_payload(response)
-    return _ensure_wav_bytes(audio_bytes, mime_type)
-
-
 @lru_cache(maxsize=4)
 def _list_macos_voices(timeout: int = 15) -> tuple[str, ...]:
     return list_macos_voices(
@@ -585,7 +516,16 @@ def _pick_voice(
     resolved_gender = _resolve_gender(gender, settings.tts_gender)
     if provider == "openrouter":
         if _is_openrouter_gemini_model(str(tts_model or "")):
-            voice = "Charon" if resolved_gender == "male" else "Aoede"
+            if resolved_gender == "male":
+                voice = (
+                    settings.openrouter_gemini_tts_voice_male
+                    or settings.openrouter_gemini_tts_voice
+                )
+            else:
+                voice = (
+                    settings.openrouter_gemini_tts_voice_female
+                    or settings.openrouter_gemini_tts_voice
+                )
         elif resolved_gender == "male":
             voice = settings.openrouter_tts_voice_male or settings.openrouter_tts_voice
         else:
@@ -596,33 +536,19 @@ def _pick_voice(
         else:
             voice = settings.macos_tts_voice_female or settings.macos_tts_voice
     else:
-        if resolved_gender == "male":
-            voice = settings.gemini_tts_voice_male or settings.gemini_tts_voice
-        else:
-            voice = settings.gemini_tts_voice_female or settings.gemini_tts_voice
+        raise ValueError(f"unsupported TTS provider: {provider}")
     return voice, resolved_gender
 
 
 def _normalize_provider(raw: str | None, default_provider: str) -> str:
-    provider = (raw or default_provider or "gemini").strip().lower()
-    if provider not in {"openrouter", "gemini", "macos"}:
-        return "gemini"
+    provider = (raw or default_provider or "openrouter").strip().lower()
+    if provider not in {"openrouter", "macos"}:
+        return "openrouter"
     return provider
 
 
 def _build_tts_client(provider: str, settings):
-    client = None
-    types: Any = None
-    if provider == "gemini":
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError as exc:
-            raise RuntimeError(
-                "google-genai is not installed. Install dependencies from requirements.txt."
-            ) from exc
-        client = genai.Client(api_key=settings.gemini_api_key)
-    return client, types
+    return None, None
 
 
 def _synthesize_wav_bytes(
@@ -650,13 +576,7 @@ def _synthesize_wav_bytes(
         if shutil.which("say") is None:
             return _synthesize_macos_connector_wav(text, settings, voice)
         return _synthesize_macos_wav(text, settings, voice)
-    return _synthesize_gemini_wav(
-        text=text,
-        settings=settings,
-        voice=voice,
-        client=client,
-        types=types,
-    )
+    raise ValueError(f"unsupported TTS provider: {provider}")
 
 
 def _safe_file_stem(name: str | None, fallback: str) -> str:
@@ -742,8 +662,6 @@ def _emit_item_progress(
 def _fingerprint_parameters(
     provider: str, settings, tts_model: str | None = None
 ) -> tuple[str, int, int]:
-    if provider == "gemini":
-        return settings.gemini_tts_model, 0, 0
     if provider == "openrouter":
         return (
             tts_model or settings.openrouter_tts_model,
@@ -900,8 +818,6 @@ def _synthesize_with_retry(
         _raise_if_cancelled(cancel_check)
         attempts += 1
         try:
-            # Gemini SDK clients are not assumed to be thread-safe. Give every
-            # bounded task its own client; HTTP providers do not create one.
             worker_client, worker_types = _build_tts_client(provider, settings)
             wav_bytes = _synthesize_wav_bytes(
                 provider,
@@ -1028,8 +944,6 @@ def synthesize_tts(
     skipped: list[str] = []
     used_dry_run = dry_run
 
-    if not dry_run and provider == "gemini" and not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set. Use --dry-run for placeholders.")
     if not dry_run and provider == "openrouter" and not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set. Use --dry-run for placeholders.")
     if (
@@ -1223,8 +1137,6 @@ def synthesize_phrase(
     voice, resolved_gender = _pick_voice(settings, provider, voice_name, gender, resolved_model)
     speaker_dir.mkdir(parents=True, exist_ok=True)
 
-    if not dry_run and provider == "gemini" and not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set. Use --dry-run for placeholders.")
     if not dry_run and provider == "openrouter" and not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set. Use --dry-run for placeholders.")
     if (

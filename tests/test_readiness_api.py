@@ -47,10 +47,8 @@ def test_readiness_response_structure(client) -> None:
 
 def test_readiness_never_leaks_api_key_values(client, monkeypatch: pytest.MonkeyPatch) -> None:
     canary_openrouter = "sk-secret-canary-12345"
-    canary_gemini = "sk-secret-canary-67890"
     canary_cloud_asr = "sk-secret-canary-13579"
     monkeypatch.setenv("OPENROUTER_API_KEY", canary_openrouter)
-    monkeypatch.setenv("GEMINI_API_KEY", canary_gemini)
     monkeypatch.setenv("SYNC_CLOUD_ASR_API_KEY", canary_cloud_asr)
 
     response = client.get("/system/readiness")
@@ -58,13 +56,12 @@ def test_readiness_never_leaks_api_key_values(client, monkeypatch: pytest.Monkey
     assert response.status_code == 200
     raw_body = response.get_data(as_text=True)
 
-    for canary in (canary_openrouter, canary_gemini, canary_cloud_asr):
+    for canary in (canary_openrouter, canary_cloud_asr):
         assert canary not in raw_body
         # Частичные/замаскированные фрагменты тоже не должны просочиться.
         assert canary[:6] not in raw_body
         assert canary[-5:] not in raw_body
     assert "12345" not in raw_body
-    assert "67890" not in raw_body
     assert "13579" not in raw_body
     assert "sk-se" not in raw_body
 

@@ -212,21 +212,6 @@ def _check_tts_provider(settings: Any) -> dict[str, str]:
             detail=f"Провайдер macos: не найдено {', '.join(missing)}.",
             hint="Доступно только на macOS со стандартными системными утилитами.",
         )
-    if provider == "gemini":
-        if settings.gemini_api_key:
-            return _readiness_item(
-                item_id="tts_provider",
-                label=label,
-                status="ok",
-                detail="Провайдер gemini: ключ задан.",
-            )
-        return _readiness_item(
-            item_id="tts_provider",
-            label=label,
-            status="warn",
-            detail="Провайдер gemini: GEMINI_API_KEY не задан.",
-            hint="Задайте GEMINI_API_KEY в .env или переключите TTS_PROVIDER.",
-        )
     if provider == "openrouter":
         if settings.openrouter_api_key:
             return _readiness_item(
@@ -247,7 +232,7 @@ def _check_tts_provider(settings: Any) -> dict[str, str]:
         label=label,
         status="warn",
         detail=f"Неизвестный провайдер: {provider!r}.",
-        hint="TTS_PROVIDER должен быть gemini, openrouter или macos.",
+        hint="TTS_PROVIDER должен быть openrouter или macos.",
     )
 
 

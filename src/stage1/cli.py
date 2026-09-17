@@ -77,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         dest="provider",
         default=None,
-        choices=["gemini", "openrouter", "macos"],
+        choices=["openrouter", "macos"],
         help="TTS provider override",
     )
     p_tts.add_argument("--speed", type=float, default=1.0, help="Playback speed, 0.5-1.5")
@@ -118,7 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         dest="provider",
         default=None,
-        choices=["gemini", "openrouter", "macos"],
+        choices=["openrouter", "macos"],
         help="TTS provider override",
     )
     p_phrase.add_argument("--voice", dest="voice_name", default=None, help="Explicit voice name")
@@ -169,7 +169,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--prepared", default="work/scenario_prepared.json")
     p_run.add_argument("--speaker", default="speaker")
     p_run.add_argument("--manifest", default="speaker/manifest.json")
-    p_run.add_argument("--provider", choices=["gemini", "openrouter", "macos"], default=None)
+    p_run.add_argument("--provider", choices=["openrouter", "macos"], default=None)
     p_run.add_argument("--voice", dest="voice_name", default=None)
     p_run.add_argument("--gender", choices=["female", "male"], default=None)
     p_run.add_argument("--speed", type=float, default=1.0)

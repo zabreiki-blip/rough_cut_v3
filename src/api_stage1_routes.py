@@ -446,11 +446,10 @@ def _stage1_tts(services: ModuleType):
 
     provider = payload.get("provider")
     if provider and str(provider).strip().lower() not in {
-        "gemini",
         "openrouter",
         "macos",
     }:
-        return services._json_error("provider must be 'gemini' or 'openrouter' or 'macos'", 400)
+        return services._json_error("provider must be 'openrouter' or 'macos'", 400)
     gender = payload.get("gender")
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return services._json_error("gender must be 'female' or 'male'", 400)
@@ -518,11 +517,10 @@ def _stage1_tts_job_start(services: ModuleType):
 
     provider = payload.get("provider")
     if provider and str(provider).strip().lower() not in {
-        "gemini",
         "openrouter",
         "macos",
     }:
-        return services._json_error("provider must be 'gemini' or 'openrouter' or 'macos'", 400)
+        return services._json_error("provider must be 'openrouter' or 'macos'", 400)
     gender = payload.get("gender")
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return services._json_error("gender must be 'female' or 'male'", 400)
@@ -733,11 +731,10 @@ def _stage1_tts_phrase(services: ModuleType):
 
     provider = payload.get("provider")
     if provider and str(provider).strip().lower() not in {
-        "gemini",
         "openrouter",
         "macos",
     }:
-        return services._json_error("provider must be 'gemini' or 'openrouter' or 'macos'", 400)
+        return services._json_error("provider must be 'openrouter' or 'macos'", 400)
     gender = payload.get("gender")
     if gender and str(gender).strip().lower() not in {"female", "male"}:
         return services._json_error("gender must be 'female' or 'male'", 400)
