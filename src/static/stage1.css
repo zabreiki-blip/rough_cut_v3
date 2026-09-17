@@ -171,6 +171,9 @@ nav { display: grid; gap: 4px; }
 .mode-tab.active { color: var(--ink); background: var(--bg-card); }
 
 .revision-changes-list { display: grid; gap: 10px; }
+.revision-toolbar-controls[hidden],
+.revision-changes-list[hidden],
+.revisions-map-view[hidden] { display: none !important; }
 .revision-run {
   padding: 8px 12px; border-radius: 10px; background: var(--bg-hover);
   color: var(--muted); font-size: 11px; text-align: center;

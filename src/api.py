@@ -155,6 +155,9 @@ def _request_body_limit() -> int:
 
 configure_logging()
 app = Flask(__name__)
+# UI modules import one another. Revalidation prevents a browser from
+# combining a fresh entry module with a cached older dependency after deploy.
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.config["MAX_CONTENT_LENGTH"] = _request_body_limit()
 _CONFIG_WARNINGS = validate_env()
 for _warning in _CONFIG_WARNINGS:

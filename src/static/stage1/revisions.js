@@ -963,6 +963,7 @@ function setRevisionsMode(mode) {
     btn.classList.toggle("active", active);
     btn.setAttribute("aria-selected", active ? "true" : "false");
   });
+  if (ids.revision_filters_bar) ids.revision_filters_bar.hidden = mode !== "list";
   if (ids.revision_changes_list) ids.revision_changes_list.hidden = mode !== "list";
   if (ids.revisions_map_view) ids.revisions_map_view.hidden = mode !== "map";
   if (mode === "map") renderDashboardGraph(revisionsState.changes);

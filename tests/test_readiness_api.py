@@ -69,6 +69,20 @@ def test_readiness_never_leaks_api_key_values(client, monkeypatch: pytest.Monkey
     assert "sk-se" not in raw_body
 
 
+def test_readiness_does_not_show_unused_gemini_key(client) -> None:
+    response = client.get("/system/readiness")
+
+    assert response.status_code == 200
+    assert "gemini_key" not in {check["id"] for check in response.get_json()["checks"]}
+
+
+def test_static_modules_are_revalidated_after_deploy(client) -> None:
+    response = client.get("/static/stage1/revisions.js")
+
+    assert response.status_code == 200
+    assert "max-age=0" in response.headers["Cache-Control"]
+
+
 def test_readiness_degrades_gracefully_without_ffmpeg(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
