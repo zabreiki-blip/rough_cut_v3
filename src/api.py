@@ -1683,6 +1683,10 @@ def _get_final_review_job(job_id: str) -> dict | None:
     return final_review_jobs.get_final_review_job(_final_review_job_services(), job_id)
 
 
+def _load_persisted_final_review_job(project: str) -> dict | None:
+    return final_review_jobs.load_persisted_final_review_job(_final_review_job_services(), project)
+
+
 def _update_final_review_job(job_id: str, **updates) -> dict | None:
     return final_review_jobs.update_final_review_job(
         _final_review_job_services(), job_id, **updates

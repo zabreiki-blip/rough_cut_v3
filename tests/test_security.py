@@ -227,6 +227,27 @@ class MacosConnectorAuthenticationTest(unittest.TestCase):
         self.assertEqual(response.get_json()["error"], "macOS synthesis failed")
         self.assertNotIn(secret, response.get_data(as_text=True))
 
+    def test_unexpected_synthesis_failure_also_returns_safe_json(self) -> None:
+        secret = "connector-internal-secret-456"
+        with (
+            patch.dict(os.environ, {"MACOS_CONNECTOR_TOKEN": "correct-token"}),
+            patch.object(macos_connector, "shutil_which", return_value="/usr/bin/tool"),
+            patch.object(
+                macos_connector,
+                "_run_say_and_convert",
+                side_effect=OSError(f"host failure: {secret}"),
+            ),
+        ):
+            response = self.client.post(
+                "/synthesize",
+                json={"text": "Тест"},
+                headers={"Authorization": "Bearer correct-token"},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["error"], "macOS synthesis failed")
+        self.assertNotIn(secret, response.get_data(as_text=True))
+
     def test_voice_inventory_is_cached_between_blocks(self) -> None:
         result = subprocess.CompletedProcess(
             ["say", "-v", "?"],

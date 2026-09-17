@@ -8,6 +8,7 @@ import pytest
 
 from api_final_review_jobs import (
     create_final_review_job,
+    load_persisted_final_review_job,
     record_final_review_iteration,
     release_final_review_project,
     run_final_review_job,
@@ -137,6 +138,40 @@ def test_final_review_status_reports_missing_and_existing_jobs() -> None:
     assert missing_status == 404
     assert found.status_code == 200
     assert found.get_json()["result"]["id"] == "job-1"
+
+
+def test_final_review_status_restores_matching_checkpoint_after_restart() -> None:
+    app = Flask(__name__)
+    checkpoint = {"id": "job-1", "project": "demo", "status": "interrupted"}
+    with app.test_request_context("/stage2/final-review/jobs/job-1?project=demo"):
+        response = _status(
+            SimpleNamespace(
+                _get_final_review_job=lambda _job_id: None,
+                _resolve_project_name=lambda value: value,
+                _load_persisted_final_review_job=lambda project: (
+                    checkpoint if project == "demo" else None
+                ),
+                _json_error=_error,
+            ),
+            "job-1",
+        )
+
+    assert response.status_code == 200
+    assert response.get_json()["result"] == checkpoint
+
+
+def test_final_review_checkpoint_marks_orphaned_worker_interrupted(tmp_path: Path) -> None:
+    status_path = tmp_path / "final_review_job_status.json"
+    services = SimpleNamespace(
+        _project_paths=lambda _project: {"final_review_job_status": status_path},
+        _read_json_safe=lambda _path: {"id": "job-1", "project": "demo", "status": "running"},
+    )
+
+    restored = load_persisted_final_review_job(services, "demo")
+
+    assert restored is not None
+    assert restored["status"] == "interrupted"
+    assert "restart" in restored["message"]
 
 
 def test_final_review_start_rejects_stale_duration(tmp_path: Path, monkeypatch) -> None:
@@ -325,6 +360,41 @@ def test_final_review_apply_records_matching_report(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.get_json()["result"]["iteration"]["id"] == "iteration_0001"
     assert recorded[0][2] == [{"block_uid": "b1"}]
+
+
+def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path: Path) -> None:
+    app = Flask(__name__)
+    recorded: list[tuple] = []
+    job = {
+        "id": "job-1",
+        "project": "demo",
+        "status": "completed",
+        "source_sequence": {"sequenceId": "sequence-1"},
+        "assembly_manifest_id": "manifest-1",
+    }
+    services = SimpleNamespace(
+        _get_final_review_job=lambda _job_id: None,
+        _load_persisted_final_review_job=lambda project: job if project == "demo" else None,
+        _resolve_project_name=lambda value: value,
+        _project_paths=lambda _project: {"final_review_report": tmp_path / "report.json"},
+        _read_json_safe=lambda _path: {
+            "job_id": "job-1",
+            "project": "demo",
+            "source_sequence": {"sequenceId": "sequence-1"},
+            "assembly_manifest_id": "manifest-1",
+            "corrections": [],
+        },
+        _record_final_review_iteration=lambda *args: (
+            recorded.append(args) or {"id": "iteration_0001"}
+        ),
+        _json_error=_error,
+    )
+
+    with app.test_request_context(json={"project": "demo"}):
+        response = _apply(services, "job-1")
+
+    assert response.status_code == 200
+    assert response.get_json()["result"]["iteration"]["id"] == "iteration_0001"
 
 
 @pytest.mark.parametrize(

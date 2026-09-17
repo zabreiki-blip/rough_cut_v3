@@ -5,6 +5,13 @@ import re
 HOST = (Path(__file__).parents[1] / "cep" / "host.jsx").read_text(encoding="utf-8")
 PANEL = (Path(__file__).parents[1] / "cep" / "js" / "main.js").read_text(encoding="utf-8")
 HTML = (Path(__file__).parents[1] / "cep" / "index.html").read_text(encoding="utf-8")
+MANIFEST = (Path(__file__).parents[1] / "cep" / "CSXS" / "manifest.xml").read_text(encoding="utf-8")
+
+
+def test_premiere_host_range_is_explicit_and_conservative() -> None:
+    """Do not claim compatibility with unknown future Premiere major releases."""
+    assert '<Host Name="PPRO" Version="[14.0,25.9]" />' in MANIFEST
+    assert "99.9" not in MANIFEST
 
 
 def test_project_picker_loads_existing_backend_projects() -> None:
