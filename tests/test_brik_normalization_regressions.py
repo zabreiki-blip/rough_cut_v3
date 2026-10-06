@@ -2,6 +2,8 @@ from pathlib import Path
 
 from stage1.normalizer import (
     _extract_sync_fragments,
+    clean_voiceover_tts_text,
+    confirm_normalization,
     generate_normalization,
     validate_for_confirmation,
 )
@@ -70,6 +72,7 @@ def test_editorial_cues_and_empty_credits_are_not_spoken(tmp_path: Path) -> None
         "ЗК. «Голос Маяковского»:",
         "ФРАГМЕНТ СЕРИАЛА — С ЛИЛЕЙ, КРАСНОЩЕКОВЫМ И ЛУЭЛЛОЙ",
         "ЗДЕСЬ БЫ НУЖЕН ФРАГМЕНТ ИЗ СЕРИАЛА – БРИК ЗА РУЛЁМ.",
+        "ЗДЕСЬ НАДО БЫ ДАТЬ ФРАГМЕНТ ИЗ СЕРИАЛА. ВСТРЕЧА НА ИППОДРОМЕ.",
         "Протоирей Андрей Дударев, куратор дачи Маяковского в Пушкино:",
     ):
         block = _normalize(tmp_path, text)
@@ -93,3 +96,43 @@ def test_confirmation_rejects_corrupt_sync_metadata(tmp_path: Path) -> None:
     assert any("speaker conflicts" in error for error in errors)
     assert any("empty fragment" in error for error in errors)
     assert any("invalid timecode" in error for error in errors)
+
+
+def test_voice_credit_and_inline_directorial_cue_are_not_spoken() -> None:
+    assert (
+        clean_voiceover_tts_text("«Голос Маяковского»- Перевел сто долларов.")
+        == "Перевел сто долларов."
+    )
+    assert (
+        clean_voiceover_tts_text("Голос за кадром читает воспоминания Лили: «Я была там»")
+        == "«Я была там»"
+    )
+    assert (
+        clean_voiceover_tts_text(
+            "Его книги выходили с посвящением. (показываем издания Маяковского)"
+        )
+        == "Его книги выходили с посвящением."
+    )
+    assert clean_voiceover_tts_text("Голос Лили. Дорогой товарищ Сталин<…>") == (
+        "Дорогой товарищ Сталин…"
+    )
+
+
+def test_confirm_relocated_source_with_matching_hash(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("ЗК: Текст диктора.\n", encoding="utf-8")
+    normalized = tmp_path / "normalized.json"
+    scenario = generate_normalization(
+        source, normalized, memory_path=tmp_path / "memory.sqlite3", use_llm=False
+    )
+    moved = tmp_path / "moved.txt"
+    source.rename(moved)
+    confirmed = confirm_normalization(
+        normalized,
+        tmp_path / "prepared.json",
+        tmp_path / "raw.txt",
+        memory_path=tmp_path / "memory.sqlite3",
+        source_path_override=moved,
+    )
+    assert confirmed["status"] == "confirmed"
+    assert confirmed["source"] == scenario["source"]

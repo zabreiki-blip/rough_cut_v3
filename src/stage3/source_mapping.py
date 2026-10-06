@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence, SupportsFloat
 import unicodedata
 
 from stage2.models import FullTimeline
+from stage3.media_catalog import MEDIA_EXTENSIONS
 
 
 @dataclass(frozen=True)
@@ -130,7 +131,12 @@ def _items(value: object, *, id_names: tuple[str, ...]) -> list[tuple[str, objec
 
 def _normalize(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
-    text = Path(text).stem
+    text = Path(text).name
+    suffix = Path(text).suffix
+    # Path.stem treats a numbered sequence title such as ``1. Трилогия о Люле``
+    # as a filename with a long extension and reduces it to just ``1``.
+    if suffix in MEDIA_EXTENSIONS:
+        text = text[: -len(suffix)]
     text = text.replace("_", " ")
     return " ".join(re.findall(r"[\w]+", text, flags=re.UNICODE))
 
