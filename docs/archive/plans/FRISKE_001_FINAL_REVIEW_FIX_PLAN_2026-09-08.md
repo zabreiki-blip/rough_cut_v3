@@ -1,5 +1,8 @@
 # FRISKE_001: план исправлений финального монтажа
 
+> Архивный план для ревизии сценария 3. После его составления в проекте была
+> подтверждена ревизия 7; диагноз и порядок работ требуют повторной проверки.
+
 - Дата: 2026-09-08
 - Статус: готово к реализации
 - Источник истины: подтверждённый сценарий, revision 3
@@ -14,13 +17,13 @@
 
 ## Использованные артефакты
 
-- [Подтверждённый сценарий](../projects/FRISKE_001/work/scenario_normalized.json)
-- [Расчётный таймлайн](../projects/FRISKE_001/work/full_timeline.json)
-- [Результаты матчинга СНХ](../projects/FRISKE_001/work/sync_matches.json)
-- [Источники СНХ](../projects/FRISKE_001/work/sync_sources.json)
-- [Финальный WAV](../projects/FRISKE_001/work/final_review.wav)
-- [Отчёт финальной проверки](../projects/FRISKE_001/work/final_review_report.json)
-- [Статус задания проверки](../projects/FRISKE_001/work/final_review_job_status.json)
+- [Подтверждённый сценарий](../../../projects/FRISKE_001/work/scenario_normalized.json)
+- [Расчётный таймлайн](../../../projects/FRISKE_001/work/full_timeline.json)
+- [Результаты матчинга СНХ](../../../projects/FRISKE_001/work/sync_matches.json)
+- [Источники СНХ](../../../projects/FRISKE_001/work/sync_sources.json)
+- [Финальный WAV](../../../projects/FRISKE_001/work/final_review.wav)
+- [Отчёт финальной проверки](../../../projects/FRISKE_001/work/final_review_report.json)
+- [Статус задания проверки](../../../projects/FRISKE_001/work/final_review_job_status.json)
 
 ## Диагноз
 

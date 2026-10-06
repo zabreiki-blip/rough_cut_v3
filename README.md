@@ -1,4 +1,4 @@
-# rough_cut_v3 — Stage 1
+# rough_cut_v3
 
 Пайплайн: нормализация сценария (`.doc/.docx`) → подтверждение блоков →
 синтез TTS → Whisper-сопоставление СНХ → сборка в Premiere.
@@ -91,7 +91,8 @@
 
 - `projects/<project>/input/` — исходный сценарий проекта.
 - `projects/<project>/work/` — canonical `scenario_normalized.json` и производные `scenario_raw.txt`/`scenario_prepared.json`.
-- `projects/<project>/speaker/` — файлы озвучки `zk1.wav`, `zk2.wav`, ...
+- `projects/<project>/speaker/assets/` — неизменяемые WAV по UID блока;
+  `speaker/revisions/rev_NNNN/` — позиционные `zkN.wav` конкретной редакции.
 - `projects/<project>/versions/` — история редакций: сценарии, diff, снимки таймлайна и recovery-копии.
 - `src/stage1/` — core-логика и CLI.
 - `src/stage2/` — таймлайн, sync-источники, Whisper word index и fuzzy matching.
@@ -422,8 +423,7 @@ LLM-нормализация сохраняет успешные batch-реше�
 Готовые синхронизированные секвенции Premiere являются источником координат.
 Видео остаётся в Premiere и не загружается в backend.
 
-Для headless-монтажа по отрендеренным просмотровкам см.
-[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md): Docker автоматически читает
+Для headless-монтажа по отрендеренным просмотровкам Docker автоматически читает
 `projects/<project>/media/reviews`, создаёт заменяемые `RC_SRC_*` sequences и
 готовый nested XML. Premiere нужен только для импорта результата.
 
@@ -493,11 +493,10 @@ docker compose config --quiet
 ### pre-commit хуки
 
 Установка один раз: `pip install pre-commit && pre-commit install`. Локально
-хуки проверяют только то, что уже обязательно и в CI — `ruff check`,
-`ruff format`, `gitleaks` и базовую гигиену файлов (trailing whitespace, EOF,
-YAML/TOML/JSON).
-`mypy` и `eslint` пока намеренно не входят в pre-commit из-за накопленного
-технического долга, но оба остаются обязательными шагами CI.
+хуки проверяют `ruff check`, `ruff format`, `gitleaks`, ESLint для CEP и
+`tests/cep_behavior_test.cjs`, а также базовую гигиену файлов (trailing
+whitespace, EOF, YAML/TOML/JSON).
+`mypy` выполняется в CI, но не входит в локальные pre-commit хуки.
 
 ## Локальная автоматизация
 
@@ -607,9 +606,5 @@ curl -X POST http://localhost:8000/stage1/analyze \
   синхронизация → conform → XML).
 - [`docs/DEPENDENCY_POLICY.md`](docs/DEPENDENCY_POLICY.md) — политика
   зависимостей и поддерживаемых платформ (Docker, macOS Apple Silicon, CI).
-- [`docs/COMPETITOR_COMPARISON.md`](docs/COMPETITOR_COMPARISON.md) —
-  конкурентный анализ (для контекста продукта, не для эксплуатации).
-- [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — план разработки и roadmap
-  (уже упомянут выше в разделе про Stage 2.1).
-- [`docs/archive/audits/README.md`](docs/archive/audits/README.md) — архив
-  датированных аудитов. Это исторические снимки, а не текущий backlog.
+- [`docs/archive/README.md`](docs/archive/README.md) — исторические аудиты,
+  планы и исследования. Их выводы не являются текущим backlog.

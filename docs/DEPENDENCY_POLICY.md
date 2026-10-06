@@ -14,12 +14,12 @@ explicit compatible ranges. Binary and platform-specific packages use separate
 requirement surfaces because a single macOS-generated lock would not be a valid
 Linux/CPython 3.11 lock.
 
-A single cross-platform lock file is therefore intentionally not generated.
-If fully reproducible deployment beyond the current Docker build becomes a
-release requirement, pin the base image by digest and generate and maintain
-separate resolver outputs for Linux
-CPython 3.11 and native Apple Silicon; do not reuse a lock produced by one
-platform on the other.
+`requirements-lock.txt` is a pinned Python 3.11 snapshot generated from the
+development and Whisper requirements. CI and Docker install the direct
+requirements files, not this snapshot. Native Apple Silicon has a separate
+requirements surface and is not represented by that lock file. Do not reuse a
+lock produced for one platform on another; a fully reproducible release would
+also need a digest-pinned base image and platform-specific resolver outputs.
 
 CI measures branch coverage for `src/` and enforces a 79% floor. The initial
 measured baseline on 2026-08-04 was 77.5%. New work should raise the floor
