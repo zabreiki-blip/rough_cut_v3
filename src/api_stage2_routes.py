@@ -434,6 +434,18 @@ def _stage2_sync_job_status_alias(services: ModuleType):
     return jsonify({"ok": True, "result": services._sync_job_with_live_summary(latest)})
 
 
+def _confirmed_parent_ids(
+    matches: list[SyncMatch], revision: object, scenario_id: object
+) -> set[str]:
+    return {
+        item.segment_id
+        for item in matches
+        if item.status == "confirmed"
+        and item.metadata.get("normalization_revision") in (None, "", revision)
+        and _scenario_revision_matches(item.metadata.get("scenario_revision_id"), scenario_id)
+    }
+
+
 def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
     payload = request.get_json(silent=True) or {}
     raw_project = request.args.get("project") if request.method == "GET" else payload.get("project")
@@ -454,13 +466,18 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                     for block in normalization_document.get("blocks", [])
                     if str(block.get("type") or "").lower() in {"sync", "host"}
                 ]
-                valid_ids = {
-                    str(unit.get("segment_id") or "")
-                    for unit in services._sync_alignment_units(confirmed_blocks)
-                    if str(unit.get("segment_id") or "")
-                }
                 revision = normalization_document.get("revision")
                 scenario_revision_id = normalization_document.get("scenario_revision_id")
+                valid_ids = {
+                    str(unit.get("segment_id") or "")
+                    for unit in services._sync_alignment_units(
+                        confirmed_blocks,
+                        preserve_whole_uids=_confirmed_parent_ids(
+                            matches, revision, scenario_revision_id
+                        ),
+                    )
+                    if str(unit.get("segment_id") or "")
+                }
                 matches = [
                     item
                     for item in matches
@@ -501,9 +518,17 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
             for block in confirmed.get("blocks", [])
             if str(block.get("type") or "").lower() in {"sync", "host"}
         ]
+        stored_matches = match_store.list()
         valid_units = {
             str(unit.get("segment_id") or ""): unit
-            for unit in services._sync_alignment_units(confirmed_blocks)
+            for unit in services._sync_alignment_units(
+                confirmed_blocks,
+                preserve_whole_uids=_confirmed_parent_ids(
+                    stored_matches,
+                    confirmed.get("revision"),
+                    confirmed.get("scenario_revision_id"),
+                ),
+            )
             if str(unit.get("segment_id") or "")
         }
         sources_by_id = {item.id: item for item in source_store.list()}

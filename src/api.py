@@ -1247,7 +1247,10 @@ def _matching_speaker(
 
 
 def _sync_alignment_units(
-    blocks: list[dict], *, source_speakers: set[tuple[str, ...]] | None = None
+    blocks: list[dict],
+    *,
+    source_speakers: set[tuple[str, ...]] | None = None,
+    preserve_whole_uids: set[str] | None = None,
 ) -> list[dict[str, object]]:
     """Expand a canonical speaker block into independently matchable pieces."""
     units: list[dict[str, object]] = []
@@ -1267,10 +1270,14 @@ def _sync_alignment_units(
             speaker = speaker_selector
             if speaker:
                 last_speaker[block_type] = speaker
-        raw_fragments = block.get("sync_fragments")
         fragments = (
-            normalized_sync_fragments(block)
-            if block_type == "sync" and isinstance(raw_fragments, list) and raw_fragments
+            normalized_sync_fragments(
+                block
+                if block.get("sync_fragments")
+                else {**block, "normalized_text": _sync_quote(block)},
+                preserve_whole=parent_uid in (preserve_whole_uids or set()),
+            )
+            if block_type == "sync"
             else [
                 {
                     "text": _sync_quote(block),
@@ -1338,6 +1345,19 @@ def _sync_job_with_live_summary(job: dict) -> dict:
                 or str(item.metadata.get("scenario_revision_id") or "") == scenario_revision_id
             )
         ]
+        confirmed_uids = {item.segment_id for item in matches if item.status == "confirmed"}
+        valid_ids = {
+            str(unit.get("segment_id") or "")
+            for unit in _sync_alignment_units(
+                [
+                    block
+                    for block in confirmed.get("blocks", [])
+                    if str(block.get("type") or "").lower() in {"sync", "host"}
+                ],
+                preserve_whole_uids=confirmed_uids,
+            )
+        }
+        matches = [item for item in matches if item.segment_id in valid_ids]
     snapshot.update(_sync_summary(matches))
     return snapshot
 

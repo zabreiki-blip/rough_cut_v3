@@ -49,14 +49,89 @@ _TIMECODE_LINE_RE = re.compile(r"^(" + _TC_PAT + r")[.\s–\-]*(.*)", re.DOTALL)
 
 SNH_PLACEHOLDER_DURATION = 10.0  # seconds
 
+_COMPOUND_SPLIT = re.compile(r"\s*(?:\.{2,}|…)\s*")
+_SENTENCE_END = re.compile(r"(?:(?<!\.)\.(?!\.)|[!?]+)(?=\s+[А-ЯЁA-Z])")
+_ABBREVIATIONS = {"т", "е", "п", "д", "г", "гг", "ул", "обл", "им", "см", "др"}
+
+
+def _merge_short_parts(parts: list[str]) -> list[str]:
+    """Keep pauses and short interjections with a neighbouring speech part."""
+    merged: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not re.search(r"\w", part):
+            continue
+        if merged and len(part.split()) < 4:
+            merged[-1] = f"{merged[-1]} {part}"
+        else:
+            merged.append(part)
+    while len(merged) > 1 and len(merged[0].split()) < 4:
+        merged[:2] = [f"{merged[0]} {merged[1]}"]
+    return merged
+
+
+def split_compound_quote(text: str) -> list[str]:
+    """Find independently searchable phrases in a quote assembled from takes."""
+    result: list[str] = []
+    for portion in _merge_short_parts(_COMPOUND_SPLIT.split(text)):
+        boundaries: list[int] = []
+        for match in _SENTENCE_END.finditer(portion):
+            if match.group() == ".":
+                previous = re.search(r"(\S+)\s*$", portion[: match.start()])
+                word = previous.group(1) if previous else ""
+                if len(word) == 1 and word.isalpha() or word.casefold() in _ABBREVIATIONS:
+                    continue
+            boundaries.append(match.end())
+        start = 0
+        sentences: list[str] = []
+        for end in boundaries:
+            sentences.append(portion[start:end])
+            start = end
+        sentences.append(portion[start:])
+        result.extend(_merge_short_parts(sentences))
+    return result or ([text.strip()] if text.strip() else [])
+
+
+def _merge_adjacent_sync_fragments(segments: list[TimelineSegment]) -> list[TimelineSegment]:
+    """Keep neighbouring phrases from one continuous take in a single clip."""
+    merged: list[TimelineSegment] = []
+    for segment in segments:
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and previous.type == segment.type == "snh"
+            and previous.parent_block_uid
+            and previous.parent_block_uid == segment.parent_block_uid
+            and previous.match_status in {"auto_matched", "confirmed"}
+            and segment.match_status in {"auto_matched", "confirmed"}
+            and previous.source_id == segment.source_id
+            and previous.source_in_sec <= segment.source_in_sec
+            and previous.source_out_sec <= segment.source_out_sec
+            and previous.speech_out_sec > previous.speech_in_sec
+            and segment.speech_out_sec > segment.speech_in_sec
+            and previous.speech_in_sec <= segment.speech_in_sec
+            and previous.speech_out_sec <= segment.speech_out_sec
+            and -1.5 <= segment.speech_in_sec - previous.speech_out_sec <= 1.5
+        ):
+            previous.text = f"{previous.text} {segment.text}"
+            previous.spoken_text = f"{previous.spoken_text} {segment.spoken_text}".strip()
+            previous.source_out_sec = segment.source_out_sec
+            previous.speech_out_sec = segment.speech_out_sec
+            previous.duration_sec = previous.source_out_sec - previous.source_in_sec
+            previous.match_confidence = min(previous.match_confidence, segment.match_confidence)
+            previous.timecode_end = segment.timecode_end
+        else:
+            merged.append(segment)
+    return merged
+
 
 def sync_fragment_id(block_uid: str, index: int, count: int) -> str:
     """Return a stable match id while preserving legacy ids for one-part blocks."""
     return block_uid if count <= 1 else f"{block_uid}::fragment:{index + 1}"
 
 
-def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
-    """Read canonical speaker fragments with a backward-compatible fallback."""
+def normalized_sync_fragments(block: dict, *, preserve_whole: bool = False) -> list[dict[str, str]]:
+    """Read canonical fragments and split unconfirmed composite quotes."""
     raw_fragments = block.get("sync_fragments")
     fragments: list[dict[str, str]] = []
     if isinstance(raw_fragments, list):
@@ -73,15 +148,30 @@ def normalized_sync_fragments(block: dict) -> list[dict[str, str]]:
                     "timecode_end": str(value.get("timecode_end") or "").strip(),
                 }
             )
-    if fragments:
+    if not fragments:
+        fragments = [
+            {
+                "text": str(
+                    block.get("normalized_text") or block.get("original_text") or ""
+                ).strip(),
+                "timecode_start": str(block.get("timecode_start") or "").strip(),
+                "timecode_end": str(block.get("timecode_end") or "").strip(),
+            }
+        ]
+    if preserve_whole:
         return fragments
-    return [
-        {
-            "text": str(block.get("normalized_text") or block.get("original_text") or "").strip(),
-            "timecode_start": str(block.get("timecode_start") or "").strip(),
-            "timecode_end": str(block.get("timecode_end") or "").strip(),
-        }
-    ]
+    expanded: list[dict[str, str]] = []
+    for fragment in fragments:
+        parts = split_compound_quote(fragment["text"])
+        for index, part in enumerate(parts):
+            expanded.append(
+                {
+                    "text": part,
+                    "timecode_start": fragment["timecode_start"] if index == 0 else "",
+                    "timecode_end": fragment["timecode_end"] if index == 0 else "",
+                }
+            )
+    return expanded or fragments
 
 
 def _spoken_text(text: str, *, block_type: str, speaker: str = "") -> str:
@@ -398,7 +488,10 @@ def parse_normalized_timeline(
         if block_type in {"sync", "host"}:
             prefix = "snh" if block_type == "sync" else "host"
             fragments = (
-                normalized_sync_fragments(block)
+                normalized_sync_fragments(
+                    block,
+                    preserve_whole=str(field(matches.get(block_uid), "status", "")) == "confirmed",
+                )
                 if block_type == "sync"
                 else [
                     {
@@ -507,6 +600,16 @@ def parse_normalized_timeline(
             )
         )
 
+    segments = _merge_adjacent_sync_fragments(segments)
+    sync_ordinal = 0
+    for segment in segments:
+        if segment.type == "snh":
+            sync_ordinal += 1
+            segment.id = f"snh{sync_ordinal}"
+            if segment.placeholder_path:
+                segment.placeholder_path = str(
+                    Path(segment.placeholder_path).with_name(f"{segment.id}_placeholder.png")
+                )
     cursor = 0.0
     for segment in segments:
         segment.start_sec = cursor

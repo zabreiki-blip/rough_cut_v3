@@ -247,6 +247,7 @@ class SyncWorkerServices(Protocol):
         blocks: list[JsonDict],
         *,
         source_speakers: set[tuple[str, ...]] | None = None,
+        preserve_whole_uids: set[str] | None = None,
     ) -> list[JsonDict]: ...
 
     def get_settings(self) -> Any: ...
