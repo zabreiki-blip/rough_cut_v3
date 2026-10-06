@@ -95,6 +95,21 @@ def test_exact_sequence_name_wins_over_weaker_speaker_match() -> None:
     assert result.details["vasilieva"]["reason"] == "exact_sequence_name"
 
 
+def test_numbered_sequence_title_maps_to_its_full_length_viewing() -> None:
+    timeline = _brik_timeline(["louella"])
+    timeline.segments[0].source_in_sec = 3200
+    timeline.segments[0].source_out_sec = 3210
+    source = _source("louella", "1. Трилогия о Люле", "Луэлла")
+    source["speakers"] = ["Люля", "Луэлла"]
+    long_viewing = _media("long", "1. Трилогия о Люле.mp4", duration=5259)
+    short_viewing = _media("short", "Люля.mpg", duration=499)
+
+    result = map_catalog_to_timeline(timeline, [source], [short_viewing, long_viewing])
+
+    assert result.catalog["louella"] is long_viewing
+    assert result.details["louella"]["reason"] == "exact_sequence_name"
+
+
 def test_equal_best_name_matches_fail_closed_as_ambiguous() -> None:
     timeline = _brik_timeline(["kurskaya"])
     sources = [_source("kurskaya", "Курская")]
