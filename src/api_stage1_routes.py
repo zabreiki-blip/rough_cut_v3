@@ -33,7 +33,14 @@ def _revision_speaker_dir(
     redirected so V2 never publishes positional aliases into V1's folder.
     """
     requested = services._abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
-    if requested.resolve() == paths["speaker"].resolve():
+    # A restored TTS job may still supply the previous revision's alias dir.
+    # Its prepared scenario is current, so writing there would leave the
+    # active revision incomplete and make its asset manifest inconsistent.
+    revisions_root = (paths["speaker"] / "revisions").resolve()
+    if (
+        requested.resolve() == paths["speaker"].resolve()
+        or requested.resolve().parent == revisions_root
+    ):
         return services._revision_speaker_dir(paths, revision_id)
     return requested
 
