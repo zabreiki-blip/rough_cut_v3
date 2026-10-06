@@ -166,9 +166,29 @@ _CLEAR_SPEAKER_CREDIT = re.compile(
     re.DOTALL,
 )
 _EDITORIAL_VOICEOVER_CUE = re.compile(
-    r"^(?:ЗТМ\.?|НА КАДРАХ\b.+|ФРАГМЕНТ СЕРИАЛА\b.+|ЗДЕСЬ БЫ НУЖЕН ФРАГМЕНТ\b.+|\([^)]*(?:фото|кадр|план)[^)]*\))$",
+    r"^(?:ЗТМ\.?|НА КАДРАХ\b.+|ФРАГМЕНТ СЕРИАЛА\b.+|"
+    r"ЗДЕСЬ\s+(?:БЫ\s+НУЖЕН|НАДО(?:\s+БЫ)?\s+(?:ДАТЬ|ПОСТАВИТЬ|ВСТАВИТЬ))\s+ФРАГМЕНТ\b.+|"
+    r"\([^)]*(?:фото|кадр|план)[^)]*\))$",
     re.IGNORECASE | re.DOTALL,
 )
+_TTS_VOICE_CREDIT = re.compile(
+    r"^\s*(?:[«\"“]\s*)?Голос\s+(?:за\s+кадром\s+читает\s+воспоминания\s+[^:]+|"
+    r"[«\"“]?[А-ЯЁа-яё]+[»\"”]?)\s*(?:[»\"”]\s*)?[:.\-–—]\s*",
+    re.IGNORECASE,
+)
+_TTS_EDITORIAL_PARENTHESES = re.compile(
+    r"\s*\((?:показываем|показать|вставить|на\s+кадрах)\b[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def clean_voiceover_tts_text(text: str) -> str:
+    """Remove speech-direction labels and on-screen cues from spoken text."""
+    value = _TTS_VOICE_CREDIT.sub("", text.strip())
+    value = _TTS_EDITORIAL_PARENTHESES.sub("", value)
+    return value.replace("<…>", "…").strip()
+
+
 _STRUCTURAL_HEADING = re.compile(
     r"^(?:часть\b|глава\b|заставка\b|эпизод\b|\d+\s*\.\s*$)",
     re.IGNORECASE,
@@ -557,6 +577,9 @@ def _generate_normalization_unlocked(
                 for block in batch:
                     block.warnings.append(message)
 
+    for block in blocks:
+        if block.type == BlockType.VOICEOVER.value:
+            block.text_for_tts = clean_voiceover_tts_text(block.text_for_tts)
     _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
         source=str(input_path),
@@ -703,6 +726,7 @@ def confirm_normalization(
     memory_path: Path | None = None,
     expected_revision: int | None = None,
     learning_decisions: list[dict[str, Any]] | None = None,
+    source_path_override: Path | None = None,
 ) -> dict[str, Any]:
     with _path_lock(normalized_path):
         return _confirm_normalization_unlocked(
@@ -712,6 +736,7 @@ def confirm_normalization(
             memory_path=memory_path,
             expected_revision=expected_revision,
             learning_decisions=learning_decisions,
+            source_path_override=source_path_override,
         )
 
 
@@ -723,6 +748,7 @@ def _confirm_normalization_unlocked(
     memory_path: Path | None = None,
     expected_revision: int | None = None,
     learning_decisions: list[dict[str, Any]] | None = None,
+    source_path_override: Path | None = None,
 ) -> dict[str, Any]:
     """Validate, learn confirmed aliases, and atomically publish projections."""
     normalized_path = Path(normalized_path)
@@ -731,7 +757,10 @@ def _confirm_normalization_unlocked(
         raise RevisionConflictError(
             f"Expected revision {expected_revision}, current revision is {scenario.revision}"
         )
-    source_path = Path(scenario.source)
+    # A revision may have been authored in a container and later repaired on
+    # the host. Keep its recorded source identity while verifying an explicit
+    # local copy against the same source hash.
+    source_path = Path(source_path_override) if source_path_override else Path(scenario.source)
     if not source_path.exists() or _file_hash(source_path) != scenario.source_hash:
         raise SourceChangedError("Source scenario changed after normalization")
     errors = validate_for_confirmation(scenario)
@@ -803,6 +832,11 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
             errors.append(f"Block {block.order} has unknown type")
         if block.type == BlockType.VOICEOVER.value and not block.text_for_tts.strip():
             errors.append(f"Voiceover block {block.order} has empty TTS text")
+        if (
+            block.type == BlockType.VOICEOVER.value
+            and clean_voiceover_tts_text(block.text_for_tts) != block.text_for_tts.strip()
+        ):
+            errors.append(f"Voiceover block {block.order} contains a speech-direction cue")
         if block.type == BlockType.VOICEOVER.value:
             label, content = _split_label(block.original_text)
             marked_cue = normalize_marker(label) in _BUILTIN_MARKERS and (
