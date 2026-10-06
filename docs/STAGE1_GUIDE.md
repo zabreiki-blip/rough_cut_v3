@@ -2,9 +2,12 @@
 
 ## Общая схема
 
+```text
+сценарий → нормализация → проверка и подтверждение → scenario_prepared.json
+         → TTS → speaker/revisions/rev_NNNN/zk*.wav → сборка
 ```
-scenario.docx → analyze → scenario_prepared.json → synthesize → speaker/zk*.wav → validate → manifest.json
-```
+
+CLI-команды ниже работают с указанными путями отдельно от истории редакций.
 
 ---
 
@@ -31,7 +34,8 @@ scenario.docx → analyze → scenario_prepared.json → synthesize → speaker/
 снимки нормализации, подготовленного сценария, карты озвучки, sync matches и
 таймлайна, если они были сохранены для редакции. Неизменившиеся и перемещённые
 блоки сохраняют стабильный UID, поэтому их озвучка и подтверждённые совпадения
-могут быть переиспользованы. Файлы `speaker/zkN.wav` — только позиционные алиасы;
+могут быть переиспользованы. Файлы
+`speaker/revisions/<revision_id>/zkN.wav` — позиционные алиасы данной редакции;
 неизменяемые аудиоактивы находятся в `speaker/assets/<block_uid>/`.
 
 ### Целостность и восстановление
@@ -260,16 +264,17 @@ projects/<project>/
 │   └── voiceover_manifest.json  # Карта UID → аудиоактив
 ├── speaker/
 │   ├── assets/<block_uid>/      # Неизменяемые WAV по UID
-│   ├── zk1.wav                  # Алиас активного блока 1
-│   ├── zk2.wav                  # Алиас активного блока 2
-│   ├── phrase_preview.wav       # Тестовая фраза
-│   └── manifest.json            # Манифест для Stage 2
+│   └── revisions/rev_NNNN/     # Позиционные zkN.wav данной редакции
 └── versions/
     ├── scenarios/               # Manifest и снимки редакций
     ├── diffs/                   # Diff и план переиспользования
     ├── timelines/               # Снимки timeline и sync matches
     └── recovery/                # Копии перед восстановлением
 ```
+
+При отдельном CLI-прогоне WAV и `manifest.json` могут лежать непосредственно
+в каталоге, переданном через `--out`/`--speaker`. В веб-процессе рабочая карта
+UID и активов хранится в `work/voiceover_manifest.json`.
 
 ---
 
