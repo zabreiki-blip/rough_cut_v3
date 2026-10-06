@@ -403,7 +403,19 @@ def run_sync_job(
             for name in source.speaker_names
             if normalize_text(name)
         }
-        units = _sync_alignment_units(blocks, source_speakers=source_speakers)
+        existing = {item.segment_id: item for item in match_store.list()}
+        confirmed_parent_ids = {
+            segment_id
+            for segment_id, item in existing.items()
+            if item.status == "confirmed"
+            and item.metadata.get("normalization_revision") in (None, "", normalization_revision)
+            and str(item.metadata.get("scenario_revision_id") or "") in ("", scenario_revision_id)
+        }
+        units = _sync_alignment_units(
+            blocks,
+            source_speakers=source_speakers,
+            preserve_whole_uids=confirmed_parent_ids,
+        )
         matcher = SyncMatcher(
             matching_sources,
             indexes,
@@ -424,7 +436,6 @@ def run_sync_job(
             llm_review_limit = 30
         llm_reviewed = 0
         llm_review_failures: list[dict[str, str]] = []
-        existing = {item.segment_id: item for item in match_store.list()}
         checkpoint_state = {"dirty": False}
         matching_started_at = _utc_now_iso()
         matching_started_at_dt = _parse_iso_datetime(matching_started_at)
