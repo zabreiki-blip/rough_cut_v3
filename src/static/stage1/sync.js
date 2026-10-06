@@ -327,6 +327,13 @@ function renderSyncMatches(document) {
             или укажите у него верные имена спикеров.</div>`;
         })()
       : "";
+    const unmatchedReasons = {
+      query_too_short: "Фраза слишком короткая для поиска по записи.",
+      no_eligible_source: "Для указанного говорящего нет подходящего источника.",
+      no_candidate: "В доступной расшифровке подходящая фраза не найдена.",
+      below_review_threshold: "Есть только слабые совпадения; проверьте запись вручную.",
+    };
+    const unmatchedReason = unmatchedReasons[match.metadata?.unmatched_reason] || "";
     const sourceIn = Number(candidate.source_in_sec);
     const sourceOut = Number(candidate.source_out_sec);
     const hasCandidate = Boolean(candidate.source_id)
@@ -386,6 +393,7 @@ function renderSyncMatches(document) {
           ? escaped(matchedText)
           : "Whisper-фрагмент не найден"}</div>
         ${llmHint}
+        ${unmatchedReason ? `<div class="sync-match-speaker-filter">${escaped(unmatchedReason)}</div>` : ""}
         ${speakerFilterHint}
         <div class="sync-match-meta" data-sync-meta>
           ${escaped(source)} · ${formatSourceSecond(sourceIn)}–${formatSourceSecond(sourceOut)}
@@ -486,7 +494,9 @@ function renderSyncJob(value) {
     : 0;
 
   ids.sync_job_status.dataset.state = status;
-  ids.sync_job_status.textContent = status === "completed" ? "готово"
+  const segmentFailures = Array.isArray(job.segment_failures) ? job.segment_failures : [];
+  ids.sync_job_status.textContent = status === "completed"
+    ? (segmentFailures.length ? "готово с ошибками" : "готово")
     : status === "failed" ? "ошибка"
     : status === "interrupted" ? "прервано"
     : status === "cancelled" ? "прервано"
@@ -494,7 +504,9 @@ function renderSyncJob(value) {
     : status === "queued" ? "в очереди"
     : "в работе";
   ids.sync_job_progress.hidden = false;
-  ids.sync_job_message.textContent = message;
+  ids.sync_job_message.textContent = segmentFailures.length
+    ? `${message} · ошибок сегментов: ${segmentFailures.length} (${segmentFailures[0].segment_id || "без ID"}: ${segmentFailures[0].error || "ошибка"})`
+    : message;
   ids.sync_job_numbers.textContent = totalSources > 0
     ? `${completedSources}/${totalSources} файлов · ${pct}%`
     : (total > 0 ? `${done}/${total}` : `${pct}%`);

@@ -944,6 +944,7 @@ class SyncMatcher:
             return base
 
         if len(query) < 2 or not sources:
+            reason = "query_too_short" if len(query) < 2 else "no_eligible_source"
             return SyncMatch(
                 segment_id=request.segment_id,
                 query_text=request.text,
@@ -951,7 +952,7 @@ class SyncMatcher:
                 approximate_timecode=str(request.approximate_timecode or ""),
                 status="not_found",
                 strategy="insufficient_input",
-                metadata=_metadata({}),
+                metadata=_metadata({"unmatched_reason": reason}),
             )
 
         local: list[_Candidate] = []
@@ -1016,6 +1017,7 @@ class SyncMatcher:
             ]
 
         if not candidates or candidates[0].confidence < self.config.review_threshold:
+            reason = "no_candidate" if not candidates else "below_review_threshold"
             alternatives: list[SyncAlternative] = []
             for item in candidates[: self.config.max_alternatives]:
                 item_in, item_out = _padded_range(item, self.sources[item.source_id], self.config)
@@ -1037,7 +1039,7 @@ class SyncMatcher:
                 status="not_found",
                 strategy=candidates[0].strategy if candidates else "no_candidates",
                 alternatives=alternatives,
-                metadata=_metadata({}),
+                metadata=_metadata({"unmatched_reason": reason}),
             )
 
         best = candidates[0]

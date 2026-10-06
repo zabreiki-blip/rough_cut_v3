@@ -252,7 +252,11 @@ async function clearTTS() {
 function restoreTtsControls(state) {
   if (!state || typeof state !== "object") return;
   if (state.prepared_path) ids.prepared_path.value = String(state.prepared_path);
-  if (state.speaker_dir) ids.speaker_dir.value = String(state.speaker_dir);
+  if (state.speaker_dir) {
+    // Job history can point at an older revision. The server maps the base
+    // speaker directory to the revision of the current prepared scenario.
+    ids.speaker_dir.value = String(state.speaker_dir).replace(/[/\\]revisions[/\\]rev_\d+$/, "");
+  }
   if (state.provider === "macos") {
     ids.provider.value = "macos";
   } else if (state.tts_model) {

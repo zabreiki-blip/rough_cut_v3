@@ -111,8 +111,9 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
 )
 _EXPLICIT_SYNC_LABEL = re.compile(r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE)
 _TIMECODE_TOKEN = (
-    r"(?:\[?\d{1,2}[:.]\d{2}(?:\s+|[:.])\d{2}\]?|"
-    r"\[?\d{1,2}[:.]\d{2}\]?|\[?\d{1,2}-\d{2}\]?)"
+    r"(?:\[?\d{1,2}[:.][0-5]\d(?:\s+|[:.])[0-5]\d\]?|"
+    r"\[?\d{1,2}[:.][0-5]\d\]?|\[?\d{1,2}-[0-5]\d\]?)"
+    r"(?!\w)"
 )
 _TIMECODE = re.compile(rf"({_TIMECODE_TOKEN})")
 _SYNC_METADATA = re.compile(
@@ -156,6 +157,17 @@ _BARE_SPEAKER_PREFIX = re.compile(
     r"^\s*(?P<speaker>(?:[А-ЯЁ][а-яё]+\s+)?[А-ЯЁ]{3,})"
     r"(?:[.:\-–—]?\s+|[.:](?=[А-ЯЁ])|(?=[а-яё]))(?P<content>.+)$",
     re.DOTALL,
+)
+_CLEAR_SPEAKER_CREDIT = re.compile(
+    r"^\s*(?P<speaker>[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)"
+    r"(?:,\s*[а-яё][а-яё,\s-]{2,80})?"
+    r"(?P<separator>[:.]\s*(?:[-–—]\s*)?)"
+    r"(?P<content>.+)$",
+    re.DOTALL,
+)
+_EDITORIAL_VOICEOVER_CUE = re.compile(
+    r"^(?:ЗТМ\.?|НА КАДРАХ\b.+|ФРАГМЕНТ СЕРИАЛА\b.+|ЗДЕСЬ БЫ НУЖЕН ФРАГМЕНТ\b.+|\([^)]*(?:фото|кадр|план)[^)]*\))$",
+    re.IGNORECASE | re.DOTALL,
 )
 _STRUCTURAL_HEADING = re.compile(
     r"^(?:часть\b|глава\b|заставка\b|эпизод\b|\d+\s*\.\s*$)",
@@ -791,6 +803,33 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
             errors.append(f"Block {block.order} has unknown type")
         if block.type == BlockType.VOICEOVER.value and not block.text_for_tts.strip():
             errors.append(f"Voiceover block {block.order} has empty TTS text")
+        if block.type == BlockType.VOICEOVER.value:
+            label, content = _split_label(block.original_text)
+            marked_cue = normalize_marker(label) in _BUILTIN_MARKERS and (
+                _EDITORIAL_VOICEOVER_CUE.match(content)
+                or (content.endswith(":") and re.search(r"\bголос\b", content, re.IGNORECASE))
+            )
+            if _EDITORIAL_VOICEOVER_CUE.match(block.original_text.strip()) or marked_cue:
+                errors.append(f"Voiceover block {block.order} contains an editorial cue")
+        if block.type == BlockType.SYNC.value:
+            if block.original_text.strip().endswith(":") and not _TIMECODE.search(
+                block.original_text
+            ):
+                errors.append(f"Sync block {block.order} contains only a speaker credit")
+            if (
+                block.original_label
+                and _SYNC_NAME_ONLY_LABEL.fullmatch(block.original_label.strip())
+                and normalize_marker(block.original_label) not in _BUILTIN_MARKERS
+                and block.speaker
+                and normalize_marker(block.original_label) != normalize_marker(block.speaker)
+            ):
+                errors.append(f"Sync block {block.order} speaker conflicts with its credit")
+            for fragment in block.sync_fragments:
+                if not re.search(r"\w", fragment.text):
+                    errors.append(f"Sync block {block.order} contains an empty fragment")
+                for timecode in (fragment.timecode_start, fragment.timecode_end):
+                    if timecode and not _TIMECODE.fullmatch(timecode):
+                        errors.append(f"Sync block {block.order} has invalid timecode {timecode}")
     return list(dict.fromkeys(errors))
 
 
@@ -1240,6 +1279,8 @@ def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
     bare-timecode detection and sync fragment splitting.
     """
     token = text[start:end]
+    if start and text[start - 1] in "0123456789:.-":
+        return False
     inner = token.strip("[]")
     if token.startswith("[") or ":" in inner or inner.count(".") >= 2 or "-" in inner:
         return True
@@ -1327,6 +1368,18 @@ def _split_label(text: str) -> tuple[str, str]:
             _SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate)
         ) and _TIMECODE.match(sync_content):
             return candidate, content
+    clear_speaker = _CLEAR_SPEAKER_CREDIT.match(text)
+    if clear_speaker and not re.match(
+        r"^(?:голос|зк|зтм|титр)\b", clear_speaker.group("speaker"), re.IGNORECASE
+    ):
+        content = clear_speaker.group("content").strip()
+        credit = clear_speaker.group("speaker").strip()
+        if len(content) >= 35 and (
+            "," in text[: clear_speaker.start("content")]
+            or _TIMECODE.search(content)
+            or clear_speaker.group("separator").strip().endswith(("-", "–", "—"))
+        ):
+            return credit, content
     # Some scripts put a timecode directly after the speaker credit, without a
     # colon: "Бартон 00:37 — 01:07 ...". Validate the prefix as a name or a
     # name-and-role credit before treating it as a label.
@@ -1376,6 +1429,16 @@ def _classify_by_rules(
             _apply_type(block, BlockType.LIFE.value, DecisionSource.BUILTIN_RULE.value, 1.0)
             return
         if marker in _BUILTIN_MARKERS:
+            if _BUILTIN_MARKERS[marker] == BlockType.VOICEOVER.value:
+                _label, marked_content = _split_label(block.original_text)
+                if _EDITORIAL_VOICEOVER_CUE.match(marked_content) or (
+                    marked_content.endswith(":")
+                    and re.search(r"\bголос\b", marked_content, re.IGNORECASE)
+                ):
+                    _apply_type(
+                        block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0
+                    )
+                    return
             _apply_type(block, _BUILTIN_MARKERS[marker], DecisionSource.BUILTIN_RULE.value, 1.0)
             return
         if marker in _TECH_MARKERS:
@@ -1397,6 +1460,11 @@ def _classify_by_rules(
             )
     if not marker and _PLAYBACK_LIFE_CUE.search(stripped):
         _apply_type(block, BlockType.LIFE.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+        return
+    if _EDITORIAL_VOICEOVER_CUE.match(stripped) or (
+        stripped.endswith(":") and not _TIMECODE.search(stripped)
+    ):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
         return
     _label, content = _split_label(block.original_text)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
@@ -1425,7 +1493,12 @@ def _classify_by_rules(
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _looks_like_section_heading(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
-    elif _BARE_SPEAKER_PREFIX.match(stripped) and block.original_label and len(content) >= 40:
+    elif (
+        (_BARE_SPEAKER_PREFIX.match(stripped) or _CLEAR_SPEAKER_CREDIT.match(stripped))
+        and block.original_label
+        and len(content) >= 35
+        and marker not in _BUILTIN_MARKERS
+    ):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif (
         re.match(r"^(?:планы?|портреты)\b", stripped, flags=re.IGNORECASE)
@@ -1484,6 +1557,20 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         block.speaker = explicit_label.group(1).strip(" \t,;:")
         block.role = ""
         has_sync_metadata = True
+    elif block.original_label and normalize_marker(block.original_label) not in _BUILTIN_MARKERS:
+        credited = _SYNC_LABEL_METADATA.match(block.original_label)
+        if credited:
+            block.speaker = credited.group(1).strip()
+            block.role = credited.group(2).strip()
+        elif _SYNC_NAME_ONLY_LABEL.match(block.original_label):
+            block.speaker = block.original_label.strip()
+        if block.speaker:
+            has_sync_metadata = True
+        elif match:
+            block.speaker = match.group(1).strip()
+            block.role = match.group(2).strip()
+            fragment_source = block.normalized_text[match.start(3) :].strip()
+            has_sync_metadata = True
     elif match:
         block.speaker = match.group(1).strip()
         block.role = match.group(2).strip()
@@ -1602,7 +1689,11 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
     expanded: list[SyncFragment] = []
     for fragment in fragments:
         parts = []
-        for raw_part in re.split(r"\b(?:СКЛ|СКЛЕЙКА)\b", fragment.text, flags=re.IGNORECASE):
+        for raw_part in re.split(
+            r"\(\s*(?:СКЛ|СКЛЕЙКА)\s*\)|\b(?:СКЛ|СКЛЕЙКА)\b",
+            fragment.text,
+            flags=re.IGNORECASE,
+        ):
             # Remove only separators adjacent to the splice marker. Sentence
             # punctuation at the far end of each fragment belongs to speech.
             part = raw_part.strip(" \t\r\n–—-").lstrip(",.;:")
