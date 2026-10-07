@@ -36,7 +36,7 @@ class NormalizationApiTest(unittest.TestCase):
         source = self.projects / project / "input" / "scenario.txt"
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text(
-            "ДИКТОР: Первый закадровый блок.\nСНХ: Ответ героя.\n",
+            "ДИКТОР: Первый закадровый блок.\nСНХ, Герой: Ответ героя.\n",
             encoding="utf-8",
         )
         return source

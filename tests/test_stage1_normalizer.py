@@ -1580,7 +1580,7 @@ class NormalizerTests(unittest.TestCase):
             prepared = root / "prepared.json"
             raw = root / "raw.txt"
             db = root / "memory.sqlite3"
-            source.write_text("Необычный голос: Текст\nСНХ: Ответ\n", encoding="utf-8")
+            source.write_text("Необычный голос: Текст\nСНХ, Герой: Ответ\n", encoding="utf-8")
             draft = generate_normalization(source, normalized, memory_path=db, use_llm=False)
             draft["blocks"][0]["type"] = "voiceover"
             draft["blocks"][0]["text_for_tts"] = "Текст"

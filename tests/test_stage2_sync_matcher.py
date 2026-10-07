@@ -74,6 +74,41 @@ def test_speaker_filter_matches_yo_and_case_variants() -> None:
     assert result.source_id == "petr"
 
 
+def test_surname_alias_selects_source_without_matching_given_name() -> None:
+    phrase = "цитата записана только у нужного человека"
+    sources = [_source("vera", "Вера Сторожева"), _source("other", "Вера Иванова")]
+    indexes = [_index("vera", phrase, 10), _index("other", phrase, 20)]
+    result = SyncMatcher(sources, indexes).match(
+        AlignmentRequest(segment_id="surname", text=phrase, speaker="СТОРОЖЕВА")
+    )
+    assert result.source_id == "vera"
+
+
+def test_shared_given_name_does_not_admit_wrong_interview() -> None:
+    phrase = "цитата записана только у другого человека"
+    result = SyncMatcher([_source("other", "Вера Иванова")], [_index("other", phrase, 10)]).match(
+        AlignmentRequest(segment_id="given-name", text=phrase, speaker="Вера Сторожева")
+    )
+    assert result.status == "not_found"
+
+
+def test_decorated_surname_source_remains_eligible() -> None:
+    phrase = "эту цитату сказала героиня интервью"
+    result = SyncMatcher(
+        [_source("viewing", "Сторожева дача")], [_index("viewing", phrase, 10)]
+    ).match(AlignmentRequest(segment_id="decorated", text=phrase, speaker="Вера Сторожева"))
+    assert result.source_id == "viewing"
+
+
+def test_registered_short_alias_matches_full_speaker_name() -> None:
+    phrase = "эту цитату сказала героиня интервью"
+    result = SyncMatcher(
+        [_source("viewing", "Люля", speakers=("Луэлла",))],
+        [_index("viewing", phrase, 10)],
+    ).match(AlignmentRequest(segment_id="alias", text=phrase, speaker="Луэлла Краснощекова"))
+    assert result.source_id == "viewing"
+
+
 def test_transcript_tokens_are_built_once_per_matcher() -> None:
     index = _index("s1", "одна и та же точная цитата героя", 10.0)
     with patch.object(

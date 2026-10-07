@@ -94,7 +94,9 @@ def prepared_from_normalized(normalized: dict[str, Any]) -> dict[str, Any]:
     blocks = [
         block
         for block in normalized.get("blocks", [])
-        if isinstance(block, dict) and block.get("type") == "voiceover"
+        if isinstance(block, dict)
+        and block.get("type") == "voiceover"
+        and not block.get("absorbed_by_uid")
     ]
     return {
         "source": normalized.get("source", ""),
@@ -133,7 +135,9 @@ def _with_block_uids(prepared: dict[str, Any], normalized: dict[str, Any]) -> di
     voiceovers = [
         block
         for block in normalized.get("blocks", [])
-        if isinstance(block, dict) and block.get("type") == "voiceover"
+        if isinstance(block, dict)
+        and block.get("type") == "voiceover"
+        and not block.get("absorbed_by_uid")
     ]
     items = []
     for index, original in enumerate(prepared.get("items", [])):

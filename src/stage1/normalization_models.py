@@ -81,6 +81,7 @@ class NormalizedBlock:
     proposed_source: str = ""
     proposed_memory_rule_id: int | None = None
     continuation_of_type: str = ""
+    absorbed_by_uid: str = ""
     # Stage 4 attaches the block's relationship to the previous scenario
     # revision here.  It must survive normalization model round-trips so the
     # timeline exporter can highlight changed clips in Premiere.

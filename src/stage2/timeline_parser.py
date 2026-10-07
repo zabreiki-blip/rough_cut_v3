@@ -457,6 +457,8 @@ def parse_normalized_timeline(
         return getattr(item, name, default)
 
     for block in blocks:
+        if block.get("absorbed_by_uid"):
+            continue
         block_type = str(block.get("type", "unknown")).lower()
         text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
         block_uid = str(block.get("uid") or "").strip()

@@ -1,10 +1,15 @@
+import json
 from pathlib import Path
+
+from stage2.timeline_parser import parse_normalized_timeline
+from stage4.revision_assets import prepared_from_normalized
 
 from stage1.normalizer import (
     _extract_sync_fragments,
     clean_voiceover_tts_text,
     confirm_normalization,
     generate_normalization,
+    save_normalization,
     validate_for_confirmation,
 )
 
@@ -96,6 +101,94 @@ def test_confirmation_rejects_corrupt_sync_metadata(tmp_path: Path) -> None:
     assert any("speaker conflicts" in error for error in errors)
     assert any("empty fragment" in error for error in errors)
     assert any("invalid timecode" in error for error in errors)
+
+
+def test_confirmation_rejects_sync_without_speaker(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("СНХ: Фраза без указания героя.\n", encoding="utf-8")
+    scenario = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )
+    assert "Sync block 1 has no speaker" in validate_for_confirmation(scenario)
+
+
+def test_confirmation_rejects_reading_direction_as_speaker(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("СНХ, Черкасов читает: Первая строка.\n", encoding="utf-8")
+    scenario = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )
+    assert any(
+        "direction instead of a speaker" in error for error in validate_for_confirmation(scenario)
+    )
+
+
+def test_sync_does_not_inherit_speaker_across_narration(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "Курская: 00:03 Первый ответ.\nЗК: Рассказ ведущего.\nСНХ: Следующий ответ.\n",
+        encoding="utf-8",
+    )
+    blocks = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )["blocks"]
+    assert [block["type"] for block in blocks] == ["sync", "voiceover", "sync"]
+    assert blocks[-1]["speaker"] == ""
+
+
+def test_absorbed_voiceover_is_kept_in_scenario_but_not_spoken_twice(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("ЗК: Первая строка.\nЗК: Вторая строка.\n", encoding="utf-8")
+    normalized = tmp_path / "normalized.json"
+    draft = generate_normalization(
+        source, normalized, memory_path=tmp_path / "memory.sqlite3", use_llm=False
+    )
+    first, second = draft["blocks"]
+    first["text_for_tts"] = "Первая строка. Вторая строка."
+    second["absorbed_by_uid"] = first["uid"]
+    second["text_for_tts"] = ""
+    assert validate_for_confirmation(draft) == []
+    saved = save_normalization(normalized, draft, expected_revision=draft["revision"])
+    confirmed = confirm_normalization(
+        normalized,
+        tmp_path / "prepared.json",
+        tmp_path / "raw.txt",
+        memory_path=tmp_path / "memory.sqlite3",
+        expected_revision=saved["revision"],
+    )
+    prepared = json.loads((tmp_path / "prepared.json").read_text())
+    raw = (tmp_path / "raw.txt").read_text()
+    timeline = parse_normalized_timeline(confirmed, tmp_path, tmp_path, "TEST")
+    assert len(confirmed["blocks"]) == 2
+    assert [item["block_uid"] for item in prepared["items"]] == [first["uid"]]
+    assert [item["block_uid"] for item in prepared_from_normalized(confirmed)["items"]] == [
+        first["uid"]
+    ]
+    assert raw.count("ЗК") == 1
+    assert [(segment.id, segment.block_uid) for segment in timeline.segments] == [
+        ("zk1", first["uid"])
+    ]
+
+
+def test_absorbed_voiceover_requires_valid_target_and_empty_tts(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("ЗК: Первая строка.\nЗК: Вторая строка.\n", encoding="utf-8")
+    draft = generate_normalization(
+        source, tmp_path / "normalized.json", memory_path=tmp_path / "memory.sqlite3", use_llm=False
+    )
+    draft["blocks"][1]["absorbed_by_uid"] = "missing"
+    errors = validate_for_confirmation(draft)
+    assert any("invalid absorbed-by link" in error for error in errors)
+    assert any("absorbed but still has TTS text" in error for error in errors)
 
 
 def test_voice_credit_and_inline_directorial_cue_are_not_spoken() -> None:

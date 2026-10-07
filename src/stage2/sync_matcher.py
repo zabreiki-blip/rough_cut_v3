@@ -875,7 +875,12 @@ class SyncMatcher:
                 [],
             )
         available = [source for source in self.sources.values() if source.id in self.indexes]
-        speaker_tokens = normalize_text(request.speaker)
+        # Role descriptions after a comma are not part of a person's name.
+        speaker_tokens = [
+            token
+            for token in normalize_text(request.speaker.split(",", 1)[0])
+            if not token.isdigit()
+        ]
         if not speaker_tokens:
             return available, []
         universal = [source for source in available if source.all_speakers]
@@ -899,30 +904,94 @@ class SyncMatcher:
         if exact:
             selected = with_universal(prefer_rendered_viewings(exact))
         else:
-            query_name = set(speaker_tokens)
-            fuzzy = [
-                source
-                for source in available
-                if any(
-                    query_name.intersection(tokens)
-                    or SequenceMatcher(
-                        None, " ".join(speaker_tokens), " ".join(tokens), autojunk=False
-                    ).ratio()
-                    >= 0.72
-                    for tokens in source_speaker_tokens(source)
-                )
-            ]
-            if fuzzy:
-                selected = with_universal(prefer_rendered_viewings(fuzzy))
-            else:
-                # A source registered without speaker metadata remains
-                # searchable, but a clearly different named speaker is not
-                # searched in this interview.
-                selected = with_universal(
-                    prefer_rendered_viewings(
-                        [source for source in available if not source_speaker_tokens(source)]
+            surname = speaker_tokens[-1]
+
+            def named_alias_match(tokens: list[str]) -> bool:
+                if not tokens:
+                    return False
+                # Source labels may contain a date prefix or a setting after
+                # the surname ("40726 Стычкин", "Сторожева дача").
+                words = [token for token in tokens if not token.isdigit()]
+                if not words:
+                    return False
+                if words[-1] == surname:
+                    return (
+                        len(speaker_tokens) == 1 or len(words) == 1 or words[0] == speaker_tokens[0]
+                    )
+                return (
+                    words[0] == surname
+                    and len(words) == 2
+                    and (
+                        words[1] in {"дач", "дом", "интервью"}
+                        or surname in {"отец", "мать", "мам", "пап", "брат", "сестр"}
                     )
                 )
+
+            surname_matches = [
+                source
+                for source in available
+                if any(named_alias_match(tokens) for tokens in source_speaker_tokens(source))
+            ]
+            if surname_matches:
+                selected = with_universal(prefer_rendered_viewings(surname_matches))
+            else:
+                # An explicitly registered short alias can be a stage name
+                # or familiar given name, e.g. Луэлла for Луэлла Краснощекова.
+                registered_aliases = [
+                    source
+                    for source in available
+                    if len(speaker_tokens) > 1
+                    and any(
+                        normalize_text(alias) == speaker_tokens[:1] for alias in source.speakers
+                    )
+                ]
+                query_words = normalize_text(request.speaker)
+                titled_sources = [
+                    source
+                    for source in available
+                    if any(
+                        len(alias_tokens := normalize_text(alias)) > 1
+                        and any(
+                            query_words[index : index + len(alias_tokens)] == alias_tokens
+                            for index in range(len(query_words) - len(alias_tokens) + 1)
+                        )
+                        for alias in source.speaker_names
+                    )
+                ]
+                if registered_aliases or titled_sources:
+                    selected = with_universal(
+                        prefer_rendered_viewings(registered_aliases or titled_sources)
+                    )
+                else:
+                    # Inflected full Russian names may differ after the text
+                    # stemmer (Иванов / Иванова). Require both name parts and a
+                    # strong whole-name match; never fuzzy-match a lone word.
+                    inflected_full = [
+                        source
+                        for source in available
+                        if any(
+                            len(tokens) > 1
+                            and len(speaker_tokens) > 1
+                            and SequenceMatcher(
+                                None, " ".join(speaker_tokens), " ".join(tokens), autojunk=False
+                            ).ratio()
+                            >= 0.9
+                            for tokens in source_speaker_tokens(source)
+                        )
+                    ]
+                    if inflected_full:
+                        selected = with_universal(prefer_rendered_viewings(inflected_full))
+                    else:
+                        # Sources without speaker metadata remain searchable.
+                        selected = with_universal(
+                            prefer_rendered_viewings(
+                                [
+                                    source
+                                    for source in available
+                                    if not source_speaker_tokens(source)
+                                ]
+                            )
+                        )
         selected_ids = {source.id for source in selected}
         # Sources excluded purely because their registered speaker names did
         # not match the request are surfaced so the UI can explain a

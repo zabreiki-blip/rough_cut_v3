@@ -827,17 +827,34 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
         _validate_structure(value)
     except NormalizationValidationError as exc:
         errors.extend(exc.errors)
+    blocks_by_uid = {block.uid: block for block in value.blocks}
     for block in value.blocks:
+        if block.absorbed_by_uid:
+            target = blocks_by_uid.get(block.absorbed_by_uid)
+            if (
+                block.type not in {BlockType.VOICEOVER.value, BlockType.TECHNICAL.value}
+                or target is None
+                or target.uid == block.uid
+                or target.type != BlockType.VOICEOVER.value
+                or target.absorbed_by_uid
+            ):
+                errors.append(f"Block {block.order} has an invalid absorbed-by link")
+            if block.text_for_tts.strip():
+                errors.append(f"Block {block.order} is absorbed but still has TTS text")
         if block.type == BlockType.UNKNOWN.value:
             errors.append(f"Block {block.order} has unknown type")
-        if block.type == BlockType.VOICEOVER.value and not block.text_for_tts.strip():
+        if (
+            block.type == BlockType.VOICEOVER.value
+            and not block.absorbed_by_uid
+            and not block.text_for_tts.strip()
+        ):
             errors.append(f"Voiceover block {block.order} has empty TTS text")
         if (
             block.type == BlockType.VOICEOVER.value
             and clean_voiceover_tts_text(block.text_for_tts) != block.text_for_tts.strip()
         ):
             errors.append(f"Voiceover block {block.order} contains a speech-direction cue")
-        if block.type == BlockType.VOICEOVER.value:
+        if block.type == BlockType.VOICEOVER.value and not block.absorbed_by_uid:
             label, content = _split_label(block.original_text)
             marked_cue = normalize_marker(label) in _BUILTIN_MARKERS and (
                 _EDITORIAL_VOICEOVER_CUE.match(content)
@@ -846,6 +863,10 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
             if _EDITORIAL_VOICEOVER_CUE.match(block.original_text.strip()) or marked_cue:
                 errors.append(f"Voiceover block {block.order} contains an editorial cue")
         if block.type == BlockType.SYNC.value:
+            if not block.speaker.strip():
+                errors.append(f"Sync block {block.order} has no speaker")
+            elif re.search(r"\b(?:читает|по[её]т)\s*$", block.speaker, re.IGNORECASE):
+                errors.append(f"Sync block {block.order} has a direction instead of a speaker")
             if block.original_text.strip().endswith(":") and not _TIMECODE.search(
                 block.original_text
             ):
@@ -1038,7 +1059,6 @@ def _annotate_continuation_context(
     blocks: list[NormalizedBlock], video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
 ) -> None:
     previous: NormalizedBlock | None = None
-    previous_sync: NormalizedBlock | None = None
     for block in blocks:
         if (
             previous is not None
@@ -1083,17 +1103,19 @@ def _annotate_continuation_context(
                 DecisionSource.BUILTIN_RULE.value,
                 0.9,
             )
-        # A scenario editor often marks the next quote only as "СНХ" (or
-        # leaves a bare timecode) after naming the interviewee once. Treat it
-        # as another independently searchable edit from that interview, not as
-        # a chronological continuation of the previous source range.
+        # A bare timecoded quote can inherit the interviewee only from the
+        # immediately preceding sync. A cue or narration in between makes
+        # that attribution uncertain and requires an explicit speaker.
         if block.type == BlockType.SYNC.value:
-            if block.speaker:
-                previous_sync = block
-            elif previous_sync is not None:
+            if (
+                not block.speaker
+                and previous is not None
+                and previous.type == BlockType.SYNC.value
+                and previous.speaker
+            ):
                 block.continuation_of_type = BlockType.SYNC.value
-                block.speaker = previous_sync.speaker
-                block.role = previous_sync.role
+                block.speaker = previous.speaker
+                block.role = previous.role
         previous = block
 
 
@@ -2176,7 +2198,11 @@ def _validate_structure(scenario: NormalizedScenario) -> None:
 
 
 def _prepared_projection(scenario: NormalizedScenario) -> dict[str, Any]:
-    voiceovers = [block for block in scenario.blocks if block.type == BlockType.VOICEOVER.value]
+    voiceovers = [
+        block
+        for block in scenario.blocks
+        if block.type == BlockType.VOICEOVER.value and not block.absorbed_by_uid
+    ]
     return {
         "source": scenario.source,
         "used_llm": any(block.source == DecisionSource.LLM.value for block in scenario.blocks),
@@ -2214,6 +2240,8 @@ def _raw_projection(scenario: NormalizedScenario) -> str:
     }
     lines: list[str] = []
     for block in scenario.blocks:
+        if block.absorbed_by_uid:
+            continue
         counters[block.type] = counters.get(block.type, 0) + 1
         prefix = prefixes[block.type]
         lines.append(f"{prefix}{counters[block.type]}: {block.normalized_text}")

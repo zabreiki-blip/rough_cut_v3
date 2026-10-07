@@ -189,6 +189,11 @@ export function renderNormalization() {
         <label class="field"><span>Таймкод начала</span><input data-field="timecode_start" value="${escaped(blockValue(block, "timecode_start", "timecode", "start_timecode"))}"${hasMultipleFragments ? " readonly title=\"Редактируйте таймкоды отдельных фрагментов ниже\"" : ""}></label>
         <label class="field"><span>Таймкод конца</span><input data-field="timecode_end" value="${escaped(blockValue(block, "timecode_end", "end_timecode"))}"${hasMultipleFragments ? " readonly title=\"Редактируйте таймкоды отдельных фрагментов ниже\"" : ""}></label>
         <label class="field"><span>Заметка</span><input data-field="notes" value="${escaped(blockValue(block, "notes"))}"></label>
+        <label class="field"><span>Включён в озвучку блока</span><select data-field="absorbed_by_uid">
+          <option value="">Нет</option>
+          ${blocks.filter((candidate) => candidate.uid !== block.uid && candidate.type === "voiceover" && !candidate.absorbed_by_uid)
+            .map((candidate) => `<option value="${escaped(candidate.uid)}"${candidate.uid === block.absorbed_by_uid ? " selected" : ""}>#${candidate.order} · ${escaped(String(candidate.normalized_text || "").slice(0, 50))}</option>`).join("")}
+        </select></label>
       </div>
       ${hasMultipleFragments ? `<div class="sync-fragment-editor">
         <div class="sync-fragment-heading">Фрагменты спикера · ${syncFragments.length}</div>
@@ -232,6 +237,11 @@ export function updateBlockFromControl(control) {
     return;
   }
   block[control.dataset.field] = control.value;
+  if (control.dataset.field === "absorbed_by_uid") {
+    block.text_for_tts = control.value ? "" : (block.type === "voiceover" ? block.normalized_text || "" : "");
+    const ttsControl = card.querySelector('[data-field="text_for_tts"]');
+    if (ttsControl) ttsControl.value = block.text_for_tts;
+  }
   if (Array.isArray(block.sync_fragments) && block.sync_fragments.length === 1) {
     if (control.dataset.field === "normalized_text") {
       block.sync_fragments[0].text = control.value;
