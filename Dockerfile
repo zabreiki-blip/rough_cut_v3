@@ -1,4 +1,9 @@
-FROM python:3.11-slim
+# Tag is kept for readability; for a fully reproducible base pin by digest:
+#   docker build --build-arg PYTHON_IMAGE=python:3.11-slim@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce .
+# (multi-arch index digest of python:3.11-slim obtained via
+#  `docker buildx imagetools inspect python:3.11-slim` on 2026-10-08; refresh periodically).
+ARG PYTHON_IMAGE=python:3.11-slim
+FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -9,11 +14,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends antiword catdoc curl fonts-dejavu-core ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Versions are pinned by requirements-lock.txt used as a constraints file
+# (it also lists dev packages; constraints only apply to what gets installed).
+COPY requirements.txt requirements-lock.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -c requirements-lock.txt
 
 COPY requirements-whisper.txt .
-RUN pip install --no-cache-dir -r requirements-whisper.txt
+RUN pip install --no-cache-dir -r requirements-whisper.txt -c requirements-lock.txt
 
 COPY src ./src
 COPY scripts ./scripts

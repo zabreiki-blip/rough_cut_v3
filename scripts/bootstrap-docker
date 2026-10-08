@@ -28,6 +28,22 @@ if [[ ! -f .env ]]; then
 fi
 
 mkdir -p projects data
+
+# The container runs as uid 10001 (see Dockerfile). On Linux bind mounts keep
+# host ownership, so hand the directories to that uid. Docker Desktop on macOS
+# maps ownership itself, so leave it untouched there.
+if [[ "$(uname -s)" == "Linux" ]]; then
+  CONTAINER_UID=10001
+  if [[ "$(stat -c '%u' projects)" != "${CONTAINER_UID}" || "$(stat -c '%u' data)" != "${CONTAINER_UID}" ]]; then
+    if chown "${CONTAINER_UID}:${CONTAINER_UID}" projects data 2>/dev/null \
+      || { command -v sudo >/dev/null 2>&1 && sudo -n chown "${CONTAINER_UID}:${CONTAINER_UID}" projects data 2>/dev/null; }; then
+      echo "Set owner of ./projects and ./data to uid ${CONTAINER_UID}."
+    else
+      echo "WARNING: cannot chown ./projects and ./data to uid ${CONTAINER_UID}; the container may fail to write." >&2
+      echo "         Run: sudo chown ${CONTAINER_UID}:${CONTAINER_UID} projects data" >&2
+    fi
+  fi
+fi
 docker compose config --quiet
 docker compose build stage1-api
 docker compose up -d stage1-api
