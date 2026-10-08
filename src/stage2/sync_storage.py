@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from typing import Any, List
+import weakref
 
 from atomic_io import atomic_write_json as _atomic_write_json
 
@@ -15,6 +17,34 @@ from .sync_models import SyncMatch, SyncSource
 # to accept the document; ``SyncSource.from_dict`` supplies defaults for older
 # records that do not contain them.
 SCHEMA_VERSION = 1
+
+
+# save()/delete() are read-modify-write sequences over one JSON file.  Callers
+# are NOT uniformly serialized by the project transition lock (the Stage 2
+# routes, the sync worker thread and the Stage 3 source registration all reach
+# these stores on their own), so two concurrent upserts could each read the
+# same version and one would silently drop the other's record.  Serialize
+# mutations with one re-entrant lock per resolved file path, shared by every
+# store instance for that path.  The lock is process-local; it does not
+# protect a caller's own list()-then-replace_all() sequence, which must still
+# hold a project-level lock.
+#
+# Weak values: a lock stays registered for as long as any thread holds or
+# waits on it (``with _path_lock(...)`` keeps a strong reference for the whole
+# block), so a held lock is never recreated; idle entries are collected
+# instead of growing with every distinct path ever seen.
+_PATH_LOCKS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.RLock:
+    key = str(Path(path).resolve())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 def _read_json(path: Path) -> Any:
@@ -50,14 +80,18 @@ class SyncSourceStore:
         return next((item for item in self.list() if item.id == source_id), None)
 
     def save(self, source: SyncSource) -> SyncSource:
-        sources = self.list()
-        by_id = {item.id: item for item in sources}
-        by_id[source.id] = source
-        ordered = [by_id[key] for key in sorted(by_id)]
-        _atomic_write_json(
-            self.path,
-            {"schema_version": SCHEMA_VERSION, "sources": [item.to_dict() for item in ordered]},
-        )
+        with _path_lock(self.path):
+            sources = self.list()
+            by_id = {item.id: item for item in sources}
+            by_id[source.id] = source
+            ordered = [by_id[key] for key in sorted(by_id)]
+            _atomic_write_json(
+                self.path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "sources": [item.to_dict() for item in ordered],
+                },
+            )
         return source
 
     def replace_all(
@@ -65,21 +99,23 @@ class SyncSourceStore:
     ) -> None:  # List not list: class method .list() shadows builtin
         if len({item.id for item in sources}) != len(sources):
             raise ValueError("duplicate sync source id")
-        _atomic_write_json(
-            self.path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "sources": [item.to_dict() for item in sources],
-            },
-        )
+        with _path_lock(self.path):
+            _atomic_write_json(
+                self.path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "sources": [item.to_dict() for item in sources],
+                },
+            )
 
     def delete(self, source_id: str) -> bool:
-        sources = self.list()
-        remaining = [item for item in sources if item.id != source_id]
-        if len(remaining) == len(sources):
-            return False
-        self.replace_all(remaining)
-        return True
+        with _path_lock(self.path):
+            sources = self.list()
+            remaining = [item for item in sources if item.id != source_id]
+            if len(remaining) == len(sources):
+                return False
+            self.replace_all(remaining)
+            return True
 
 
 class SyncMatchStore:
@@ -93,14 +129,18 @@ class SyncMatchStore:
         return next((item for item in self.list() if item.segment_id == segment_id), None)
 
     def save(self, match: SyncMatch) -> SyncMatch:
-        matches = self.list()
-        by_id = {item.segment_id: item for item in matches}
-        by_id[match.segment_id] = match
-        ordered = [by_id[key] for key in sorted(by_id)]
-        _atomic_write_json(
-            self.path,
-            {"schema_version": SCHEMA_VERSION, "matches": [item.to_dict() for item in ordered]},
-        )
+        with _path_lock(self.path):
+            matches = self.list()
+            by_id = {item.segment_id: item for item in matches}
+            by_id[match.segment_id] = match
+            ordered = [by_id[key] for key in sorted(by_id)]
+            _atomic_write_json(
+                self.path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "matches": [item.to_dict() for item in ordered],
+                },
+            )
         return match
 
     def replace_all(
@@ -108,18 +148,20 @@ class SyncMatchStore:
     ) -> None:  # List not list: class method .list() shadows builtin
         if len({item.segment_id for item in matches}) != len(matches):
             raise ValueError("duplicate segment_id in sync matches")
-        _atomic_write_json(
-            self.path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "matches": [item.to_dict() for item in matches],
-            },
-        )
+        with _path_lock(self.path):
+            _atomic_write_json(
+                self.path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "matches": [item.to_dict() for item in matches],
+                },
+            )
 
     def delete(self, segment_id: str) -> bool:
-        matches = self.list()
-        remaining = [item for item in matches if item.segment_id != segment_id]
-        if len(remaining) == len(matches):
-            return False
-        self.replace_all(remaining)
-        return True
+        with _path_lock(self.path):
+            matches = self.list()
+            remaining = [item for item in matches if item.segment_id != segment_id]
+            if len(remaining) == len(matches):
+                return False
+            self.replace_all(remaining)
+            return True
