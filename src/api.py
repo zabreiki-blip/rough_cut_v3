@@ -193,11 +193,21 @@ _UPLOAD_ENDPOINTS = frozenset({"stage2_sync_source_audio"})
 class _LimitedRequest(Request):
     """Apply the large body limit only to upload endpoints."""
 
+    # Explicit per-request override. Stored locally so the setter works on both
+    # Flask 3.0 (read-only base property) and Flask 3.1 (read-write base property).
+    _explicit_max_content_length: int | None = None
+
     @property
-    def max_content_length(self) -> int | None:  # type: ignore[override]
+    def max_content_length(self) -> int | None:
+        if self._explicit_max_content_length is not None:
+            return self._explicit_max_content_length
         if self.method in {"PUT", "POST"} and self.endpoint in _UPLOAD_ENDPOINTS:
             return _request_body_limit()
         return super().max_content_length
+
+    @max_content_length.setter
+    def max_content_length(self, value: int | None) -> None:
+        self._explicit_max_content_length = value
 
 
 configure_logging()
