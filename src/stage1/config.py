@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
+
+
+DEFAULT_OPENROUTER_MAX_TOKENS = 16384
 
 
 @dataclass
@@ -29,6 +33,13 @@ class Settings:
     macos_command_timeout: int
     project_name: str
     max_zk_blocks: int
+    # Hard cap on completion tokens for OpenRouter chat requests (cost guard).
+    openrouter_max_tokens: int = DEFAULT_OPENROUTER_MAX_TOKENS
+
+
+# Extra seconds the client waits beyond the connector's command timeout
+# (covers the `afconvert` step, queueing and network overhead).
+MACOS_CONNECTOR_TIMEOUT_MARGIN_SECONDS = 60
 
 
 def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
@@ -64,14 +75,53 @@ def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
         warnings.append("MACOS_CONNECTOR_URL must start with http:// or https://")
 
     integer("MAX_ZK_BLOCKS", 1)
+    integer("OPENROUTER_MAX_TOKENS", 1)
     integer("OPENROUTER_TTS_SAMPLE_RATE", 8000, 192000)
     integer("MACOS_TTS_RATE", 80, 420)
     integer("MACOS_TTS_SAMPLE_RATE", 8000, 192000)
     integer("MACOS_CONNECTOR_TIMEOUT", 5)
     integer("MACOS_COMMAND_TIMEOUT", 30, 7200)
+    integer("MACOS_SAY_CONCURRENCY", 1, 8)
+    integer("MACOS_CONNECTOR_MAX_PARALLEL", 1, 8)
+    _warn_connector_timeout_below_command(env, warnings)
     integer("SYNC_WHISPER_TIMEOUT_SECONDS", 1)
     integer("SYNC_AUDIO_MAX_BYTES", 1)
     return warnings
+
+
+def _warn_connector_timeout_below_command(env: Mapping[str, str], warnings: list[str]) -> None:
+    try:
+        client = int(str(env.get("MACOS_CONNECTOR_TIMEOUT", "")).strip())
+    except ValueError:
+        return
+    try:
+        command = int(str(env.get("MACOS_COMMAND_TIMEOUT", "900")).strip() or 900)
+    except ValueError:
+        command = 900
+    if client < command:
+        warnings.append(
+            f"MACOS_CONNECTOR_TIMEOUT ({client}) is below MACOS_COMMAND_TIMEOUT ({command}); "
+            "the client may give up while `say` still runs on the connector and retry in parallel"
+        )
+
+
+_WARNING_VARIABLE_RE = re.compile(r"^[A-Z][A-Z0-9_]*")
+
+
+def warning_variable_names(warnings: Iterable[str]) -> list[str]:
+    """Reduce ``validate_env`` warnings to their variable names.
+
+    Warning texts may quote raw (possibly secret-adjacent) environment values,
+    so unauthenticated surfaces such as ``/health`` expose only the names.
+    """
+
+    names: list[str] = []
+    for warning in warnings:
+        match = _WARNING_VARIABLE_RE.match(str(warning))
+        name = match.group(0) if match else "CONFIGURATION"
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def get_settings() -> Settings:
@@ -82,6 +132,14 @@ def get_settings() -> Settings:
         max_blocks = 40
     if max_blocks < 1:
         max_blocks = 40
+
+    max_tokens_raw = os.getenv("OPENROUTER_MAX_TOKENS", str(DEFAULT_OPENROUTER_MAX_TOKENS)).strip()
+    try:
+        max_tokens = int(max_tokens_raw)
+    except ValueError:
+        max_tokens = DEFAULT_OPENROUTER_MAX_TOKENS
+    if max_tokens < 1:
+        max_tokens = DEFAULT_OPENROUTER_MAX_TOKENS
 
     sample_rate_raw = os.getenv("OPENROUTER_TTS_SAMPLE_RATE", "24000").strip()
     try:
@@ -109,14 +167,6 @@ def get_settings() -> Settings:
     if macos_sr < 8000:
         macos_sr = 24000
 
-    macos_connector_timeout_raw = os.getenv("MACOS_CONNECTOR_TIMEOUT", "90").strip()
-    try:
-        macos_connector_timeout = int(macos_connector_timeout_raw)
-    except ValueError:
-        macos_connector_timeout = 90
-    if macos_connector_timeout < 5:
-        macos_connector_timeout = 5
-
     macos_command_timeout_raw = os.getenv("MACOS_COMMAND_TIMEOUT", "900").strip()
     try:
         macos_command_timeout = int(macos_command_timeout_raw)
@@ -124,6 +174,16 @@ def get_settings() -> Settings:
         macos_command_timeout = 900
     if macos_command_timeout < 30:
         macos_command_timeout = 30
+
+    # The connector may still be running `say` for up to MACOS_COMMAND_TIMEOUT; a
+    # shorter client timeout would abandon the request and start a parallel one.
+    macos_connector_timeout = macos_command_timeout + MACOS_CONNECTOR_TIMEOUT_MARGIN_SECONDS
+    macos_connector_timeout_raw = os.getenv("MACOS_CONNECTOR_TIMEOUT", "").strip()
+    if macos_connector_timeout_raw:
+        try:
+            macos_connector_timeout = max(5, int(macos_connector_timeout_raw))
+        except ValueError:
+            pass
 
     return Settings(
         tts_provider=os.getenv("TTS_PROVIDER", "openrouter").strip().lower(),
@@ -166,4 +226,5 @@ def get_settings() -> Settings:
         macos_command_timeout=macos_command_timeout,
         project_name=os.getenv("PROJECT_NAME", "rough_cut_v3").strip(),
         max_zk_blocks=max_blocks,
+        openrouter_max_tokens=max_tokens,
     )
