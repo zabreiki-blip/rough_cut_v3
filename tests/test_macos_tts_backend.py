@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -52,6 +55,59 @@ class MacosVoicePolicyTests(unittest.TestCase):
             )
 
         self.assertEqual(len(commands), 1)
+
+
+class MacosConnectorSerializationTests(unittest.TestCase):
+    def test_concurrent_requests_do_not_run_say_in_parallel(self) -> None:
+        active = 0
+        peak = 0
+        guard = threading.Lock()
+
+        def fake_run(command, **_kwargs):
+            nonlocal active, peak
+            if command[0] == "say":
+                with guard:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.15)
+                with guard:
+                    active -= 1
+            if command[0] == "afconvert":
+                Path(command[-1]).write_bytes(b"RIFF-test")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        results: list[bytes] = []
+
+        def worker() -> None:
+            results.append(macos_connector._run_say_and_convert("Текст", "Milena", 175, 24000))
+
+        with patch.object(macos_connector.subprocess, "run", side_effect=fake_run):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertEqual(results, [b"RIFF-test"] * 2)
+        self.assertEqual(peak, 1)
+
+    def test_slot_is_released_when_synthesis_raises(self) -> None:
+        with patch.object(macos_connector, "run_say_and_convert", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                macos_connector._run_say_and_convert("Текст", "Milena", 175, 24000)
+
+        results: list[bytes] = []
+
+        def second() -> None:
+            results.append(macos_connector._run_say_and_convert("Текст", "Milena", 175, 24000))
+
+        with patch.object(macos_connector, "run_say_and_convert", return_value=b"RIFF-ok"):
+            thread = threading.Thread(target=second, daemon=True)
+            thread.start()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive(), "semaphore was not released after an exception")
+        self.assertEqual(results, [b"RIFF-ok"])
 
 
 if __name__ == "__main__":

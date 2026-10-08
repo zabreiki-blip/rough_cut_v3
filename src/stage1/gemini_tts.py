@@ -218,14 +218,30 @@ def _write_silence_wav(path: Path, duration_ms: int = 1500) -> None:
     _atomic_write_bytes(path, buf.getvalue(), validate_wav=True)
 
 
+def _wav_stream_is_complete(source: Any) -> bool:
+    """True for a parseable WAV with audio whose declared data is fully present."""
+    try:
+        with wave.open(source, "rb") as wf:
+            nframes = wf.getnframes()
+            frame_size = wf.getsampwidth() * wf.getnchannels()
+            if nframes <= 0 or frame_size <= 0:
+                return False
+            # The header declares nframes; a truncated file yields a short read
+            # of the last frame. Seeking avoids loading the whole payload.
+            wf.setpos(nframes - 1)
+            return len(wf.readframes(1)) == frame_size
+    except Exception:
+        return False
+
+
 def _is_valid_wav(path: Path) -> bool:
     if not path.exists() or path.stat().st_size < 44:
         return False
-    try:
-        with wave.open(str(path), "rb"):
-            return True
-    except Exception:
-        return False
+    return _wav_stream_is_complete(str(path))
+
+
+def _is_valid_wav_bytes(data: bytes) -> bool:
+    return len(data) >= 44 and _wav_stream_is_complete(io.BytesIO(data))
 
 
 def _synthesis_fingerprint(
@@ -350,7 +366,7 @@ def _synthesize_openrouter_wav(
 
 
 @lru_cache(maxsize=4)
-def _list_macos_voices(timeout: int = 15) -> tuple[str, ...]:
+def _list_macos_voices_cached(timeout: int) -> tuple[str, ...]:
     return list_macos_voices(
         timeout=timeout,
         run=subprocess.run,
@@ -359,8 +375,33 @@ def _list_macos_voices(timeout: int = 15) -> tuple[str, ...]:
     )
 
 
+def _list_macos_voices(timeout: int = 15) -> tuple[str, ...]:
+    """Cached voice inventory; an empty result (failed ``say -v ?``) is never kept."""
+    voices = _list_macos_voices_cached(timeout)
+    if not voices:
+        _list_macos_voices_cached.cache_clear()
+    return voices
+
+
 def _resolve_macos_voice(voice: str, timeout: int = 15) -> str:
-    return resolve_macos_voice(voice, _list_macos_voices(timeout=timeout))
+    resolved = resolve_macos_voice(voice, _list_macos_voices(timeout=timeout))
+    if resolved != voice:
+        logger.warning("macOS voice %r is unavailable; using %r", voice, resolved)
+    return resolved
+
+
+def _fingerprint_voice(provider: str, voice: str, settings) -> str:
+    """Voice identity for the cache: what is actually spoken, not what was asked.
+
+    Local ``say`` silently substitutes unavailable voices, so the requested name
+    alone would key identical audio differently (or different audio identically)
+    as the installed voice inventory changes. A remote connector applies its own
+    policy that is not observable before synthesis; the requested name is used.
+    """
+    if provider == "macos" and shutil.which("say") is not None:
+        command_timeout = int(getattr(settings, "macos_command_timeout", 900))
+        return resolve_macos_voice(voice, _list_macos_voices(timeout=min(30, command_timeout)))
+    return voice
 
 
 def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
@@ -380,6 +421,18 @@ def _synthesize_macos_wav(text: str, settings, voice: str) -> bytes:
         retry_with_default_voice=True,
         run=subprocess.run,
     )
+
+
+def _macos_connector_max_parallel() -> int:
+    try:
+        value = int(os.getenv("MACOS_CONNECTOR_MAX_PARALLEL", "1"))
+    except ValueError:
+        value = 1
+    return max(1, min(8, value))
+
+
+class MacosConnectorReadTimeoutError(RuntimeError):
+    """The connector accepted the request but did not answer in time (never retried)."""
 
 
 def _synthesize_macos_connector_wav(text: str, settings, voice: str) -> bytes:
@@ -408,6 +461,11 @@ def _synthesize_macos_connector_wav(text: str, settings, voice: str) -> bytes:
             headers=headers,
             timeout=settings.macos_connector_timeout,
         )
+    except requests.ReadTimeout as exc:
+        # The connector may still be running `say`; retrying would start a second one.
+        raise MacosConnectorReadTimeoutError(
+            f"macOS connector read timed out after {settings.macos_connector_timeout}s: {exc}"
+        ) from exc
     except requests.RequestException as exc:
         raise RuntimeError(f"macOS connector request failed: {exc}") from exc
 
@@ -418,12 +476,14 @@ def _synthesize_macos_connector_wav(text: str, settings, voice: str) -> bytes:
         )
     if not response.content:
         raise RuntimeError("macOS connector returned empty body")
-    if not response.content.startswith(b"RIFF"):
-        raise RuntimeError("macOS connector returned non-WAV data")
+    if not _is_valid_wav_bytes(response.content):
+        raise RuntimeError("macOS connector returned invalid, empty or truncated WAV data")
     return response.content
 
 
 def _is_retryable_tts_error(provider: str, exc: Exception) -> bool:
+    if isinstance(exc, MacosConnectorReadTimeoutError):
+        return False
     msg = str(exc).lower()
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
@@ -671,6 +731,30 @@ def _fingerprint_parameters(
     return "", settings.macos_tts_sample_rate, settings.macos_tts_rate
 
 
+def _item_fingerprint(
+    text: str,
+    provider: str,
+    voice: str,
+    gender: str,
+    speed: float,
+    settings,
+    tts_model: str | None,
+    tts_style: str,
+) -> str:
+    fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(provider, settings, tts_model)
+    return _synthesis_fingerprint(
+        text,
+        provider,
+        _fingerprint_voice(provider, voice, settings),
+        gender,
+        speed,
+        fp_model,
+        fp_sample_rate,
+        fp_extra_rate,
+        tts_style,
+    )
+
+
 def _prepare_tts_items(items: list[dict]) -> list[tuple[str, str, str]]:
     prepared_items: list[tuple[str, str, str]] = []
     for item in items:
@@ -709,6 +793,7 @@ def _plan_tts_items(
     tts_model: str | None = None,
     tts_style: str = "",
 ) -> list[tuple[int, str, str, str, Path, Path, str, str]]:
+    fp_voice = _fingerprint_voice(provider, voice, settings)
     fp_model, fp_sample_rate, fp_extra_rate = _fingerprint_parameters(provider, settings, tts_model)
     plan: list[tuple[int, str, str, str, Path, Path, str, str]] = []
 
@@ -718,7 +803,7 @@ def _plan_tts_items(
         fingerprint = _synthesis_fingerprint(
             text,
             provider,
-            voice,
+            fp_voice,
             resolved_gender,
             speed,
             fp_model,
@@ -810,7 +895,12 @@ def _synthesize_with_retry(
     usage_callback: Callable[[dict[str, Any]], None] | None,
     tts_model: str | None = None,
     tts_style: str = "",
-) -> tuple[bytes | None, int, list[str], Exception | None]:
+) -> tuple[bytes | None, int, list[str], Exception | None, bool]:
+    """Synthesize with retries.
+
+    The last element is True when the audio was produced after the style was
+    dropped, so it must not be cached under the styled fingerprint.
+    """
     attempts = 0
     retry_errors: list[str] = []
     retry_without_style = False
@@ -831,12 +921,13 @@ def _synthesize_with_retry(
                 tts_style="" if retry_without_style else tts_style,
             )
             _raise_if_cancelled(cancel_check)
-            return _apply_tempo(wav_bytes, speed), attempts, retry_errors, None
+            style_dropped = retry_without_style and bool(tts_style)
+            return _apply_tempo(wav_bytes, speed), attempts, retry_errors, None, style_dropped
         except TtsCancelledError:
             raise
         except Exception as exc:
             if attempts >= 4 or not _is_retryable_tts_error(provider, exc):
-                return None, attempts, retry_errors, exc
+                return None, attempts, retry_errors, exc, False
             if _retry_openrouter_gemini_without_style(provider, tts_model, exc):
                 retry_without_style = True
                 logger.warning(
@@ -848,12 +939,20 @@ def _synthesize_with_retry(
 
 def _publish_synthesized_item(
     pending_item: tuple[int, str, str, str, Path, Path, str],
-    future: Future[tuple[bytes | None, int, list[str], Exception | None]],
+    future: Future[tuple[bytes | None, int, list[str], Exception | None, bool]],
     total_items: int,
     generated: list[str],
     skipped: list[str],
     progress_callback: Callable[[dict], None] | None,
-) -> None:
+    plain_fingerprint: str | None = None,
+) -> tuple[str, Path]:
+    """Publish one synthesized item and return the (fingerprint, asset) it is cached as.
+
+    If synthesis had to drop the style, the audio is not what the styled
+    fingerprint promises. It is published under ``plain_fingerprint`` (the key
+    of an unstyled request, which it really satisfies) so a later run with the
+    style misses the cache and tries the style again.
+    """
     index, block_id, _block_uid, _text, out_file, asset_file, fingerprint = pending_item
     _emit_item_progress(
         progress_callback,
@@ -865,7 +964,7 @@ def _publish_synthesized_item(
         generated,
         skipped,
     )
-    wav_bytes, attempts, retry_errors, final_error = future.result()
+    wav_bytes, attempts, retry_errors, final_error, style_dropped = future.result()
     for retry_attempt, error_text in enumerate(retry_errors, start=1):
         _emit_item_progress(
             progress_callback,
@@ -896,6 +995,14 @@ def _publish_synthesized_item(
         )
         raise final_error
 
+    if style_dropped and plain_fingerprint and plain_fingerprint != fingerprint:
+        logger.warning(
+            "Block %s was synthesized without the requested style; "
+            "caching it as an unstyled result",
+            block_id,
+        )
+        fingerprint = plain_fingerprint
+        asset_file = asset_file.parent / f"{fingerprint}.wav"
     _atomic_write_bytes(asset_file, wav_bytes, validate_wav=True)
     _materialize_voiceover_alias(asset_file, out_file, fingerprint)
     generated.append(str(out_file))
@@ -910,6 +1017,7 @@ def _publish_synthesized_item(
         skipped,
         attempts=attempts,
     )
+    return fingerprint, asset_file
 
 
 def synthesize_tts(
@@ -942,6 +1050,7 @@ def synthesize_tts(
 
     generated: list[str] = []
     skipped: list[str] = []
+    published_assets: dict[int, tuple[str, Path]] = {}
     used_dry_run = dry_run
 
     if not dry_run and provider == "openrouter" and not settings.openrouter_api_key:
@@ -986,10 +1095,14 @@ def synthesize_tts(
         except ValueError:
             configured_workers = 3
         max_workers = max(1, min(4, configured_workers, len(pending)))
+        if provider == "macos" and shutil.which("say") is None:
+            # The connector runs `say` one at a time; extra parallel requests would
+            # only queue there and eat into the client's read timeout.
+            max_workers = min(max_workers, _macos_connector_max_parallel())
         pool = ThreadPoolExecutor(max_workers=max_workers)
         futures: dict[
             int,
-            Future[tuple[bytes | None, int, list[str], Exception | None]],
+            Future[tuple[bytes | None, int, list[str], Exception | None, bool]],
         ] = {}
         try:
             futures = {
@@ -1022,7 +1135,21 @@ def synthesize_tts(
                         fingerprint,
                         _action,
                     ) = planned_item
-                    _publish_synthesized_item(
+                    plain_fingerprint = (
+                        _item_fingerprint(
+                            text,
+                            provider,
+                            voice,
+                            resolved_gender,
+                            speed,
+                            settings,
+                            resolved_model,
+                            "",
+                        )
+                        if resolved_style
+                        else None
+                    )
+                    published_assets[index] = _publish_synthesized_item(
                         (
                             index,
                             block_id,
@@ -1037,6 +1164,7 @@ def synthesize_tts(
                         generated,
                         skipped,
                         progress_callback,
+                        plain_fingerprint,
                     )
                 else:
                     _publish_local_item(
@@ -1084,11 +1212,11 @@ def synthesize_tts(
             {
                 "id": block_id,
                 "block_uid": block_uid,
-                "fingerprint": fingerprint,
-                "asset": str(asset_file),
+                "fingerprint": published_fingerprint,
+                "asset": str(published_asset),
             }
             for (
-                _index,
+                index,
                 block_id,
                 block_uid,
                 _text,
@@ -1097,7 +1225,10 @@ def synthesize_tts(
                 fingerprint,
                 _action,
             ) in plan
-            if asset_file.is_file()
+            for published_fingerprint, published_asset in [
+                published_assets.get(index, (fingerprint, asset_file))
+            ]
+            if published_asset.is_file()
         ],
     }
     _emit_batch_progress(

@@ -255,14 +255,26 @@ class MacosConnectorAuthenticationTest(unittest.TestCase):
             "Milena ru_RU # Russian\nYuri ru_RU # Russian\n",
             "",
         )
-        macos_connector._available_voices.cache_clear()
+        macos_connector._available_voices_cached.cache_clear()
         try:
             with patch.object(macos_connector.subprocess, "run", return_value=result) as run:
                 self.assertTrue(macos_connector._voice_exists("Milena"))
                 self.assertTrue(macos_connector._voice_exists("Yuri"))
             run.assert_called_once()
         finally:
-            macos_connector._available_voices.cache_clear()
+            macos_connector._available_voices_cached.cache_clear()
+
+    def test_empty_voice_inventory_is_not_cached(self) -> None:
+        failed = subprocess.CompletedProcess(["say", "-v", "?"], 1, "", "boom")
+        ok = subprocess.CompletedProcess(["say", "-v", "?"], 0, "Milena ru_RU # Russian\n", "")
+        macos_connector._available_voices_cached.cache_clear()
+        try:
+            with patch.object(macos_connector.subprocess, "run", side_effect=[failed, ok]) as run:
+                self.assertFalse(macos_connector._voice_exists("Milena"))
+                self.assertTrue(macos_connector._voice_exists("Milena"))
+            self.assertEqual(run.call_count, 2)
+        finally:
+            macos_connector._available_voices_cached.cache_clear()
 
     def test_multiline_dash_text_is_read_from_file_not_argv(self) -> None:
         commands = []
