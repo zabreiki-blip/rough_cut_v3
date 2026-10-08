@@ -555,6 +555,28 @@ def test_final_review_jobs_create_run_and_record_iteration(tmp_path: Path) -> No
     assert services._test_writes[-1][1]["iterations"] == [iteration]
 
 
+def test_final_review_jobs_trim_finished_but_keep_running(tmp_path: Path, monkeypatch) -> None:
+    import api_final_review_jobs
+
+    monkeypatch.setattr(api_final_review_jobs, "_FINAL_REVIEW_JOBS_MAX", 3)
+    services = _job_services(tmp_path)
+    services._FINAL_REVIEW_JOBS.update(
+        {
+            "run": {"status": "running", "created_at": "2026-01-01T00:00:00+00:00"},
+            "old1": {"status": "completed", "finished_at": "2026-01-02T00:00:00+00:00"},
+            "old2": {"status": "failed", "finished_at": "2026-01-03T00:00:00+00:00"},
+            "old3": {"status": "completed", "finished_at": "2026-01-04T00:00:00+00:00"},
+        }
+    )
+    audio = services._test_paths["work"] / "review.wav"
+    create_final_review_job(services, "demo", audio, {})
+
+    assert "run" in services._FINAL_REVIEW_JOBS
+    assert "old1" not in services._FINAL_REVIEW_JOBS
+    assert "old2" not in services._FINAL_REVIEW_JOBS
+    assert len(services._FINAL_REVIEW_JOBS) == 3
+
+
 def test_final_review_worker_records_cloud_cost_and_failure_cost(tmp_path: Path) -> None:
     services = _job_services(
         tmp_path,

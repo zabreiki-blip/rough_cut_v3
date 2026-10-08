@@ -362,11 +362,16 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
 
     @app.get("/health")
     def health():
+        # /health is public. Warning texts can quote raw env values, so only
+        # authenticated callers get them; anonymous callers see variable names.
+        warnings = list(services._CONFIG_WARNINGS)
+        if not services._request_is_authenticated():
+            warnings = services.warning_variable_names(warnings)
         return jsonify(
             {
                 "ok": True,
                 "status": "healthy",
-                "configuration_warnings": list(services._CONFIG_WARNINGS),
+                "configuration_warnings": warnings,
             }
         )
 

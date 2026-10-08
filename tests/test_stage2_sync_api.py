@@ -2298,3 +2298,61 @@ def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
     assert job["transcription_wall_sec_total"] >= 0.0
     usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
     assert usage["total_cost_usd"] == pytest.approx(0.02)
+
+
+class _SpySemaphore:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        self.events.append("acquire")
+        return True
+
+    def release(self) -> None:
+        self.events.append("release")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"asr_engine": "cloud"}, ["acquire", "release"]),
+        ({"asr_engine": "local"}, []),
+    ],
+)
+def test_only_cloud_asr_takes_global_heavy_job_slot(sync_api, payload, expected) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/audio",
+            data={"project": "demo", "audio": (BytesIO(_wav_bytes()), "guide.wav")},
+            content_type="multipart/form-data",
+        ).status_code
+        == 200
+    )
+    spy = _SpySemaphore()
+
+    def fake_transcribe(path, **_kwargs):
+        spy.events.append("transcribe")
+        return {
+            "backend": "cloud-audio",
+            "model": "m",
+            "language": "ru",
+            "words": [{"word": "слово", "start": 1.0, "end": 1.2}],
+        }
+
+    with (
+        patch.object(api, "_HEAVY_JOB_SEMAPHORE", spy),
+        patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo", **payload})
+
+    assert response.status_code == 200, response.get_json()
+    slot_events = [event for event in spy.events if event != "transcribe"]
+    assert slot_events == expected
+    if expected:
+        assert spy.events == ["acquire", "transcribe", "release"]
+    else:
+        assert "transcribe" in spy.events

@@ -15,12 +15,16 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from atomic_io import atomic_write_json, atomic_write_text
 from export_naming import xml_export_filename
+from job_runtime import trim_terminal_jobs
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
+# Bound the in-memory job history; the latest status per project is persisted.
+_STAGE3_JOBS_MAX = 200
+_STAGE3_JOBS_TTL_SECONDS = 24 * 60 * 60
 
 
 class Stage3OperationError(RuntimeError):
@@ -565,6 +569,7 @@ def _create_job(project: str, kind: str, jobs: dict, jobs_lock, services: Module
     }
     with jobs_lock:
         jobs[job_id] = job
+        trim_terminal_jobs(jobs, max_jobs=_STAGE3_JOBS_MAX, ttl_seconds=_STAGE3_JOBS_TTL_SECONDS)
     _persist_job(job, services)
     return dict(job)
 

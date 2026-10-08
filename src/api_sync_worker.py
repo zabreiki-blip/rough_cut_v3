@@ -43,6 +43,9 @@ class _AsrMetrics(TypedDict):
     transcription_wall_sec_total: float
 
 
+_CLOUD_ASR_BACKENDS = frozenset({"cloud", "cloud-audio", "openrouter"})
+
+
 def run_sync_job(
     services: SyncWorkerServices,
     *,
@@ -306,15 +309,34 @@ def run_sync_job(
 
                     input_audio_signature = audio_signature or _audio_cache_signature(audio_path)
                     transcription_started_at = time.monotonic()
-                    result = transcribe_audio(
-                        audio_path,
-                        backend=backend,
-                        model=model,
-                        language=language,
-                        progress_callback=report_progress,
-                        cancel_event=cancel_event,
-                        timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
+                    uses_cloud_asr = (
+                        asr_engine == "cloud"
+                        or str(config.get("backend") or "").lower() in _CLOUD_ASR_BACKENDS
                     )
+                    # Paid/remote ASR shares the global heavy-job cap with
+                    # normalization; local Whisper keeps its own process limits.
+                    slot_held = False
+                    if uses_cloud_asr:
+                        slot_held = services.acquire_slot(
+                            services._HEAVY_JOB_SEMAPHORE, cancel_event
+                        )
+                        if not slot_held:
+                            raise _JobCancelled("Sync job cancelled")
+                    try:
+                        result = transcribe_audio(
+                            audio_path,
+                            backend=backend,
+                            model=model,
+                            language=language,
+                            progress_callback=report_progress,
+                            cancel_event=cancel_event,
+                            timeout_seconds=(
+                                app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None
+                            ),
+                        )
+                    finally:
+                        if slot_held:
+                            services._HEAVY_JOB_SEMAPHORE.release()
                     result_backend_metadata = result.get("backend_metadata") or {}
                     if str(result.get("backend") or backend or "") == "cloud-audio":
                         asr_usage_callback(

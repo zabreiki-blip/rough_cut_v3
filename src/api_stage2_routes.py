@@ -155,6 +155,11 @@ def _stage2_sync_source_audio(services: ModuleType, source_id: str):
             audio_path = services._resolve_sync_audio_path(source, paths)
         except ValueError as exc:
             return services._json_error(str(exc), 400)
+        # Only real audio may be streamed. guide_audio can point anywhere in
+        # the project (it may be a video used for transcription), so the
+        # suffix gate keeps this route from serving JSON/state/other files.
+        if audio_path.suffix.lower() not in services.AUDIO_EXTENSIONS:
+            return services._json_error("sync guide audio not found", 404)
         if not audio_path.is_file():
             return services._json_error("sync guide audio not found", 404)
         return send_from_directory(audio_path.parent, audio_path.name, as_attachment=False)
