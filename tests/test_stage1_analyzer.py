@@ -184,6 +184,83 @@ class Stage1AnalyzerTests(unittest.TestCase):
             self.assertEqual(result["llm_errors_count"], 1)
             self.assertIn("temporary LLM error", payload["llm_errors"][0])
             self.assertEqual(len(payload["items"]), 1)
+            self.assertIn("llm_failed", payload["items"][0]["notes"])
+            self.assertTrue(result["warnings"])
+
+    def test_partial_llm_failure_marks_only_fallback_blocks(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            input_path = tmp / "scenario.txt"
+            output_path = tmp / "scenario_prepared.json"
+            raw_output_path = tmp / "scenario_raw.txt"
+            good = "Первый авторский абзац достаточно длинный для проверки. " * 20
+            bad = "Второй авторский абзац достаточно длинный для fallback. " * 20
+            input_path.write_text(good + "\n\n" + bad, encoding="utf-8")
+
+            def analyze_chunk(_settings, chunk, *_args):
+                if "Второй" in chunk:
+                    raise RuntimeError("temporary LLM error")
+                return [
+                    NarrationBlock(
+                        id="zk1", text_original=chunk, text_for_tts=chunk, notes="llm_note"
+                    )
+                ]
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key", "MAX_ZK_BLOCKS": "100"}),
+                patch("stage1.analyzer._chunk_for_llm", return_value=[good, bad]),
+                patch("stage1.analyzer.analyze_with_openrouter", side_effect=analyze_chunk),
+            ):
+                result = analyze_script(
+                    input_path=input_path,
+                    output_path=output_path,
+                    raw_output_path=raw_output_path,
+                    use_llm=True,
+                )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["used_llm"])
+            self.assertEqual(result["extraction_method"], "llm")
+            self.assertEqual(result["llm_errors_count"], 1)
+            self.assertEqual(result["llm_failed_chunks"], 1)
+            self.assertTrue(any("fallback" in w for w in result["warnings"]))
+            self.assertEqual(payload["warnings"], result["warnings"])
+            self.assertEqual(payload["llm_failed_chunks"], 1)
+            notes = [item["notes"] for item in payload["items"]]
+            self.assertTrue(any("llm_failed" in note for note in notes))
+            self.assertTrue(any("llm_failed" not in note for note in notes))
+            self.assertTrue(
+                all(
+                    "llm_failed" in item["notes"]
+                    for item in payload["items"]
+                    if "Второй" in item["text_for_tts"]
+                )
+            )
+
+    def test_successful_llm_run_has_no_quality_warnings(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            input_path = tmp / "scenario.txt"
+            input_path.write_text("Достаточно длинный авторский абзац для проверки.", "utf-8")
+            llm_blocks = [
+                NarrationBlock(
+                    id="zk1",
+                    text_original="Достаточно длинный авторский абзац для проверки.",
+                    text_for_tts="Достаточно длинный авторский абзац для проверки.",
+                )
+            ]
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}),
+                patch("stage1.analyzer.analyze_with_openrouter", return_value=llm_blocks),
+            ):
+                result = analyze_script(
+                    input_path=input_path,
+                    output_path=tmp / "p.json",
+                    raw_output_path=tmp / "r.txt",
+                    use_llm=True,
+                )
+            self.assertEqual(result["warnings"], [])
+            self.assertEqual(result["llm_failed_chunks"], 0)
 
     def test_llm_chunks_run_concurrently_but_keep_source_order(self) -> None:
         with TemporaryDirectory() as tmp_dir:

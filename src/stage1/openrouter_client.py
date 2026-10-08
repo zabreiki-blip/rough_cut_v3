@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any, Callable
 
 from openrouter_usage import report_json_usage
@@ -25,6 +24,10 @@ logger = logging.getLogger(__name__)
 from .config import Settings
 from .models import NarrationBlock
 
+
+# Transient statuses only; other 4xx responses are caller errors and must not be
+# retried (each retry is a paid request).
+RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 SYSTEM_PROMPT = """Ты редактор закадрового текста для телевизионного диктора.
 
@@ -62,20 +65,50 @@ SYSTEM_PROMPT = """Ты редактор закадрового текста д�
 """
 
 
+def _decode_items_object(content: str) -> dict[str, Any] | None:
+    """Return the first JSON object in ``content`` that carries an ``items`` key."""
+    decoder = json.JSONDecoder()
+    position = content.find("{")
+    while position != -1:
+        try:
+            candidate, _end = decoder.raw_decode(content, position)
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict) and "items" in candidate:
+            return candidate
+        position = content.find("{", position + 1)
+    return None
+
+
 def _extract_json(content: str) -> dict[str, Any]:
-    content = content.strip()
-    if content.startswith("{"):
-        return json.loads(content)
+    # Strict JSON, a fence, surrounding prose and wrappers such as
+    # {"result": {"items": [...]}} are handled uniformly: scan every object
+    # start and accept only an object that has the expected ``items`` key, so
+    # an unrelated brace span (or a wrapper without items) is never the answer.
+    found = _decode_items_object(content.strip())
+    if found is not None:
+        return found
+    raise ValueError("LLM response does not contain JSON object with items")
 
-    fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, flags=re.S)
-    if fence_match:
-        return json.loads(fence_match.group(1))
 
-    start = content.find("{")
-    end = content.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(content[start : end + 1])
-    raise ValueError("LLM response does not contain JSON object")
+def _validate_items(parsed: Any) -> list[dict[str, Any]]:
+    """Validate the expected ``{"items":[{...}]}`` schema; never accept empty output."""
+    if not isinstance(parsed, dict):
+        raise ValueError("OpenRouter response is not a JSON object")
+    items = parsed.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("OpenRouter returned empty or invalid items")
+    if not all(isinstance(item, dict) for item in items):
+        raise ValueError("OpenRouter returned items that are not objects")
+    usable = [
+        item
+        for item in items
+        if str(item.get("text_original") or "").strip()
+        or str(item.get("text_for_tts") or "").strip()
+    ]
+    if not usable:
+        raise ValueError("OpenRouter returned items without text")
+    return usable
 
 
 def _normalize_blocks(raw_items: list[dict[str, Any]]) -> list[NarrationBlock]:
@@ -134,6 +167,7 @@ def analyze_with_openrouter(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
+        "max_tokens": settings.openrouter_max_tokens,
         "response_format": {"type": "json_object"},
     }
     headers = {
@@ -160,7 +194,7 @@ def analyze_with_openrouter(
 
             if isinstance(exc, _req.HTTPError):
                 code = exc.response.status_code if exc.response is not None else 0
-                return code in (429, 500, 502, 503, 504)
+                return code in RETRYABLE_STATUS_CODES
             return False
 
         _do_request_with_retry = retry(
@@ -179,7 +213,4 @@ def analyze_with_openrouter(
     report_json_usage(usage_callback, data, model=settings.openrouter_model)
     content = data["choices"][0]["message"]["content"]
     parsed = _extract_json(content if isinstance(content, str) else json.dumps(content))
-    items = parsed.get("items", [])
-    if not isinstance(items, list) or not items:
-        raise ValueError("OpenRouter returned empty or invalid items")
-    return _normalize_blocks(items)
+    return _normalize_blocks(_validate_items(parsed))

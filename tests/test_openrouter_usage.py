@@ -132,3 +132,114 @@ def test_normalizer_reports_paid_response_before_content_parse_fails() -> None:
 
     assert usage[0]["generation_id"] == "gen-invalid"
     assert usage[0]["cost_usd"] == "0.003"
+
+
+def _classifier_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        openrouter_api_key="key",
+        openrouter_model="test/model",
+        openrouter_base_url="https://openrouter.ai/api/v1",
+        openrouter_max_tokens=4321,
+    )
+
+
+def _classifier_response(content: str, status_code: int = 200):
+    class Response:
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if status_code >= 400:
+                import requests
+
+                raise requests.HTTPError("error", response=self)
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": content}}]}
+
+    return Response()
+
+
+def test_classifier_sends_max_tokens() -> None:
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch(
+            "requests.post", return_value=_classifier_response('{"items":[{"uid":"a"}]}')
+        ) as post,
+    ):
+        normalizer_module._openrouter_classifier([{"uid": "a"}], "")
+
+    assert post.call_args.kwargs["json"]["max_tokens"] == 4321
+
+
+def test_classifier_does_not_retry_client_errors() -> None:
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", return_value=_classifier_response("{}", 400)) as post,
+        patch.object(normalizer_module.time, "sleep") as sleep,
+        pytest.raises(Exception, match="error"),
+    ):
+        normalizer_module._openrouter_classifier([{"uid": "a"}], "")
+
+    assert post.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_classifier_does_not_retry_non_transient_request_exceptions() -> None:
+    import requests
+
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", side_effect=requests.exceptions.InvalidURL("bad")) as post,
+        patch.object(normalizer_module.time, "sleep"),
+        pytest.raises(requests.exceptions.InvalidURL),
+    ):
+        normalizer_module._openrouter_classifier([{"uid": "a"}], "")
+
+    assert post.call_count == 1
+
+
+def test_classifier_retries_chunked_encoding_error() -> None:
+    import requests
+
+    ok = _classifier_response('{"items":[{"uid":"a"}]}')
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch(
+            "requests.post",
+            side_effect=[requests.exceptions.ChunkedEncodingError("cut"), ok],
+        ) as post,
+        patch.object(normalizer_module.time, "sleep") as sleep,
+    ):
+        normalizer_module._openrouter_classifier([{"uid": "a"}], "")
+
+    assert post.call_count == 2
+    sleep.assert_called_once()
+
+
+def test_classifier_does_not_retry_ssl_errors() -> None:
+    import requests
+
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", side_effect=requests.exceptions.SSLError("cert")) as post,
+        patch.object(normalizer_module.time, "sleep") as sleep,
+        pytest.raises(requests.exceptions.SSLError),
+    ):
+        normalizer_module._openrouter_classifier([{"uid": "a"}], "")
+
+    assert post.call_count == 1
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"items":[]}', '{"other":1}', '{"items":["x"]}', '{"items":"x"}'],
+)
+def test_classifier_rejects_empty_or_invalid_items(content: str) -> None:
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", return_value=_classifier_response(content)),
+        pytest.raises(ValueError),
+    ):
+        normalizer_module._openrouter_classifier([{"uid": "a"}], "")
