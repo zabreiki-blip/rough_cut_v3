@@ -107,6 +107,11 @@ def validate_stage1(
     items = payload.get("items", [])
     if not isinstance(items, list) or not items:
         raise ValueError("Prepared scenario has no items")
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Prepared scenario items[{index}] must be an object, got {type(item).__name__}"
+            )
 
     errors: list[str] = []
     warnings: list[str] = []

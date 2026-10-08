@@ -305,3 +305,79 @@ def test_extract_text_dispatches_docx_and_doc_handlers(
 
     assert extract_text(docx_path) == "docx:scenario.docx"
     assert extract_text(doc_path) == "doc:scenario.doc"
+
+
+# ---------------------------------------------------------------------------
+# DOCX archive safety (zip-bomb / size cap)
+# ---------------------------------------------------------------------------
+
+
+def _write_zip(path: Path, members: dict[str, bytes]) -> None:
+    import zipfile
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+
+def test_docx_normal_file_passes_validation(tmp_path: Path) -> None:
+    from docx import Document
+
+    path = tmp_path / "ok.docx"
+    doc = Document()
+    doc.add_paragraph("Обычный абзац")
+    doc.save(str(path))
+
+    stage1_io_utils.validate_docx_archive(path)
+    assert "Обычный абзац" in extract_text(path)
+
+
+def test_docx_high_compression_ratio_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "bomb.docx"
+    _write_zip(path, {"word/document.xml": b"\0" * (20 * 1024 * 1024)})
+
+    with pytest.raises(ValueError, match="compression ratio"):
+        extract_text(path)
+    with pytest.raises(ValueError, match="compression ratio"):
+        extract_paragraphs_from_docx(path)
+    with pytest.raises(ValueError, match="compression ratio"):
+        extract_marked_blocks_from_docx(path)
+    with pytest.raises(ValueError, match="compression ratio"):
+        stage1_io_utils.extract_paragraphs(path)
+
+
+def test_docx_huge_declared_uncompressed_size_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "big.docx"
+    _write_zip(path, {"word/document.xml": b"abc" * 1000})
+    monkeypatch.setenv(stage1_io_utils.DOCX_MAX_UNCOMPRESSED_BYTES_ENV, "1000")
+
+    with pytest.raises(ValueError, match="expands to too much data"):
+        extract_text(path)
+
+
+def test_docx_too_many_members_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "many.docx"
+    _write_zip(path, {f"f{i}.xml": b"x" for i in range(5)})
+    monkeypatch.setenv(stage1_io_utils.DOCX_MAX_MEMBERS_ENV, "3")
+
+    with pytest.raises(ValueError, match="too many entries"):
+        extract_text(path)
+
+
+def test_docx_file_size_cap_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "large.docx"
+    _write_zip(path, {"word/document.xml": b"abc"})
+    monkeypatch.setenv(stage1_io_utils.DOCX_MAX_FILE_BYTES_ENV, "10")
+
+    with pytest.raises(ValueError, match="too large"):
+        extract_text(path)
+
+
+def test_docx_corrupted_zip_gives_clear_error(tmp_path: Path) -> None:
+    path = tmp_path / "broken.docx"
+    path.write_bytes(b"this is not a zip archive at all")
+
+    with pytest.raises(ValueError, match="corrupted or is not a valid"):
+        extract_text(path)
