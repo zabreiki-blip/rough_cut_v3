@@ -211,6 +211,96 @@ def test_voice_credit_and_inline_directorial_cue_are_not_spoken() -> None:
     )
 
 
+def test_announce_paragraph_without_timecode_or_label_is_not_sync(tmp_path: Path) -> None:
+    block = _normalize(
+        tmp_path,
+        "Девятисерийный фильм «Лиля» сняла режиссёр Вера Сторожева.",
+    )
+    assert block["type"] != "sync"
+
+
+def test_label_only_sync_marker_without_colon_sets_speaker(tmp_path: Path) -> None:
+    block = _normalize(tmp_path, "Синх Сторожевой")
+    assert block["type"] == "sync"
+    assert block["speaker"] == "Сторожевой"
+    assert block["text_for_tts"] == ""
+
+
+def test_three_paragraph_sync_pattern_inherits_speaker_from_label_marker(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "Девятисерийный фильм «Лиля» сняла режиссёр Вера Сторожева.\n"
+        "Синх Сторожевой\n"
+        "То, что получилось у нас, это живая история... "
+        "00:03:04 Мы делали кино, которое мы старались делать, что это живые люди.\n",
+        encoding="utf-8",
+    )
+    blocks = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )["blocks"]
+
+    assert blocks[0]["type"] != "sync"
+    assert blocks[1]["type"] == "sync"
+    assert blocks[1]["speaker"] == "Сторожевой"
+    assert blocks[2]["type"] == "sync"
+    assert blocks[2]["speaker"] == "Сторожевой"
+    assert blocks[2]["original_label"] == ""
+    assert "Мы делали кино" in blocks[2]["normalized_text"]
+    assert blocks[2]["sync_fragments"]
+    assert blocks[2]["sync_fragments"][-1]["timecode_start"] == "00:03:04"
+    assert "Мы делали кино" in blocks[2]["sync_fragments"][-1]["text"]
+
+
+def test_voiceover_with_mid_sentence_timecode_after_sync_does_not_inherit_speaker(
+    tmp_path: Path,
+) -> None:
+    # Regression: a bare, unlabeled voiceover/cue paragraph that merely
+    # contains a timecode somewhere in its text must not be swept into the
+    # preceding sync block just because that sync has a known speaker. Only
+    # a label-only "Синх <Фамилия>" carrier (handled separately) should
+    # trigger that inheritance.
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "ИВАНОВ: 00:00:05 Мы завершили стройку в срок.\n"
+        "Архивные кадры пожара на фабрике. Оператор снял эвакуацию жителей "
+        "соседних домов 00:15:22.\n",
+        encoding="utf-8",
+    )
+    blocks = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )["blocks"]
+
+    assert blocks[0]["type"] == "sync"
+    assert blocks[0]["speaker"]
+    assert blocks[1]["type"] != "sync"
+    assert not blocks[1]["speaker"]
+
+
+def test_llm_sync_suggestion_without_signal_is_downgraded(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "Девятисерийный фильм «Лиля» сняла режиссёр Вера Сторожева.\n",
+        encoding="utf-8",
+    )
+
+    def classifier(items, _hint):
+        return [{"uid": items[0]["uid"], "type": "sync", "confidence": 0.95}]
+
+    result = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        classifier=classifier,
+    )
+    assert result["blocks"][0]["type"] != "sync"
+
+
 def test_confirm_relocated_source_with_matching_hash(tmp_path: Path) -> None:
     source = tmp_path / "source.txt"
     source.write_text("ЗК: Текст диктора.\n", encoding="utf-8")
