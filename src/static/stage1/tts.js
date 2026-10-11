@@ -15,6 +15,7 @@ let ttsJobClientStartedAt = null;
 let lastTtsEtaJobId = null;
 let ttsPollTimer = null;
 let ttsPollFailures = 0;
+export const PHRASE_TTS_TIMEOUT_MS = 20 * 60 * 1000;
 
 function eventTitle(event) {
   const map = {
@@ -249,13 +250,27 @@ async function clearTTS() {
   await refreshStatus();
 }
 
+export function restoredSpeakerDirectory(value) {
+  const parts = String(value || "").replace(/\\/g, "/").split("/");
+  const index = parts.findIndex((part, position) =>
+    part === "projects" && parts[position + 1] === project && parts[position + 2] === "speaker");
+  if (index < 0) return null;
+  let suffix = parts.slice(index + 3);
+  if (suffix.length === 2 && suffix[0] === "revisions" && /^rev_\d+$/.test(suffix[1])) {
+    suffix = [];
+  }
+  if (suffix.some((part) => !part || part === "." || part === "..")) return null;
+  return `projects/${project}/speaker${suffix.length ? `/${suffix.join("/")}` : ""}`;
+}
+
 function restoreTtsControls(state) {
   if (!state || typeof state !== "object") return;
   if (state.prepared_path) ids.prepared_path.value = String(state.prepared_path);
   if (state.speaker_dir) {
-    // Job history can point at an older revision. The server maps the base
-    // speaker directory to the revision of the current prepared scenario.
-    ids.speaker_dir.value = String(state.speaker_dir).replace(/[/\\]revisions[/\\]rev_\d+$/, "");
+    // Job history may contain a path from macOS while the API now runs in
+    // Docker. A project-relative path works in either environment.
+    const restored = restoredSpeakerDirectory(state.speaker_dir);
+    if (restored) ids.speaker_dir.value = restored;
   }
   if (state.provider === "macos") {
     ids.provider.value = "macos";
@@ -368,7 +383,7 @@ async function doPhraseTTS() {
     file_name: f.phrase_file_name || null,
     dry_run: f.dry_run,
     speed: f.speed,
-  });
+  }, PHRASE_TTS_TIMEOUT_MS);
   toast("Фраза озвучена", "success");
   appendLog(`Phrase done: file=${result.file}, voice=${result.voice}`);
   if (result.playback_url && ids.phrase_player) {

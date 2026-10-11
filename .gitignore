@@ -33,3 +33,6 @@ artifacts/
 
 # Local CEP debug configuration
 cep/.debug
+
+# Local kilo planning scratch files
+.kilo/plans/

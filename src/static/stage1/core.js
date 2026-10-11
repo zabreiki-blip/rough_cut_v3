@@ -191,12 +191,12 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
   }
 }
 
-export async function postJSON(url, payload) {
+export async function postJSON(url, payload, timeoutMs = FETCH_TIMEOUT_MS) {
   const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
+  }, timeoutMs);
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok === false) {
     throw new Error(data.error || JSON.stringify(data));
