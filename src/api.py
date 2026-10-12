@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hmac
@@ -15,6 +16,7 @@ import threading
 import time
 from typing import BinaryIO, cast
 import uuid
+import weakref
 
 try:
     from dotenv import load_dotenv
@@ -23,7 +25,7 @@ try:
 except ImportError:
     pass
 
-from flask import Flask, jsonify, request
+from flask import Flask, Request, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from api_core_routes import register_core_routes
@@ -42,9 +44,17 @@ from api_stage3_routes import register_stage3_routes
 from api_stage4_routes import register_stage4_routes
 from api_sync_worker import run_sync_job
 from atomic_io import atomic_write_json
-from job_runtime import JobRegistry, get_job, release_project, reserve_project, update_job
+from auth_throttle import FailedAuthThrottle
+from job_runtime import (
+    JobRegistry,
+    acquire_slot,
+    get_job,
+    release_project,
+    reserve_project,
+    update_job,
+)
 from openrouter_usage import make_usage_callback, reconcile_pending, usage_summary
-from inbox_service import discover_project_inbox
+from inbox_service import AUDIO_EXTENSIONS, discover_project_inbox
 from logging_config import configure_logging
 from project_service import (
     PROJECT_NAME_RE,
@@ -62,7 +72,7 @@ from project_service import (
 # compatibility facade at call time. Tests and integrations also patch them on
 # ``api``, so they are intentionally retained without direct local references.
 from stage1.analyzer import analyze_script
-from stage1.config import get_settings, validate_env
+from stage1.config import get_settings, validate_env, warning_variable_names
 from stage1.gemini_tts import (
     TtsCancelledError,
     normalize_openrouter_tts_model,
@@ -129,6 +139,8 @@ from stage4.versioning import inspect_revision_state, repair_active_revision_met
 
 _DEFAULT_SYNC_AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024
 _REQUEST_BODY_MULTIPART_HEADROOM = 16 * 1024 * 1024
+_DEFAULT_JSON_BODY_MAX_BYTES = 16 * 1024 * 1024
+_DEFAULT_HEAVY_JOBS_MAX = 2
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -139,8 +151,16 @@ def _positive_env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _non_negative_env_int(name: str, default: int) -> int:
+    try:
+        value = int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
 def _request_body_limit() -> int:
-    """Return a configurable Flask body limit without breaking large WAV uploads.
+    """Return the body limit for WAV/media upload endpoints only.
 
     ``SYNC_AUDIO_MAX_BYTES`` limits WAV bytes after multipart parsing. Flask's
     request limit must leave room for multipart metadata, otherwise a valid
@@ -153,12 +173,50 @@ def _request_body_limit() -> int:
     return max(configured, minimum)
 
 
+def _default_request_body_limit() -> int:
+    """Return the (small) body limit applied to every non-upload request."""
+
+    return _positive_env_int("ROUGH_CUT_MAX_JSON_BODY_BYTES", _DEFAULT_JSON_BODY_MAX_BYTES)
+
+
+def _heavy_job_limit() -> int:
+    """Return the cross-project cap for normalization and cloud-ASR jobs."""
+
+    return _positive_env_int("ROUGH_CUT_MAX_HEAVY_JOBS", _DEFAULT_HEAVY_JOBS_MAX)
+
+
+# Endpoints that legitimately receive large binary bodies. Everything else
+# (JSON APIs) is held to ``_default_request_body_limit``.
+_UPLOAD_ENDPOINTS = frozenset({"stage2_sync_source_audio"})
+
+
+class _LimitedRequest(Request):
+    """Apply the large body limit only to upload endpoints."""
+
+    # Explicit per-request override. Stored locally so the setter works on both
+    # Flask 3.0 (read-only base property) and Flask 3.1 (read-write base property).
+    _explicit_max_content_length: int | None = None
+
+    @property
+    def max_content_length(self) -> int | None:
+        if self._explicit_max_content_length is not None:
+            return self._explicit_max_content_length
+        if self.method in {"PUT", "POST"} and self.endpoint in _UPLOAD_ENDPOINTS:
+            return _request_body_limit()
+        return super().max_content_length
+
+    @max_content_length.setter
+    def max_content_length(self, value: int | None) -> None:
+        self._explicit_max_content_length = value
+
+
 configure_logging()
 app = Flask(__name__)
+app.request_class = _LimitedRequest
 # UI modules import one another. Revalidation prevents a browser from
 # combining a fresh entry module with a cached older dependency after deploy.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
-app.config["MAX_CONTENT_LENGTH"] = _request_body_limit()
+app.config["MAX_CONTENT_LENGTH"] = _default_request_body_limit()
 _CONFIG_WARNINGS = validate_env()
 for _warning in _CONFIG_WARNINGS:
     app.logger.warning("Configuration: %s", _warning)
@@ -211,9 +269,13 @@ _TTS_JOBS_MAX = 200
 _TTS_JOBS_TTL_SECONDS = 24 * 60 * 60
 _TTS_CONCURRENT_MAX = 3
 _TTS_SEMAPHORE = threading.Semaphore(_TTS_CONCURRENT_MAX)
+# Cross-project cap for normalization and cloud-ASR jobs. Like the TTS slot,
+# an over-limit job stays queued (polling for the slot) instead of failing.
+_HEAVY_JOB_SEMAPHORE = threading.Semaphore(_heavy_job_limit())
 _TTS_ACTIVE_PROJECTS = _TTS_RUNTIME.active_projects
 _TTS_CANCEL_EVENTS = _TTS_RUNTIME.cancel_events
-_SOURCE_HASH_CACHE: dict[str, tuple[int, int, str]] = {}
+_SOURCE_HASH_CACHE_MAX = 256
+_SOURCE_HASH_CACHE: OrderedDict[str, tuple[int, int, str]] = OrderedDict()
 _SOURCE_HASH_CACHE_LOCK = threading.Lock()
 _SYNC_RUNTIME = JobRegistry()
 _SYNC_JOBS = _SYNC_RUNTIME.jobs
@@ -232,7 +294,12 @@ _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
 _NORMALIZATION_ACTIVE_PROJECTS = _NORMALIZATION_RUNTIME.active_projects
 _NORMALIZATION_JOBS_MAX = 50
-_PROJECT_TRANSITION_LOCKS: dict[str, threading.RLock] = {}
+# Weak values: an entry lives only while some caller holds or waits on the lock
+# (``with _project_transition_lock(p):`` keeps a strong reference for the whole
+# block), so an in-use lock can never be recreated, while idle entries vanish.
+_PROJECT_TRANSITION_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
 _PROJECT_TRANSITION_LOCKS_GUARD = threading.Lock()
 
 # Priority order matters: the first matching registry's label is reported to
@@ -256,7 +323,11 @@ def _project_transition_lock(project: str) -> threading.RLock:
     """Serialize job reservations with scenario-version transitions per project."""
 
     with _PROJECT_TRANSITION_LOCKS_GUARD:
-        return _PROJECT_TRANSITION_LOCKS.setdefault(project, threading.RLock())
+        lock = _PROJECT_TRANSITION_LOCKS.get(project)
+        if lock is None:
+            lock = threading.RLock()
+            _PROJECT_TRANSITION_LOCKS[project] = lock
+        return lock
 
 
 def _project_has_active_mutation(project: str) -> bool:
@@ -303,6 +374,27 @@ def _cep_cors_origin() -> str:
     return origin if origin in {"null", "file://"} else ""
 
 
+_AUTH_THROTTLE = FailedAuthThrottle(
+    max_failures=_non_negative_env_int("ROUGH_CUT_AUTH_MAX_FAILURES", 10),
+    window_seconds=_positive_env_int("ROUGH_CUT_AUTH_FAILURE_WINDOW_SECONDS", 60),
+)
+
+
+def _token_matches(supplied: str, expected: str) -> bool:
+    if not supplied or not expected:
+        return False
+    # Bytes keep compare_digest timing-safe and total for non-ASCII input.
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _request_is_authenticated() -> bool:
+    """Whether this request carries valid credentials (or tests bypass auth)."""
+
+    if app.config.get("TESTING") and app.config.get("API_TOKEN") is None:
+        return True
+    return _token_matches(_request_token(), _api_token())
+
+
 @app.before_request
 def require_api_authentication():
     if request.endpoint == "health":
@@ -318,9 +410,23 @@ def require_api_authentication():
         return None
     if not expected:
         return _json_error("ROUGH_CUT_API_TOKEN is not configured", 503)
+    client_key = request.remote_addr or "unknown"
+    # Locked-out clients are refused before any comparison so a brute-force
+    # run cannot learn whether a guess was right once the budget is spent.
+    retry_after = _AUTH_THROTTLE.retry_after(client_key)
+    if retry_after:
+        throttled = jsonify({"ok": False, "error": "too many failed authentication attempts"})
+        throttled.status_code = 429
+        throttled.headers["Retry-After"] = str(retry_after)
+        return throttled
     supplied = _request_token()
-    if supplied and hmac.compare_digest(supplied, expected):
+    if _token_matches(supplied, expected):
+        _AUTH_THROTTLE.record_success(client_key)
         return None
+    # A request with no credentials at all (e.g. the first browser navigation
+    # that triggers the Basic challenge) is not a guess and is not counted.
+    if supplied:
+        _AUTH_THROTTLE.record_failure(client_key)
     response = jsonify({"ok": False, "error": "unauthorized"})
     response.status_code = 401
     # A Basic challenge makes Chromium-based CEP panels display a native
@@ -345,8 +451,44 @@ def add_cep_cors_headers(response):
     return response
 
 
+def _redact_local_paths(message: str) -> str:
+    """Show filesystem locations relative to the project tree, never absolute.
+
+    A base only matches on a path-segment boundary: ``/app`` must not eat the
+    start of ``/application/x`` or the middle of ``https://host/app/y``.
+    """
+
+    labels: dict[str, str] = {}
+    for base, label in ((PROJECTS_DIR, "projects"), (ROOT_DIR, "")):
+        for candidate in {str(base), str(Path(base).resolve())}:
+            candidate = candidate.rstrip(os.sep)
+            if candidate:
+                labels.setdefault(candidate, label)
+    if not labels:
+        return message
+    alternation = "|".join(re.escape(item) for item in sorted(labels, key=len, reverse=True))
+    pattern = re.compile(
+        rf"(?<![\w.:/~-])(?P<base>{alternation})"
+        r"(?:(?P<sep>/)|(?=$|[\s:'\",;)\]]))"
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        label = labels[match.group("base")]
+        if match.group("sep"):
+            return f"{label}/" if label else ""
+        return label or "."
+
+    return pattern.sub(replace, message)
+
+
+def _display_path(path: Path | str) -> str:
+    """Return ``path`` relative to the project tree for user-facing messages."""
+
+    return _redact_local_paths(str(path))
+
+
 def _json_error(message: str, status_code: int = 400):
-    return jsonify({"ok": False, "error": message}), status_code
+    return jsonify({"ok": False, "error": _redact_local_paths(str(message))}), status_code
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -473,12 +615,17 @@ def _normalization_source_is_current(document: dict, project_root: Path) -> bool
         cache_key = str(source_path)
         with _SOURCE_HASH_CACHE_LOCK:
             cached = _SOURCE_HASH_CACHE.get(cache_key)
+            if cached is not None:
+                _SOURCE_HASH_CACHE.move_to_end(cache_key)
         if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size):
             current_hash = cached[2]
         else:
             current_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
             with _SOURCE_HASH_CACHE_LOCK:
                 _SOURCE_HASH_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, current_hash)
+                _SOURCE_HASH_CACHE.move_to_end(cache_key)
+                while len(_SOURCE_HASH_CACHE) > _SOURCE_HASH_CACHE_MAX:
+                    _SOURCE_HASH_CACHE.popitem(last=False)
     except (OSError, ValueError):
         return False
     return current_hash == expected_hash

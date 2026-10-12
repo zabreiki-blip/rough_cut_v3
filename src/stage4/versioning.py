@@ -14,6 +14,8 @@ import shutil
 from threading import Lock, RLock
 from typing import Any, Callable
 import unicodedata
+import uuid
+import weakref
 
 from atomic_io import atomic_write_json
 from stage4.revision_assets import (
@@ -61,7 +63,10 @@ _DOWNSTREAM_FIELDS = (
 _SPEAKER_TOKEN_ALIASES = {
     "протоирей": "протоиерей",
 }
-_PROJECT_LOCKS: dict[str, RLock] = {}
+# Weak values: the lock stays registered while any thread holds or waits on it
+# (``lock`` below is a strong local for the whole ``with``), so a held lock is
+# never recreated; idle entries are collected.
+_PROJECT_LOCKS: weakref.WeakValueDictionary[str, RLock] = weakref.WeakValueDictionary()
 _PROJECT_LOCKS_GUARD = Lock()
 
 
@@ -73,7 +78,10 @@ class RevisionStateConflictError(ValueError):
 def _project_lock(project_paths: dict[str, Path]):
     key = str(project_paths["root"].resolve())
     with _PROJECT_LOCKS_GUARD:
-        lock = _PROJECT_LOCKS.setdefault(key, RLock())
+        lock = _PROJECT_LOCKS.get(key)
+        if lock is None:
+            lock = RLock()
+            _PROJECT_LOCKS[key] = lock
     with lock:
         yield
 
@@ -329,8 +337,32 @@ def recover_interrupted_activation(project_paths: dict[str, Path]) -> dict[str, 
                 "revision_id": revision_id,
                 "error": "журнал незавершённой активации не содержит корректный id редакции",
             }
+        journal_activation_id = str(intent.get("activation_id") or "")
+        if journal_activation_id:
+            active_path = project_paths["work"] / "active_revision.json"
+            try:
+                committed_id = str(_read_json(active_path).get("activation_id") or "")
+            except (OSError, ValueError):
+                committed_id = ""
+            if committed_id == journal_activation_id:
+                # active_revision.json is the last projection activate_revision
+                # writes, so this activation fully committed and only the final
+                # journal unlink was lost. Replaying would overwrite edits the
+                # user made after the activation; just drop the stale journal.
+                try:
+                    journal_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    return {
+                        "recovered": False,
+                        "revision_id": revision_id,
+                        "error": f"не удалось удалить журнал завершённой активации: {exc}",
+                    }
+                return {"recovered": True, "revision_id": revision_id, "error": None}
         try:
-            activate_revision(revision_id, project_paths, _resume=True)
+            resume_kwargs: dict[str, Any] = {"_resume": True}
+            if journal_activation_id:
+                resume_kwargs["_activation_id"] = journal_activation_id
+            activate_revision(revision_id, project_paths, **resume_kwargs)
         except Exception as exc:  # noqa: BLE001 - report, never crash a read-only integrity check
             return {
                 "recovered": False,
@@ -1021,8 +1053,13 @@ def activate_revision(
     project_paths: dict[str, Path],
     *,
     _resume: bool = False,
+    _activation_id: str | None = None,
 ) -> dict[str, Any]:
     """Switch the project's mutable work projection to ``revision_id``.
+
+    ``_activation_id`` (internal) lets a resumed activation keep the id from
+    the interrupted attempt's journal; otherwise a fresh one is generated.
+    The id is stored in both the intent journal and ``active_revision.json``.
 
     ``_resume`` is for internal use by ``recover_interrupted_activation``
     only. The intent journal ``restore_revision_assets`` writes before it
@@ -1042,7 +1079,10 @@ def activate_revision(
         active_id = str(_read_json(active_path).get("revision_id") or "")
         working = _read_json(project_paths["normalized"])
         working_id = str(working.get("scenario_revision_id") or "")
-        if active_id and working_id != active_id:
+        # A resumed activation may already have committed the incoming
+        # revision's normalized scenario before crashing; the journal proves
+        # that, so accept it as well as the outgoing active revision.
+        if active_id and working_id != active_id and not (_resume and working_id == revision_id):
             raise RevisionStateConflictError(
                 "active revision does not match the working scenario; "
                 "repair or reconcile the project before switching revisions"
@@ -1089,7 +1129,17 @@ def activate_revision(
         if active_id and active_id != revision_id:
             snapshot_revision_assets(active_id, project_paths)
             manifest = _read_json(manifest_path)
-    restore_revision_assets(revision_id, manifest, normalized, project_paths)
+    # Keep the intent journal until active_revision.json is written: a crash
+    # between restore and the remaining projections must stay resumable.
+    activation_id = _activation_id or uuid.uuid4().hex
+    restore_revision_assets(
+        revision_id,
+        manifest,
+        normalized,
+        project_paths,
+        keep_intent=True,
+        activation_id=activation_id,
+    )
     atomic_write_json(project_paths["normalized"], normalized)
     atomic_write_json(project_paths["sync_matches"], matches)
     if manifest.get("timeline_snapshot"):
@@ -1114,8 +1164,9 @@ def activate_revision(
         (project_paths["work"] / "stage3_source_mapping.json").unlink(missing_ok=True)
     atomic_write_json(
         project_paths["work"] / "active_revision.json",
-        {"revision_id": revision_id, "activated_at": _utcnow()},
+        {"revision_id": revision_id, "activated_at": _utcnow(), "activation_id": activation_id},
     )
+    activation_intent_path(project_paths).unlink(missing_ok=True)
     return {"revision": manifest, "reused_sync_matches": len(kept)}
 
 

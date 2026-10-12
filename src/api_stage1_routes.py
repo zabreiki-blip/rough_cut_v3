@@ -8,6 +8,7 @@ from types import ModuleType
 from flask import Flask, jsonify, request
 
 from stage1.normalizer import invalidate_video_cue_seed_cache
+from stage4.revision_assets import CorruptStateError
 
 
 def _resolve_tts_direction(services: ModuleType, payload: dict, provider: str | None):
@@ -128,7 +129,7 @@ def _stage1_normalization_job_start(services: ModuleType):
             str(payload.get("input_path") or ""), default_input, paths["root"]
         )
         if not input_path.is_file():
-            raise FileNotFoundError(f"Input file not found: {input_path}")
+            raise FileNotFoundError(f"Input file not found: {services._display_path(input_path)}")
         llm_preset = services.normalize_llm_preset(payload.get("llm_preset"))
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -507,6 +508,10 @@ def _stage1_tts(services: ModuleType):
             tts_style=tts_style,
         )
         services._save_voiceover_revision_assets(project, result)
+    except CorruptStateError as exc:
+        # Server-side project state is damaged; this is not a client error.
+        services.app.logger.error("Corrupt project state while saving TTS manifest: %s", exc)
+        return services._json_error(str(exc), 500)
     except ValueError as exc:
         return services._json_error(str(exc), 400)
     except FileNotFoundError as exc:

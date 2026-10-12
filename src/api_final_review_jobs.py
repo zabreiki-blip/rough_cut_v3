@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from api_service_contracts import FinalReviewJobServices
+from job_runtime import trim_terminal_jobs
+
+_FINAL_REVIEW_JOBS_MAX = 100
+_FINAL_REVIEW_JOBS_TTL_SECONDS = 24 * 60 * 60
 
 
 def reserve_final_review_project(services: FinalReviewJobServices, project: str) -> bool:
@@ -51,6 +55,11 @@ def create_final_review_job(
     job_id = str(job["id"])
     with services._FINAL_REVIEW_JOBS_LOCK:
         services._FINAL_REVIEW_JOBS[job_id] = job
+        trim_terminal_jobs(
+            services._FINAL_REVIEW_JOBS,
+            max_jobs=_FINAL_REVIEW_JOBS_MAX,
+            ttl_seconds=_FINAL_REVIEW_JOBS_TTL_SECONDS,
+        )
     services._atomic_write_json_file(
         services._project_paths(project)["final_review_job_status"], job
     )

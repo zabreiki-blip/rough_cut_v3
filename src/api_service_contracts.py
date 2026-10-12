@@ -143,6 +143,7 @@ class NormalizationJobServices(Protocol):
     _NORMALIZATION_JOBS_LOCK: Any
     _NORMALIZATION_ACTIVE_PROJECTS: set[str]
     _NORMALIZATION_JOBS_MAX: int
+    _HEAVY_JOB_SEMAPHORE: Any
 
     def _normalize_project_name(self, name: str) -> str: ...
 
@@ -174,6 +175,8 @@ class NormalizationJobServices(Protocol):
 
     def _release_normalization_project(self, project: str) -> None: ...
 
+    def acquire_slot(self, semaphore: Any, cancel_event: Any = None) -> bool: ...
+
     def _make_openrouter_usage_callback(self, project: str, **context: Any) -> UsageCallback: ...
 
     def generate_normalization(
@@ -197,6 +200,9 @@ class SyncWorkerServices(Protocol):
     _SYNC_DATA_LOCK: Any
     _SYNC_JOBS_LOCK: Any
     _SYNC_CANCEL_EVENTS: dict[str, Any]
+    _HEAVY_JOB_SEMAPHORE: Any
+
+    def acquire_slot(self, semaphore: Any, cancel_event: Any = None) -> bool: ...
 
     def _project_paths(self, project: str) -> dict[str, Path]: ...
 

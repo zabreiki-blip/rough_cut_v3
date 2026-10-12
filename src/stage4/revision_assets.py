@@ -3,15 +3,20 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
+import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 import threading
 from typing import Any
+import uuid
 
 from atomic_io import atomic_write_json
 
 
+_LOGGER = logging.getLogger(__name__)
 _VOICEOVER_ALIAS_RE = re.compile(r"^zk\d+\.wav$")
 _ACTIVATION_INTENT_FILENAME = "activation_intent.json"
 
@@ -33,19 +38,54 @@ def _manifest_lock(path: Path) -> threading.Lock:
         return _MANIFEST_LOCKS.setdefault(key, threading.Lock())
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+class CorruptStateError(ValueError):
+    """Server-side project state (not user input) is unreadable or malformed."""
+
+
+def _read_json(path: Path, *, strict: bool = False) -> dict[str, Any]:
+    """Read a JSON object, treating a missing file as ``{}``.
+
+    The default (tolerant) mode also maps unreadable, corrupt or non-object
+    content to ``{}`` and is only suitable for informational reads whose result
+    is never persisted back over history.  ``strict=True`` distinguishes "file
+    does not exist" (still ``{}``) from "file exists but cannot be trusted"
+    (``ValueError``), so snapshot and other writing paths never replace
+    historical data with a freshly derived projection.
+    """
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
-    return value if isinstance(value, dict) else {}
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if strict:
+            raise CorruptStateError(
+                f"Состояние проекта повреждено: не удалось прочитать {path.name} ({exc})"
+            ) from exc
+        return {}
+    if not isinstance(value, dict):
+        if strict:
+            raise CorruptStateError(
+                f"Состояние проекта повреждено: {path.name} не содержит JSON-объект"
+            )
+        return {}
+    return value
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp")
-    shutil.copy2(source, temporary)
-    temporary.replace(destination)
+    # Unique temp name: concurrent copies to one destination must not clean
+    # up (or replace) each other's in-flight temporary file.
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _safe_uid(value: str) -> str:
@@ -152,14 +192,16 @@ def _with_block_uids(prepared: dict[str, Any], normalized: dict[str, Any]) -> di
 
 
 def capture_legacy_voiceover_manifest(project_paths: dict[str, Path]) -> dict[str, Any]:
-    prepared = _read_json(project_paths["prepared"])
-    normalized = _read_json(project_paths["normalized"])
+    # Strictly read every input before the first write: a corrupt input must
+    # leave all working files untouched.
+    prepared = _read_json(project_paths["prepared"], strict=True)
+    normalized = _read_json(project_paths["normalized"], strict=True)
+    current = _read_json(project_paths["active_voiceover_manifest"], strict=True)
     if not prepared:
         prepared = prepared_from_normalized(normalized)
     prepared = _with_block_uids(prepared, normalized)
     atomic_write_json(project_paths["prepared"], prepared)
 
-    current = _read_json(project_paths["active_voiceover_manifest"])
     by_id = {
         str(item.get("id") or ""): item
         for item in current.get("items", [])
@@ -213,15 +255,19 @@ def capture_legacy_voiceover_manifest(project_paths: dict[str, Path]) -> dict[st
 
 def snapshot_revision_assets(revision_id: str, project_paths: dict[str, Path]) -> dict[str, Any]:
     manifest_path = project_paths["scenario_versions"] / f"{revision_id}.json"
-    revision = _read_json(manifest_path)
+    revision = _read_json(manifest_path, strict=True)
     if not revision:
         return {}
-    normalized = _read_json(project_paths["normalized"])
+    normalized = _read_json(project_paths["normalized"], strict=True)
     if str(normalized.get("scenario_revision_id") or "") != revision_id:
         # The work projection may already belong to a newly normalized or
         # otherwise different scenario.  Never overwrite the active revision's
         # historical snapshot with that unrelated payload.
         return {}
+    # Preflight the inputs capture_legacy_voiceover_manifest reads strictly, so
+    # a corrupt one fails before the normalized source rewrite below.
+    _read_json(project_paths["prepared"], strict=True)
+    _read_json(project_paths["active_voiceover_manifest"], strict=True)
     source_snapshot_name = str(revision.get("source_snapshot") or "")
     expected_source_snapshot = (
         f"{revision_id}.source{Path(str(revision.get('source_file') or '')).suffix.lower()}"
@@ -328,14 +374,18 @@ def create_revision_asset_snapshots(
     prepared_snapshot = project_paths["scenario_versions"] / f"{revision_id}.prepared.json"
     atomic_write_json(prepared_snapshot, prepared)
 
-    active = _read_json(project_paths["active_voiceover_manifest"])
+    active = _read_json(project_paths["active_voiceover_manifest"], strict=True)
     parent_id = str(normalized.get("parent_revision_id") or "")
     parent_revision = (
-        _read_json(project_paths["scenario_versions"] / f"{parent_id}.json") if parent_id else {}
+        _read_json(project_paths["scenario_versions"] / f"{parent_id}.json", strict=True)
+        if parent_id
+        else {}
     )
     parent_snapshot = str(parent_revision.get("voiceover_manifest_snapshot") or "")
     if parent_snapshot:
-        parent_manifest = _read_json(project_paths["scenario_versions"] / parent_snapshot)
+        parent_manifest = _read_json(
+            project_paths["scenario_versions"] / parent_snapshot, strict=True
+        )
         if parent_manifest:
             active = parent_manifest
     by_uid = {
@@ -388,7 +438,7 @@ def save_tts_manifest(project_paths: dict[str, Path], result: dict[str, Any]) ->
         except (OSError, ValueError):
             continue
         items.append(item)
-    normalized = _read_json(project_paths["normalized"])
+    normalized = _read_json(project_paths["normalized"], strict=True)
     active_revision_id = str(normalized.get("scenario_revision_id") or "")
     revision_id = str(result.get("scenario_revision_id") or active_revision_id)
     manifest = {
@@ -400,7 +450,7 @@ def save_tts_manifest(project_paths: dict[str, Path], result: dict[str, Any]) ->
         snapshot = project_paths["scenario_versions"] / f"{revision_id}.voiceover.json"
         atomic_write_json(snapshot, manifest)
         revision_path = project_paths["scenario_versions"] / f"{revision_id}.json"
-        revision = _read_json(revision_path)
+        revision = _read_json(revision_path, strict=True)
         if revision:
             revision["voiceover_manifest_snapshot"] = snapshot.name
             atomic_write_json(revision_path, revision)
@@ -437,7 +487,14 @@ def merge_voiceover_manifest_item(
     """
     if not re.fullmatch(r"zk\d+", block_id) or not fingerprint:
         return
-    normalized = _read_json(project_paths["normalized"])
+    try:
+        normalized = _read_json(project_paths["normalized"], strict=True)
+    except ValueError as exc:
+        # Best-effort incremental journal called from TTS worker threads:
+        # never crash synthesis and never write on top of untrusted state.
+        # save_tts_manifest still records the whole batch afterwards.
+        _LOGGER.warning("skip voiceover manifest merge: %s", exc)
+        return
     active_revision_id = str(normalized.get("scenario_revision_id") or "")
     if revision_id and active_revision_id and revision_id != active_revision_id:
         # This synthesis run targets a revision other than the active one;
@@ -454,7 +511,11 @@ def merge_voiceover_manifest_item(
         return
     manifest_path = project_paths["active_voiceover_manifest"]
     with _manifest_lock(manifest_path):
-        manifest = _read_json(manifest_path)
+        try:
+            manifest = _read_json(manifest_path, strict=True)
+        except ValueError as exc:
+            _LOGGER.warning("skip voiceover manifest merge: %s", exc)
+            return
         items = [
             item
             for item in manifest.get("items", [])
@@ -481,13 +542,28 @@ def restore_revision_assets(
     revision: dict[str, Any],
     normalized: dict[str, Any],
     project_paths: dict[str, Path],
+    *,
+    keep_intent: bool = False,
+    activation_id: str | None = None,
 ) -> None:
+    """Restore ``revision_id``'s prepared/manifest/alias projections.
+
+    ``activation_id`` is recorded in the intent journal; the caller stores the
+    same id in ``active_revision.json`` so recovery can tell a fully committed
+    activation (journal merely left behind) from an interrupted one.
+
+    By default the write-ahead intent journal is removed once every alias is
+    in place.  Callers that still have further projections to commit after
+    this call (``stage4.versioning.activate_revision``) pass
+    ``keep_intent=True`` and remove the journal themselves, so a crash in
+    that later window can still be resumed.
+    """
     prepared_snapshot = str(revision.get("prepared_snapshot") or "")
     if prepared_snapshot and prepared_snapshot != f"{revision_id}.prepared.json":
         raise ValueError("invalid prepared snapshot")
     prepared_source = project_paths["scenario_versions"] / prepared_snapshot
     if prepared_snapshot and prepared_source.is_file():
-        prepared_payload = _with_block_uids(_read_json(prepared_source), normalized)
+        prepared_payload = _with_block_uids(_read_json(prepared_source, strict=True), normalized)
     else:
         prepared_payload = prepared_from_normalized(normalized)
 
@@ -495,7 +571,7 @@ def restore_revision_assets(
     if manifest_snapshot and manifest_snapshot != f"{revision_id}.voiceover.json":
         raise ValueError("invalid voiceover manifest snapshot")
     manifest_source = project_paths["scenario_versions"] / manifest_snapshot
-    manifest = _read_json(manifest_source) if manifest_snapshot else {}
+    manifest = _read_json(manifest_source, strict=True) if manifest_snapshot else {}
     if not manifest:
         manifest = {"schema_version": 1, "scenario_revision_id": revision_id, "items": []}
     desired: dict[str, tuple[Path, str]] = {}
@@ -537,6 +613,7 @@ def restore_revision_assets(
         {
             "schema_version": 1,
             "revision_id": revision_id,
+            "activation_id": activation_id or uuid.uuid4().hex,
             "created_at": datetime.now(UTC).isoformat(),
             "operations": [
                 {
@@ -575,5 +652,7 @@ def restore_revision_assets(
         ):
             alias.unlink()
             alias.with_suffix(".wav.meta").unlink(missing_ok=True)
-    # Every alias now matches revision_id; the intent recorded above is done.
-    intent_path.unlink(missing_ok=True)
+    # Every alias now matches revision_id; the intent recorded above is done
+    # unless the caller still has projections left to commit.
+    if not keep_intent:
+        intent_path.unlink(missing_ok=True)

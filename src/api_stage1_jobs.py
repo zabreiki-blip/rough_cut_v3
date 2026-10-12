@@ -500,13 +500,17 @@ def run_normalization_job(
     hint: str,
     llm_preset: str,
 ) -> None:
-    services._update_normalization_job(
-        job_id,
-        status="running",
-        message="Normalizing scenario",
-        started_at=services._utc_now_iso(),
-    )
+    # Cross-project cap: wait in "queued" state for a free slot (same queueing
+    # behaviour as the TTS slot) before doing any LLM/CPU-heavy work.
+    slot_acquired = False
     try:
+        slot_acquired = services.acquire_slot(services._HEAVY_JOB_SEMAPHORE)
+        services._update_normalization_job(
+            job_id,
+            status="running",
+            message="Normalizing scenario",
+            started_at=services._utc_now_iso(),
+        )
         result = services.generate_normalization(
             input_path,
             output_path,
@@ -542,4 +546,6 @@ def run_normalization_job(
             finished_at=services._utc_now_iso(),
         )
     finally:
+        if slot_acquired:
+            services._HEAVY_JOB_SEMAPHORE.release()
         services._release_normalization_project(project)

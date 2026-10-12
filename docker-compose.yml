@@ -32,6 +32,9 @@ services:
     # inter-process lock.
     command: gunicorn -b 0.0.0.0:8000 --workers 1 --threads 4 --timeout 3600 api:app
     restart: unless-stopped
+    # Resource limits (override via .env / environment).
+    mem_limit: ${RC_MEM_LIMIT:-8g}
+    cpus: ${RC_CPUS:-8}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

@@ -160,6 +160,15 @@ matches и таймлайн. Озвучка привязана к стабиль
 
 Обязательные ключи:
 - `ROUGH_CUT_API_TOKEN` — обязательный токен веб-интерфейса и API
+- `ROUGH_CUT_AUTH_MAX_FAILURES` (по умолчанию `10`) и
+  `ROUGH_CUT_AUTH_FAILURE_WINDOW_SECONDS` (`60`) — ограничитель неудачных попыток
+  входа: после N неверных токенов за окно клиент получает `429` с `Retry-After`.
+  Успешный вход сбрасывает счётчик. Клиент определяется по IP соединения
+  (`remote_addr`); заголовок `X-Forwarded-For` намеренно не учитывается.
+  **За Docker bridge или reverse proxy все клиенты приходят с одного IP**, поэтому
+  одна панель с неверным токеном может заблокировать остальных. В таком случае
+  поставьте `ROUGH_CUT_AUTH_MAX_FAILURES=0` (ограничитель выключен; защитой
+  остаётся длинный случайный токен и сетевые ограничения прокси).
 - `OPENROUTER_API_KEY`
 
 Если используешь только `TTS_PROVIDER=macos`, ключи для TTS не нужны.
@@ -174,6 +183,7 @@ matches и таймлайн. Озвучка привязана к стабиль
 - `TTS_PROVIDER=openrouter|macos` (в веб-интерфейсе OpenRouter-модель выбирается отдельно)
 - `TTS_GENDER=female|male` (пол голоса по умолчанию)
 - `TTS_MAX_WORKERS=3` ограничивает параллельные запросы синтеза (`1–4`)
+- `OPENROUTER_MAX_TOKENS=16384` — лимит вывода LLM-запроса; согласуйте с лимитом выбранной модели (при превышении OpenRouter вернёт 400, это не ретраится)
 - `ANALYZER_LLM_WORKERS=4` ограничивает параллельный анализ независимых LLM-чанков (`1–4`)
 - для `openrouter` доступны `microsoft/mai-voice-2` и
   `google/gemini-3.1-flash-tts-preview` через отдельный TTS endpoint.
@@ -356,7 +366,10 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `DELETE /projects/<project>` — удалить проект.
 - `GET /project/<project>` — UI первого этапа для конкретного проекта.
 - `GET /health`
+- `GET /system/readiness` — проверка готовности окружения (ffmpeg, Whisper-бэкенд, TTS-провайдер, ключ OpenRouter); значения ключей не возвращаются.
+- `GET /speaker/<project>/<filename>` — отдать WAV диктора активной редакции проекта (только `*.wav`).
 - `GET /stage1/status?project=<project>`
+- `GET /stage1/openrouter-usage?project=<project>` — сводка использования OpenRouter по проекту.
 - `POST /stage1/normalization/generate`
 - `POST /stage1/normalization/reset`
 - `GET|PUT /stage1/normalization`
@@ -374,9 +387,13 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 - `GET /stage1/tts-jobs/status?project=<project>` (последняя задача, включая checkpoint после рестарта)
 - `POST /stage1/tts-jobs/<job_id>/cancel` (остановка после текущего внешнего вызова)
 - `POST /stage1/tts-phrase` (озвучка одной фразы)
+- `POST /stage1/tts/clear` — очистить озвучку проекта (отклоняется с 409, пока идёт фоновая задача проекта)
 - `POST /stage1/validate`
 - `POST /stage2/build`
 - `GET /stage2/export/xml?project=<project>`
+- `POST /stage2/final-review/start` — запустить финальную проверку собранного WAV (асинхронная job, ответ 202)
+- `GET /stage2/final-review/jobs/<job_id>?project=<project>` — статус job финальной проверки
+- `POST /stage2/final-review/jobs/<job_id>/apply` — применить исправления завершённой проверки
 - `GET|POST|DELETE /stage2/sync-sources`
 - `GET|PUT /stage2/sync-sources/<source_id>/audio`
 - `PUT /stage2/sync-sources/<source_id>/words`

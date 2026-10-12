@@ -217,12 +217,36 @@ def test_worker_restarts_after_error() -> None:
     assert result["worker_pid"] != failed_worker_pid
 
 
+# Safety net only: a correct implementation kills the hung worker within
+# milliseconds. The deadline bounds polling so a regression fails instead of
+# hanging, and nothing asserts on elapsed wall-clock time.
+_KILL_DEADLINE_SECONDS = 10.0
+
+
+def _hang_forever() -> None:
+    # Blocks until the parent kills this worker; never a timing source.
+    threading.Event().wait(60.0)
+
+
+def _wait_until_process_gone(pid: int) -> bool:
+    deadline = time.monotonic() + _KILL_DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_timeout_terminates_worker_promptly() -> None:
-    def hang(_path, **_kwargs):
-        time.sleep(5.0)
+    worker_pids: list[int] = []
+
+    def hang(_path, *, progress_callback, **_kwargs):
+        progress_callback(0.0, 1.0, os.getpid())
+        _hang_forever()
         return {"words": []}
 
-    started = time.monotonic()
     with (
         patch("stage2.whisper_process.transcribe_audio", side_effect=hang),
         pytest.raises(WhisperTimeoutError, match="exceeded"),
@@ -231,19 +255,27 @@ def test_timeout_terminates_worker_promptly() -> None:
             "unused.wav",
             timeout_seconds=0.1,
             _start_method="fork",
+            progress_callback=lambda _done, _total, pid: worker_pids.append(pid),
         )
 
-    assert time.monotonic() - started < 2.0
+    assert worker_pids
+    assert whisper_process._worker is None
+    assert _wait_until_process_gone(worker_pids[0])
 
 
 def test_cancel_event_terminates_worker_promptly() -> None:
+    worker_pids: list[int] = []
+    cancel_event = threading.Event()
+
     def hang(_path, *, progress_callback, **_kwargs):
-        progress_callback(0.0, 1.0, 0)
-        time.sleep(5.0)
+        progress_callback(0.0, 1.0, os.getpid())
+        _hang_forever()
         return {"words": []}
 
-    cancel_event = threading.Event()
-    started = time.monotonic()
+    def on_progress(_done, _total, pid) -> None:
+        worker_pids.append(pid)
+        cancel_event.set()
+
     with (
         patch("stage2.whisper_process.transcribe_audio", side_effect=hang),
         pytest.raises(WhisperCancelledError, match="cancelled"),
@@ -251,19 +283,21 @@ def test_cancel_event_terminates_worker_promptly() -> None:
         transcribe_audio_in_process(
             "unused.wav",
             cancel_event=cancel_event,
-            timeout_seconds=10.0,
+            timeout_seconds=60.0,
             _start_method="fork",
-            progress_callback=lambda *_args: cancel_event.set(),
+            progress_callback=on_progress,
         )
 
     assert cancel_event.is_set()
-    assert time.monotonic() - started < 2.0
+    assert worker_pids
+    assert whisper_process._worker is None
+    assert _wait_until_process_gone(worker_pids[0])
 
 
 def test_worker_restarts_after_timeout() -> None:
     def hang(_path, *, progress_callback, **_kwargs):
         progress_callback(0.0, 1.0, os.getpid())
-        time.sleep(5.0)
+        _hang_forever()
         return {"words": []}
 
     timed_out_worker_pids = []
@@ -286,25 +320,31 @@ def test_worker_restarts_after_timeout() -> None:
 
     assert timed_out_worker_pids
     assert result["worker_pid"] != timed_out_worker_pids[0]
+    assert _wait_until_process_gone(timed_out_worker_pids[0])
 
 
 @pytest.mark.filterwarnings("ignore:This process.*multi-threaded.*:DeprecationWarning")
 def test_shutdown_does_not_wait_for_long_running_request() -> None:
     worker_started = threading.Event()
+    worker_pids: list[int] = []
     errors = []
 
     def hang(_path, *, progress_callback, **_kwargs):
-        progress_callback(0.0, 1.0, 0)
-        time.sleep(5.0)
+        progress_callback(0.0, 1.0, os.getpid())
+        _hang_forever()
         return {"words": []}
+
+    def on_progress(_done, _total, pid) -> None:
+        worker_pids.append(pid)
+        worker_started.set()
 
     def run_request() -> None:
         try:
             transcribe_audio_in_process(
                 "unused.wav",
-                timeout_seconds=10.0,
+                timeout_seconds=60.0,
                 _start_method="fork",
-                progress_callback=lambda *_args: worker_started.set(),
+                progress_callback=on_progress,
             )
         except WhisperProcessError as exc:
             errors.append(exc)
@@ -312,12 +352,13 @@ def test_shutdown_does_not_wait_for_long_running_request() -> None:
     with patch("stage2.whisper_process.transcribe_audio", side_effect=hang):
         request_thread = threading.Thread(target=run_request, daemon=True)
         request_thread.start()
-        assert worker_started.wait(timeout=1.0)
-        started = time.monotonic()
+        assert worker_started.wait(timeout=_KILL_DEADLINE_SECONDS)
+        # Returns instead of blocking on the in-flight request (which would
+        # only end at its 60s timeout); the request thread then unblocks.
         _shutdown_worker()
-        elapsed = time.monotonic() - started
-        request_thread.join(timeout=2.0)
+        request_thread.join(timeout=_KILL_DEADLINE_SECONDS)
 
-    assert elapsed < 2.0
     assert not request_thread.is_alive()
     assert errors
+    assert not isinstance(errors[0], WhisperTimeoutError)
+    assert _wait_until_process_gone(worker_pids[0])

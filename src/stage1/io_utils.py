@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 from typing import Any
+import zipfile
 
 from atomic_io import atomic_write_json
 
@@ -17,6 +19,70 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+_MIB = 1024 * 1024
+# Limits are read at call time so they can be tuned via environment variables.
+DOCX_MAX_FILE_BYTES_ENV = "ROUGH_CUT_DOCX_MAX_FILE_BYTES"
+DOCX_MAX_UNCOMPRESSED_BYTES_ENV = "ROUGH_CUT_DOCX_MAX_UNCOMPRESSED_BYTES"
+DOCX_MAX_MEMBERS_ENV = "ROUGH_CUT_DOCX_MAX_MEMBERS"
+DEFAULT_DOCX_MAX_FILE_BYTES = 50 * _MIB
+DEFAULT_DOCX_MAX_UNCOMPRESSED_BYTES = 200 * _MIB
+DEFAULT_DOCX_MAX_MEMBERS = 5000
+# Compression ratio is only suspicious once the payload is non-trivial.
+DOCX_SUSPICIOUS_RATIO = 100
+DOCX_RATIO_MIN_UNCOMPRESSED_BYTES = 10 * _MIB
+
+
+def validate_docx_archive(path: Path) -> None:
+    """Reject oversized, malformed or zip-bomb-like .docx before parsing it.
+
+    Raises ValueError with a user-facing message (mapped to 4xx by the API).
+    """
+    path = Path(path)
+    max_file = _env_int(DOCX_MAX_FILE_BYTES_ENV, DEFAULT_DOCX_MAX_FILE_BYTES)
+    max_total = _env_int(DOCX_MAX_UNCOMPRESSED_BYTES_ENV, DEFAULT_DOCX_MAX_UNCOMPRESSED_BYTES)
+    max_members = _env_int(DOCX_MAX_MEMBERS_ENV, DEFAULT_DOCX_MAX_MEMBERS)
+
+    file_size = path.stat().st_size
+    if file_size > max_file:
+        raise ValueError(f"DOCX file is too large: {file_size} bytes (limit {max_file} bytes)")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+    except (zipfile.BadZipFile, EOFError, OSError, NotImplementedError) as exc:
+        raise ValueError(f"DOCX file is corrupted or is not a valid .docx archive: {exc}") from exc
+
+    if len(infos) > max_members:
+        raise ValueError(f"DOCX archive has too many entries: {len(infos)} (limit {max_members})")
+    total = sum(info.file_size for info in infos)
+    if total > max_total:
+        raise ValueError(
+            f"DOCX archive expands to too much data: {total} bytes (limit {max_total} bytes)"
+        )
+    compressed = sum(info.compress_size for info in infos)
+    if (
+        total >= DOCX_RATIO_MIN_UNCOMPRESSED_BYTES
+        and total > max(compressed, 1) * DOCX_SUSPICIOUS_RATIO
+    ):
+        raise ValueError(
+            "DOCX archive has a suspicious compression ratio "
+            f"({total} bytes from {compressed} compressed); possible zip bomb"
+        )
+
+
+def _open_docx(document_factory: Any, path: Path) -> Any:
+    """Validate the archive, then open it with python-docx."""
+    validate_docx_archive(path)
+    return document_factory(str(path))
+
+
 def extract_text_from_docx(path: Path) -> str:
     try:
         from docx import Document  # lazy import for clearer error messages
@@ -24,7 +90,7 @@ def extract_text_from_docx(path: Path) -> str:
         raise RuntimeError(
             "python-docx is not installed. Install dependencies from requirements.txt."
         ) from exc
-    doc = Document(str(path))
+    doc = _open_docx(Document, path)
     lines = list(_iter_docx_text_blocks(doc))
     return normalize_whitespace("\n".join(lines))
 
@@ -41,7 +107,7 @@ def extract_paragraphs(path: Path) -> list[str]:
             ) from exc
         return [
             normalized
-            for text in _iter_docx_text_blocks(Document(str(path)))
+            for text in _iter_docx_text_blocks(_open_docx(Document, path))
             if (normalized := normalize_whitespace(text))
         ]
     text = extract_text(path)
@@ -117,7 +183,7 @@ def extract_marked_blocks_from_docx(path: Path) -> list[str]:
             "python-docx is not installed. Install dependencies from requirements.txt."
         ) from exc
 
-    doc = Document(str(path))
+    doc = _open_docx(Document, path)
     blocks: list[str] = []
 
     for paragraph in doc.paragraphs:
@@ -180,7 +246,7 @@ def extract_paragraphs_from_docx(path: Path) -> list[DocxParagraph]:
             "python-docx is not installed. Install dependencies from requirements.txt."
         ) from exc
 
-    doc = Document(str(path))
+    doc = _open_docx(Document, path)
     result: list[DocxParagraph] = []
 
     for idx, paragraph in enumerate(doc.paragraphs):

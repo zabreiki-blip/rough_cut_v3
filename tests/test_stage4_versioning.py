@@ -480,6 +480,11 @@ def test_activation_interrupted_between_files_is_detected_and_recoverable(
     with pytest.raises(RevisionStateConflictError, match="does not match"):
         activate_revision("rev_0001", paths)
 
+    # The crash left an intent journal, which inspect_revision_state would
+    # resume automatically.  Drop it to model a divergence with no journal
+    # (hand edit, older crash) so this test keeps exercising reconcile.
+    (paths["work"] / "activation_intent.json").unlink()
+
     result = reconcile_revision_state("rev_0002", paths)
 
     assert result["reconciled"] is True
@@ -768,3 +773,197 @@ def test_recover_interrupted_activation_runs_activation_exactly_once(
     assert len(results) == 2
     assert sum(1 for result in results if result is not None and result["recovered"]) == 1
     assert not journal_path.is_file()
+
+
+def test_activation_crash_after_restore_keeps_intent_journal_and_resumes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The journal must survive until active_revision.json is written.
+
+    A crash after restore_revision_assets but before the remaining
+    projections (normalized, sync matches, timeline, active pointer) are
+    written used to leave a half-switched project with no journal, so the
+    resume path had nothing to finish.
+    """
+    import json
+
+    import pytest
+
+    from stage4 import versioning
+
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    blocks = [_block("one", "Первая", "voiceover"), _block("two", "Вторая", "voiceover")]
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": blocks,
+        },
+    )
+    _write_wav(paths["speaker"] / "zk1.wav", 1)
+    _write_wav(paths["speaker"] / "zk2.wav", 2)
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": blocks,
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+
+    journal_path = paths["work"] / "activation_intent.json"
+    real_write = versioning.atomic_write_json
+
+    def crashing_write(path, payload, *args, **kwargs):
+        if Path(path).name == "active_revision.json":
+            raise RuntimeError("simulated crash before active pointer")
+        return real_write(path, payload, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(versioning, "atomic_write_json", crashing_write)
+        with pytest.raises(RuntimeError, match="simulated crash before active pointer"):
+            activate_revision("rev_0002", paths)
+
+    active_after_crash = json.loads((paths["work"] / "active_revision.json").read_text("utf-8"))
+    assert active_after_crash["revision_id"] == "rev_0001"
+    assert journal_path.is_file()
+
+    recovered = inspect_revision_state(paths)
+
+    assert recovered["status"] == "ok"
+    assert recovered["active_revision_id"] == "rev_0002"
+    active_after = json.loads((paths["work"] / "active_revision.json").read_text("utf-8"))
+    assert active_after["revision_id"] == "rev_0002"
+    assert not journal_path.is_file()
+
+
+def _prepare_two_revisions(tmp_path: Path) -> dict[str, Path]:
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    blocks = [_block("one", "Первая", "voiceover"), _block("two", "Вторая", "voiceover")]
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": blocks,
+        },
+    )
+    _write_wav(paths["speaker"] / "zk1.wav", 1)
+    _write_wav(paths["speaker"] / "zk2.wav", 2)
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": blocks,
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+    return paths
+
+
+def test_recovery_does_not_replay_when_activation_already_committed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A crash after active_revision.json but before the journal unlink must
+    not make recovery overwrite user edits made after the activation."""
+    import json
+
+    import pytest
+
+    paths = _prepare_two_revisions(tmp_path)
+    journal_path = paths["work"] / "activation_intent.json"
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self.name == "activation_intent.json":
+            raise OSError("simulated crash before journal unlink")
+        return real_unlink(self, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "unlink", failing_unlink)
+        with pytest.raises(OSError, match="before journal unlink"):
+            activate_revision("rev_0002", paths)
+
+    assert journal_path.is_file()
+    assert "activation_id" in json.loads(journal_path.read_text("utf-8"))
+    active = json.loads((paths["work"] / "active_revision.json").read_text("utf-8"))
+    assert active["revision_id"] == "rev_0002"
+    assert active["activation_id"] == json.loads(journal_path.read_text("utf-8"))["activation_id"]
+
+    normalized = json.loads(paths["normalized"].read_text("utf-8"))
+    normalized["blocks"][0]["normalized_text"] = "Правка пользователя"
+    atomic_write_json(paths["normalized"], normalized)
+
+    state = inspect_revision_state(paths)
+
+    assert state["status"] == "ok"
+    after = json.loads(paths["normalized"].read_text("utf-8"))
+    assert after["blocks"][0]["normalized_text"] == "Правка пользователя"
+    assert not journal_path.is_file()
+
+
+def test_resume_with_third_revision_in_work_still_conflicts(tmp_path: Path, monkeypatch) -> None:
+    import json
+
+    import pytest
+
+    from stage4 import versioning
+
+    paths = _prepare_two_revisions(tmp_path)
+    journal_path = paths["work"] / "activation_intent.json"
+    real_write = versioning.atomic_write_json
+
+    def crashing_write(path, payload, *args, **kwargs):
+        if Path(path).name == "active_revision.json":
+            raise RuntimeError("simulated crash before active pointer")
+        return real_write(path, payload, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(versioning, "atomic_write_json", crashing_write)
+        with pytest.raises(RuntimeError):
+            activate_revision("rev_0002", paths)
+    assert journal_path.is_file()
+
+    normalized = json.loads(paths["normalized"].read_text("utf-8"))
+    normalized["scenario_revision_id"] = "rev_0003"
+    atomic_write_json(paths["normalized"], normalized)
+
+    with pytest.raises(RevisionStateConflictError):
+        activate_revision("rev_0002", paths, _resume=True)
+    assert inspect_revision_state(paths)["status"] == "activation_recovery_failed"
+    assert journal_path.is_file()

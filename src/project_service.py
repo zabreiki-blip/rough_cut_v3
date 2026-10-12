@@ -145,5 +145,5 @@ def resolve_path(
         candidate = root_dir / candidate
     resolved = candidate.resolve()
     if not resolved.is_relative_to(allowed_root):
-        raise ValueError(f"Path must be inside {allowed_root.name}/: {value}")
+        raise ValueError(f"Path must be inside {allowed_root.name}/")
     return resolved

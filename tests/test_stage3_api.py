@@ -826,3 +826,21 @@ def test_latest_stage3_job_status_survives_route_registry_restart(client) -> Non
     job = restored.get_json()["result"]
     assert job["id"] == completed_id
     assert job["status"] == "completed"
+
+
+def test_stage3_jobs_history_is_bounded_and_keeps_running(client, monkeypatch) -> None:
+    _http, app, _mp = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    monkeypatch.setattr(api_stage3_routes, "_STAGE3_JOBS_MAX", 2)
+    paths = services._ensure_project("demo")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    jobs = {
+        "run": {"status": "running", "created_at": "2026-01-01T00:00:00+00:00"},
+        "d1": {"status": "completed", "finished_at": "2026-01-02T00:00:00+00:00"},
+        "d2": {"status": "failed", "finished_at": "2026-01-03T00:00:00+00:00"},
+    }
+    lock = threading.RLock()
+
+    created = api_stage3_routes._create_job("demo", "scan", jobs, lock, services)
+
+    assert set(jobs) == {"run", created["id"]}

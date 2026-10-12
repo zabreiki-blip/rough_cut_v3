@@ -301,3 +301,77 @@ def test_store_reports_malformed_json_instead_of_overwriting_it() -> None:
         path.write_text("{broken", encoding="utf-8")
         with pytest.raises(ValueError, match="invalid JSON"):
             SyncSourceStore(path).save(_source())
+
+
+def test_source_store_concurrent_saves_do_not_lose_updates() -> None:
+    import threading
+
+    with TemporaryDirectory() as temporary:
+        path = Path(temporary) / "sync_sources.json"
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                SyncSourceStore(path).save(_source(f"src_{index:02d}"))
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(24)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert [item.id for item in SyncSourceStore(path).list()] == [
+            f"src_{i:02d}" for i in range(24)
+        ]
+
+
+def test_match_store_concurrent_saves_do_not_lose_updates() -> None:
+    import threading
+
+    with TemporaryDirectory() as temporary:
+        path = Path(temporary) / "sync_matches.json"
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                SyncMatchStore(path).save(
+                    SyncMatch(
+                        segment_id=f"seg_{index:02d}",
+                        query_text="q",
+                        source_id="s",
+                        source_in_sec=0.0,
+                        source_out_sec=1.0,
+                        confidence=0.5,
+                        status="auto_matched",
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(24)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert len(SyncMatchStore(path).list()) == 24
+
+
+def test_path_locks_are_weak_and_stable_while_held(tmp_path: Path) -> None:
+    import gc
+
+    from stage2 import sync_storage
+
+    path = tmp_path / "sources.json"
+    key = str(path.resolve())
+    held = sync_storage._path_lock(path)
+    with held:
+        assert sync_storage._path_lock(path) is held
+    del held
+    gc.collect()
+
+    assert key not in sync_storage._PATH_LOCKS

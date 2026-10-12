@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -88,6 +89,69 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertIs(first, second)
         self.assertEqual(loaded, [1])
         _MODEL_CACHE.pop(key, None)
+
+    def _run_cache_scenario(self, env: dict[str, str], keys: list[str]) -> list[str]:
+        loaded: list[str] = []
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch.dict("stage2.whisper_runner._MODEL_CACHE", {}, clear=True),
+        ):
+            for key in keys:
+                _cached_model((key,), lambda key=key: loaded.append(key) or object())
+        return loaded
+
+    def test_model_cache_default_capacity_one_evicts_previous_key(self) -> None:
+        with patch("stage2.whisper_runner.gc.collect") as collect:
+            loaded = self._run_cache_scenario({}, ["a", "a", "b", "a"])
+
+        self.assertEqual(loaded, ["a", "b", "a"])
+        self.assertEqual(collect.call_count, 2)
+
+    def test_model_cache_same_key_does_not_reload_or_collect(self) -> None:
+        with patch("stage2.whisper_runner.gc.collect") as collect:
+            loaded = self._run_cache_scenario({}, ["a", "a", "a"])
+
+        self.assertEqual(loaded, ["a"])
+        collect.assert_not_called()
+
+    def test_model_cache_capacity_two_keeps_two_models_and_evicts_lru(self) -> None:
+        env = {"ROUGH_CUT_WHISPER_MODEL_CACHE_SIZE": "2"}
+        loaded = self._run_cache_scenario(env, ["a", "b", "b", "a", "c", "a"])
+        # "a" is refreshed before "c" arrives, so "b" is evicted, then "a" stays.
+        self.assertEqual(loaded, ["a", "b", "c"])
+        loaded = self._run_cache_scenario(env, ["a", "b", "a", "c", "b"])
+        self.assertEqual(loaded, ["a", "b", "c", "b"])
+
+    def test_model_cache_eviction_drops_reference(self) -> None:
+        import weakref
+
+        class Heavy:
+            pass
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.dict("stage2.whisper_runner._MODEL_CACHE", {}, clear=True),
+        ):
+            model, _lock = _cached_model(("a",), Heavy)
+            ref = weakref.ref(model)
+            del model, _lock
+            _cached_model(("b",), Heavy)
+            gc.collect()
+            self.assertIsNone(ref())
+
+    def test_model_cache_rejects_invalid_capacity(self) -> None:
+        for value in ("0", "-1", "abc"):
+            with self.subTest(value=value):
+                with (
+                    patch.dict(
+                        "os.environ",
+                        {"ROUGH_CUT_WHISPER_MODEL_CACHE_SIZE": value},
+                        clear=True,
+                    ),
+                    patch.dict("stage2.whisper_runner._MODEL_CACHE", {}, clear=True),
+                ):
+                    with self.assertRaisesRegex(ValueError, "ROUGH_CUT_WHISPER_MODEL_CACHE_SIZE"):
+                        _cached_model(("a",), object)
 
     def test_faster_whisper_reports_streaming_audio_progress(self) -> None:
         class FakeModel:

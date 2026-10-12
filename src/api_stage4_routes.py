@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from types import ModuleType
 
 from flask import Flask, jsonify, request
@@ -13,6 +14,8 @@ from stage4.versioning import (
     list_revisions,
     reconcile_revision_state,
 )
+
+_REVISION_ID_RE = re.compile(r"rev_\d+", re.ASCII)
 
 
 def _active_project_job(services: ModuleType, project: str) -> str:
@@ -118,7 +121,7 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
     def stage4_revision_activate(revision_id: str):
         payload = request.get_json(silent=True) or {}
         try:
-            if not revision_id.startswith("rev_") or not revision_id[4:].isdigit():
+            if not _REVISION_ID_RE.fullmatch(revision_id):
                 raise ValueError("invalid revision id")
             project = services._resolve_project_name(payload.get("project"))
             with services._project_transition_lock(project):
@@ -142,7 +145,7 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
     def stage4_revision_reconcile(revision_id: str):
         payload = request.get_json(silent=True) or {}
         try:
-            if not revision_id.startswith("rev_") or not revision_id[4:].isdigit():
+            if not _REVISION_ID_RE.fullmatch(revision_id):
                 raise ValueError("invalid revision id")
             project = services._resolve_project_name(payload.get("project"))
             with services._project_transition_lock(project):

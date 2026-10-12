@@ -381,6 +381,52 @@ class TtsManifestSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["blocking"])
 
+    def test_sync_route_reports_corrupt_server_state_as_500(self) -> None:
+        def corrupting_synthesize(*_args, **_kwargs):
+            self.paths["normalized"].write_text("{broken", encoding="utf-8")
+            return {"voiceover_assets": [], "scenario_revision_id": "rev_0001"}
+
+        api_module.app.config.update(TESTING=True)
+        api_module.app.config.pop("API_TOKEN", None)
+        client = api_module.app.test_client()
+        with (
+            patch.object(api_module, "_normalization_required", return_value=None),
+            patch.object(api_module, "_prepared_projection_required", return_value=None),
+            patch.object(api_module, "synthesize_tts", side_effect=corrupting_synthesize),
+            patch.object(
+                api_module, "_confirmed_prepared_path", return_value=self.paths["prepared"]
+            ),
+        ):
+            response = client.post("/stage1/tts", json={"project": "demo", "dry_run": True})
+
+        self.assertEqual(response.status_code, 500)
+        body = response.get_json()
+        self.assertFalse(body["ok"])
+        self.assertIn("повреждено", body["error"])
+
+    def test_job_reports_corrupt_server_state_as_failed_with_message(self) -> None:
+        def corrupting_synthesize(*_args, **_kwargs):
+            self.paths["normalized"].write_text("{broken", encoding="utf-8")
+            return {"voiceover_assets": [], "scenario_revision_id": "rev_0001"}
+
+        self.assertTrue(api_module._reserve_tts_project("demo"))
+        job = api_module._create_tts_job("demo")
+        with patch.object(api_module, "synthesize_tts", side_effect=corrupting_synthesize):
+            api_module._run_tts_job(
+                job_id=job["id"],
+                project="demo",
+                prepared_path=self.paths["prepared"],
+                speaker_dir=revision_speaker_alias_dir(self.paths, "rev_0001"),
+                provider=None,
+                voice_name=None,
+                gender=None,
+                dry_run=True,
+            )
+
+        state = api_module._get_tts_job(job["id"])
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("повреждено", state["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

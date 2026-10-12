@@ -68,3 +68,32 @@ def test_api_job_facade_honors_reassigned_legacy_state(monkeypatch) -> None:
     assert api._get_tts_job("job-1") == {"status": "running"}
     api._release_tts_project("demo")
     assert active == set()
+
+
+def test_trim_terminal_jobs_applies_ttl_and_cap_but_keeps_active_jobs() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from job_runtime import trim_terminal_jobs
+
+    now = datetime(2026, 1, 10, tzinfo=UTC)
+
+    def stamp(days: float) -> str:
+        return (now - timedelta(days=days)).isoformat()
+
+    jobs = {
+        "running": {"status": "running", "created_at": stamp(30)},
+        "queued": {"status": "queued", "created_at": stamp(30)},
+        "old": {"status": "completed", "finished_at": stamp(5)},
+        "bad": {"status": "failed", "finished_at": "not-a-date"},
+        "b": {"status": "completed", "finished_at": stamp(0.3)},
+        "c": {"status": "failed", "finished_at": stamp(0.2)},
+        "d": {"status": "completed", "finished_at": stamp(0.1)},
+    }
+
+    dropped = trim_terminal_jobs(jobs, max_jobs=5, ttl_seconds=86400, now=now)
+
+    assert dropped == ["old", "bad"]  # unparseable time is the oldest
+    assert set(jobs) == {"running", "queued", "b", "c", "d"}
+
+    trim_terminal_jobs(jobs, max_jobs=0, now=now)
+    assert set(jobs) == {"running", "queued"}

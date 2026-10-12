@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import UTC, datetime
+import gc
 import importlib.util
 from math import isfinite
 import os
@@ -30,7 +32,10 @@ class WhisperTranscriptionError(RuntimeError):
 SUPPORTED_BACKENDS = ("mlx-whisper", "faster-whisper", "openai-whisper", "cloud-audio")
 _LOCAL_BACKENDS = ("mlx-whisper", "faster-whisper", "openai-whisper")
 _CLOUD_BACKENDS = ("cloud-audio",)
-_MODEL_CACHE: dict[tuple[str, ...], tuple[Any, threading.Lock]] = {}
+_MODEL_CACHE_SIZE_ENV = "ROUGH_CUT_WHISPER_MODEL_CACHE_SIZE"
+_DEFAULT_MODEL_CACHE_SIZE = 1
+# Bounded LRU: every cached Whisper model can hold up to ~3 GB of memory.
+_MODEL_CACHE: OrderedDict[tuple[str, ...], tuple[Any, threading.Lock]] = OrderedDict()
 _MODEL_CACHE_LOCK = threading.Lock()
 ProgressCallback = Callable[[float, float, int], None]
 
@@ -59,12 +64,31 @@ def _emit_progress(
 
 
 def _cached_model(key: tuple[str, ...], loader) -> tuple[Any, threading.Lock]:
-    """Load each heavyweight model once per API process."""
+    """Load heavyweight models once per API process, keeping a bounded LRU.
+
+    Capacity comes from ``ROUGH_CUT_WHISPER_MODEL_CACHE_SIZE`` (default 1, min 1).
+    Least recently used entries are dropped before a new model is loaded so two
+    large models do not coexist in memory.
+
+    Trade-off: evicting *before* loading lowers the peak memory (the old and
+    new model are never resident together), but if ``loader`` raises, the
+    evicted model is already gone and the cache is left empty (or smaller);
+    the next call simply reloads. Nothing is cached for the failed key.
+    """
+    capacity = _env_int(_MODEL_CACHE_SIZE_ENV, _DEFAULT_MODEL_CACHE_SIZE, minimum=1)
     with _MODEL_CACHE_LOCK:
         cached = _MODEL_CACHE.get(key)
-        if cached is None:
-            cached = (loader(), threading.Lock())
-            _MODEL_CACHE[key] = cached
+        if cached is not None:
+            _MODEL_CACHE.move_to_end(key)
+            return cached
+        evicted = False
+        while len(_MODEL_CACHE) >= capacity:
+            _MODEL_CACHE.popitem(last=False)
+            evicted = True
+        if evicted:
+            gc.collect()
+        cached = (loader(), threading.Lock())
+        _MODEL_CACHE[key] = cached
         return cached
 
 

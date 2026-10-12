@@ -4,6 +4,7 @@ import os
 import hmac
 from functools import lru_cache
 import subprocess
+import threading
 
 from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -62,7 +63,7 @@ def _auth_ok() -> bool:
 
 
 @lru_cache(maxsize=1)
-def _available_voices() -> frozenset[str]:
+def _available_voices_cached() -> frozenset[str]:
     return frozenset(
         list_macos_voices(
             timeout=15,
@@ -75,21 +76,35 @@ def _available_voices() -> frozenset[str]:
     )
 
 
+def _available_voices() -> frozenset[str]:
+    """Cached voice inventory; an empty result (failed ``say -v ?``) is never kept."""
+    voices = _available_voices_cached()
+    if not voices:
+        _available_voices_cached.cache_clear()
+    return voices
+
+
 def _voice_exists(voice: str) -> bool:
     return bool(voice) and voice in _available_voices()
 
 
+_say_slots = threading.BoundedSemaphore(_env_int("MACOS_SAY_CONCURRENCY", 1, 1, 8))
+
+
 def _run_say_and_convert(text: str, voice: str, rate: int, sample_rate: int) -> bytes:
     command_timeout = _env_int("MACOS_COMMAND_TIMEOUT", 900, 30, 7200)
-    return run_say_and_convert(
-        text,
-        voice=voice,
-        rate=rate,
-        sample_rate=sample_rate,
-        timeout=command_timeout,
-        run=subprocess.run,
-        command_names=("say", "afconvert"),
-    )
+    # Serialize synthesis so a client that gave up and retried cannot start a
+    # second `say` while the previous one is still running.
+    with _say_slots:
+        return run_say_and_convert(
+            text,
+            voice=voice,
+            rate=rate,
+            sample_rate=sample_rate,
+            timeout=command_timeout,
+            run=subprocess.run,
+            command_names=("say", "afconvert"),
+        )
 
 
 @app.get("/health")

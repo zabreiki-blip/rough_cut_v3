@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1248,6 +1249,39 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(result["blocks"][1]["source"], "llm")
             self.assertEqual(result["blocks"][1]["text_for_tts"], "Новый текст")
 
+    def test_oversized_block_is_not_sent_to_llm_and_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            source.write_text(
+                "Новый текст про лёд. " * 700 + "\n\nАвтор: Короткий текст\n",
+                encoding="utf-8",
+            )
+            sent: list[int] = []
+
+            def classifier(items, _hint):
+                sent.append(len(items))
+                self.assertTrue(
+                    all(len(json.dumps(item, ensure_ascii=False)) <= 12_000 for item in items)
+                )
+                return [
+                    {"uid": item["uid"], "type": "voiceover", "confidence": 0.9} for item in items
+                ]
+
+            result = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                classifier=classifier,
+            )
+
+            self.assertEqual(sent, [1])
+            self.assertEqual(len(result["blocks"]), 2)
+            big, small = result["blocks"]
+            self.assertEqual(big["type"], "unknown")
+            self.assertTrue(any("too large" in w for w in big["warnings"]))
+            self.assertEqual(small["source"], "llm")
+
     def test_prose_prefix_is_not_stripped_without_marker_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1396,6 +1430,28 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(by_text["В"]["type"], "other")
             self.assertNotEqual(by_text["Б"]["type"], "other")
             self.assertTrue(by_text["Б"]["warnings"])
+
+    def test_oversized_block_is_unknown_with_warning_and_not_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            big = "слово " * 2500
+            source.write_text(big.strip(), encoding="utf-8")
+            classifier = unittest.mock.Mock(return_value=[])
+            result = generate_normalization(
+                source,
+                root / "out.json",
+                memory_path=root / "memory.sqlite3",
+                classifier=classifier,
+            )
+
+            self.assertGreater(len(big), 12_000)
+            classifier.assert_not_called()
+            self.assertEqual(len(result["blocks"]), 1)
+            block = result["blocks"][0]
+            self.assertEqual(block["type"], "unknown")
+            self.assertTrue(any("too large for one request" in w for w in block["warnings"]))
+            self.assertEqual("".join(block["original_text"]).strip(), big.strip())
 
     def test_default_llm_classifier_handles_multiple_compact_batches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1842,7 +1898,11 @@ class LlmPresetTests(unittest.TestCase):
                 return None
 
             def json(self) -> dict:
-                return {"choices": [{"message": {"content": '{"items": []}'}}]}
+                return {
+                    "choices": [
+                        {"message": {"content": '{"items": [{"uid": "u1", "type": "other"}]}'}}
+                    ]
+                }
 
         with (
             patch.object(normalizer_module, "get_settings", return_value=settings),
@@ -1868,7 +1928,11 @@ class LlmPresetTests(unittest.TestCase):
                 return None
 
             def json(self) -> dict:
-                return {"choices": [{"message": {"content": '{"items": []}'}}]}
+                return {
+                    "choices": [
+                        {"message": {"content": '{"items": [{"uid": "u1", "type": "other"}]}'}}
+                    ]
+                }
 
         with (
             patch.object(normalizer_module, "get_settings", return_value=settings),

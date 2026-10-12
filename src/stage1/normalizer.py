@@ -17,7 +17,7 @@ from atomic_io import atomic_write_json as _atomic_write_json
 from atomic_io import atomic_write_text as _atomic_write_text
 from openrouter_usage import report_json_usage
 
-from .config import get_settings
+from .config import DEFAULT_OPENROUTER_MAX_TOKENS, get_settings
 from .io_utils import extract_paragraphs, read_json
 from .normalization_memory import DEFAULT_MEMORY_PATH, NormalizationMemory, normalize_marker
 from .normalization_models import (
@@ -30,6 +30,8 @@ from .normalization_models import (
     VALID_BLOCK_TYPES,
     VALID_DECISION_SOURCES,
 )
+from .openrouter_client import RETRYABLE_STATUS_CODES
+from .openrouter_client import _extract_json as _extract_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +527,12 @@ def _generate_normalization_unlocked(
                     author_hint,
                     llm_preset=llm_preset,
                     usage_callback=usage_callback,
+                )
+            unresolved, oversized = _split_oversized_llm_blocks(unresolved)
+            for block in oversized:
+                block.warnings.append(
+                    f"LLM classification skipped: block is too large for one request "
+                    f"(over {_LLM_BATCH_MAX_CHARS} characters); classify it manually"
                 )
             batches = _llm_batches(unresolved)
             payloads = [[_llm_input(block) for block in batch] for batch in batches]
@@ -2208,14 +2216,38 @@ def _cache_llm_results(
     return True
 
 
+_LLM_BATCH_MAX_CHARS = 12_000
+
+
+def _llm_block_size(block: NormalizedBlock) -> int:
+    return len(json.dumps(_llm_input(block), ensure_ascii=False))
+
+
+def _split_oversized_llm_blocks(
+    blocks: list[NormalizedBlock], max_chars: int = _LLM_BATCH_MAX_CHARS
+) -> tuple[list[NormalizedBlock], list[NormalizedBlock]]:
+    """Separate blocks that can never fit one LLM request.
+
+    Results are keyed by block uid and the model may rewrite ``text_for_tts``,
+    so a block must not be sliced or truncated: partial output would silently
+    drop narration.  Oversized blocks are rejected from automatic
+    classification and left for manual resolution instead.
+    """
+    sendable: list[NormalizedBlock] = []
+    oversized: list[NormalizedBlock] = []
+    for block in blocks:
+        (oversized if _llm_block_size(block) > max_chars else sendable).append(block)
+    return sendable, oversized
+
+
 def _llm_batches(
-    blocks: list[NormalizedBlock], max_chars: int = 12_000
+    blocks: list[NormalizedBlock], max_chars: int = _LLM_BATCH_MAX_CHARS
 ) -> list[list[NormalizedBlock]]:
     batches: list[list[NormalizedBlock]] = []
     current: list[NormalizedBlock] = []
     current_size = 0
     for block in blocks:
-        block_size = len(json.dumps(_llm_input(block), ensure_ascii=False))
+        block_size = _llm_block_size(block)
         if current and current_size + block_size > max_chars:
             batches.append(current)
             current = []
@@ -2264,6 +2296,9 @@ def _openrouter_classifier(
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
+        "max_tokens": int(
+            getattr(settings, "openrouter_max_tokens", 0) or DEFAULT_OPENROUTER_MAX_TOKENS
+        ),
         "response_format": {"type": "json_object"},
     }
     if llm_preset == "fast":
@@ -2282,12 +2317,22 @@ def _openrouter_classifier(
             response = requests.post(
                 f"{settings.openrouter_base_url}/chat/completions", **request_kwargs
             )
-        except requests.RequestException:
+        except requests.exceptions.SSLError:
+            # Certificate/handshake problems are not transient: fail immediately.
+            raise
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ):
+            # Only transient transport failures (connection/proxy errors,
+            # timeouts, truncated bodies) are retried; invalid URLs and similar
+            # request errors fail immediately.
             if attempt == 2:
                 raise
             time.sleep(2**attempt)
             continue
-        if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
+        if response.status_code not in RETRYABLE_STATUS_CODES or attempt == 2:
             break
         time.sleep(2**attempt)
     assert response is not None
@@ -2297,16 +2342,14 @@ def _openrouter_classifier(
     content = body["choices"][0]["message"]["content"]
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
-    content = content.strip()
-    if not content.startswith("{"):
-        start, end = content.find("{"), content.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("OpenRouter response does not contain a JSON object")
-        content = content[start : end + 1]
-    parsed = json.loads(content)
-    items = parsed.get("items", [])
+    parsed = _extract_llm_json(content)
+    items = parsed.get("items")
     if not isinstance(items, list):
         raise ValueError("OpenRouter response does not contain an items array")
+    if blocks and not items:
+        raise ValueError("OpenRouter returned no classifications for a non-empty batch")
+    if not all(isinstance(item, dict) for item in items):
+        raise ValueError("OpenRouter response items must be objects")
     return items
 
 

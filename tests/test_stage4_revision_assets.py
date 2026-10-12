@@ -5,11 +5,17 @@ import json
 from pathlib import Path
 import wave
 
+import pytest
+
 from atomic_io import atomic_write_json
 from project_service import ensure_project
 from stage4.revision_assets import (
+    CorruptStateError,
+    _atomic_copy,
+    capture_legacy_voiceover_manifest,
     merge_voiceover_manifest_item,
     revision_speaker_alias_dir,
+    restore_revision_assets,
     save_tts_manifest,
     snapshot_revision_assets,
 )
@@ -574,3 +580,189 @@ def test_merge_voiceover_manifest_item_ignores_missing_asset(tmp_path: Path) -> 
     )
 
     assert _read_json(paths["active_voiceover_manifest"]) == before
+
+
+def test_snapshot_does_not_overwrite_history_when_revision_manifest_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    manifest_path = paths["scenario_versions"] / "rev_0001.json"
+    snapshot_path = paths["scenario_versions"] / "rev_0001.normalized.json"
+    manifest_path.write_text("{broken", encoding="utf-8")
+    snapshot_before = snapshot_path.read_bytes()
+
+    with pytest.raises(ValueError):
+        snapshot_revision_assets("rev_0001", paths)
+
+    assert manifest_path.read_text(encoding="utf-8") == "{broken"
+    assert snapshot_path.read_bytes() == snapshot_before
+
+
+def test_snapshot_does_not_overwrite_history_when_work_projection_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    prepared_snapshot = paths["scenario_versions"] / "rev_0001.prepared.json"
+    voiceover_snapshot = paths["scenario_versions"] / "rev_0001.voiceover.json"
+    before = (prepared_snapshot.read_bytes(), voiceover_snapshot.read_bytes())
+    paths["prepared"].write_text("not json", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        snapshot_revision_assets("rev_0001", paths)
+
+    assert (prepared_snapshot.read_bytes(), voiceover_snapshot.read_bytes()) == before
+    assert paths["prepared"].read_text(encoding="utf-8") == "not json"
+
+
+def test_snapshot_does_not_replace_corrupt_active_voiceover_manifest(tmp_path: Path) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    voiceover_snapshot = paths["scenario_versions"] / "rev_0001.voiceover.json"
+    before = voiceover_snapshot.read_bytes()
+    paths["active_voiceover_manifest"].write_text("[1, 2]", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        snapshot_revision_assets("rev_0001", paths)
+
+    assert voiceover_snapshot.read_bytes() == before
+    assert paths["active_voiceover_manifest"].read_text(encoding="utf-8") == "[1, 2]"
+
+
+def test_snapshot_tolerates_missing_files(tmp_path: Path) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    paths["active_voiceover_manifest"].unlink()
+
+    assert snapshot_revision_assets("rev_0001", paths)["revision_id"] == "rev_0001"
+    assert snapshot_revision_assets("rev_9999", paths) == {}
+
+
+def test_merge_voiceover_manifest_item_keeps_corrupt_manifest(tmp_path: Path) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    speaker_dir = revision_speaker_alias_dir(paths, "rev_0001")
+    _write_wav(speaker_dir / "assets" / "voice-stable" / "fp-new.wav", 77)
+    paths["active_voiceover_manifest"].write_text("{broken", encoding="utf-8")
+
+    merge_voiceover_manifest_item(
+        paths,
+        revision_id="rev_0001",
+        block_id="zk1",
+        block_uid="voice-stable",
+        fingerprint="fp-new",
+        speaker_dir=speaker_dir,
+    )
+
+    assert paths["active_voiceover_manifest"].read_text(encoding="utf-8") == "{broken"
+
+
+def test_restore_revision_assets_rejects_corrupt_snapshot_without_touching_work(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    revision = ensure_baseline("demo", paths)
+    normalized = _read_json(paths["normalized"])
+    prepared_before = paths["prepared"].read_bytes()
+    manifest_before = paths["active_voiceover_manifest"].read_bytes()
+    (paths["scenario_versions"] / revision["voiceover_manifest_snapshot"]).write_text(
+        "{broken", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError):
+        restore_revision_assets("rev_0001", revision, normalized, paths)
+
+    assert paths["prepared"].read_bytes() == prepared_before
+    assert paths["active_voiceover_manifest"].read_bytes() == manifest_before
+
+
+def test_atomic_copy_removes_temporary_file_on_failure(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"data")
+    destination = tmp_path / "out" / "dest.bin"
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+    with pytest.raises(OSError):
+        _atomic_copy(source, destination)
+
+    assert list(destination.parent.iterdir()) == []
+
+
+def test_atomic_copy_uses_unique_temporary_names(tmp_path: Path, monkeypatch) -> None:
+    import shutil
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"data")
+    destination = tmp_path / "out" / "dest.bin"
+    temporaries: list[Path] = []
+    real_copy2 = shutil.copy2
+
+    def recording_copy2(src, dst, *args, **kwargs):
+        temporaries.append(Path(dst))
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", recording_copy2)
+
+    _atomic_copy(source, destination)
+    _atomic_copy(source, destination)
+
+    assert len(temporaries) == 2
+    assert temporaries[0] != temporaries[1]
+    assert destination.read_bytes() == b"data"
+    assert [item.name for item in destination.parent.iterdir()] == ["dest.bin"]
+
+
+def test_capture_legacy_manifest_corrupt_input_leaves_work_files_untouched(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    paths["active_voiceover_manifest"].write_text("{broken", encoding="utf-8")
+    prepared_before = paths["prepared"].read_bytes()
+    normalized_before = paths["normalized"].read_bytes()
+
+    with pytest.raises(ValueError):
+        capture_legacy_voiceover_manifest(paths)
+
+    assert paths["prepared"].read_bytes() == prepared_before
+    assert paths["normalized"].read_bytes() == normalized_before
+    assert paths["active_voiceover_manifest"].read_text(encoding="utf-8") == "{broken"
+
+
+def test_snapshot_revision_assets_corrupt_input_leaves_work_files_untouched(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    # Different path string so normalized["source"] would be rewritten.
+    normalized = _read_json(paths["normalized"])
+    normalized["source"] = "somewhere/else.docx"
+    atomic_write_json(paths["normalized"], normalized)
+    paths["prepared"].write_text("{broken", encoding="utf-8")
+    normalized_before = paths["normalized"].read_bytes()
+    manifest_before = paths["active_voiceover_manifest"].read_bytes()
+
+    with pytest.raises(ValueError):
+        snapshot_revision_assets("rev_0001", paths)
+
+    assert paths["normalized"].read_bytes() == normalized_before
+    assert paths["prepared"].read_text(encoding="utf-8") == "{broken"
+    assert paths["active_voiceover_manifest"].read_bytes() == manifest_before
+
+
+def test_save_tts_manifest_corrupt_normalized_raises_corrupt_state_error(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    paths["normalized"].write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(CorruptStateError) as excinfo:
+        save_tts_manifest(paths, {"voiceover_assets": []})
+
+    assert isinstance(excinfo.value, ValueError)
+    assert "повреждено" in str(excinfo.value)

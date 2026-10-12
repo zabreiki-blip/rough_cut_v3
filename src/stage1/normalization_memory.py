@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -14,6 +15,11 @@ from .normalization_models import VALID_BLOCK_TYPES
 DEFAULT_MEMORY_PATH = Path(__file__).resolve().parents[2] / "data" / "normalization_memory.sqlite3"
 
 VALID_ALIAS_SCOPES = {"marker", "video_cue"}
+
+MEMORY_FILENAME = "normalization_memory.sqlite3"
+# "project" (default): every project keeps its own memory in ``<project>/work``.
+# "global": legacy behaviour, a single shared database for all projects.
+MEMORY_SCOPE_ENV = "NORMALIZATION_MEMORY_SCOPE"
 
 # Service-cue prefixes that a speaker index is commonly glued directly to
 # ("тех32", "зк5", "снх12"), as opposed to a person's name ("Сергей1",
@@ -70,16 +76,106 @@ def normalize_marker(marker: str) -> str:
     return value.strip()
 
 
+def project_memory_path(work_dir: Path | str) -> Path:
+    """Location of a project's own normalization memory database."""
+    return Path(work_dir) / MEMORY_FILENAME
+
+
+def resolve_memory_path(work_dir: Path | str, *, global_path: Path | str | None = None) -> Path:
+    """Memory database to use for the project whose ``work`` directory is given.
+
+    By default each project gets an isolated database so that learned rules do
+    not leak between projects. On first use it is seeded once with the manual
+    rules and suppressions of the legacy shared database (``global_path``);
+    learned ``llm``/``correction`` rules are intentionally not copied. Set
+    ``NORMALIZATION_MEMORY_SCOPE=global`` to keep using the shared database.
+    """
+    legacy = Path(global_path or DEFAULT_MEMORY_PATH)
+    mode = (os.environ.get(MEMORY_SCOPE_ENV) or "project").strip().lower()
+    if mode == "global":
+        return legacy
+    if mode != "project":
+        raise ValueError(f"{MEMORY_SCOPE_ENV} must be 'project' or 'global', got {mode!r}")
+    path = project_memory_path(work_dir)
+    if not path.exists():
+        with NormalizationMemory(path, seed_from=legacy):
+            pass
+    return path
+
+
 class NormalizationMemory:
-    def __init__(self, path: Path | str | None = None):
+    def __init__(self, path: Path | str | None = None, *, seed_from: Path | str | None = None):
         self.path = Path(path or DEFAULT_MEMORY_PATH)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not self.path.exists()
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
-        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._create_schema()
+        if is_new and seed_from is not None:
+            self._seed_from_legacy(Path(seed_from))
+
+    def _seed_from_legacy(self, legacy_path: Path) -> None:
+        """Copy manual rules and suppressions from a legacy shared database.
+
+        The legacy file is opened read-only and never modified. Learned rules
+        (``llm``/``correction``) stay behind: they were the ones leaking
+        between projects.
+        """
+        if legacy_path.resolve() == self.path.resolve() or not legacy_path.is_file():
+            return
+        try:
+            legacy = sqlite3.connect(f"{legacy_path.resolve().as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return
+        try:
+            legacy.row_factory = sqlite3.Row
+            legacy.execute("PRAGMA busy_timeout = 5000")
+            tables = {
+                row[0]
+                for row in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            columns = (
+                {row[1] for row in legacy.execute("PRAGMA table_info(aliases)")}
+                if "aliases" in tables
+                else set()
+            )
+            scope_sql = "scope" if "scope" in columns else "'marker'"
+            rules = (
+                legacy.execute(
+                    f"""SELECT marker, normalized_marker, target_type, source, status,
+                        confirmations, corrections, confidence, created_at, updated_at,
+                        {scope_sql} AS scope
+                        FROM aliases WHERE source='manual' ORDER BY id"""
+                ).fetchall()
+                if columns
+                else []
+            )
+            suppressions = (
+                legacy.execute(
+                    "SELECT normalized_marker, marker, created_at FROM alias_suppressions"
+                ).fetchall()
+                if "alias_suppressions" in tables
+                else []
+            )
+        except sqlite3.Error:
+            return
+        finally:
+            legacy.close()
+        with self.transaction():
+            self._conn.executemany(
+                """INSERT OR IGNORE INTO aliases
+                   (marker, normalized_marker, target_type, source, status,
+                    confirmations, corrections, confidence, created_at, updated_at, scope)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [tuple(row) for row in rules],
+            )
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO alias_suppressions(normalized_marker, marker, created_at) VALUES (?, ?, ?)",
+                [tuple(row) for row in suppressions],
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -138,14 +234,21 @@ class NormalizationMemory:
         """Rebuild the ``aliases`` table for databases created before the
         ``scope`` column existed. Idempotent: no-ops once ``scope`` is present.
         """
-        columns = [row[1] for row in self._conn.execute("PRAGMA table_info(aliases)")]
-        if "scope" in columns:
+        if self._has_scope_column():
             return
-        before_count = self._conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
         previous_foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()[0]
         try:
+            # PRAGMA foreign_keys is a no-op inside a transaction, so it must be
+            # switched off before BEGIN.
             self._conn.execute("PRAGMA foreign_keys = OFF")
-            self._conn.execute("BEGIN")
+            # Take the write lock up front: a deferred BEGIN lets two concurrent
+            # migrations both pass the check above and then collide.
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self._has_scope_column():
+                # Another connection migrated while we waited for the lock.
+                self._conn.rollback()
+                return
+            before_count = self._conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
             self._conn.execute(
                 """
                 CREATE TABLE aliases_new (
@@ -189,6 +292,9 @@ class NormalizationMemory:
             raise
         finally:
             self._conn.execute(f"PRAGMA foreign_keys = {'ON' if previous_foreign_keys else 'OFF'}")
+
+    def _has_scope_column(self) -> bool:
+        return any(row[1] == "scope" for row in self._conn.execute("PRAGMA table_info(aliases)"))
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:

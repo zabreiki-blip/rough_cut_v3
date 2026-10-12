@@ -30,7 +30,7 @@ repos:
     hooks:
       - id: eslint
         name: ESLint
-        entry: npx eslint cep tests/cep_behavior_test.cjs
+        entry: npx eslint cep tests --ext .js,.jsx,.cjs
         language: system
-        files: '(^cep/.*\.(js|jsx)$|^tests/cep_behavior_test\.cjs$)'
+        files: '(^cep/.*\.(js|jsx)$|^tests/.*\.cjs$)'
         pass_filenames: false

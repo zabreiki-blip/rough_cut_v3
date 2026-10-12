@@ -36,7 +36,7 @@
     },
     {
       "files": [
-        "tests/cep_behavior_test.cjs"
+        "tests/*.cjs"
       ],
       "parserOptions": {
         "ecmaVersion": 2020,

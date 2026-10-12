@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 import threading
 from typing import Any
 
@@ -31,6 +33,25 @@ class JobRegistry:
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         return get_job(self.lock, self.jobs, job_id)
+
+
+def acquire_slot(
+    semaphore: threading.Semaphore,
+    cancel_event: threading.Event | None = None,
+    *,
+    poll_seconds: float = 0.25,
+) -> bool:
+    """Wait (queue) for a global concurrency slot, like the TTS job loop.
+
+    Returns ``True`` once the slot is held (the caller must release it), or
+    ``False`` if ``cancel_event`` was set while still waiting.
+    """
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if semaphore.acquire(timeout=poll_seconds):
+            return True
 
 
 def reserve_project(lock: threading.Lock, active: set[str], project: str) -> bool:
@@ -80,3 +101,61 @@ def get_job(
     with lock:
         job = jobs.get(job_id)
         return dict(job) if job is not None else None
+
+
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+
+
+def trim_terminal_jobs(
+    jobs: dict[str, dict[str, Any]],
+    *,
+    max_jobs: int,
+    ttl_seconds: float | None = None,
+    terminal_statuses: Collection[str] = TERMINAL_JOB_STATUSES,
+    now: datetime | None = None,
+) -> list[str]:
+    """Evict finished jobs by TTL, then oldest-first down to ``max_jobs``.
+
+    The caller must hold the lock that guards ``jobs``. Only jobs whose status
+    is in ``terminal_statuses`` are ever removed, so queued/running jobs are
+    never evicted even when the cap is exceeded. Returns the evicted ids.
+    """
+    current = now or datetime.now(UTC)
+    dropped: list[str] = []
+
+    def stamp(job: dict[str, Any]) -> str:
+        return str(job.get("finished_at") or job.get("created_at") or "")
+
+    def sort_time(job: dict[str, Any]) -> datetime:
+        # Compare instants, not ISO strings ("Z" vs "+00:00" sort wrongly).
+        # Unparseable times count as the oldest so they are evicted first.
+        try:
+            parsed = datetime.fromisoformat(stamp(job))
+        except (TypeError, ValueError):
+            return datetime.min.replace(tzinfo=UTC)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+    if ttl_seconds is not None:
+        for job_id, job in list(jobs.items()):
+            if job.get("status") not in terminal_statuses:
+                continue
+            try:
+                parsed = datetime.fromisoformat(stamp(job))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                expired = (current - parsed).total_seconds() > ttl_seconds
+            except (TypeError, ValueError):
+                expired = False
+            if expired:
+                jobs.pop(job_id, None)
+                dropped.append(job_id)
+    excess = len(jobs) - max_jobs
+    if excess > 0:
+        terminal = sorted(
+            (item for item in jobs.items() if item[1].get("status") in terminal_statuses),
+            key=lambda item: (sort_time(item[1]), item[0]),
+        )
+        for job_id, _job in terminal[:excess]:
+            jobs.pop(job_id, None)
+            dropped.append(job_id)
+    return dropped

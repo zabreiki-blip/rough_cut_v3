@@ -504,6 +504,16 @@ def _fallback_blocks(scenario_text: str) -> list[NarrationBlock]:
     return blocks
 
 
+LLM_FAILED_NOTE = "llm_failed"
+
+
+def _mark_llm_failed(blocks: list[NarrationBlock]) -> list[NarrationBlock]:
+    """Flag heuristic-fallback blocks that replaced a failed LLM chunk."""
+    for block in blocks:
+        block.notes = _merge_block_notes(block.notes, LLM_FAILED_NOTE)
+    return blocks
+
+
 # === Numbering & merging ===
 
 
@@ -898,14 +908,17 @@ def analyze_script(
                                 _cache_llm_blocks(cache_path, cache, cache_keys[idx], result_blocks)
                             except Exception as exc:
                                 llm_errors.append(f"chunk {idx + 1}: {type(exc).__name__}: {exc}")
-                                chunk_results[idx] = _fallback_blocks(chunks[idx])
+                                chunk_results[idx] = _mark_llm_failed(_fallback_blocks(chunks[idx]))
 
                 for idx in range(len(chunks)):
                     llm_blocks.extend(chunk_results[idx] or [])
                     if chunk_success[idx]:
                         llm_success_chunks += 1
 
-                blocks = llm_blocks if llm_blocks else _fallback_blocks(scenario_text)
+                if llm_blocks:
+                    blocks = llm_blocks
+                else:
+                    blocks = _mark_llm_failed(_fallback_blocks(scenario_text))
                 used_llm = llm_success_chunks > 0
                 extraction_method = "llm" if used_llm else "fallback"
             else:
@@ -920,6 +933,16 @@ def analyze_script(
     blocks = _merge_blocks_to_limit(blocks, settings.max_zk_blocks)
     blocks = _renumber_blocks(blocks)
 
+    llm_failed_chunks = len(llm_errors)
+    warnings: list[str] = []
+    if llm_failed_chunks:
+        degraded = sum(1 for block in blocks if LLM_FAILED_NOTE in block.notes)
+        warnings.append(
+            f"LLM analysis failed for {llm_failed_chunks} chunk(s); "
+            f"{degraded} block(s) were extracted by heuristic fallback "
+            f"(marked '{LLM_FAILED_NOTE}' in notes) and need manual review"
+        )
+
     raw_text, raw_projection_fallbacks = _canonical_raw_projection(scenario_text, blocks)
     raw_output_path.write_text(raw_text + "\n", encoding="utf-8")
 
@@ -929,6 +952,8 @@ def analyze_script(
         "manual_markers_used": manual_markers_used,
         "extraction_method": extraction_method,
         "llm_errors": llm_errors,
+        "llm_failed_chunks": llm_failed_chunks,
+        "warnings": warnings,
         "raw_projection_fallbacks": raw_projection_fallbacks,
         "max_zk_blocks": settings.max_zk_blocks,
         "blocks_count_before_merge": before_merge_count,
@@ -953,4 +978,6 @@ def analyze_script(
         "manual_markers_used": manual_markers_used,
         "extraction_method": extraction_method,
         "llm_errors_count": len(llm_errors),
+        "llm_failed_chunks": llm_failed_chunks,
+        "warnings": warnings,
     }
