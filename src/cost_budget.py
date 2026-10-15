@@ -66,6 +66,11 @@ class CostBudget:
     def _reserved_usd(self) -> Decimal:
         return sum(self._reservations.values(), Decimal("0"))
 
+    @property
+    def has_pending_reservations(self) -> bool:
+        """Unknown provider cost stays pending even when its estimate is zero."""
+        return bool(self._reservations)
+
     def reserve_attempt(self, seconds: float) -> str:
         estimate = self.estimate_seconds(seconds)
         projected_total = self._spent_usd + self._reserved_usd() + estimate

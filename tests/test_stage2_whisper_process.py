@@ -533,7 +533,8 @@ def test_cancel_preserves_budget_message_queued_behind_progress() -> None:
 
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
-def test_cloud_options_parent_stop_interrupts_provider_http(tmp_path, monkeypatch, stop) -> None:
+@pytest.mark.parametrize("rate", ["0.06", "0"])
+def test_cloud_options_parent_stop_interrupts_provider_http(tmp_path, monkeypatch, stop, rate) -> None:
     import asyncio
     import httpx
     from stage2 import cloud_asr
@@ -592,8 +593,8 @@ def test_cloud_options_parent_stop_interrupts_provider_http(tmp_path, monkeypatc
                     "api_key": "test-key",
                     "chunk_minutes": 1,
                     "overlap_sec": 0,
-                    "max_cost_usd": "1",
-                    "usd_per_minute_estimate": "0.06",
+                    "max_cost_usd": "0" if rate == "0" else "1",
+                    "usd_per_minute_estimate": rate,
                 },
             )
     finally:
@@ -603,7 +604,8 @@ def test_cloud_options_parent_stop_interrupts_provider_http(tmp_path, monkeypatc
     assert entered_http.is_set()
     assert calls.value == 1
     assert time.monotonic() - started < 1.0
-    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+    assert caught.value.reserved_cost_usd == pytest.approx(float(rate))
+    assert caught.value.cost_pending is True
     assert whisper_process._worker is None
 
 

@@ -661,12 +661,14 @@ def test_budget_reserves_before_every_http_attempt(monkeypatch) -> None:
     assert result["cost_usd"] == pytest.approx(0.02)
     assert result["reserved_cost_usd"] == pytest.approx(0.06)
     assert result["cost_limit_usd"] == 1.0
+    assert result["cost_pending"] is True
     assert snapshots[-1] == pytest.approx(
         {
             "limit_usd": 1.0,
             "spent_usd": 0.02,
             "reserved_usd": 0.06,
             "total_usd": 0.08,
+            "cost_pending": True,
         }
     )
 

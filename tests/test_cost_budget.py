@@ -160,3 +160,16 @@ def test_budget_rejects_invalid_provider_cost_without_mutation(actual: object) -
     assert budget.snapshot() == before
     budget.settle(reservation, 0)
     assert budget.snapshot()["total_usd"] == 0.0
+
+
+def test_zero_dollar_reservations_remain_pending_until_actual_zero_is_known():
+    budget = CostBudget(Decimal('0'), Decimal('0'))
+    assert budget.has_pending_reservations is False
+    reservation = budget.reserve_attempt(60)
+    assert budget.snapshot()['reserved_usd'] == 0
+    assert budget.has_pending_reservations is True
+    budget.settle(reservation, None)
+    assert budget.has_pending_reservations is True
+    budget.settle(reservation, 0)
+    assert budget.snapshot()['spent_usd'] == 0
+    assert budget.has_pending_reservations is False

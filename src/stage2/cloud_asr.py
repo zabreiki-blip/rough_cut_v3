@@ -82,7 +82,9 @@ def _publish_budget(
 ) -> None:
     if callback is not None:
         try:
-            callback(budget.snapshot())
+            snapshot = budget.snapshot()
+            snapshot["cost_pending"] = budget.has_pending_reservations
+            callback(snapshot)
         except Exception:
             logger.debug("Cloud ASR budget callback failed", exc_info=True)
 
@@ -92,6 +94,7 @@ def _attach_budget(error: BaseException, budget: CostBudget) -> None:
     error.cost_usd = snapshot["spent_usd"]  # type: ignore[attr-defined]
     error.reserved_cost_usd = snapshot["reserved_usd"]  # type: ignore[attr-defined]
     error.cost_limit_usd = snapshot["limit_usd"]  # type: ignore[attr-defined]
+    error.cost_pending = budget.has_pending_reservations  # type: ignore[attr-defined]
 
 
 DEFAULT_MODEL = "google/gemini-3.7-flash"
@@ -1657,5 +1660,6 @@ def transcribe_cloud(
         "cost_usd": snapshot["spent_usd"],
         "reserved_cost_usd": snapshot["reserved_usd"],
         "cost_limit_usd": snapshot["limit_usd"],
+        "cost_pending": budget.has_pending_reservations,
         "base_url": str(result.params.get("base_url") or ""),
     }

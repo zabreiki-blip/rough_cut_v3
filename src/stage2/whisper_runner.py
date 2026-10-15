@@ -355,6 +355,7 @@ def _transcribe_cloud(
         error.cost_usd = exc.cost_usd  # type: ignore[attr-defined]
         error.reserved_cost_usd = getattr(exc, "reserved_cost_usd", None)  # type: ignore[attr-defined]
         error.cost_limit_usd = getattr(exc, "cost_limit_usd", None)  # type: ignore[attr-defined]
+        error.cost_pending = getattr(exc, "cost_pending", None)  # type: ignore[attr-defined]
         raise error from exc
 
     segments = result.get("segments") or []
@@ -371,6 +372,7 @@ def _transcribe_cloud(
         "cost_usd": result.get("cost_usd"),
         "reserved_cost_usd": result.get("reserved_cost_usd"),
         "cost_limit_usd": result.get("cost_limit_usd"),
+        "cost_pending": result.get("cost_pending"),
         "base_url": result.get("base_url"),
         "timestamp_precision": "interpolated",
         "segment_count": len(segments),
@@ -431,6 +433,7 @@ def transcribe_audio(
         error.cost_usd = backend_meta.get("cost_usd")  # type: ignore[attr-defined]
         error.reserved_cost_usd = backend_meta.get("reserved_cost_usd")  # type: ignore[attr-defined]
         error.cost_limit_usd = backend_meta.get("cost_limit_usd")  # type: ignore[attr-defined]
+        error.cost_pending = backend_meta.get("cost_pending")  # type: ignore[attr-defined]
         raise error
 
     completed_duration = float(backend_meta.get("duration_sec") or words[-1]["end"])
@@ -447,7 +450,7 @@ def transcribe_audio(
     # every backend still shares one generic assembly path.
     top_level_extra: dict[str, Any] = {}
     if selected == "cloud-audio":
-        for field in ("cost_usd", "reserved_cost_usd", "cost_limit_usd"):
+        for field in ("cost_usd", "reserved_cost_usd", "cost_limit_usd", "cost_pending"):
             top_level_extra[field] = backend_meta.get(field)
     segments_for_top_level = backend_meta.pop("segments", None)
     if segments_for_top_level is not None:

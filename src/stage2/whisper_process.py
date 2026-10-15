@@ -181,6 +181,7 @@ def _transcribe_worker(connection: Connection) -> None:
                             getattr(exc, "cost_usd", None),
                             getattr(exc, "reserved_cost_usd", None),
                             getattr(exc, "cost_limit_usd", None),
+                            getattr(exc, "cost_pending", None),
                         )
                     )
                 except (BrokenPipeError, EOFError, OSError):
@@ -441,6 +442,7 @@ def transcribe_audio_in_process(
         error.cost_usd = last_budget["spent_usd"]  # type: ignore[attr-defined]
         error.reserved_cost_usd = last_budget["reserved_usd"]  # type: ignore[attr-defined]
         error.cost_limit_usd = last_budget["limit_usd"]  # type: ignore[attr-defined]
+        error.cost_pending = bool(last_budget.get("cost_pending", False))  # type: ignore[attr-defined]
         return error
 
     def check_stop(worker: _Worker | None = None) -> None:
@@ -464,7 +466,7 @@ def transcribe_audio_in_process(
                             receive_budget(message[2])
                         elif message[0] == "error":
                             for index, field in enumerate(
-                                ("spent_usd", "reserved_usd", "limit_usd"), start=4
+                                ("spent_usd", "reserved_usd", "limit_usd", "cost_pending"), start=4
                             ):
                                 if len(message) > index and message[index] is not None:
                                     last_budget[field] = message[index]
@@ -562,7 +564,7 @@ def transcribe_audio_in_process(
                     _discard_worker_locked(worker)
                     error = attach_budget(WhisperProcessError(worker_error))
                     for index, field in enumerate(
-                        ("cost_usd", "reserved_cost_usd", "cost_limit_usd"), start=4
+                        ("cost_usd", "reserved_cost_usd", "cost_limit_usd", "cost_pending"), start=4
                     ):
                         if len(message) > index and message[index] is not None:
                             setattr(error, field, message[index])

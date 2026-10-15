@@ -1128,9 +1128,11 @@ def test_real_usage_ledger_keeps_reserved_exposure_pending_once(controller, spen
         if stop == 'cancelled':
             error = WhisperCancelledError('stopped with a reservation')
             error.cost_usd, error.reserved_cost_usd, error.cost_limit_usd = spent, reserved, 1.0
+            error.cost_pending = True
             raise error
         return {'backend': 'cloud-audio', 'backend_metadata': {
             'cost_usd': spent, 'reserved_cost_usd': reserved, 'cost_limit_usd': 1.0,
+            'cost_pending': True,
         }}
 
     services.transcribe_audio = transcribe
@@ -1192,4 +1194,82 @@ def test_real_local_process_error_preserves_limit_without_provider_usage(control
     assert job['reserved_cost_usd'] == 0
     assert not ledger.exists()
     assert usage_summary(ledger, create=False)['pending_count'] == 0
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize('provider_cost', [None, 0])
+@pytest.mark.parametrize('valid_transcript', [True, False])
+def test_disabled_guard_tracks_provider_cost_knowledge_through_real_process_and_ledger(
+    controller, monkeypatch, provider_cost, valid_transcript
+):
+    import json
+    import multiprocessing
+    import httpx
+    from openrouter_usage import make_usage_callback, usage_summary
+    from stage2 import cloud_asr
+    from stage2.whisper_process import _shutdown_worker, transcribe_audio_in_process
+
+    if 'fork' not in multiprocessing.get_all_start_methods():
+        pytest.skip('full cloud accounting regression requires inherited mock HTTP transport')
+    _shutdown_worker()
+    client, services = controller
+    monkeypatch.setenv('ROUGH_CUT_MAX_USD_PER_JOB', '0')
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0')
+    monkeypatch.setenv('SYNC_CLOUD_ASR_API_KEY', 'test-key')
+    ledger = services._test_paths['work'] / 'usage.json'
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(ledger, **context)
+    actual_client = httpx.AsyncClient
+
+    async def extract(*_args):
+        return b'mp3'
+
+    async def handler(_request):
+        content = '[00:01] ГОЛОС 1: Готово' if valid_transcript else 'invalid transcript'
+        response = {'choices': [{'message': {'content': content}}]}
+        if provider_cost is not None:
+            response['usage'] = {'cost': provider_cost}
+        return httpx.Response(200, json=response)
+
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, '_extract_chunk_mp3', extract)
+    monkeypatch.setattr(cloud_asr.httpx, 'AsyncClient', lambda **_kwargs: actual_client(transport=httpx.MockTransport(handler)))
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    assert response.status_code == 202
+    job_id = response.get_json()['result']['job_id']
+    process_signals = []
+    metadata_signals = []
+
+    def transcribe(path, **options):
+        try:
+            result = transcribe_audio_in_process(path, timeout_seconds=2, _start_method='fork', **options)
+        except Exception as error:
+            process_signals.append(getattr(error, 'cost_pending', None))
+            raise
+        process_signals.append(result.get('cost_pending'))
+        metadata_signals.append(result['backend_metadata'].get('cost_pending'))
+        return result
+
+    services.transcribe_audio = transcribe
+    try:
+        _run_pending(services)
+    finally:
+        _shutdown_worker()
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == ('completed' if valid_transcript else 'failed')
+    assert job['cost_usd'] == 0
+    assert job['reserved_cost_usd'] == 0
+    assert usage_summary(ledger)['pending_count'] == (1 if provider_cost is None else 0)
+    events = json.loads(ledger.read_text())['events']
+    if provider_cost is None:
+        assert len(events) == 1
+        assert events[0]['status'] == 'pending'
+        assert events[0]['cost_usd'] is None
+        assert events[0]['event_id'] == f'final-review-asr:{job_id}:reserved'
+    else:
+        assert len(events) == 1
+        assert events[0]['status'] == 'confirmed'
+        assert float(events[0]['cost_usd']) == 0
+    assert process_signals == [provider_cost is None]
+    if valid_transcript:
+        assert metadata_signals == [provider_cost is None]
+    assert job['cost_pending'] is (provider_cost is None)
     _assert_released(services, job_id)

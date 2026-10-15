@@ -75,6 +75,7 @@ def create_final_review_job(
         "cost_limit_usd": payload.get("cost_limit_usd", 0.0),
         "cost_usd": 0.0,
         "reserved_cost_usd": 0.0,
+        "cost_pending": False,
         "transcription_processed_sec": 0.0,
         "transcription_duration_sec": payload.get("duration_sec", 0.0),
         "transcription_words": 0,
@@ -234,6 +235,7 @@ def run_final_review_job(
             cost_usd=snapshot["spent_usd"],
             reserved_cost_usd=snapshot["reserved_usd"],
             cost_limit_usd=snapshot["limit_usd"],
+            **({"cost_pending": bool(snapshot["cost_pending"])} if "cost_pending" in snapshot else {}),
         )
 
     def cost_updates(source: Any) -> dict[str, Any]:
@@ -244,16 +246,20 @@ def run_final_review_job(
             value = source.get(field) if isinstance(source, dict) else getattr(source, field, None)
             if value is not None:
                 values[field] = float(value)
+        pending = source.get("cost_pending") if isinstance(source, dict) else getattr(source, "cost_pending", None)
+        if pending is not None:
+            values["cost_pending"] = bool(pending)
         return values
 
     def record_usage(
-        cost: Any, selected_model: str, *, reserved_cost: Any = None, allow_unknown: bool = False
+        cost: Any, selected_model: str, *,
+        cost_pending: bool = False, allow_unknown: bool = False,
     ) -> None:
         nonlocal usage_recorded, reserved_usage_recorded
         if usage_callback is None:
             return
         if not reserved_usage_recorded and (
-            (reserved_cost or 0) > 0 or (allow_unknown and cost is None)
+            cost_pending or (allow_unknown and cost is None)
         ):
             # An unresolved reservation is exposure, not confirmed spend.
             # Keep a distinct stable pending event so the real ledger retains
@@ -265,7 +271,7 @@ def run_final_review_job(
                 "pending": True,
             })
             reserved_usage_recorded = True
-        if not usage_recorded and cost is not None:
+        if not usage_recorded and cost is not None and (not cost_pending or cost > 0):
             usage_callback({
                 "event_id": f"final-review-asr:{job_id}",
                 "model": selected_model,
@@ -280,7 +286,7 @@ def run_final_review_job(
             if provider_costs and (backend == "cloud-audio" or "cost_usd" in failed_cost):
                 record_usage(
                     failed_cost.get("cost_usd", latest.get("cost_usd")), str(model or ""),
-                    reserved_cost=failed_cost.get("reserved_cost_usd", latest.get("reserved_cost_usd")),
+                    cost_pending=bool(failed_cost.get("cost_pending", latest.get("cost_pending", False))),
                 )
         finally:
             services._update_final_review_job(
@@ -326,11 +332,11 @@ def run_final_review_job(
         result_backend_metadata = result.get("backend_metadata") or {}
         final_cost = cost_updates(result_backend_metadata)
         final_cost.update(cost_updates(result))
-        services._update_final_review_job(job_id, **final_cost)
+        final_snapshot = services._update_final_review_job(job_id, **final_cost) or final_cost
         if provider_costs and str(result.get("backend") or backend or "") == "cloud-audio":
             record_usage(
                 final_cost.get("cost_usd"), str(result.get("model") or model or ""),
-                reserved_cost=final_cost.get("reserved_cost_usd"),
+                cost_pending=bool(final_snapshot.get("cost_pending", False)),
                 allow_unknown=True,
             )
         check_stop()
