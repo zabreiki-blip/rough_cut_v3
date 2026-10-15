@@ -1746,9 +1746,11 @@ def _run_final_review_job(
     )
 
 
-def _record_final_review_iteration(project: str, job: dict, corrections: list[dict]) -> dict:
+def _record_final_review_iteration(
+    project: str, job: dict, corrections: list[dict], request_id: str = ""
+) -> dict:
     return final_review_jobs.record_final_review_iteration(
-        _final_review_job_services(), project, job, corrections
+        _final_review_job_services(), project, job, corrections, request_id
     )
 
 

@@ -1,5 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+import json
 import threading
 import time
 import uuid
@@ -63,6 +65,7 @@ def test_final_review_apply_rejects_report_from_another_job(tmp_path: Path) -> N
     app = Flask(__name__)
     report_path = tmp_path / "final_review_report.json"
     services = SimpleNamespace(
+        _project_transition_lock=lambda _project: threading.RLock(),
         _get_final_review_job=lambda _job_id: {
             "id": "job-new",
             "project": "demo",
@@ -343,6 +346,7 @@ def test_final_review_apply_records_matching_report(tmp_path: Path) -> None:
         "assembly_manifest_id": "manifest-1",
     }
     services = SimpleNamespace(
+        _project_transition_lock=lambda _project: threading.RLock(),
         _get_final_review_job=lambda _job_id: job,
         _resolve_project_name=lambda _value: "demo",
         _project_paths=lambda _project: {"final_review_report": tmp_path / "report.json"},
@@ -354,7 +358,7 @@ def test_final_review_apply_records_matching_report(tmp_path: Path) -> None:
             "corrections": [{"block_uid": "b1"}],
         },
         _record_final_review_iteration=lambda *args: (
-            recorded.append(args) or {"id": "iteration_0001"}
+            recorded.append(args) or {"id": "iteration_0001", "corrections": args[2]}
         ),
         _json_error=_error,
     )
@@ -378,6 +382,7 @@ def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path
         "assembly_manifest_id": "manifest-1",
     }
     services = SimpleNamespace(
+        _project_transition_lock=lambda _project: threading.RLock(),
         _get_final_review_job=lambda _job_id: None,
         _load_persisted_final_review_job=lambda project: job if project == "demo" else None,
         _resolve_project_name=lambda value: value,
@@ -390,7 +395,7 @@ def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path
             "corrections": [],
         },
         _record_final_review_iteration=lambda *args: (
-            recorded.append(args) or {"id": "iteration_0001"}
+            recorded.append(args) or {"id": "iteration_0001", "corrections": args[2]}
         ),
         _json_error=_error,
     )
@@ -400,6 +405,185 @@ def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path
 
     assert response.status_code == 200
     assert response.get_json()["result"]["iteration"]["id"] == "iteration_0001"
+
+
+@pytest.fixture
+def apply_controller(tmp_path: Path, monkeypatch):
+    """Keep the registered route, API facade, lock, and JSON persistence real."""
+    import api
+
+    paths = {
+        "final_review_report": tmp_path / "report.json",
+        "final_review_iterations": tmp_path / "iterations.json",
+    }
+    job = {
+        "id": "job-1", "project": "demo", "status": "completed",
+        "source_sequence": {"sequenceId": "sequence-1"},
+        "assembly_manifest_id": "manifest-1",
+    }
+    jobs = {"job-1": job, "job-2": {**job, "id": "job-2"}}
+
+    def publish_report(job_id="job-1", corrections=None):
+        paths["final_review_report"].write_text(json.dumps({
+            **jobs[job_id], "job_id": job_id,
+            "corrections": [{"block_uid": "b1"}] if corrections is None else corrections,
+        }))
+
+    publish_report()
+    monkeypatch.setattr(api, "_project_paths", lambda _project: paths)
+    monkeypatch.setattr(api, "_resolve_project_name", lambda value: value)
+    monkeypatch.setattr(api, "_get_final_review_job", jobs.get)
+    app = Flask(__name__)
+    register_final_review_routes(app, api)
+    return SimpleNamespace(api=api, app=app, paths=paths, publish_report=publish_report)
+
+
+@pytest.mark.parametrize("request_id", ["x" * 129, None, 1, True, [], {}])
+def test_final_review_apply_rejects_invalid_request_id(apply_controller, request_id):
+    state = apply_controller
+    with state.app.test_client() as client:
+        response = client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": request_id,
+        })
+    assert response.status_code == 400
+    assert "request_id" in response.get_json()["error"]
+    assert not state.paths["final_review_iterations"].exists()
+
+
+@pytest.mark.parametrize("extra", [{}, {"request_id": ""}, {"request_id": " \t "}])
+def test_final_review_apply_without_request_id_creates_new_iteration(apply_controller, extra):
+    state = apply_controller
+    with state.app.test_client() as client:
+        responses = [client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", **extra,
+        }) for _ in range(2)]
+    assert [response.status_code for response in responses] == [200, 200]
+    items = json.loads(state.paths["final_review_iterations"].read_text())["iterations"]
+    assert [item["id"] for item in items] == ["iteration_0001", "iteration_0002"]
+    assert all("request_id" not in item for item in items)
+
+
+def test_final_review_apply_replays_same_job_and_trimmed_request_id(apply_controller):
+    state = apply_controller
+    request_id = "x" * 128
+    with state.app.test_client() as client:
+        first = client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": f" {request_id} ",
+        })
+        original_history = state.paths["final_review_iterations"].read_bytes()
+        state.publish_report(corrections=[{"block_uid": "changed"}])
+        replay = client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": request_id,
+        })
+    assert first.status_code == replay.status_code == 200
+    assert replay.get_json() == first.get_json()
+    assert first.get_json()["result"]["iteration"]["request_id"] == request_id
+    assert state.paths["final_review_iterations"].read_bytes() == original_history
+
+
+def test_final_review_apply_rejects_request_id_reused_for_another_job(apply_controller):
+    state = apply_controller
+    with state.app.test_client() as client:
+        first = client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": "apply-1",
+        })
+        assert first.status_code == 200
+        original_history = state.paths["final_review_iterations"].read_bytes()
+        state.publish_report("job-2")
+        conflict = client.post("/stage2/final-review/jobs/job-2/apply", json={
+            "project": "demo", "request_id": "apply-1",
+        })
+    assert conflict.status_code == 409
+    assert "request_id" in conflict.get_json()["error"]
+    assert state.paths["final_review_iterations"].read_bytes() == original_history
+
+
+def test_final_review_apply_replays_after_a_newer_report_replaces_current_report(apply_controller):
+    state = apply_controller
+    with state.app.test_client() as client:
+        first = client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": "apply-1",
+        })
+        assert first.status_code == 200
+        original_history = state.paths["final_review_iterations"].read_bytes()
+        state.publish_report("job-2")
+        replay = client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": "apply-1",
+        })
+    assert replay.status_code == 200
+    assert replay.get_json() == first.get_json()
+    assert state.paths["final_review_iterations"].read_bytes() == original_history
+
+
+def test_final_review_apply_different_request_ids_preserve_intentional_repeat(apply_controller):
+    state = apply_controller
+    with state.app.test_client() as client:
+        responses = [client.post("/stage2/final-review/jobs/job-1/apply", json={
+            "project": "demo", "request_id": request_id,
+        }) for request_id in ("apply-1", "apply-2")]
+    assert [response.status_code for response in responses] == [200, 200]
+    items = json.loads(state.paths["final_review_iterations"].read_text())["iterations"]
+    assert [item["id"] for item in items] == ["iteration_0001", "iteration_0002"]
+    assert [item["request_id"] for item in items] == ["apply-1", "apply-2"]
+    assert items[0]["corrections"] == items[1]["corrections"] == [{"block_uid": "b1"}]
+
+
+def test_final_review_apply_concurrent_iterations_preserve_both_entries(apply_controller, monkeypatch):
+    state = apply_controller
+    api = state.api
+    start = threading.Barrier(2)
+    contender_reached_history = threading.Event()
+    counter_lock = threading.Lock()
+    counts = {"lock": 0, "read": 0}
+    real_get_job = api._get_final_review_job
+    real_read = api._read_json_safe
+    real_project_lock = api._project_transition_lock
+
+    def synchronized_job(job_id):
+        start.wait(timeout=5)
+        return real_get_job(job_id)
+
+    def observed_project_lock(project):
+        with counter_lock:
+            counts["lock"] += 1
+            if counts["lock"] == 2:
+                contender_reached_history.set()
+        return real_project_lock(project)
+
+    def synchronized_history_read(path):
+        result = real_read(path)
+        if path == state.paths["final_review_iterations"]:
+            with counter_lock:
+                counts["read"] += 1
+                first_reader = counts["read"] == 1
+            if first_reader:
+                # Wait for a competing lock attempt (serialized implementation),
+                # or its history read (the original lost-update implementation).
+                assert contender_reached_history.wait(timeout=5)
+            else:
+                contender_reached_history.set()
+        return result
+
+    monkeypatch.setattr(api, "_get_final_review_job", synchronized_job)
+    monkeypatch.setattr(api, "_project_transition_lock", observed_project_lock)
+    monkeypatch.setattr(api, "_read_json_safe", synchronized_history_read)
+
+    def apply(request_id):
+        with state.app.test_client() as client:
+            response = client.post("/stage2/final-review/jobs/job-1/apply", json={
+                "project": "demo", "request_id": request_id,
+            })
+        return response.status_code, response.get_json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(apply, ("apply-1", "apply-2")))
+    assert [status for status, _ in results] == [200, 200]
+    assert {body["result"]["iteration"]["id"] for _, body in results} == {
+        "iteration_0001", "iteration_0002",
+    }
+    items = json.loads(state.paths["final_review_iterations"].read_text())["iterations"]
+    assert [item["id"] for item in items] == ["iteration_0001", "iteration_0002"]
+    assert {item["request_id"] for item in items} == {"apply-1", "apply-2"}
 
 
 @pytest.mark.parametrize(
@@ -444,6 +628,7 @@ def test_final_review_apply_guard_branches(tmp_path: Path, case: str, expected_e
     services = SimpleNamespace(
         _get_final_review_job=lambda _job_id: job,
         _resolve_project_name=resolve_project,
+        _project_transition_lock=lambda _project: threading.RLock(),
         _project_paths=lambda _project: {"final_review_report": tmp_path / "report.json"},
         _read_json_safe=lambda _path: report,
         _json_error=_error,

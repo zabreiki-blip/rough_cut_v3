@@ -13,6 +13,10 @@ from api_service_contracts import FinalReviewJobServices
 from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
 
 
+class FinalReviewRequestConflict(ValueError):
+    """An Apply request ID has already been used for another review job."""
+
+
 def canonical_decimal_string(value: object) -> str:
     amount = Decimal(str(value))
     if amount == 0:
@@ -397,23 +401,44 @@ def run_final_review_job(
         services._release_final_review_project(project)
 
 
+def find_final_review_iteration(
+    history: dict[str, Any], job_id: str, request_id: str
+) -> dict[str, Any] | None:
+    if request_id:
+        for item in history.get("iterations") or []:
+            if item.get("request_id") == request_id:
+                if item.get("review_job_id") != job_id:
+                    raise FinalReviewRequestConflict(
+                        "request_id has already been used for another final review job"
+                    )
+                return item
+    return None
+
+
 def record_final_review_iteration(
     services: FinalReviewJobServices,
     project: str,
     job: dict[str, Any],
     corrections: list[dict[str, Any]],
+    request_id: str = "",
 ) -> dict[str, Any]:
-    paths = services._project_paths(project)
-    history = services._read_json_safe(paths["final_review_iterations"])
-    items = list(history.get("iterations") or [])
-    iteration = {
-        "id": f"iteration_{len(items) + 1:04d}",
-        "review_job_id": job["id"],
-        "source_sequence": dict(job.get("source_sequence") or {}),
-        "corrections": corrections,
-        "status": "prepared",
-        "created_at": services._utc_now_iso(),
-    }
-    items.append(iteration)
-    services._atomic_write_json_file(paths["final_review_iterations"], {"iterations": items})
-    return iteration
+    with services._project_transition_lock(project):
+        paths = services._project_paths(project)
+        history = services._read_json_safe(paths["final_review_iterations"])
+        existing = find_final_review_iteration(history, job["id"], request_id)
+        if existing is not None:
+            return existing
+        items = list(history.get("iterations") or [])
+        iteration = {
+            "id": f"iteration_{len(items) + 1:04d}",
+            "review_job_id": job["id"],
+            "source_sequence": dict(job.get("source_sequence") or {}),
+            "corrections": corrections,
+            "status": "prepared",
+            "created_at": services._utc_now_iso(),
+        }
+        if request_id:
+            iteration["request_id"] = request_id
+        items.append(iteration)
+        services._atomic_write_json_file(paths["final_review_iterations"], {"iterations": items})
+        return iteration

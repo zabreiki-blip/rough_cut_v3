@@ -18,7 +18,12 @@ import wave
 
 from flask import Flask, has_request_context, jsonify, request
 
-from api_final_review_jobs import canonical_decimal_string, final_review_deadline
+from api_final_review_jobs import (
+    FinalReviewRequestConflict,
+    canonical_decimal_string,
+    find_final_review_iteration,
+    final_review_deadline,
+)
 from cost_budget import CostGuardConfig
 from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
 from stage2.whisper_runner import resolve_backend
@@ -315,8 +320,25 @@ def _status(services: ModuleType, job_id: str):
     return jsonify({"ok": True, "result": job})
 
 
+def _apply_result(project: str, iteration: dict):
+    return jsonify({
+        "ok": True,
+        "result": {
+            "project": project,
+            "iteration": iteration,
+            "corrections": iteration["corrections"],
+        },
+    })
+
+
 def _apply(services: ModuleType, job_id: str):
     payload = request.get_json(silent=True) or {}
+    request_id = payload.get("request_id", "")
+    if not isinstance(request_id, str):
+        return services._json_error("request_id must be a string", 400)
+    request_id = request_id.strip()
+    if len(request_id) > 128:
+        return services._json_error("request_id must be at most 128 characters", 400)
     job = services._get_final_review_job(job_id)
     if not job:
         try:
@@ -338,25 +360,30 @@ def _apply(services: ModuleType, job_id: str):
         return services._json_error(str(exc), 400)
     if project != job.get("project"):
         return services._json_error("project does not match final review job", 409)
-    report = services._read_json_safe(services._project_paths(project)["final_review_report"])
-    if str(report.get("job_id") or "") != str(job_id):
-        return services._json_error("final review report does not belong to this job", 409)
-    if str(report.get("project") or "") != project:
-        return services._json_error("final review report does not belong to this project", 409)
-    if str(report.get("assembly_manifest_id") or "") != str(job.get("assembly_manifest_id") or ""):
-        return services._json_error("final review assembly snapshot changed", 409)
-    report_sequence = dict(report.get("source_sequence") or {})
-    job_sequence = dict(job.get("source_sequence") or {})
-    if str(report_sequence.get("sequenceId") or "") != str(job_sequence.get("sequenceId") or ""):
-        return services._json_error("final review sequence identity changed", 409)
-    corrections = report.get("corrections") if isinstance(report.get("corrections"), list) else []
-    iteration = services._record_final_review_iteration(project, job, corrections)
-    return jsonify(
-        {
-            "ok": True,
-            "result": {"project": project, "iteration": iteration, "corrections": corrections},
-        }
-    )
+    try:
+        with services._project_transition_lock(project):
+            paths = services._project_paths(project)
+            if request_id:
+                history = services._read_json_safe(paths["final_review_iterations"])
+                existing = find_final_review_iteration(history, job_id, request_id)
+                if existing is not None:
+                    return _apply_result(project, existing)
+            report = services._read_json_safe(paths["final_review_report"])
+            if str(report.get("job_id") or "") != str(job_id):
+                return services._json_error("final review report does not belong to this job", 409)
+            if str(report.get("project") or "") != project:
+                return services._json_error("final review report does not belong to this project", 409)
+            if str(report.get("assembly_manifest_id") or "") != str(job.get("assembly_manifest_id") or ""):
+                return services._json_error("final review assembly snapshot changed", 409)
+            report_sequence = dict(report.get("source_sequence") or {})
+            job_sequence = dict(job.get("source_sequence") or {})
+            if str(report_sequence.get("sequenceId") or "") != str(job_sequence.get("sequenceId") or ""):
+                return services._json_error("final review sequence identity changed", 409)
+            corrections = report.get("corrections") if isinstance(report.get("corrections"), list) else []
+            iteration = services._record_final_review_iteration(project, job, corrections, request_id)
+    except FinalReviewRequestConflict as exc:
+        return services._json_error(str(exc), 409)
+    return _apply_result(project, iteration)
 
 
 def register_final_review_routes(app: Flask, services: ModuleType) -> None:
