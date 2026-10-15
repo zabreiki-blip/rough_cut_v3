@@ -397,20 +397,31 @@ def transcribe_audio_in_process(
     key = _worker_key(backend, model, language, _start_method)
     if deadline_monotonic is not None and not math.isfinite(deadline_monotonic):
         raise ValueError("deadline_monotonic must be finite")
+    is_cloud = key[0] in {"cloud-audio", "cloud", "openrouter"}
     # Preserve Decimal precision when values cross the process boundary. These
     # are per-request options, so changing a budget never replaces a warm model.
-    options = {
-        name: str(value) if isinstance(value, Decimal) else value
-        for name, value in (cloud_options or {}).items()
-    }
-    initial_limit = options.get("max_cost_usd")
-    if initial_limit is None and key[0] in {"cloud-audio", "cloud", "openrouter"}:
-        initial_limit = os.getenv("ROUGH_CUT_MAX_USD_PER_JOB", "0")
-    last_budget = {
-        "spent_usd": float(options.get("initial_cost_usd") or 0),
-        "reserved_usd": 0.0,
-        "limit_usd": float(initial_limit or 0),
-    }
+    options: dict[str, Any] | None = None
+    last_budget = {"spent_usd": 0.0, "reserved_usd": 0.0, "limit_usd": 0.0}
+    configured_cloud_timeout = timeout
+    if is_cloud:
+        options = {
+            name: str(value) if isinstance(value, Decimal) else value
+            for name, value in (cloud_options or {}).items()
+        }
+        # A warm worker inherited its environment at startup. Resolve mutable
+        # defaults in the parent on every request, including disabled budgets.
+        for option, variable in (
+            ("max_cost_usd", "ROUGH_CUT_MAX_USD_PER_JOB"),
+            ("usd_per_minute_estimate", "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE"),
+        ):
+            if options.get(option) is None:
+                options[option] = os.getenv(variable, "0").strip() or "0"
+        last_budget["spent_usd"] = float(options.get("initial_cost_usd") or 0)
+        last_budget["limit_usd"] = float(options.get("max_cost_usd") or 0)
+        if options.get("timeout_sec") is not None:
+            configured_cloud_timeout = float(options["timeout_sec"])
+            if not math.isfinite(configured_cloud_timeout) or configured_cloud_timeout <= 0:
+                raise ValueError("cloud timeout_sec must be a finite positive number")
     deadline = deadline_monotonic
     request_id: int | None = None
 
@@ -468,12 +479,8 @@ def transcribe_audio_in_process(
         check_stop(worker)
         # Cloud requests get a cooperative timeout too; the parent remains the
         # hard stop and kills the child if its request does not return in time.
-        remaining = deadline - time.monotonic()
-        configured_cloud_timeout = options.get("timeout_sec")
-        options["timeout_sec"] = min(
-            remaining,
-            float(configured_cloud_timeout) if configured_cloud_timeout is not None else timeout,
-        )
+        if options is not None:
+            options["timeout_sec"] = min(deadline - time.monotonic(), configured_cloud_timeout)
         _request_number += 1
         request_id = _request_number
         try:

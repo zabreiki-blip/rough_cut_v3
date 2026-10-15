@@ -61,6 +61,7 @@ import os
 import random
 import re
 import subprocess
+import time
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -1202,6 +1203,7 @@ class CloudAudioAsrAdapter:
         budget: CostBudget | None = None,
         duration_sec: float = 0.0,
         budget_callback: Callable[[dict[str, float]], None] | None = None,
+        deadline_monotonic: float | None = None,
     ) -> tuple[str, float | None, dict]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -1240,6 +1242,8 @@ class CloudAudioAsrAdapter:
             attempt += 1
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError("Распознавание отменено пользователем")
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("Cloud ASR transcription exceeded its deadline")
             reservation_id = None
             if budget is not None:
                 reservation_id = budget.reserve_attempt(duration_sec)
@@ -1247,6 +1251,10 @@ class CloudAudioAsrAdapter:
             # A callback can request cancellation before this paid attempt.
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError("Распознавание отменено пользователем")
+            # Synchronous callbacks can consume the remaining allowance while
+            # the event loop is unable to deliver asyncio's timeout callback.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("Cloud ASR transcription exceeded its deadline")
             try:
                 resp = await self._await_cancellable(
                     client.post(self._chat_url, headers=self._headers(), json=payload), cancel
@@ -1323,6 +1331,7 @@ class CloudAudioAsrAdapter:
         cancel: asyncio.Event | None = None,
         budget: CostBudget | None = None,
         budget_callback: Callable[[dict[str, float]], None] | None = None,
+        deadline_monotonic: float | None = None,
     ) -> AsrRunResult:
         self._require_available()
         audio_path = Path(audio_path)
@@ -1380,6 +1389,7 @@ class CloudAudioAsrAdapter:
                         budget=budget,
                         duration_sec=part_end - part_start,
                         budget_callback=budget_callback,
+                        deadline_monotonic=deadline_monotonic,
                     )
                 except CloudAudioAsrError as exc:
                     # Ретраи внутри _call_model уже исчерпаны для ЭТОГО чанка —
@@ -1591,6 +1601,7 @@ def transcribe_cloud(
         overlap_sec=overlap_sec,
         timeout_sec=timeout_sec if timeout_sec is not None else DEFAULT_TIMEOUT_SEC,
     )
+    deadline_monotonic = time.monotonic() + timeout_sec if timeout_sec is not None else None
 
     async def run() -> AsrRunResult:
         if cancel is not None and cancel.is_set():
@@ -1603,6 +1614,7 @@ def transcribe_cloud(
                 cancel=cancel,
                 budget=budget,
                 budget_callback=budget_callback,
+                deadline_monotonic=deadline_monotonic,
             ),
             timeout=timeout_sec,
         )

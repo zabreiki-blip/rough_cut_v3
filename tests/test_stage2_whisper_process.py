@@ -430,6 +430,7 @@ def test_cancel_while_waiting_for_worker_lock_is_prompt() -> None:
         try:
             transcribe_audio_in_process(
                 "unused.wav",
+                backend="cloud-audio",
                 cancel_event=cancel,
                 _start_method="fork",
                 cloud_options={"initial_cost_usd": "0.03", "max_cost_usd": "1"},
@@ -624,3 +625,110 @@ def test_cancel_before_cloud_start_retains_environment_budget_limit(monkeypatch)
     assert caught.value.reserved_cost_usd == 0.0
     assert caught.value.cost_limit_usd == pytest.approx(0.15)
     assert whisper_process._worker is None
+
+
+@pytest.mark.parametrize("new_limit,new_rate", [("0.01", "0.06"), ("1", "2")])
+def test_cloud_options_refresh_environment_budget_in_reused_worker(
+    tmp_path, monkeypatch, new_limit, new_rate
+) -> None:
+    import httpx
+    from stage2 import cloud_asr
+
+    calls = multiprocessing.get_context("fork").Value("i", 0)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+
+    async def extract(*_args):
+        return b"mp3"
+
+    def handler(_request):
+        with calls.get_lock():
+            calls.value += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "[00:01] ГОЛОС 1: Готово"}}],
+                "usage": {"cost": 0.005},
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_probe_duration", lambda *_: 60.0)
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    monkeypatch.setattr(
+        cloud_asr.httpx,
+        "AsyncClient",
+        lambda **_kw: real_client(transport=httpx.MockTransport(handler)),
+    )
+    first = transcribe_audio_in_process(
+        audio_path,
+        backend="cloud-audio",
+        timeout_seconds=2,
+        _start_method="fork",
+        cloud_options={"api_key": "test-key"},
+    )
+    assert first["cost_limit_usd"] == 1.0
+    assert calls.value == 1
+    assert whisper_process._worker is not None
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", new_limit)
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", new_rate)
+
+    with pytest.raises(WhisperProcessError, match="CostBudgetExceeded") as caught:
+        transcribe_audio_in_process(
+            audio_path,
+            backend="cloud-audio",
+            timeout_seconds=2,
+            _start_method="fork",
+            cloud_options={"api_key": "test-key"},
+        )
+
+    assert calls.value == 1
+    assert caught.value.cost_limit_usd == float(new_limit)
+    assert caught.value.reserved_cost_usd == 0.0
+
+
+@pytest.mark.parametrize(
+    "bad_options",
+    [
+        {"max_cost_usd": "invalid"},
+        {"initial_cost_usd": "invalid"},
+        {"timeout_sec": "invalid"},
+    ],
+)
+def test_local_backend_ignores_malformed_cloud_options_and_reuses_worker(monkeypatch, bad_options):
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "invalid")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "invalid")
+
+    def local(_path, *, cloud_options=None, **_kwargs):
+        return {"worker_pid": os.getpid(), "cloud_options": cloud_options}
+
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=local):
+        first = transcribe_audio_in_process(
+            "unused.wav",
+            backend="faster-whisper",
+            timeout_seconds=2,
+            _start_method="fork",
+        )
+        second = transcribe_audio_in_process(
+            "unused.wav",
+            backend="faster-whisper",
+            timeout_seconds=2,
+            _start_method="fork",
+            cloud_options=bad_options,
+        )
+        third = transcribe_audio_in_process(
+            "unused.wav",
+            backend="faster-whisper",
+            timeout_seconds=2,
+            _start_method="fork",
+        )
+
+    assert first["worker_pid"] == second["worker_pid"] == third["worker_pid"]
+    assert first["cloud_options"] is None
+    assert second["cloud_options"] is None
+    assert third["cloud_options"] is None
+    assert whisper_process._worker is not None
+    assert whisper_process._worker.process.is_alive()
+    assert whisper_process._worker_last_active is not None

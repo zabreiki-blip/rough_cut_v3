@@ -860,3 +860,27 @@ def test_cancellation_after_first_chunk_prevents_next_http_dispatch(monkeypatch)
     assert len(calls) == 1
     assert caught.value.cost_usd == pytest.approx(0.01)
     assert caught.value.reserved_cost_usd == 0.0
+
+
+def test_deadline_expiring_inside_budget_callback_prevents_http_dispatch(monkeypatch) -> None:
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    def blocking_callback(_snapshot):
+        time.sleep(0.08)
+
+    _patch_async_client(monkeypatch, handler)
+    with pytest.raises(TimeoutError):
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            timeout_sec=0.02,
+            max_cost_usd="1",
+            usd_per_minute_estimate="0.06",
+            budget_callback=blocking_callback,
+        )
+
+    assert len(calls) == 0
