@@ -919,6 +919,34 @@ def _probe_duration(
         ) from exc
 
 
+def plan_cloud_chunks(
+    duration_sec: float, chunk_minutes: float, overlap_sec: float
+) -> list[tuple[float, float]]:
+    """Return absolute chunk boundaries, including repeated overlap audio."""
+    for name, value in (
+        ("duration_sec", duration_sec),
+        ("chunk_minutes", chunk_minutes),
+        ("overlap_sec", overlap_sec),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+
+    chunk_len = chunk_minutes * 60
+    if duration_sec <= 0:
+        return [(0.0, 0.0)]
+    if duration_sec <= chunk_len or chunk_len <= 0:
+        return [(0.0, duration_sec)]
+
+    parts: list[tuple[float, float]] = []
+    count = math.ceil(duration_sec / chunk_len)
+    for i in range(count):
+        nominal_start = i * chunk_len
+        nominal_end = min((i + 1) * chunk_len, duration_sec)
+        start = 0.0 if i == 0 else max(0.0, nominal_start - overlap_sec)
+        parts.append((start, nominal_end))
+    return parts
+
+
 class CloudAudioAsrAdapter:
     """ASR-адаптер поверх облачной модели с аудио-входом.
 
@@ -1004,20 +1032,7 @@ class CloudAudioAsrAdapter:
 
     def _plan_chunks(self, duration_sec: float) -> list[tuple[float, float]]:
         """Части файла (начало, конец) в абсолютных секундах с перекрытием."""
-        chunk_len = self.chunk_minutes * 60
-        if duration_sec <= 0:
-            return [(0.0, 0.0)]
-        if duration_sec <= chunk_len or chunk_len <= 0:
-            return [(0.0, duration_sec)]
-
-        parts: list[tuple[float, float]] = []
-        count = math.ceil(duration_sec / chunk_len)
-        for i in range(count):
-            nominal_start = i * chunk_len
-            nominal_end = min((i + 1) * chunk_len, duration_sec)
-            start = 0.0 if i == 0 else max(0.0, nominal_start - self.overlap_sec)
-            parts.append((start, nominal_end))
-        return parts
+        return plan_cloud_chunks(duration_sec, self.chunk_minutes, self.overlap_sec)
 
     def _probe_duration(self, media_path: Path) -> float:
         try:

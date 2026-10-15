@@ -26,6 +26,7 @@ from stage2.cloud_asr import (
     _reconcile_speakers,
     _rescale_stretched_timestamps,
     _stitch_chunk,
+    plan_cloud_chunks,
     parse_speaker_legend,
     parse_transcript,
     transcribe_cloud,
@@ -140,6 +141,36 @@ def test_plan_chunks_zero_duration() -> None:
 def test_plan_chunks_exactly_chunk_length() -> None:
     parts = _plan_chunks_for(20 * 60)
     assert parts == [(0.0, 1200.0)]
+
+
+def test_plan_cloud_chunks_counts_overlap_in_billable_duration() -> None:
+    parts = plan_cloud_chunks(2700.0, 20.0, 60.0)
+    assert parts == [(0.0, 1200.0), (1140.0, 2400.0), (2340.0, 2700.0)]
+    assert sum(end - start for start, end in parts) == 2820.0
+
+
+@pytest.mark.parametrize(("duration", "chunk_minutes", "overlap", "expected"), [
+    (0.0, 20.0, 60.0, [(0.0, 0.0)]),
+    (600.0, 20.0, 60.0, [(0.0, 600.0)]),
+    (1200.0, 20.0, 60.0, [(0.0, 1200.0)]),
+    (2700.0, 0.0, 60.0, [(0.0, 2700.0)]),
+    (130.0, 1.0, 90.0, [(0.0, 60.0), (0.0, 120.0), (30.0, 130.0)]),
+    (130.0, 1.0, 0.0, [(0.0, 60.0), (60.0, 120.0), (120.0, 130.0)]),
+])
+def test_plan_cloud_chunks_preserves_adapter_boundaries(
+    duration: float, chunk_minutes: float, overlap: float, expected: list[tuple[float, float]]
+) -> None:
+    assert plan_cloud_chunks(duration, chunk_minutes, overlap) == expected
+    assert _plan_chunks_for(duration, chunk_minutes=chunk_minutes, overlap_sec=overlap) == expected
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_plan_cloud_chunks_rejects_invalid_inputs(position: int, value: float) -> None:
+    args = [2700.0, 20.0, 60.0]
+    args[position] = value
+    with pytest.raises(ValueError):
+        plan_cloud_chunks(*args)
 
 
 def test_rescale_stretched_timestamps_preserves_relative_position() -> None:
