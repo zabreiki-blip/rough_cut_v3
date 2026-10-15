@@ -47,3 +47,55 @@ def test_validate_env_rejects_removed_direct_gemini_provider() -> None:
     )
 
     assert "TTS_PROVIDER must be openrouter or macos" in warnings
+
+
+def test_validate_env_rejects_invalid_final_review_cost_guard() -> None:
+    secret = "private-cost-input"
+    warnings = validate_env(
+        {
+            "FINAL_REVIEW_TIMEOUT_SECONDS": "not-a-deadline",
+            "ROUGH_CUT_MAX_USD_PER_JOB": "-2.50",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": secret,
+        }
+    )
+
+    rendered = "\n".join(warnings)
+    assert "FINAL_REVIEW_TIMEOUT_SECONDS" in rendered
+    assert "ROUGH_CUT_MAX_USD_PER_JOB" in rendered
+    assert "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in rendered
+    assert secret not in rendered
+
+    incomplete_guard = validate_env(
+        {
+            "TTS_PROVIDER": "macos",
+            "ROUGH_CUT_API_TOKEN": "configured",
+            "ROUGH_CUT_MAX_USD_PER_JOB": "1.25",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0",
+        }
+    )
+    assert any(
+        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in warning
+        and "positive" in warning
+        for warning in incomplete_guard
+    )
+
+
+def test_validate_env_accepts_disabled_or_complete_cost_guard() -> None:
+    assert validate_env(
+        {
+            "FINAL_REVIEW_TIMEOUT_SECONDS": "7200",
+            "ROUGH_CUT_MAX_USD_PER_JOB": "0",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0",
+            "TTS_PROVIDER": "macos",
+            "ROUGH_CUT_API_TOKEN": "configured",
+        }
+    ) == []
+    assert validate_env(
+        {
+            "FINAL_REVIEW_TIMEOUT_SECONDS": "300",
+            "ROUGH_CUT_MAX_USD_PER_JOB": "2.75",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0.04",
+            "TTS_PROVIDER": "macos",
+            "ROUGH_CUT_API_TOKEN": "configured",
+        }
+    ) == []

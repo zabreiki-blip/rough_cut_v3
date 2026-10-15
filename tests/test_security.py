@@ -375,3 +375,20 @@ class ContainerSecurityConfigurationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_runtime_requests_pin_is_patched() -> None:
+    from packaging.version import Version
+
+    pins = []
+    for filename in ("requirements.txt", "requirements-lock.txt"):
+        matches = [
+            line.split("==", 1)[1]
+            for line in (ROOT_DIR / filename).read_text().splitlines()
+            if line.lower().startswith("requests==")
+        ]
+        assert len(matches) == 1, f"expected one Requests pin in {filename}"
+        pins.append(matches[0])
+
+    assert pins[0] == pins[1]
+    assert Version(pins[0]) >= Version("2.32.4")
