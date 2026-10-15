@@ -53,13 +53,21 @@ def test_host_speaker_path_maps_into_container_project(tmp_path: Path, monkeypat
         _revision_speaker_dir=lambda _paths, revision: speaker / "revisions" / revision,
     )
 
-    assert _revision_speaker_dir(
-        services, {"speaker_dir": str(host_projects / "BRIK" / "speaker")}, paths, "rev_0005"
-    ) == speaker / "revisions" / "rev_0005"
-    assert _revision_speaker_dir(
-        services, {"speaker_dir": str(host_projects / "BRIK" / "speaker" / "draft")}, paths,
-        "rev_0005",
-    ) == speaker / "draft"
+    assert (
+        _revision_speaker_dir(
+            services, {"speaker_dir": str(host_projects / "BRIK" / "speaker")}, paths, "rev_0005"
+        )
+        == speaker / "revisions" / "rev_0005"
+    )
+    assert (
+        _revision_speaker_dir(
+            services,
+            {"speaker_dir": str(host_projects / "BRIK" / "speaker" / "draft")},
+            paths,
+            "rev_0005",
+        )
+        == speaker / "draft"
+    )
     with pytest.raises(ValueError, match="Path must be inside"):
         _revision_speaker_dir(
             services,
