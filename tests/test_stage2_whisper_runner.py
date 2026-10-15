@@ -472,3 +472,88 @@ class WhisperRunnerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_cloud_options_reach_provider_and_preserve_budget_metadata(tmp_path) -> None:
+    from decimal import Decimal
+
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+    snapshots = []
+    seen = {}
+
+    def cloud(_path, *, budget_callback, **options):
+        seen.update(options)
+        budget_callback(
+            {"limit_usd": 1.0, "spent_usd": 0.04, "reserved_usd": 0.06, "total_usd": 0.1}
+        )
+        return {
+            "segments": [{"text": "раз два", "start": 0.0, "end": 2.0}],
+            "cost_usd": 0.04,
+            "reserved_cost_usd": 0.06,
+            "cost_limit_usd": 1.0,
+        }
+
+    with patch("stage2.whisper_runner.transcribe_cloud", side_effect=cloud):
+        result = transcribe_audio(
+            audio_path,
+            backend="cloud-audio",
+            model="test-model",
+            cloud_options={
+                "max_cost_usd": Decimal("1"),
+                "initial_cost_usd": "0.03",
+                "usd_per_minute_estimate": "0.06",
+                "timeout_sec": 0.5,
+            },
+            budget_callback=snapshots.append,
+        )
+
+    assert seen["max_cost_usd"] == Decimal("1")
+    assert seen["initial_cost_usd"] == "0.03"
+    assert seen["timeout_sec"] == 0.5
+    assert snapshots[-1]["reserved_usd"] == 0.06
+    for key, value in (("cost_usd", 0.04), ("reserved_cost_usd", 0.06), ("cost_limit_usd", 1.0)):
+        assert result["backend_metadata"][key] == value
+        assert result[key] == value
+
+
+def test_cloud_options_are_ignored_by_local_backend(tmp_path) -> None:
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    # Deliberately unsupported cloud options cannot affect a local backend.
+    def local(path, model, language, progress_callback):
+        return [{"word": "готово", "start": 0.0, "end": 1.0}], {}
+
+    with (
+        patch("stage2.whisper_runner.resolve_backend", return_value="faster-whisper"),
+        patch("stage2.whisper_runner._transcribe_faster", side_effect=local),
+    ):
+        result = transcribe_audio(
+            audio_path,
+            backend="faster-whisper",
+            model="test-model",
+            cloud_options={"unsupported_option": "unused"},
+            budget_callback=lambda _: (_ for _ in ()).throw(AssertionError("cloud callback")),
+        )
+
+    assert result["words"][0]["word"] == "готово"
+    assert "reserved_cost_usd" not in result
+
+
+def test_cloud_options_asr_error_retains_budget_fields(tmp_path) -> None:
+    import pytest
+
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+    error = CloudAudioAsrError("invalid transcript", cost_usd=0.04)
+    error.reserved_cost_usd = 0.06
+    error.cost_limit_usd = 1.0
+
+    with patch("stage2.whisper_runner.transcribe_cloud", side_effect=error):
+        with pytest.raises(WhisperTranscriptionError) as caught:
+            transcribe_audio(audio_path, backend="cloud-audio", cloud_options={})
+
+    assert caught.value.cost_usd == 0.04
+    assert caught.value.reserved_cost_usd == 0.06
+    assert caught.value.cost_limit_usd == 1.0

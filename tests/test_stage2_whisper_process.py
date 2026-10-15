@@ -321,3 +321,306 @@ def test_shutdown_does_not_wait_for_long_running_request() -> None:
     assert elapsed < 2.0
     assert not request_thread.is_alive()
     assert errors
+
+
+def test_cloud_options_are_decimal_safe_and_reach_child_runner() -> None:
+    from decimal import Decimal
+
+    options = {
+        "max_cost_usd": Decimal("0.123456789123456789"),
+        "usd_per_minute_estimate": Decimal("0.06"),
+        "initial_cost_usd": Decimal("0.03"),
+    }
+
+    def inspect_options(_path, *, cloud_options, **_kwargs):
+        return {"options": cloud_options}
+
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=inspect_options):
+        result = transcribe_audio_in_process(
+            "unused.wav",
+            backend="cloud-audio",
+            cloud_options=options,
+            timeout_seconds=2,
+            _start_method="fork",
+        )
+
+    assert result["options"]["max_cost_usd"] == "0.123456789123456789"
+    assert result["options"]["usd_per_minute_estimate"] == "0.06"
+    assert result["options"]["initial_cost_usd"] == "0.03"
+    assert 0 < result["options"]["timeout_sec"] <= 2
+    assert options["max_cost_usd"] == Decimal("0.123456789123456789")
+
+
+@pytest.mark.parametrize("stop", ["cancel", "timeout"])
+def test_cloud_options_budget_snapshot_survives_cancel_or_timeout(stop) -> None:
+    cancel = threading.Event()
+    reported = threading.Event()
+    observed_progress = []
+
+    def hang(_path, *, progress_callback, budget_callback, **_kwargs):
+        budget_callback(
+            {"limit_usd": 1.0, "spent_usd": 0.03, "reserved_usd": 0.12, "total_usd": 0.15}
+        )
+        progress_callback(1.0, 60.0, 2)
+        time.sleep(5)
+        return {}
+
+    def on_progress(done, total, words):
+        observed_progress.append((done, total, words))
+        reported.set()
+        if stop == "cancel":
+            cancel.set()
+
+    started = time.monotonic()
+    error_type = WhisperCancelledError if stop == "cancel" else WhisperTimeoutError
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=hang):
+        with pytest.raises(error_type) as caught:
+            transcribe_audio_in_process(
+                "unused.wav",
+                backend="cloud-audio",
+                cloud_options={
+                    "initial_cost_usd": "0.03",
+                    "max_cost_usd": "1",
+                    "usd_per_minute_estimate": "0.06",
+                },
+                cancel_event=cancel,
+                timeout_seconds=0.2,
+                _start_method="fork",
+                progress_callback=on_progress,
+            )
+
+    assert reported.is_set()
+    assert observed_progress == [(1.0, 60.0, 2)]
+    assert caught.value.cost_usd == pytest.approx(0.03)
+    assert caught.value.reserved_cost_usd == pytest.approx(0.12)
+    assert caught.value.cost_limit_usd == 1.0
+    assert whisper_process._worker is None
+    assert time.monotonic() - started < 1.0
+
+
+def test_cloud_options_budget_error_crosses_process_boundary() -> None:
+    from cost_budget import CostBudgetExceeded
+
+    def fail(_path, **_kwargs):
+        error = CostBudgetExceeded("budget exceeded")
+        error.cost_usd = 0.04
+        error.reserved_cost_usd = 0.12
+        error.cost_limit_usd = 0.15
+        raise error
+
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=fail):
+        with pytest.raises(WhisperProcessError, match="CostBudgetExceeded") as caught:
+            transcribe_audio_in_process(
+                "unused.wav",
+                cloud_options={"max_cost_usd": "0.15"},
+                timeout_seconds=2,
+                _start_method="fork",
+            )
+
+    assert caught.value.cost_usd == pytest.approx(0.04)
+    assert caught.value.reserved_cost_usd == pytest.approx(0.12)
+    assert caught.value.cost_limit_usd == pytest.approx(0.15)
+
+
+def test_cancel_while_waiting_for_worker_lock_is_prompt() -> None:
+    cancel = threading.Event()
+    errors = []
+
+    def request():
+        try:
+            transcribe_audio_in_process(
+                "unused.wav",
+                cancel_event=cancel,
+                _start_method="fork",
+                cloud_options={"initial_cost_usd": "0.03", "max_cost_usd": "1"},
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    whisper_process._worker_lock.acquire()
+    thread = threading.Thread(target=request, daemon=True)
+    try:
+        thread.start()
+        cancel.set()
+        thread.join(timeout=0.5)
+        assert not thread.is_alive(), "cancellation waited behind the busy worker"
+    finally:
+        whisper_process._worker_lock.release()
+        thread.join(timeout=2)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], WhisperCancelledError)
+    assert errors[0].cost_usd == pytest.approx(0.03)
+    assert errors[0].reserved_cost_usd == 0.0
+    assert whisper_process._worker is None
+
+
+def test_timeout_whole_job_deadline_includes_worker_queue_time() -> None:
+    errors = []
+
+    def request():
+        try:
+            transcribe_audio_in_process(
+                "unused.wav",
+                deadline_monotonic=time.monotonic() + 0.05,
+                timeout_seconds=10,
+                _start_method="fork",
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    whisper_process._worker_lock.acquire()
+    thread = threading.Thread(target=request, daemon=True)
+    try:
+        thread.start()
+        thread.join(timeout=0.5)
+        assert not thread.is_alive(), "whole-job deadline ignored worker queue time"
+    finally:
+        whisper_process._worker_lock.release()
+        thread.join(timeout=2)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], WhisperTimeoutError)
+    assert whisper_process._worker is None
+
+
+def test_timeout_remaining_deadline_bounds_cloud_inference_options() -> None:
+    def inspect_options(_path, *, cloud_options, **_kwargs):
+        return {"timeout": cloud_options["timeout_sec"]}
+
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=inspect_options):
+        result = transcribe_audio_in_process(
+            "unused.wav",
+            backend="cloud-audio",
+            timeout_seconds=10,
+            deadline_monotonic=time.monotonic() + 0.5,
+            _start_method="fork",
+        )
+
+    assert 0 < result["timeout"] <= 0.5
+
+
+def test_cancel_preserves_budget_message_queued_behind_progress() -> None:
+    cancel = threading.Event()
+    budget_sent = multiprocessing.get_context("fork").Event()
+
+    def hang(_path, *, progress_callback, budget_callback, **_kwargs):
+        progress_callback(0, 60, 0)
+        budget_callback(
+            {"limit_usd": 1.0, "spent_usd": 0.03, "reserved_usd": 0.06, "total_usd": 0.09}
+        )
+        budget_sent.set()
+        time.sleep(5)
+        return {}
+
+    def on_progress(*_args):
+        assert budget_sent.wait(timeout=1)
+        cancel.set()
+
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=hang):
+        with pytest.raises(WhisperCancelledError) as caught:
+            transcribe_audio_in_process(
+                "unused.wav",
+                cancel_event=cancel,
+                timeout_seconds=2,
+                _start_method="fork",
+                progress_callback=on_progress,
+            )
+
+    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+    assert caught.value.cost_usd == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize("stop", ["cancel", "timeout"])
+def test_cloud_options_parent_stop_interrupts_provider_http(tmp_path, monkeypatch, stop) -> None:
+    import asyncio
+    import httpx
+    from stage2 import cloud_asr
+
+    context = multiprocessing.get_context("fork")
+    calls = context.Value("i", 0)
+    entered_http = context.Event()
+    cancel = threading.Event()
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    async def extract(*_args):
+        return b"mp3"
+
+    async def handler(_request):
+        with calls.get_lock():
+            calls.value += 1
+        entered_http.set()
+        await asyncio.sleep(5)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "[00:01] ГОЛОС 1: Готово"}}],
+                "usage": {"cost": 0.01},
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    monkeypatch.setattr(
+        cloud_asr.httpx,
+        "AsyncClient",
+        lambda **_kw: real_client(transport=httpx.MockTransport(handler)),
+    )
+
+    def cancel_after_http_starts():
+        if entered_http.wait(timeout=2):
+            cancel.set()
+
+    thread = None
+    if stop == "cancel":
+        thread = threading.Thread(target=cancel_after_http_starts, daemon=True)
+        thread.start()
+    started = time.monotonic()
+    error_type = WhisperCancelledError if stop == "cancel" else WhisperTimeoutError
+    try:
+        with pytest.raises(error_type) as caught:
+            transcribe_audio_in_process(
+                audio_path,
+                backend="cloud-audio",
+                cancel_event=cancel,
+                timeout_seconds=0.2 if stop == "timeout" else 2,
+                _start_method="fork",
+                cloud_options={
+                    "api_key": "test-key",
+                    "chunk_minutes": 1,
+                    "overlap_sec": 0,
+                    "max_cost_usd": "1",
+                    "usd_per_minute_estimate": "0.06",
+                },
+            )
+    finally:
+        if thread is not None:
+            thread.join(timeout=2)
+
+    assert entered_http.is_set()
+    assert calls.value == 1
+    assert time.monotonic() - started < 1.0
+    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+    assert whisper_process._worker is None
+
+
+def test_cancel_before_cloud_start_retains_environment_budget_limit(monkeypatch) -> None:
+    cancel = threading.Event()
+    cancel.set()
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.15")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+
+    with pytest.raises(WhisperCancelledError) as caught:
+        transcribe_audio_in_process(
+            "unused.wav",
+            backend="cloud-audio",
+            cancel_event=cancel,
+            _start_method="fork",
+        )
+
+    assert caught.value.cost_usd == 0.0
+    assert caught.value.reserved_cost_usd == 0.0
+    assert caught.value.cost_limit_usd == pytest.approx(0.15)
+    assert whisper_process._worker is None
