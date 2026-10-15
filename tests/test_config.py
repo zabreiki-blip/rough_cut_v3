@@ -99,3 +99,41 @@ def test_validate_env_accepts_disabled_or_complete_cost_guard() -> None:
             "ROUGH_CUT_API_TOKEN": "configured",
         }
     ) == []
+
+
+def test_validate_env_rejects_nonfinite_costs_and_cost_guard_boundaries() -> None:
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        warnings = validate_env(
+            {
+                "TTS_PROVIDER": "macos",
+                "ROUGH_CUT_API_TOKEN": "configured",
+                "ROUGH_CUT_MAX_USD_PER_JOB": raw,
+                "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": raw,
+            }
+        )
+        rendered = "\n".join(warnings)
+        assert "ROUGH_CUT_MAX_USD_PER_JOB" in rendered
+        assert "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in rendered
+        assert raw not in rendered
+
+    nonpositive_timeout = validate_env(
+        {
+            "TTS_PROVIDER": "macos",
+            "ROUGH_CUT_API_TOKEN": "configured",
+            "FINAL_REVIEW_TIMEOUT_SECONDS": "0",
+        }
+    )
+    assert any("FINAL_REVIEW_TIMEOUT_SECONDS" in warning for warning in nonpositive_timeout)
+
+    missing_estimate = validate_env(
+        {
+            "TTS_PROVIDER": "macos",
+            "ROUGH_CUT_API_TOKEN": "configured",
+            "ROUGH_CUT_MAX_USD_PER_JOB": "1.25",
+        }
+    )
+    assert any(
+        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in warning
+        and "positive" in warning
+        for warning in missing_estimate
+    )
