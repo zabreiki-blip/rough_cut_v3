@@ -227,6 +227,7 @@ _FINAL_REVIEW_RUNTIME = JobRegistry()
 _FINAL_REVIEW_JOBS = _FINAL_REVIEW_RUNTIME.jobs
 _FINAL_REVIEW_JOBS_LOCK = _FINAL_REVIEW_RUNTIME.lock
 _FINAL_REVIEW_ACTIVE_PROJECTS = _FINAL_REVIEW_RUNTIME.active_projects
+_FINAL_REVIEW_CANCEL_EVENTS = _FINAL_REVIEW_RUNTIME.cancel_events
 _NORMALIZATION_RUNTIME = JobRegistry()
 _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
@@ -1703,6 +1704,14 @@ def _get_final_review_job(job_id: str) -> dict | None:
     return final_review_jobs.get_final_review_job(_final_review_job_services(), job_id)
 
 
+def _get_latest_final_review_job(project: str) -> dict | None:
+    return final_review_jobs.get_latest_final_review_job(_final_review_job_services(), project)
+
+
+def _cancel_final_review_job(job_id: str) -> tuple[dict | None, str | None]:
+    return final_review_jobs.cancel_final_review_job(_final_review_job_services(), job_id)
+
+
 def _load_persisted_final_review_job(project: str) -> dict | None:
     return final_review_jobs.load_persisted_final_review_job(_final_review_job_services(), project)
 
@@ -1722,6 +1731,7 @@ def _run_final_review_job(
     backend: str | None,
     model: str | None,
     source_sequence: dict,
+    cloud_options: dict | None = None,
 ) -> None:
     final_review_jobs.run_final_review_job(
         _final_review_job_services(),
@@ -1732,6 +1742,7 @@ def _run_final_review_job(
         backend=backend,
         model=model,
         source_sequence=source_sequence,
+        cloud_options=cloud_options,
     )
 
 

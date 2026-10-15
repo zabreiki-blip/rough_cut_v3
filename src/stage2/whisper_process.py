@@ -380,6 +380,7 @@ def transcribe_audio_in_process(
     timeout_seconds: float | None = None,
     cloud_options: Mapping[str, Any] | None = None,
     deadline_monotonic: float | None = None,
+    budget_callback: Callable[[dict[str, float]], None] | None = None,
     _start_method: str = "spawn",
 ) -> dict[str, Any]:
     """Transcribe in a reusable, killable child process.
@@ -424,6 +425,17 @@ def transcribe_audio_in_process(
                 raise ValueError("cloud timeout_sec must be a finite positive number")
     deadline = deadline_monotonic
     request_id: int | None = None
+    published_budget: dict[str, float] | None = None
+
+    def receive_budget(snapshot: dict[str, float]) -> None:
+        nonlocal last_budget, published_budget
+        last_budget = dict(snapshot)
+        if budget_callback is not None and last_budget != published_budget:
+            published_budget = dict(last_budget)
+            try:
+                budget_callback(dict(last_budget))
+            except Exception:
+                pass
 
     def attach_budget(error: BaseException) -> BaseException:
         error.cost_usd = last_budget["spent_usd"]  # type: ignore[attr-defined]
@@ -449,7 +461,7 @@ def transcribe_audio_in_process(
                         if message[1] != request_id:
                             continue
                         if message[0] == "budget":
-                            last_budget = dict(message[2])
+                            receive_budget(message[2])
                         elif message[0] == "error":
                             for index, field in enumerate(
                                 ("spent_usd", "reserved_usd", "limit_usd"), start=4
@@ -530,7 +542,7 @@ def transcribe_audio_in_process(
                         WhisperProcessError("Whisper worker returned an unexpected response")
                     )
                 if kind == "budget":
-                    last_budget = dict(message[2])
+                    receive_budget(message[2])
                 elif kind == "progress":
                     if progress_callback is not None:
                         try:

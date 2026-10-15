@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import threading
+import time
 from typing import Any
 
 from api_service_contracts import FinalReviewJobServices
+from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
+
+
+def final_review_deadline() -> float:
+    raw = os.getenv("FINAL_REVIEW_TIMEOUT_SECONDS", "").strip() or "7200"
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise ValueError("FINAL_REVIEW_TIMEOUT_SECONDS must be a positive integer") from exc
+    if seconds <= 0:
+        raise ValueError("FINAL_REVIEW_TIMEOUT_SECONDS must be a positive integer")
+    return time.monotonic() + seconds
 
 
 def reserve_final_review_project(services: FinalReviewJobServices, project: str) -> bool:
@@ -47,13 +62,30 @@ def create_final_review_job(
         "finished_at": "",
         "error": "",
         "report_path": "",
+        "estimated_cost_usd": payload.get("estimated_cost_usd", 0.0),
+        "cost_limit_usd": payload.get("cost_limit_usd", 0.0),
+        "cost_usd": 0.0,
+        "reserved_cost_usd": 0.0,
+        "transcription_processed_sec": 0.0,
+        "transcription_duration_sec": payload.get("duration_sec", 0.0),
+        "transcription_words": 0,
+        "deadline_monotonic": (
+            payload["deadline_monotonic"]
+            if "deadline_monotonic" in payload else final_review_deadline()
+        ),
     }
     job_id = str(job["id"])
     with services._FINAL_REVIEW_JOBS_LOCK:
         services._FINAL_REVIEW_JOBS[job_id] = job
-    services._atomic_write_json_file(
-        services._project_paths(project)["final_review_job_status"], job
-    )
+        services._FINAL_REVIEW_CANCEL_EVENTS[job_id] = threading.Event()
+        try:
+            services._atomic_write_json_file(
+                services._project_paths(project)["final_review_job_status"], job
+            )
+        except Exception:
+            services._FINAL_REVIEW_JOBS.pop(job_id, None)
+            services._FINAL_REVIEW_CANCEL_EVENTS.pop(job_id, None)
+            raise
     return dict(job)
 
 
@@ -75,7 +107,7 @@ def load_persisted_final_review_job(
     if payload.get("project") != project or not str(payload.get("id") or "").strip():
         return None
     restored = dict(payload)
-    if str(restored.get("status") or "").lower() in {"queued", "running"}:
+    if str(restored.get("status") or "").lower() in {"queued", "running", "cancelling"}:
         # The worker thread died with the process. Report a terminal state
         # rather than allowing the CEP panel to poll a job that cannot advance.
         restored["status"] = "interrupted"
@@ -83,23 +115,64 @@ def load_persisted_final_review_job(
     return restored
 
 
+def get_latest_final_review_job(
+    services: FinalReviewJobServices, project: str
+) -> dict[str, Any] | None:
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        candidates = [
+            dict(job) for job in services._FINAL_REVIEW_JOBS.values()
+            if job.get("project") == project
+        ]
+    if candidates:
+        return max(candidates, key=lambda job: str(job.get("created_at") or ""))
+    return load_persisted_final_review_job(services, project)
+
+
+def cancel_final_review_job(
+    services: FinalReviewJobServices, job_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        job = services._FINAL_REVIEW_JOBS.get(job_id)
+        if job is None:
+            return None, "job not found"
+        if job.get("status") not in {"queued", "running", "cancelling"}:
+            return dict(job), None
+        event = services._FINAL_REVIEW_CANCEL_EVENTS.get(job_id)
+        if event is None:
+            return None, "job worker is not active"
+        event.set()
+        job.update(status="cancelling", message="Cancellation requested; stopping final review")
+        snapshot = dict(job)
+        services._atomic_write_json_file(
+            services._project_paths(str(job["project"]))["final_review_job_status"], snapshot
+        )
+        return snapshot, None
+
+
 def update_final_review_job(
     services: FinalReviewJobServices,
     job_id: str,
+    *,
+    persist: bool = True,
     **updates: Any,
 ) -> dict[str, Any] | None:
-    snapshot = services.update_job(
-        services._FINAL_REVIEW_JOBS_LOCK,
-        services._FINAL_REVIEW_JOBS,
-        job_id,
-        updates,
-    )
-    if snapshot:
-        services._atomic_write_json_file(
-            services._project_paths(str(snapshot["project"]))["final_review_job_status"],
-            snapshot,
-        )
-    return snapshot
+    # Serialize mutation and persistence so a slow progress write cannot
+    # overwrite a newer cancellation or terminal checkpoint.
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        job = services._FINAL_REVIEW_JOBS.get(job_id)
+        if job is None:
+            return None
+        if updates.get("status") == "running" and job.get("status") == "cancelling":
+            updates.pop("status")
+            updates.pop("message", None)
+        job.update(updates)
+        snapshot = dict(job)
+        if persist:
+            services._atomic_write_json_file(
+                services._project_paths(str(snapshot["project"]))["final_review_job_status"],
+                snapshot,
+            )
+        return snapshot
 
 
 def run_final_review_job(
@@ -112,14 +185,83 @@ def run_final_review_job(
     backend: str | None,
     model: str | None,
     source_sequence: dict[str, Any],
+    cloud_options: dict[str, Any] | None = None,
 ) -> None:
-    usage_callback = services._make_openrouter_usage_callback(
-        project,
-        stage="assembly",
-        operation="final_review_asr",
-        job_id=job_id,
-    )
+    usage_callback = None
+    usage_recorded = False
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        job = dict(services._FINAL_REVIEW_JOBS.get(job_id) or {})
+        cancel_event = services._FINAL_REVIEW_CANCEL_EVENTS.get(job_id)
+    deadline = job.get("deadline_monotonic")
+    last_persisted = float("-inf")
+
+    def check_stop() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise WhisperCancelledError("Final review cancelled")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WhisperTimeoutError("Final review whole-job deadline exceeded")
+
+    def checkpoint(**updates: Any) -> None:
+        nonlocal last_persisted
+        now = time.monotonic()
+        persist = now - last_persisted >= 1.0
+        services._update_final_review_job(job_id, persist=persist, **updates)
+        if persist:
+            last_persisted = now
+
+    def progress(processed: float, duration: float, words: int) -> None:
+        checkpoint(
+            transcription_processed_sec=processed,
+            transcription_duration_sec=duration,
+            transcription_words=words,
+        )
+
+    def budget(snapshot: dict[str, float]) -> None:
+        checkpoint(
+            cost_usd=snapshot["spent_usd"],
+            reserved_cost_usd=snapshot["reserved_usd"],
+            cost_limit_usd=snapshot["limit_usd"],
+        )
+
+    def cost_updates(source: Any) -> dict[str, Any]:
+        values = {}
+        for field in ("cost_usd", "reserved_cost_usd", "cost_limit_usd"):
+            value = source.get(field) if isinstance(source, dict) else getattr(source, field, None)
+            if value is not None:
+                values[field] = float(value)
+        return values
+
+    def record_usage(cost: Any, selected_model: str, *, allow_unknown: bool = False) -> None:
+        nonlocal usage_recorded
+        if not usage_recorded and usage_callback is not None and (cost is not None or allow_unknown):
+            usage_callback({
+                "event_id": f"final-review-asr:{job_id}",
+                "model": selected_model,
+                "cost_usd": cost,
+            })
+            usage_recorded = True
+
+    def finish_error(exc: Exception, *, cancelled: bool = False) -> None:
+        failed_cost = cost_updates(exc)
+        latest = get_final_review_job(services, job_id) or {}
+        try:
+            if backend == "cloud-audio" or "cost_usd" in failed_cost:
+                record_usage(failed_cost.get("cost_usd", latest.get("cost_usd")), str(model or ""))
+        finally:
+            services._update_final_review_job(
+                job_id,
+                status="cancelled" if cancelled else "failed",
+                message="Final review cancelled" if cancelled else "Final review failed",
+                error="" if cancelled else str(exc),
+                finished_at=services._utc_now_iso(),
+                **failed_cost,
+            )
+
     try:
+        check_stop()
+        usage_callback = services._make_openrouter_usage_callback(
+            project, stage="assembly", operation="final_review_asr", job_id=job_id
+        )
         paths = services._project_paths(project)
         manifest = services._read_json_safe(paths["assembly_manifest"])
         services.validate_assembly_manifest(
@@ -134,21 +276,28 @@ def run_final_review_job(
             message="Transcribing rendered timeline",
             started_at=services._utc_now_iso(),
         )
+        check_stop()
         result = services.transcribe_audio(
             audio_path,
             backend=backend,
             model=model,
             language=language,
+            cancel_event=cancel_event,
+            deadline_monotonic=deadline,
+            cloud_options=cloud_options,
+            progress_callback=progress,
+            budget_callback=budget,
         )
         result_backend_metadata = result.get("backend_metadata") or {}
+        final_cost = cost_updates(result_backend_metadata)
+        final_cost.update(cost_updates(result))
+        services._update_final_review_job(job_id, **final_cost)
         if str(result.get("backend") or backend or "") == "cloud-audio":
-            usage_callback(
-                {
-                    "event_id": f"final-review-asr:{job_id}",
-                    "model": str(result.get("model") or model or ""),
-                    "cost_usd": result_backend_metadata.get("cost_usd"),
-                }
+            record_usage(
+                final_cost.get("cost_usd"), str(result.get("model") or model or ""),
+                allow_unknown=True,
             )
+        check_stop()
         services.validate_assembly_manifest(
             manifest,
             timeline_path=paths["timeline"],
@@ -161,7 +310,7 @@ def run_final_review_job(
             model=str(result.get("model") or model or ""),
             language=str(result.get("language") or language),
         )
-        services.save_word_index(paths["final_review_words"], index)
+        check_stop()
         timeline_data = services._read_json_safe(paths["work"] / "full_timeline.json")
         timeline = services.FullTimeline.from_dict(timeline_data)
         report = services.review_rendered_timeline(timeline, index)
@@ -178,32 +327,28 @@ def run_final_review_job(
                 "assembly_findings": list(manifest.get("findings") or []),
             }
         )
-        services._atomic_write_json_file(paths["final_review_report"], report)
-        services._update_final_review_job(
-            job_id,
-            status="completed",
-            message="Final review completed",
-            finished_at=services._utc_now_iso(),
-            report_path=str(paths["final_review_report"].relative_to(paths["root"])),
-        )
+        # Cancellation and artifact publication share one commit boundary.
+        # A cancel accepted before this lock always wins; after publication
+        # callers observe the existing terminal job without changing it.
+        with services._FINAL_REVIEW_JOBS_LOCK:
+            check_stop()
+            services.save_word_index(paths["final_review_words"], index)
+            services._atomic_write_json_file(paths["final_review_report"], report)
+            current = services._FINAL_REVIEW_JOBS.get(job_id)
+            if current is not None:
+                current.update(
+                    status="completed", message="Final review completed",
+                    finished_at=services._utc_now_iso(),
+                    report_path=str(paths["final_review_report"].relative_to(paths["root"])),
+                )
+                services._atomic_write_json_file(paths["final_review_job_status"], dict(current))
+    except WhisperCancelledError as exc:
+        finish_error(exc, cancelled=True)
     except Exception as exc:
-        failed_cost = getattr(exc, "cost_usd", None)
-        if failed_cost is not None:
-            usage_callback(
-                {
-                    "event_id": f"final-review-asr:{job_id}",
-                    "model": str(model or ""),
-                    "cost_usd": failed_cost,
-                }
-            )
-        services._update_final_review_job(
-            job_id,
-            status="failed",
-            message="Final review failed",
-            error=str(exc),
-            finished_at=services._utc_now_iso(),
-        )
+        finish_error(exc)
     finally:
+        with services._FINAL_REVIEW_JOBS_LOCK:
+            services._FINAL_REVIEW_CANCEL_EVENTS.pop(job_id, None)
         services._release_final_review_project(project)
 
 

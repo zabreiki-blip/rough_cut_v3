@@ -732,3 +732,25 @@ def test_local_backend_ignores_malformed_cloud_options_and_reuses_worker(monkeyp
     assert whisper_process._worker is not None
     assert whisper_process._worker.process.is_alive()
     assert whisper_process._worker_last_active is not None
+
+
+def test_process_forwards_distinct_live_budget_snapshots() -> None:
+    snapshots = []
+
+    def fake_transcribe(_path, *, budget_callback, **_kwargs):
+        first = {'limit_usd': 1.0, 'spent_usd': 0.0, 'reserved_usd': 0.06, 'total_usd': 0.06}
+        budget_callback(first)
+        budget_callback(dict(first))
+        budget_callback({'limit_usd': 1.0, 'spent_usd': 0.04, 'reserved_usd': 0.0, 'total_usd': 0.04})
+        return {'words': []}
+
+    with patch('stage2.whisper_process.transcribe_audio', side_effect=fake_transcribe):
+        transcribe_audio_in_process(
+            'unused.wav', backend='cloud-audio', timeout_seconds=2.0,
+            _start_method='fork', budget_callback=lambda snapshot: snapshots.append(dict(snapshot)),
+        )
+
+    assert snapshots == [
+        {'limit_usd': 1.0, 'spent_usd': 0.0, 'reserved_usd': 0.06, 'total_usd': 0.06},
+        {'limit_usd': 1.0, 'spent_usd': 0.04, 'reserved_usd': 0.0, 'total_usd': 0.04},
+    ]

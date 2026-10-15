@@ -1,11 +1,14 @@
 from pathlib import Path
 from types import SimpleNamespace
 import threading
+import time
 import uuid
+import wave
 
 from flask import Flask
 import pytest
 
+import api_final_review_jobs
 from api_final_review_jobs import (
     create_final_review_job,
     load_persisted_final_review_job,
@@ -26,6 +29,7 @@ from api_final_review_routes import (
 )
 from job_runtime import get_job, release_project, reserve_project, update_job
 from stage2.models import FullTimeline
+from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
 
 
 def _error(message: str, status: int):
@@ -208,6 +212,7 @@ def test_final_review_start_rejects_stale_duration(tmp_path: Path, monkeypatch) 
 
 
 def test_final_review_start_creates_job_and_worker(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(api_final_review_routes, "resolve_backend", lambda _backend: "cloud-audio", raising=False)
     app = Flask(__name__)
     root = tmp_path / "demo"
     work = root / "work"
@@ -483,6 +488,10 @@ def _job_services(tmp_path: Path, *, transcribe=None):
         _FINAL_REVIEW_JOBS=jobs,
         _FINAL_REVIEW_JOBS_LOCK=threading.RLock(),
         _FINAL_REVIEW_ACTIVE_PROJECTS=active,
+        _FINAL_REVIEW_CANCEL_EVENTS={"job-1": threading.Event()},
+        threading=threading,
+        time=time,
+        WhisperCancelledError=WhisperCancelledError,
         uuid=uuid,
         FullTimeline=SimpleNamespace(from_dict=lambda payload: payload),
         _project_transition_lock=lambda _project: threading.RLock(),
@@ -596,3 +605,423 @@ def test_final_review_worker_records_cloud_cost_and_failure_cost(tmp_path: Path)
     assert failed._FINAL_REVIEW_JOBS["job-1"]["status"] == "failed"
     assert failed._test_usage[0]["cost_usd"] == 0.5
     assert "demo" not in failed._FINAL_REVIEW_ACTIVE_PROJECTS
+
+
+@pytest.fixture
+def controller(tmp_path, monkeypatch):
+    """Real registry/routes/files with only external transcription and threads deferred."""
+    services = _job_services(tmp_path)
+    paths = services._test_paths
+    audio = paths['work'] / 'review.wav'
+    with wave.open(str(audio), 'wb') as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(1)
+        target.writeframes(b'\0\0' * 150)
+    paths['final_review_audio'] = audio
+    (paths['work'] / 'full_timeline.json').write_text('{}')
+    services._FINAL_REVIEW_JOBS.clear()
+    services._FINAL_REVIEW_ACTIVE_PROJECTS.clear()
+    services._FINAL_REVIEW_CANCEL_EVENTS.clear()
+    services.FullTimeline = SimpleNamespace(
+        from_dict=lambda _payload: SimpleNamespace(total_duration_sec=150)
+    )
+    services._resolve_project_name = lambda value: (
+        value if value == 'demo' else (_ for _ in ()).throw(ValueError('project is required'))
+    )
+    services._ensure_project = services._project_paths
+    services._normalization_required = lambda _project: None
+    services._json_error = _error
+    services._reserve_final_review_project = lambda project: reserve_project(
+        services._FINAL_REVIEW_JOBS_LOCK, services._FINAL_REVIEW_ACTIVE_PROJECTS, project
+    )
+    services.build_assembly_manifest = lambda **_options: {'manifest_id': 'manifest-1'}
+    services.attach_scenario_revision = lambda *_args: None
+    services._create_final_review_job = lambda project, audio, payload: create_final_review_job(
+        services, project, audio, payload
+    )
+    services._get_final_review_job = lambda job_id: get_job(
+        services._FINAL_REVIEW_JOBS_LOCK, services._FINAL_REVIEW_JOBS, job_id
+    )
+    services._get_latest_final_review_job = lambda project: (
+        api_final_review_jobs.get_latest_final_review_job(services, project)
+    )
+    services._cancel_final_review_job = lambda job_id: (
+        api_final_review_jobs.cancel_final_review_job(services, job_id)
+    )
+    services._load_persisted_final_review_job = lambda project: load_persisted_final_review_job(
+        services, project
+    )
+    services._run_final_review_job = lambda **options: run_final_review_job(services, **options)
+    pending = []
+
+    class DeferredThread:
+        def __init__(self, *, target, kwargs, daemon):
+            self.target, self.kwargs = target, kwargs
+            pending.append(self)
+
+        def start(self):
+            pass
+
+    services.threading = SimpleNamespace(Thread=DeferredThread, Event=threading.Event)
+    services._test_pending = pending
+    monkeypatch.setattr(api_final_review_routes, '_stable_wav', lambda _path: True)
+    monkeypatch.setenv('ROUGH_CUT_MAX_USD_PER_JOB', '1')
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0.06')
+    monkeypatch.setenv('FINAL_REVIEW_TIMEOUT_SECONDS', '10')
+    app = Flask(__name__)
+    register_final_review_routes(app, services)
+    return app.test_client(), services
+
+
+def _start_payload(**updates):
+    return {
+        'project': 'demo', 'backend': 'cloud-audio',
+        'cloud_options': {'chunk_minutes': 1, 'overlap_sec': 10}, **updates,
+    }
+
+
+def _run_pending(services):
+    pending = services._test_pending[-1]
+    pending.target(**pending.kwargs)
+
+
+def _assert_released(services, job_id):
+    assert 'demo' not in services._FINAL_REVIEW_ACTIVE_PROJECTS
+    assert job_id not in services._FINAL_REVIEW_CANCEL_EVENTS
+
+
+def test_latest_selects_newest_matching_memory_job_then_persisted(controller):
+    client, services = controller
+    services._FINAL_REVIEW_JOBS.update({
+        'new': {'id': 'new', 'project': 'demo', 'status': 'running', 'created_at': '2026-10-15'},
+        'old': {'id': 'old', 'project': 'demo', 'status': 'completed', 'created_at': '2026-10-14'},
+        'other': {'id': 'other', 'project': 'other', 'created_at': '2026-10-16'},
+    })
+    assert client.get('/stage2/final-review/latest?project=demo').get_json()['result']['id'] == 'new'
+    services._FINAL_REVIEW_JOBS.clear()
+    services._read_json_safe = lambda _path: {
+        'id': 'disk', 'project': 'demo', 'status': 'cancelling', 'cost_usd': 0.02,
+        'reserved_cost_usd': 0.06,
+    }
+    result = client.get('/stage2/final-review/latest?project=demo').get_json()['result']
+    assert result['id'] == 'disk'
+    assert result['status'] == 'interrupted'
+    assert result['reserved_cost_usd'] == 0.06
+    services._read_json_safe = lambda _path: {}
+    assert client.get('/stage2/final-review/latest?project=demo').status_code == 404
+
+
+@pytest.mark.parametrize('project', ['', '../bad'])
+def test_latest_rejects_missing_or_invalid_project(controller, project):
+    client, _services = controller
+    assert client.get('/stage2/final-review/latest', query_string={'project': project}).status_code == 400
+
+
+def test_estimate_counts_overlap_and_start_uses_identical_options(controller):
+    client, services = controller
+    estimate = client.post('/stage2/final-review/estimate', json=_start_payload())
+    assert estimate.status_code == 200
+    assert estimate.get_json()['result'] == {
+        'duration': 150.0, 'duration_sec': 150.0, 'planned_chunks': 3, 'estimated_cost_usd': 0.17,
+        'cost_limit_usd': 1.0, 'enforced': True,
+    }
+    assert services._FINAL_REVIEW_JOBS == {}
+    response = client.post('/stage2/final-review/start', json=_start_payload(confirmed_estimate_usd=0.17))
+    assert response.status_code == 202
+    job_id = response.get_json()['result']['job_id']
+    queued = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
+    assert queued['estimated_cost_usd'] == 0.17
+    assert queued['cost_limit_usd'] == 1.0
+    assert queued['cost_usd'] == 0.0
+    observed = {}
+
+    def transcribe(_path, **options):
+        observed.update(options)
+        running = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
+        assert running['status'] == 'running'
+        assert running['estimated_cost_usd'] == 0.17
+        assert running['cost_limit_usd'] == 1.0
+        assert running['cost_usd'] == 0.0
+        return {'backend': 'cloud-audio', 'backend_metadata': {'cost_usd': 0.12}}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    result = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
+    assert result['status'] == 'completed'
+    assert result['estimated_cost_usd'] == 0.17
+    assert result['cost_usd'] == 0.12
+    assert observed['cloud_options']['chunk_minutes'] == 1
+    assert observed['cloud_options']['overlap_sec'] == 10
+    assert str(observed['cloud_options']['max_cost_usd']) == '1'
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize('endpoint', ['estimate', 'start'])
+@pytest.mark.parametrize('rate,limit,status', [('0', '1', 400), ('0.06', '0.16', 409)])
+def test_preflight_blocks_unknown_or_over_budget_before_acceptance(
+    controller, monkeypatch, endpoint, rate, limit, status
+):
+    client, services = controller
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', rate)
+    monkeypatch.setenv('ROUGH_CUT_MAX_USD_PER_JOB', limit)
+    response = client.post(f'/stage2/final-review/{endpoint}', json=_start_payload())
+    assert response.status_code == status
+    assert services._FINAL_REVIEW_JOBS == {}
+    assert services._FINAL_REVIEW_ACTIVE_PROJECTS == set()
+    assert services._test_usage == []
+
+
+def test_start_rejects_changed_confirmation_and_invalid_estimate(controller):
+    client, services = controller
+    assert client.post('/stage2/final-review/start', json=_start_payload(confirmed_estimate_usd='0.16')).status_code == 409
+    assert client.post('/stage2/final-review/start', json=_start_payload(confirmed_estimate_usd='NaN')).status_code == 400
+    assert not services._test_pending
+
+
+def test_estimate_disabled_guard_allows_unknown_cost(controller, monkeypatch):
+    client, _services = controller
+    monkeypatch.setenv('ROUGH_CUT_MAX_USD_PER_JOB', '0')
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0')
+    response = client.post('/stage2/final-review/estimate', json=_start_payload())
+    assert response.status_code == 200
+    assert response.get_json()['result']['enforced'] is False
+    assert response.get_json()['result']['estimated_cost_usd'] == 0
+
+
+def test_cancel_queued_job_prevents_transcription_and_releases_project(controller):
+    client, services = controller
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+    cancelled = client.post(f'/stage2/final-review/jobs/{job_id}/cancel')
+    assert cancelled.status_code == 202
+    assert cancelled.get_json()['result']['status'] == 'cancelling'
+    services.transcribe_audio = lambda *_a, **_k: pytest.fail('cancelled job reached transcription')
+    _run_pending(services)
+    result = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
+    assert result['status'] == 'cancelled'
+    assert not any(path == services._test_paths['final_review_report'] for path, _ in services._test_writes)
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize('status', ['completed', 'failed', 'cancelled', 'interrupted'])
+def test_terminal_cancel_is_unchanged_and_idempotent(controller, status):
+    client, services = controller
+    job = {'id': 'terminal', 'project': 'demo', 'status': status, 'message': 'existing', 'cost_usd': 0.04}
+    services._FINAL_REVIEW_JOBS['terminal'] = dict(job)
+    before = list(services._test_writes)
+    for _attempt in range(2):
+        response = client.post('/stage2/final-review/jobs/terminal/cancel')
+        assert response.status_code == 200
+        assert response.get_json()['result'] == job
+    assert services._test_writes == before
+    assert client.post('/stage2/final-review/jobs/absent/cancel').status_code == 404
+
+
+def test_cancel_after_transcription_prevents_artifact_writes_and_retains_spend(controller):
+    client, services = controller
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+
+    def transcribe(_path, **options):
+        assert options['cancel_event'] is services._FINAL_REVIEW_CANCEL_EVENTS[job_id]
+        client.post(f'/stage2/final-review/jobs/{job_id}/cancel')
+        return {'backend': 'cloud-audio', 'backend_metadata': {'cost_usd': 0.07}}
+
+    services.transcribe_audio = transcribe
+    services.save_word_index = lambda *_args: pytest.fail('cancelled job wrote word index')
+    _run_pending(services)
+    job = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
+    assert job['status'] == 'cancelled'
+    assert job['cost_usd'] == 0.07
+    assert services._test_usage[-1]['cost_usd'] == 0.07
+    _assert_released(services, job_id)
+
+
+def test_whole_job_deadline_starts_before_worker_queue(controller, monkeypatch):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+    clock[0] = 106.0
+    observed = {}
+
+    def transcribe(_path, **options):
+        observed.update(options)
+        return {'backend': 'local'}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert observed['deadline_monotonic'] == 110.0
+    assert services._FINAL_REVIEW_JOBS[job_id]['status'] == 'completed'
+    _assert_released(services, job_id)
+
+
+def test_expired_queue_deadline_fails_before_transcription(controller, monkeypatch):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+    clock[0] = 111.0
+    services.transcribe_audio = lambda *_a, **_k: pytest.fail('expired job reached transcription')
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == 'failed'
+    assert 'deadline' in job['error'].lower()
+    assert job['estimated_cost_usd'] == 0.17
+    assert job['cost_usd'] == 0
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize('exception,status', [(WhisperTimeoutError, 'failed'), (WhisperCancelledError, 'cancelled')])
+def test_process_stop_retains_spent_and_reserved_cost(controller, exception, status):
+    client, services = controller
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+
+    def transcribe(*_args, **_options):
+        error = exception('stopped')
+        error.cost_usd, error.reserved_cost_usd, error.cost_limit_usd = 0.03, 0.06, 1.0
+        raise error
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == status
+    assert job['cost_usd'] == 0.03
+    assert job['reserved_cost_usd'] == 0.06
+    assert job['cost_limit_usd'] == 1.0
+    assert job['estimated_cost_usd'] == 0.17
+    assert services._test_usage[-1]['cost_usd'] == 0.03
+    _assert_released(services, job_id)
+
+
+def test_progress_persists_latest_budget_at_bounded_cadence(controller, monkeypatch):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+
+    def transcribe(_path, *, progress_callback, budget_callback, **_options):
+        budget_callback({'spent_usd': 0.02, 'reserved_usd': 0.06, 'limit_usd': 1.0, 'total_usd': 0.08})
+        before = len(services._test_writes)
+        for processed in range(1, 101):
+            progress_callback(float(processed), 150.0, processed)
+        assert len(services._test_writes) <= before + 1
+        clock[0] += 1.1
+        progress_callback(120.0, 150.0, 42)
+        persisted = services._test_writes[-1][1]
+        assert persisted['transcription_processed_sec'] == 120.0
+        assert persisted['transcription_duration_sec'] == 150.0
+        assert persisted['cost_usd'] == 0.02
+        assert persisted['reserved_cost_usd'] == 0.06
+        assert persisted['cost_limit_usd'] == 1.0
+        raise RuntimeError('after progress')
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == 'failed'
+    assert job['cost_usd'] == 0.02
+    assert job['reserved_cost_usd'] == 0.06
+    _assert_released(services, job_id)
+
+
+def test_local_preflight_ignores_cloud_rate_configuration(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', 'not-a-rate')
+    monkeypatch.setattr('stage2.whisper_runner.available_backends', lambda: ['faster-whisper'])
+    payload = _start_payload(backend='faster-whisper')
+    response = client.post('/stage2/final-review/estimate', json=payload)
+    assert response.status_code == 200
+    assert response.get_json()['result'] == {
+        'duration': 150.0, 'duration_sec': 150.0, 'planned_chunks': 0,
+        'estimated_cost_usd': 0.0, 'cost_limit_usd': 1.0, 'enforced': False,
+    }
+    assert client.post('/stage2/final-review/start', json=payload).status_code == 202
+    assert services._test_pending[-1].kwargs['backend'] == 'faster-whisper'
+
+
+def test_worker_start_failure_marks_job_failed_and_cleans_runtime(controller):
+    client, services = controller
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError('thread capacity exhausted')
+
+    services.threading.Thread = FailingThread
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    assert response.status_code == 500
+    job = next(iter(services._FINAL_REVIEW_JOBS.values()))
+    assert job['status'] == 'failed'
+    assert 'thread capacity' in job['error']
+    _assert_released(services, job['id'])
+
+
+def test_manifest_conflict_still_returns_409_and_releases_project(controller):
+    client, services = controller
+    services.build_assembly_manifest = lambda **_options: (_ for _ in ()).throw(ValueError('snapshot changed'))
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    assert response.status_code == 409
+    assert not services._FINAL_REVIEW_ACTIVE_PROJECTS
+    assert not services._FINAL_REVIEW_CANCEL_EVENTS
+
+
+def test_cancel_during_report_generation_prevents_artifact_commit(controller):
+    client, services = controller
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+    artifacts = []
+    services.save_word_index = lambda path, _index: artifacts.append(path)
+
+    def review(_timeline, _index):
+        client.post(f'/stage2/final-review/jobs/{job_id}/cancel')
+        return {'corrections': []}
+
+    services.review_rendered_timeline = review
+    _run_pending(services)
+    assert services._FINAL_REVIEW_JOBS[job_id]['status'] == 'cancelled'
+    assert artifacts == []
+    assert not any(path == services._test_paths['final_review_report'] for path, _ in services._test_writes)
+    _assert_released(services, job_id)
+
+
+def test_unknown_cloud_usage_stays_pending_in_usage_ledger(controller):
+    client, services = controller
+    client.post('/stage2/final-review/start', json=_start_payload())
+    services.transcribe_audio = lambda *_a, **_k: {
+        'backend': 'cloud-audio', 'backend_metadata': {'cost_usd': None, 'reserved_cost_usd': 0.17},
+    }
+    _run_pending(services)
+    assert services._test_usage[-1]['cost_usd'] is None
+    job = next(iter(services._FINAL_REVIEW_JOBS.values()))
+    assert job['cost_usd'] == 0
+    assert job['reserved_cost_usd'] == 0.17
+
+
+def test_cancel_restored_terminal_checkpoint_is_idempotent(controller):
+    client, services = controller
+    checkpoint = {'id': 'disk', 'project': 'demo', 'status': 'completed', 'cost_usd': 0.04}
+    services._read_json_safe = lambda _path: checkpoint
+    response = client.post('/stage2/final-review/jobs/disk/cancel?project=demo')
+    assert response.status_code == 200
+    assert response.get_json()['result'] == checkpoint
+    assert services._test_writes == []
+
+
+def test_local_failure_does_not_add_provider_usage(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setattr('stage2.whisper_runner.available_backends', lambda: ['faster-whisper'])
+    client.post('/stage2/final-review/start', json=_start_payload(backend='faster-whisper'))
+    services.transcribe_audio = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError('local inference failed'))
+    _run_pending(services)
+    job = next(iter(services._FINAL_REVIEW_JOBS.values()))
+    assert job['status'] == 'failed'
+    assert services._test_usage == []
+    _assert_released(services, job['id'])
