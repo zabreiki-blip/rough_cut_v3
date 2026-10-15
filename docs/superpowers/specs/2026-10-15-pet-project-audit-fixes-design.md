@@ -19,10 +19,15 @@ the worktree remain untouched.
 
 ### Recoverable final review
 
-The backend adds:
+The backend adds three routes:
 
 - `GET /stage2/final-review/latest?project=<project>` to return the latest
   persisted job for the project;
+- `POST /stage2/final-review/estimate` to compute the planned chunks and cost
+  estimate for `project` and `audio_path` before confirmation. It returns
+  `duration`, planned chunks including overlap, `estimated_cost_usd`,
+  `cost_limit_usd`, and whether a limit is enforced. It makes no provider
+  calls. The start route accepts `confirmed_estimate_usd` (see Cost guard);
 - `POST /stage2/final-review/jobs/<job_id>/cancel` to request cancellation.
 
 On panel startup and project change, CEP asks for the latest job. A queued or
@@ -37,31 +42,51 @@ Polling retries transient status failures with bounded exponential delays of
 message, and exposes an immediate Retry action after the automatic retry budget
 is exhausted. A polling error never starts another final-review job.
 
-The final-review timer participates in the existing panel visibility lifecycle:
-it is cleared when the panel is hidden and one immediate status refresh occurs
-when the panel becomes visible.
+The final-review poller keeps a timer handle and a generation counter. Hiding
+the panel, changing project, starting a new job, or cancelling increments the
+generation, and poll responses from an older generation are ignored. The timer
+participates in the existing panel visibility lifecycle: it is cleared when the
+panel is hidden, and one immediate status refresh occurs when the panel becomes
+visible.
 
 ### Cancellation and deadline
 
 Final-review jobs use the same per-job `threading.Event` pattern as TTS and sync
 jobs. The cancel endpoint changes an active job to `cancelling`, persists it,
-and sets its event. The worker checks cancellation:
+and sets its event. The worker passes the job's cancel event and the remaining
+whole-job deadline into `services.transcribe_audio`, which is
+`transcribe_audio_in_process` (`src/stage2/whisper_process.py`). That function
+runs ASR, including cloud audio, in a spawned, reusable child process that
+receives a plain tuple over a pipe. It already accepts `cancel_event` and
+`timeout_seconds`, and cancels or times out by terminating the child. Sync
+already passes both.
+
+The worker checks cancellation:
 
 1. before transcription;
-2. while the cloud request is pending, using the cloud adapter's existing
-   cancellable await;
-3. between cloud chunks;
+2. while waiting for the shared worker slot (`_worker_lock`). The in-process
+   wrapper currently does not observe `cancel_event` during this wait, so it
+   polls acquire with a timeout and checks `cancel_event` and the job deadline
+   on each attempt;
+3. during transcription. Cancellation or deadline expiry terminates the
+   transcription child process. The parent cannot await the cloud adapter's
+   asyncio event across the process boundary, so the `_await_cancellable`
+   path is not used for final review;
 4. before writing the word index and report.
+
+The whole-job deadline includes time queued behind other transcriptions. The
+timeout passed to the child is `min(remaining job time, configured whisper
+timeout)`. The deadline starts when the job is accepted, not after the worker
+slot is acquired, which is where the current wrapper starts its timer.
 
 Cancellation finishes as `cancelled`, records `finished_at`, and releases the
 project reservation in `finally`. A request already accepted by a provider may
 still be billable; the panel says so.
 
 `FINAL_REVIEW_TIMEOUT_SECONDS` defines the whole-job deadline and defaults to
-7200 seconds. The worker passes the remaining deadline into transcription and
-treats expiry as `failed` with an explicit timeout error. Per-request cloud
-timeouts remain capped by the smaller of the adapter timeout and remaining job
-time.
+7200 seconds. Expiry is treated as `failed` with an explicit timeout error.
+Per-request cloud timeouts remain capped by the smaller of the adapter timeout
+and remaining job time.
 
 After process restart, persisted `queued`, `running`, or `cancelling` jobs are
 reported as `interrupted`, since their worker and cancellation event no longer
@@ -70,11 +95,16 @@ exist.
 ### Safe apply semantics
 
 Iteration allocation and history writing execute under the existing project
-transition lock. Each Apply request carries `request_id`:
+transition lock. Each Apply request carries `request_id`, which is stored in the
+iteration record. Under the same lock, the server looks up an existing iteration
+by `request_id`:
 
-- replaying the same `request_id` returns the already prepared iteration;
+- replaying the same `request_id` for the same `job_id` returns the already
+  prepared iteration;
+- replaying a `request_id` with a different `job_id` returns HTTP 409;
 - a new `request_id` intentionally creates a new iteration, preserving E2E
   checklist F4;
+- a missing `request_id` (old clients) is treated as a new request;
 - concurrent different request IDs are serialized and receive different
   iteration IDs.
 
@@ -90,28 +120,52 @@ guard adds two optional settings:
 - `ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE`, default `0` (unknown).
 
 When a positive job limit is configured for cloud ASR, a positive per-minute
-estimate is required. Before start, the server calculates a conservative
+estimate is required. This is checked at startup config validation with a clear
+message. A job start under such a misconfiguration returns HTTP 400 as a
+configuration error. Before start, the server calculates a conservative
 estimate from planned chunk durations including overlap. It rejects the job
-with HTTP 409 when the estimate exceeds the job limit and with HTTP 503 when a
-limit is enabled but estimation is not configured.
+with HTTP 409 when the estimate exceeds the job limit.
 
-During transcription, the cloud adapter receives the job limit and estimate.
-Before each provider attempt, including retries, it reserves the estimated
-cost of that chunk attempt against the job budget. After a response, it replaces
-the reservation with the provider-reported actual cost when available. If the
-next attempt would exceed the limit, processing stops before dispatch with a
-budget-specific error. Unknown provider cost remains represented as the
-reserved estimate, so the guard fails closed when enabled.
+Estimate before confirmation: `POST /stage2/final-review/estimate` returns the
+estimate without any provider calls. The start route accepts
+`confirmed_estimate_usd`. The server recomputes the estimate, and if it differs
+from the confirmed value, it returns HTTP 409 so the user re-confirms.
+
+When no limit is enabled (limit `0`) or the estimate is unknown, CEP must state
+explicitly that the displayed amount is accounting, not a spending cap.
+
+Budget values cross the process boundary as plain values. The transcription
+request message to the child process includes the job limit and the per-minute
+estimate as Decimal-serialised strings. Inside the child, the cloud adapter
+(`transcribe_cloud` in `src/stage2/cloud_asr.py`) enforces per-attempt
+reservations. Before each provider attempt, including retries, it reserves the
+estimated cost of that chunk attempt against the job limit. After a response, it
+replaces the reservation with the provider-reported actual cost when available.
+If the next attempt would exceed the limit, processing stops before dispatch
+with a budget-specific error. Unknown provider cost remains represented as the
+reserved estimate, so the guard fails closed when enabled. The child returns
+spent and reserved cost in the result and in the error payload.
+
+If the child is terminated by cancellation or timeout, the parent cannot know
+the in-flight cost. It records the last known reserved amount, meaning the
+reservations made before dispatch as reported by progress messages, in the
+usage ledger as reserved/unsettled.
 
 The job status exposes `estimated_cost_usd`, `cost_limit_usd`, and the actual or
 reserved `cost_usd`. CEP shows the estimate before confirmation and the final
 amount/status afterward. The limit is per job; it does not reinterpret the
 project-wide ledger total as available budget.
 
-The same reusable budget object is passed to cloud sync transcription. Semantic
-LLM review keeps its existing request-count limit in this change; extending
-monetary reservations to every LLM/TTS operation is a later, separately scoped
-change.
+Sync budget: the limit applies per sync job across all sources in that job. It
+uses the same preflight estimate (the sum over sources of each source's planned
+chunk durations including overlap, computed by the same rules as final review)
+and the same status fields `estimated_cost_usd`, `cost_limit_usd`, and
+`cost_usd`. Each source transcription receives the budget values with the
+remaining budget.
+
+Semantic LLM review keeps its existing request-count limit in this change;
+extending monetary reservations to every LLM/TTS operation is a later,
+separately scoped change.
 
 ## Dependency and CI changes
 
@@ -133,10 +187,14 @@ first correct implementation.
 
 - `api_final_review_jobs.py` owns final-review state, cancellation events,
   deadline handling, and serialized iteration allocation.
-- `api_final_review_routes.py` owns validation and the latest/cancel/apply HTTP
-  contracts.
-- `cloud_asr.py` owns request-level cancellation, deadline enforcement, and
-  budget reservations.
+- `api_final_review_routes.py` owns validation and the latest, estimate,
+  cancel, and apply HTTP contracts.
+- `src/stage2/whisper_process.py` owns the cancellable wait for the worker slot,
+  budget values in the IPC request and response, and reserved-cost reporting.
+- `src/stage2/whisper_runner.py` and `transcribe_cloud` in
+  `src/stage2/cloud_asr.py` accept and forward budget values to the adapter.
+- `cloud_asr.py` owns request-level deadline enforcement and per-attempt budget
+  reservations inside the child process.
 - a small cost-budget module owns Decimal parsing, conservative reservation,
   settlement, and budget errors so final review and sync use identical rules.
 - `cep/js/main.js` owns restored UI state, retry timers, visibility handling,
@@ -164,14 +222,19 @@ introduced.
 All behavior changes follow red-green TDD.
 
 Backend tests cover latest-job recovery, all cancellation state transitions,
-deadline expiry, cancellation during cloud await, cancellation between chunks,
-budget preflight and retry reservation, persisted terminal state, and project
-release. Apply tests cover same-request replay and concurrent different request
-IDs.
+deadline expiry, cancel while queued for the worker slot, deadline counting
+queue time, cancellation by terminating the transcription child during
+transcription, budget preflight and retry reservation, budget values
+round-tripping through the child process, reserved-cost recording after
+termination, persisted terminal state, and project release. Estimate tests cover
+the estimate route and stale-confirmation 409. Apply tests cover same-request
+replay, a replayed `request_id` with a different `job_id` (409), a missing
+`request_id` treated as new, and concurrent different request IDs.
 
 CEP tests cover automatic retry, retry exhaustion/manual retry, reload recovery,
 sequence mismatch, cancel UI, Apply request-ID reuse, and hidden/visible timer
-lifecycle. Contract tests verify the two new routes and controls.
+lifecycle, including ignored stale-generation poll responses. Contract tests
+verify the three new routes and controls.
 
 CI/config tests verify the patched Requests version, new environment settings,
 and runtime smoke job. Final verification runs the full Python suite with

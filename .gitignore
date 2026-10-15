@@ -36,3 +36,6 @@ cep/.debug
 
 # Local kilo planning scratch files
 .kilo/plans/
+
+# Isolated Codex worktrees
+.worktrees/
