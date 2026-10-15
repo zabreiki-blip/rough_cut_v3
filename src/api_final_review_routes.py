@@ -18,7 +18,7 @@ import wave
 
 from flask import Flask, has_request_context, jsonify, request
 
-from api_final_review_jobs import final_review_deadline
+from api_final_review_jobs import canonical_decimal_string, final_review_deadline
 from cost_budget import CostGuardConfig
 from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
 from stage2.whisper_runner import resolve_backend
@@ -61,7 +61,7 @@ def _money(value: object, name: str) -> Decimal:
         amount = Decimal(str(value))
     except InvalidOperation as exc:
         raise ValueError(f"{name} must be a finite non-negative decimal") from exc
-    if not amount.is_finite() or amount < 0 or not math.isfinite(float(amount)):
+    if not amount.is_finite() or amount < 0:
         raise ValueError(f"{name} must be a finite non-negative decimal")
     return amount
 
@@ -79,7 +79,7 @@ def _estimate_final_review(
         "duration": duration_sec,
         "duration_sec": duration_sec,
         "planned_chunks": 0,
-        "estimated_cost_usd": 0.0,
+        "estimated_cost_usd": "0",
         "cost_limit_usd": 0.0,
         "enforced": False,
     }
@@ -107,13 +107,14 @@ def _estimate_final_review(
     estimate = seconds * guard.cloud_asr_usd_per_minute / Decimal("60")
     amount = _money(estimate, "estimated_cost_usd")
     limit = _money(guard.max_usd_per_job, "cost_limit_usd")
-    if limit > 0 and (amount <= 0 or float(amount) == 0):
+    if limit > 0 and amount <= 0:
         raise ValueError("enabled cost limit requires a positive cloud ASR estimate")
     result.update(
-        planned_chunks=len(chunks), estimated_cost_usd=float(amount),
+        planned_chunks=len(chunks), estimated_cost_usd=canonical_decimal_string(amount),
         cost_limit_usd=float(limit), enforced=limit > 0,
     )
     options = {
+        "duration_sec": duration_sec,
         "chunk_minutes": chunk_minutes,
         "overlap_sec": overlap_sec,
         "max_cost_usd": str(guard.max_usd_per_job),
@@ -193,7 +194,7 @@ def _start(services: ModuleType):
         estimate, cloud_options, backend = _preflight(audio_path, payload, duration_sec=wav_duration)
         if payload.get("confirmed_estimate_usd") is not None:
             confirmed = _money(payload["confirmed_estimate_usd"], "confirmed_estimate_usd")
-            if confirmed != Decimal(str(estimate["estimated_cost_usd"])):
+            if confirmed != Decimal(estimate["estimated_cost_usd"]):
                 return services._json_error("cloud ASR estimate changed; confirm the new estimate", 409)
         deadline = final_review_deadline()
     except OverflowError as exc:

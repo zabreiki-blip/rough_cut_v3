@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from decimal import Decimal
 import os
 import threading
 import time
@@ -10,6 +11,14 @@ from typing import Any
 
 from api_service_contracts import FinalReviewJobServices
 from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
+
+
+def canonical_decimal_string(value: object) -> str:
+    amount = Decimal(str(value))
+    if amount == 0:
+        return "0"
+    rendered = format(amount, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
 
 
 def final_review_deadline() -> float:
@@ -62,7 +71,7 @@ def create_final_review_job(
         "finished_at": "",
         "error": "",
         "report_path": "",
-        "estimated_cost_usd": payload.get("estimated_cost_usd", 0.0),
+        "estimated_cost_usd": canonical_decimal_string(payload.get("estimated_cost_usd", "0")),
         "cost_limit_usd": payload.get("cost_limit_usd", 0.0),
         "cost_usd": 0.0,
         "reserved_cost_usd": 0.0,
@@ -189,11 +198,13 @@ def run_final_review_job(
 ) -> None:
     usage_callback = None
     usage_recorded = False
+    reserved_usage_recorded = False
     with services._FINAL_REVIEW_JOBS_LOCK:
         job = dict(services._FINAL_REVIEW_JOBS.get(job_id) or {})
         cancel_event = services._FINAL_REVIEW_CANCEL_EVENTS.get(job_id)
     deadline = job.get("deadline_monotonic")
     last_persisted = float("-inf")
+    provider_costs = backend is None or backend in {"cloud-audio", "cloud", "openrouter"}
 
     def check_stop() -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -217,6 +228,8 @@ def run_final_review_job(
         )
 
     def budget(snapshot: dict[str, float]) -> None:
+        if not provider_costs:
+            return
         checkpoint(
             cost_usd=snapshot["spent_usd"],
             reserved_cost_usd=snapshot["reserved_usd"],
@@ -224,16 +237,35 @@ def run_final_review_job(
         )
 
     def cost_updates(source: Any) -> dict[str, Any]:
-        values = {}
+        values: dict[str, Any] = {}
+        if not provider_costs:
+            return values
         for field in ("cost_usd", "reserved_cost_usd", "cost_limit_usd"):
             value = source.get(field) if isinstance(source, dict) else getattr(source, field, None)
             if value is not None:
                 values[field] = float(value)
         return values
 
-    def record_usage(cost: Any, selected_model: str, *, allow_unknown: bool = False) -> None:
-        nonlocal usage_recorded
-        if not usage_recorded and usage_callback is not None and (cost is not None or allow_unknown):
+    def record_usage(
+        cost: Any, selected_model: str, *, reserved_cost: Any = None, allow_unknown: bool = False
+    ) -> None:
+        nonlocal usage_recorded, reserved_usage_recorded
+        if usage_callback is None:
+            return
+        if not reserved_usage_recorded and (
+            (reserved_cost or 0) > 0 or (allow_unknown and cost is None)
+        ):
+            # An unresolved reservation is exposure, not confirmed spend.
+            # Keep a distinct stable pending event so the real ledger retains
+            # it without counting the estimate toward actual provider cost.
+            usage_callback({
+                "event_id": f"final-review-asr:{job_id}:reserved",
+                "model": selected_model,
+                "cost_usd": None,
+                "pending": True,
+            })
+            reserved_usage_recorded = True
+        if not usage_recorded and cost is not None:
             usage_callback({
                 "event_id": f"final-review-asr:{job_id}",
                 "model": selected_model,
@@ -245,8 +277,11 @@ def run_final_review_job(
         failed_cost = cost_updates(exc)
         latest = get_final_review_job(services, job_id) or {}
         try:
-            if backend == "cloud-audio" or "cost_usd" in failed_cost:
-                record_usage(failed_cost.get("cost_usd", latest.get("cost_usd")), str(model or ""))
+            if provider_costs and (backend == "cloud-audio" or "cost_usd" in failed_cost):
+                record_usage(
+                    failed_cost.get("cost_usd", latest.get("cost_usd")), str(model or ""),
+                    reserved_cost=failed_cost.get("reserved_cost_usd", latest.get("reserved_cost_usd")),
+                )
         finally:
             services._update_final_review_job(
                 job_id,
@@ -292,9 +327,10 @@ def run_final_review_job(
         final_cost = cost_updates(result_backend_metadata)
         final_cost.update(cost_updates(result))
         services._update_final_review_job(job_id, **final_cost)
-        if str(result.get("backend") or backend or "") == "cloud-audio":
+        if provider_costs and str(result.get("backend") or backend or "") == "cloud-audio":
             record_usage(
                 final_cost.get("cost_usd"), str(result.get("model") or model or ""),
+                reserved_cost=final_cost.get("reserved_cost_usd"),
                 allow_unknown=True,
             )
         check_stop()
@@ -333,12 +369,15 @@ def run_final_review_job(
         with services._FINAL_REVIEW_JOBS_LOCK:
             check_stop()
             services.save_word_index(paths["final_review_words"], index)
+            check_stop()
             services._atomic_write_json_file(paths["final_review_report"], report)
             current = services._FINAL_REVIEW_JOBS.get(job_id)
             if current is not None:
+                finished_at = services._utc_now_iso()
+                check_stop()
                 current.update(
                     status="completed", message="Final review completed",
-                    finished_at=services._utc_now_iso(),
+                    finished_at=finished_at,
                     report_path=str(paths["final_review_report"].relative_to(paths["root"])),
                 )
                 services._atomic_write_json_file(paths["final_review_job_status"], dict(current))

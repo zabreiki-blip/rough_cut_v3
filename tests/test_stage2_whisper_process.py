@@ -754,3 +754,41 @@ def test_process_forwards_distinct_live_budget_snapshots() -> None:
         {'limit_usd': 1.0, 'spent_usd': 0.0, 'reserved_usd': 0.06, 'total_usd': 0.06},
         {'limit_usd': 1.0, 'spent_usd': 0.04, 'reserved_usd': 0.0, 'total_usd': 0.04},
     ]
+
+
+def test_cloud_confirmed_duration_reaches_execution_without_reprobe(tmp_path, monkeypatch):
+    import httpx
+    from stage2 import cloud_asr
+
+    calls = multiprocessing.get_context('fork').Value('i', 0)
+    audio = tmp_path / 'audio.wav'
+    audio.touch()
+
+    async def extract(*_args):
+        return b'mp3'
+
+    async def handler(_request):
+        with calls.get_lock():
+            calls.value += 1
+        return httpx.Response(200, json={
+            'choices': [{'message': {'content': '[00:01] ГОЛОС 1: Готово'}}],
+        })
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, '_probe_duration', lambda *_: 151.0)
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, '_extract_chunk_mp3', extract)
+    monkeypatch.setattr(cloud_asr.httpx, 'AsyncClient', lambda **_kw: real_client(transport=httpx.MockTransport(handler)))
+    snapshots = []
+    result = transcribe_audio_in_process(
+        audio, backend='cloud-audio', timeout_seconds=2, _start_method='fork',
+        cloud_options={
+            'api_key': 'test-key', 'chunk_minutes': 1, 'overlap_sec': 10,
+            'duration_sec': 150.0, 'max_cost_usd': '0.17',
+            'usd_per_minute_estimate': '0.06',
+        },
+        budget_callback=snapshots.append,
+    )
+    assert calls.value == 3
+    assert result['backend_metadata']['duration_sec'] == 150.0
+    assert result['reserved_cost_usd'] == pytest.approx(0.17)
+    assert snapshots[-1]['reserved_usd'] == pytest.approx(0.17)

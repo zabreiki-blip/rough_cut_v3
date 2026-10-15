@@ -1332,6 +1332,7 @@ class CloudAudioAsrAdapter:
         budget: CostBudget | None = None,
         budget_callback: Callable[[dict[str, float]], None] | None = None,
         deadline_monotonic: float | None = None,
+        duration_sec: float | None = None,
     ) -> AsrRunResult:
         self._require_available()
         audio_path = Path(audio_path)
@@ -1340,7 +1341,14 @@ class CloudAudioAsrAdapter:
         # вызванный напрямую внутри этой корутины, он блокировал бы event
         # loop на всё это время. asyncio.to_thread выносит блокирующий вызов
         # в отдельный поток.
-        duration_sec = await asyncio.to_thread(self._probe_duration, audio_path)
+        if duration_sec is None:
+            duration_sec = await asyncio.to_thread(self._probe_duration, audio_path)
+        else:
+            # A final-review preflight has already accepted this WAV duration.
+            # Reprobing can move chunk boundaries and alter confirmed cost.
+            duration_sec = float(duration_sec)
+            if not math.isfinite(duration_sec) or duration_sec <= 0:
+                raise ValueError("duration_sec must be a finite positive number")
         parts = self._plan_chunks(duration_sec)
         chunk_len = self.chunk_minutes * 60
 
@@ -1568,6 +1576,7 @@ def transcribe_cloud(
     initial_cost_usd: Decimal | str | float | None = None,
     timeout_sec: float | None = None,
     budget_callback: Callable[[dict[str, float]], None] | None = None,
+    duration_sec: float | None = None,
 ) -> dict[str, Any]:
     """Синхронный публичный вход в облачный ASR-адаптер (этап 1: только сам
     адаптер, без интеграции в whisper_runner/UI — см. docstring модуля).
@@ -1615,6 +1624,7 @@ def transcribe_cloud(
                 budget=budget,
                 budget_callback=budget_callback,
                 deadline_monotonic=deadline_monotonic,
+                duration_sec=duration_sec,
             ),
             timeout=timeout_sec,
         )

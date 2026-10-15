@@ -723,7 +723,7 @@ def test_estimate_counts_overlap_and_start_uses_identical_options(controller):
     estimate = client.post('/stage2/final-review/estimate', json=_start_payload())
     assert estimate.status_code == 200
     assert estimate.get_json()['result'] == {
-        'duration': 150.0, 'duration_sec': 150.0, 'planned_chunks': 3, 'estimated_cost_usd': 0.17,
+        'duration': 150.0, 'duration_sec': 150.0, 'planned_chunks': 3, 'estimated_cost_usd': '0.17',
         'cost_limit_usd': 1.0, 'enforced': True,
     }
     assert services._FINAL_REVIEW_JOBS == {}
@@ -731,7 +731,7 @@ def test_estimate_counts_overlap_and_start_uses_identical_options(controller):
     assert response.status_code == 202
     job_id = response.get_json()['result']['job_id']
     queued = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
-    assert queued['estimated_cost_usd'] == 0.17
+    assert queued['estimated_cost_usd'] == '0.17'
     assert queued['cost_limit_usd'] == 1.0
     assert queued['cost_usd'] == 0.0
     observed = {}
@@ -740,7 +740,7 @@ def test_estimate_counts_overlap_and_start_uses_identical_options(controller):
         observed.update(options)
         running = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
         assert running['status'] == 'running'
-        assert running['estimated_cost_usd'] == 0.17
+        assert running['estimated_cost_usd'] == '0.17'
         assert running['cost_limit_usd'] == 1.0
         assert running['cost_usd'] == 0.0
         return {'backend': 'cloud-audio', 'backend_metadata': {'cost_usd': 0.12}}
@@ -749,7 +749,7 @@ def test_estimate_counts_overlap_and_start_uses_identical_options(controller):
     _run_pending(services)
     result = client.get(f'/stage2/final-review/jobs/{job_id}').get_json()['result']
     assert result['status'] == 'completed'
-    assert result['estimated_cost_usd'] == 0.17
+    assert result['estimated_cost_usd'] == '0.17'
     assert result['cost_usd'] == 0.12
     assert observed['cloud_options']['chunk_minutes'] == 1
     assert observed['cloud_options']['overlap_sec'] == 10
@@ -786,7 +786,7 @@ def test_estimate_disabled_guard_allows_unknown_cost(controller, monkeypatch):
     response = client.post('/stage2/final-review/estimate', json=_start_payload())
     assert response.status_code == 200
     assert response.get_json()['result']['enforced'] is False
-    assert response.get_json()['result']['estimated_cost_usd'] == 0
+    assert response.get_json()['result']['estimated_cost_usd'] == '0'
 
 
 def test_cancel_queued_job_prevents_transcription_and_releases_project(controller):
@@ -870,7 +870,7 @@ def test_expired_queue_deadline_fails_before_transcription(controller, monkeypat
     job = services._FINAL_REVIEW_JOBS[job_id]
     assert job['status'] == 'failed'
     assert 'deadline' in job['error'].lower()
-    assert job['estimated_cost_usd'] == 0.17
+    assert job['estimated_cost_usd'] == '0.17'
     assert job['cost_usd'] == 0
     _assert_released(services, job_id)
 
@@ -893,7 +893,7 @@ def test_process_stop_retains_spent_and_reserved_cost(controller, exception, sta
     assert job['cost_usd'] == 0.03
     assert job['reserved_cost_usd'] == 0.06
     assert job['cost_limit_usd'] == 1.0
-    assert job['estimated_cost_usd'] == 0.17
+    assert job['estimated_cost_usd'] == '0.17'
     assert services._test_usage[-1]['cost_usd'] == 0.03
     _assert_released(services, job_id)
 
@@ -939,7 +939,7 @@ def test_local_preflight_ignores_cloud_rate_configuration(controller, monkeypatc
     assert response.status_code == 200
     assert response.get_json()['result'] == {
         'duration': 150.0, 'duration_sec': 150.0, 'planned_chunks': 0,
-        'estimated_cost_usd': 0.0, 'cost_limit_usd': 1.0, 'enforced': False,
+        'estimated_cost_usd': '0', 'cost_limit_usd': 1.0, 'enforced': False,
     }
     assert client.post('/stage2/final-review/start', json=payload).status_code == 202
     assert services._test_pending[-1].kwargs['backend'] == 'faster-whisper'
@@ -1025,3 +1025,171 @@ def test_local_failure_does_not_add_provider_usage(controller, monkeypatch):
     assert job['status'] == 'failed'
     assert services._test_usage == []
     _assert_released(services, job['id'])
+
+
+def test_accepted_wav_duration_is_frozen_in_cloud_execution_options(controller):
+    client, services = controller
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    assert response.status_code == 202
+    observed = {}
+
+    def transcribe(_path, **options):
+        observed.update(options)
+        return {'backend': 'cloud-audio'}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert observed['cloud_options']['duration_sec'] == 150.0
+
+
+def test_stale_confirmation_detects_rate_change_below_float_precision(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0.060000000000000001')
+    first = client.post('/stage2/final-review/estimate', json=_start_payload())
+    assert first.status_code == 200
+    confirmed = first.get_json()['result']['estimated_cost_usd']
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0.060000000000000002')
+    response = client.post('/stage2/final-review/start', json=_start_payload(confirmed_estimate_usd=confirmed))
+    assert response.status_code == 409
+    assert services._FINAL_REVIEW_JOBS == {}
+
+
+def test_estimate_and_jobs_keep_canonical_decimal_strings(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0.060000000000000001')
+    result = client.post('/stage2/final-review/estimate', json=_start_payload()).get_json()['result']
+    assert result['estimated_cost_usd'] == '0.1700000000000000028333333333'
+    response = client.post('/stage2/final-review/start', json=_start_payload(
+        confirmed_estimate_usd='0.1700000000000000028333333333',
+    ))
+    assert response.status_code == 202
+    job = services._FINAL_REVIEW_JOBS[response.get_json()['result']['job_id']]
+    assert job['estimated_cost_usd'] == '0.1700000000000000028333333333'
+
+
+@pytest.mark.parametrize('phase', ['words', 'report'])
+def test_deadline_during_artifact_write_never_completes(controller, monkeypatch, phase):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+    paths = services._test_paths
+    if phase == 'words':
+        services.save_word_index = lambda *_args: clock.__setitem__(0, 111.0)
+    else:
+        original_write = services._atomic_write_json_file
+
+        def write(path, payload):
+            original_write(path, payload)
+            if path == paths['final_review_report']:
+                clock[0] = 111.0
+
+        services._atomic_write_json_file = write
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == 'failed'
+    assert 'deadline' in job['error'].lower()
+    if phase == 'words':
+        assert not any(path == paths['final_review_report'] for path, _ in services._test_writes)
+    assert not any(payload.get('status') == 'completed' for _path, payload in services._test_writes)
+    _assert_released(services, job_id)
+
+
+def test_cancel_during_word_artifact_write_stops_before_report(controller):
+    client, services = controller
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+    services.save_word_index = lambda *_args: services._FINAL_REVIEW_CANCEL_EVENTS[job_id].set()
+    _run_pending(services)
+    assert services._FINAL_REVIEW_JOBS[job_id]['status'] == 'cancelled'
+    assert not any(path == services._test_paths['final_review_report'] for path, _ in services._test_writes)
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize('spent,reserved,stop', [
+    (None, 0.17, 'completed'),
+    (0.03, 0.06, 'completed'),
+    (0.03, 0.06, 'after-result'),
+    (0.03, 0.06, 'cancelled'),
+])
+def test_real_usage_ledger_keeps_reserved_exposure_pending_once(controller, spent, reserved, stop):
+    import json
+    from decimal import Decimal
+    from openrouter_usage import make_usage_callback, usage_summary
+
+    client, services = controller
+    ledger = services._test_paths['work'] / 'usage.json'
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(ledger, **context)
+    response = client.post('/stage2/final-review/start', json=_start_payload())
+    job_id = response.get_json()['result']['job_id']
+
+    def transcribe(*_args, **_options):
+        if stop == 'cancelled':
+            error = WhisperCancelledError('stopped with a reservation')
+            error.cost_usd, error.reserved_cost_usd, error.cost_limit_usd = spent, reserved, 1.0
+            raise error
+        return {'backend': 'cloud-audio', 'backend_metadata': {
+            'cost_usd': spent, 'reserved_cost_usd': reserved, 'cost_limit_usd': 1.0,
+        }}
+
+    services.transcribe_audio = transcribe
+    if stop == 'after-result':
+        services.review_rendered_timeline = lambda *_args: (_ for _ in ()).throw(RuntimeError('report failed'))
+    _run_pending(services)
+    summary = usage_summary(ledger)
+    assert summary['pending_count'] == 1
+    assert summary['total_cost_usd'] == (spent or 0)
+    data = json.loads(ledger.read_text())
+    pending = [event for event in data['events'] if event['status'] == 'pending']
+    assert len(pending) == 1
+    assert pending[0]['event_id'] == f'final-review-asr:{job_id}:reserved'
+    assert pending[0]['cost_usd'] is None
+    confirmed = [event for event in data['events'] if event['status'] == 'confirmed']
+    if spent:
+        assert len(confirmed) == 1
+        assert confirmed[0]['event_id'] == f'final-review-asr:{job_id}'
+        assert Decimal(confirmed[0]['cost_usd']) == Decimal('0.03')
+    else:
+        assert confirmed == []
+    _assert_released(services, job_id)
+
+
+def test_real_local_process_error_preserves_limit_without_provider_usage(controller, monkeypatch):
+    import multiprocessing
+    from openrouter_usage import make_usage_callback, usage_summary
+    from stage2.whisper_process import WhisperProcessError, transcribe_audio_in_process
+
+    if 'fork' not in multiprocessing.get_all_start_methods():
+        pytest.skip('process-shaped local error regression requires fork')
+    client, services = controller
+    monkeypatch.setattr('stage2.whisper_runner.available_backends', lambda: ['faster-whisper'])
+    ledger = services._test_paths['work'] / 'usage.json'
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(ledger, **context)
+    response = client.post('/stage2/final-review/start', json=_start_payload(backend='faster-whisper'))
+    job_id = response.get_json()['result']['job_id']
+    process_errors = []
+
+    def transcribe(path, **options):
+        try:
+            return transcribe_audio_in_process(
+                path.with_name('missing.wav'), timeout_seconds=2, _start_method='fork', **options,
+            )
+        except WhisperProcessError as error:
+            process_errors.append(error)
+            raise
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert len(process_errors) == 1
+    assert process_errors[0].cost_usd == 0
+    assert process_errors[0].reserved_cost_usd == 0
+    assert process_errors[0].cost_limit_usd == 0
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == 'failed'
+    assert job['cost_limit_usd'] == 1.0
+    assert job['cost_usd'] == 0
+    assert job['reserved_cost_usd'] == 0
+    assert not ledger.exists()
+    assert usage_summary(ledger, create=False)['pending_count'] == 0
+    _assert_released(services, job_id)
