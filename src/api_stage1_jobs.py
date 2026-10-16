@@ -262,6 +262,7 @@ def run_tts_job(
                     block_uid=block_uid_by_id.get(current_id) or current_id,
                     fingerprint=fingerprint,
                     speaker_dir=speaker_dir,
+                    degraded=bool(progress.get("style_degraded")),
                 )
         existing = services._get_tts_job(job_id) or {}
         services._update_tts_job(
@@ -339,6 +340,7 @@ def run_tts_job(
             resolved_voice=str(result.get("voice", "")),
             gender=str(result.get("gender", "")),
             dry_run=bool(result.get("dry_run", False)),
+            style_degraded_ids=list(result.get("style_degraded_ids") or []),
             result=result,
         )
     except services.TtsCancelledError:

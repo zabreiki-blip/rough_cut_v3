@@ -381,6 +381,75 @@ class TtsManifestSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["blocking"])
 
+    def test_completed_job_keeps_degraded_flag_in_manifest_and_status(self) -> None:
+        degraded_audio = b"\x00" * 8
+
+        def fake_synthesize_tts(*, speaker_dir, progress_callback, **_kwargs):
+            asset = speaker_dir / "assets" / "voice-stable" / "plain-fingerprint.wav"
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            asset.write_bytes(degraded_audio)
+            (speaker_dir / "zk1.wav").write_bytes(degraded_audio)
+            atomic_write_json(speaker_dir / "zk1.wav.meta", {"fingerprint": "plain-fingerprint"})
+            progress_callback(
+                {
+                    "event": "item_generated",
+                    "id": "zk1",
+                    "total": 1,
+                    "completed": 1,
+                    "generated": 1,
+                    "skipped": 0,
+                    "style_degraded": True,
+                }
+            )
+            manifest = json.loads(self.paths["active_voiceover_manifest"].read_text("utf-8"))
+            entry = next(item for item in manifest["items"] if item["id"] == "zk1")
+            self.assertTrue(entry["degraded"])
+            self.assertEqual(entry["style"], "")
+            return {
+                "provider": "openrouter",
+                "model": "m",
+                "style": "кино",
+                "voice": "v",
+                "gender": "female",
+                "dry_run": False,
+                "items_total": 1,
+                "files_count": 1,
+                "skipped_count": 0,
+                "scenario_revision_id": "rev_0001",
+                "voiceover_assets": [
+                    {
+                        "id": "zk1",
+                        "block_uid": "voice-stable",
+                        "fingerprint": "plain-fingerprint",
+                        "asset": str(asset),
+                        "style": "",
+                        "degraded": True,
+                    }
+                ],
+                "style_degraded_ids": ["zk1"],
+            }
+
+        self.assertTrue(api_module._reserve_tts_project("demo"))
+        job = api_module._create_tts_job("demo")
+        with patch.object(api_module, "synthesize_tts", side_effect=fake_synthesize_tts):
+            api_module._run_tts_job(
+                job_id=job["id"],
+                project="demo",
+                prepared_path=self.paths["prepared"],
+                speaker_dir=revision_speaker_alias_dir(self.paths, "rev_0001"),
+                provider=None,
+                voice_name=None,
+                gender=None,
+                dry_run=False,
+            )
+
+        state = api_module._get_tts_job(job["id"])
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["style_degraded_ids"], ["zk1"])
+        manifest = json.loads(self.paths["active_voiceover_manifest"].read_text("utf-8"))
+        entry = next(item for item in manifest["items"] if item["id"] == "zk1")
+        self.assertTrue(entry["degraded"])
+
 
 if __name__ == "__main__":
     unittest.main()

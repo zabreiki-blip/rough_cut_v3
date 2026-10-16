@@ -574,3 +574,47 @@ def test_merge_voiceover_manifest_item_ignores_missing_asset(tmp_path: Path) -> 
     )
 
     assert _read_json(paths["active_voiceover_manifest"]) == before
+
+
+def test_merge_voiceover_manifest_item_preserves_degraded_flag(tmp_path: Path) -> None:
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    speaker_dir = revision_speaker_alias_dir(paths, "rev_0001")
+    _write_wav(speaker_dir / "assets" / "voice-stable" / "plain-fp.wav", 321)
+
+    merge_voiceover_manifest_item(
+        paths,
+        revision_id="rev_0001",
+        block_id="zk1",
+        block_uid="voice-stable",
+        fingerprint="plain-fp",
+        speaker_dir=speaker_dir,
+        degraded=True,
+    )
+
+    entry = _entry_for_uid(_read_json(paths["active_voiceover_manifest"]), "voice-stable")
+    assert entry["fingerprint"] == "plain-fp"
+    assert entry["style"] == ""
+    assert entry["degraded"] is True
+
+
+def test_merge_voiceover_manifest_item_omits_degraded_keys_by_default(tmp_path: Path) -> None:
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    speaker_dir = revision_speaker_alias_dir(paths, "rev_0001")
+    _write_wav(speaker_dir / "assets" / "voice-stable" / "plain-fp.wav", 321)
+    _write_wav(speaker_dir / "assets" / "voice-stable" / "styled-fp.wav", 654)
+
+    kwargs = {
+        "revision_id": "rev_0001",
+        "block_id": "zk1",
+        "block_uid": "voice-stable",
+        "speaker_dir": speaker_dir,
+    }
+    merge_voiceover_manifest_item(paths, fingerprint="plain-fp", degraded=True, **kwargs)
+    merge_voiceover_manifest_item(paths, fingerprint="styled-fp", **kwargs)
+
+    entry = _entry_for_uid(_read_json(paths["active_voiceover_manifest"]), "voice-stable")
+    assert entry["fingerprint"] == "styled-fp"
+    assert "degraded" not in entry
+    assert "style" not in entry

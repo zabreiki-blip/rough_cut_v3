@@ -419,6 +419,7 @@ def merge_voiceover_manifest_item(
     block_uid: str,
     fingerprint: str,
     speaker_dir: Path,
+    degraded: bool = False,
 ) -> None:
     """Record one freshly synthesized block in the active voiceover manifest.
 
@@ -434,6 +435,10 @@ def merge_voiceover_manifest_item(
     ``stage4.versioning.inspect_revision_state`` does not mistake a
     legitimate, in-progress or partially cancelled resynthesis for project
     corruption.
+
+    ``degraded`` marks audio produced by the plain-transcript fallback although a
+    style was requested; it is recorded as ``style: ""`` / ``degraded: true`` and the
+    keys are omitted otherwise (manifest compatibility).
     """
     if not re.fullmatch(r"zk\d+", block_id) or not fingerprint:
         return
@@ -460,14 +465,16 @@ def merge_voiceover_manifest_item(
             for item in manifest.get("items", [])
             if isinstance(item, dict) and str(item.get("id") or "") != block_id
         ]
-        items.append(
-            {
-                "id": block_id,
-                "block_uid": block_uid,
-                "fingerprint": fingerprint,
-                "asset": asset_relative,
-            }
-        )
+        new_item: dict[str, Any] = {
+            "id": block_id,
+            "block_uid": block_uid,
+            "fingerprint": fingerprint,
+            "asset": asset_relative,
+        }
+        if degraded:
+            new_item["style"] = ""
+            new_item["degraded"] = True
+        items.append(new_item)
         updated = {
             "schema_version": 1,
             "scenario_revision_id": revision_id or str(manifest.get("scenario_revision_id") or ""),
