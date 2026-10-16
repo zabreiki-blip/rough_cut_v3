@@ -381,21 +381,33 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_runtime_requests_pin_is_patched() -> None:
-    from packaging.version import Version
-
+def _runtime_pin(name: str) -> str:
     pins = []
     for filename in ("requirements.txt", "requirements-lock.txt"):
         matches = [
             line.split("==", 1)[1]
             for line in (ROOT_DIR / filename).read_text().splitlines()
-            if line.lower().startswith("requests==")
+            if line.lower().startswith(f"{name}==")
         ]
-        assert len(matches) == 1, f"expected one Requests pin in {filename}"
+        assert len(matches) == 1, f"expected one {name} pin in {filename}"
         pins.append(matches[0])
 
     assert pins[0] == pins[1]
-    assert Version(pins[0]) >= Version("2.32.4")
+    return pins[0]
+
+
+def test_runtime_requests_pin_is_patched() -> None:
+    from packaging.version import Version
+
+    # CVE-2026-25645 / PYSEC-2026-2275 fixed in 2.33.0.
+    assert Version(_runtime_pin("requests")) >= Version("2.33.0")
+
+
+def test_runtime_flask_pin_is_patched() -> None:
+    from packaging.version import Version
+
+    # CVE-2026-27205 / PYSEC-2026-2151 / GHSA-68rp-wp8r-4726 fixed in 3.1.3.
+    assert Version(_runtime_pin("flask")) >= Version("3.1.3")
 
 
 def test_runtime_gunicorn_pin_is_patched() -> None:
