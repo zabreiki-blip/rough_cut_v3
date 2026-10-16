@@ -50,8 +50,9 @@ CEP-панель, политика зависимостей, Docker/CI и свя
 
 ## Статус исправлений — 16 октября 2026
 
-Проверен полный diff `c25ab3f..3b734a3` (33 файла): код, тесты,
-конфигурация и операторская документация. Исправления выполнены по
+Проверенный объём расширен до diff `c25ab3f..867578e` (37 файлов):
+предыдущая проверка кода, тестов, конфигурации и операторской документации
+дополнена исправлениями итогового ревью. Исправления выполнены по
 [согласованному дизайну](../../superpowers/specs/2026-10-15-pet-project-audit-fixes-design.md)
 и [плану](../../superpowers/plans/2026-10-15-pet-project-audit-fixes.md).
 A1–A8 закрыты по локальным автоматическим проверкам и ревью реализации.
@@ -61,13 +62,13 @@ A9 принят как рекомендация по сопровождению 
 | ID | Реализация и коммиты | Проверяющее доказательство |
 | --- | --- | --- |
 | A1 | `requests==2.32.4` в обоих пинах; `90380e9`, `2c5f6df` | [Проверка совпадения и минимальной безопасной версии](../../../tests/test_security.py#L384); полный Python gate ниже. |
-| A2 | CEP повторы через 3/6/12/24/30 с и ручной Retry с прежним job ID; `a847bfb`, `2f68084`, `cafbace`, `3b734a3` | [Behavior: backoff, исчерпание повторов и восстановление](../../../tests/cep_behavior_test.cjs#L1833). Повтор опроса не вызывает Start. [Start ждёт initial recovery, затем сохраняет baseline при неоднозначном ответе](../../../tests/cep_behavior_test.cjs#L2398). |
-| A3 | Серверный latest, восстановление source sequence, проверка активного `sequenceId`; `a847bfb`, `2f68084`, `cafbace`, `3b734a3`, `ef4bb9c` | [Latest и orphan recovery](../../../tests/test_api_final_review_routes.py#L939), [восстановление и проверка host перед Apply](../../../tests/cep_behavior_test.cjs#L1857), [initial recovery: текущий 404 разрешает Start, ошибочный/устаревший ответ и смена проекта сохраняют блокировку](../../../tests/cep_behavior_test.cjs#L2430). |
+| A2 | CEP повторы через 3/6/12/24/30 с и ручной Retry с прежним job ID; `a847bfb`, `2f68084`, `cafbace`, `3b734a3` | [Behavior: backoff, исчерпание повторов и восстановление](../../../tests/cep_behavior_test.cjs#L1899). Повтор опроса не вызывает Start. [Start ждёт initial recovery, затем сохраняет baseline при неоднозначном ответе](../../../tests/cep_behavior_test.cjs#L2513). |
+| A3 | Серверный latest, восстановление source sequence, проверка активного `sequenceId`; `a847bfb`, `2f68084`, `cafbace`, `3b734a3`, `ef4bb9c` | [Latest и orphan recovery](../../../tests/test_api_final_review_routes.py#L939), [восстановление и проверка host перед Apply](../../../tests/cep_behavior_test.cjs#L1923), [initial recovery: текущий 404 разрешает Start, ошибочный/устаревший ответ и смена проекта сохраняют блокировку](../../../tests/cep_behavior_test.cjs#L2545). |
 | A4 | Cancel, общий deadline с учётом очереди, killable ASR, сохранение стоимости и освобождение проекта; `48f5a76`, `029f94a`, `ef4bb9c`, `3db5b0d`, `c9cc214` | [Отмена до ASR](../../../tests/test_api_final_review_routes.py#L1073), [отмена в очереди](../../../tests/test_stage2_whisper_process.py#L425), [deadline очереди](../../../tests/test_stage2_whisper_process.py#L459), [остановка активного HTTP](../../../tests/test_stage2_whisper_process.py#L537), [сохранение spent/reserved](../../../tests/test_api_final_review_routes.py#L1170). |
 | A5 | Lock проекта на allocation/history и `request_id`: replay одного действия, новый ID для нового Apply; `aab4bca` | [Replay](../../../tests/test_api_final_review_routes.py#L486), [replay после нового отчёта](../../../tests/test_api_final_review_routes.py#L537), [конкурентные Apply сохраняют обе итерации](../../../tests/test_api_final_review_routes.py#L582). |
-| A6 | Общий chunk planner, Decimal preflight и резерв перед каждой попыткой; общий лимит sync по всем исходникам; `20b7ec4`, `48f5a76`, `ef4bb9c`, `c298c9d`, `c4b8383`, `c9831fe` | [Резерв до dispatch](../../../src/cost_budget.py#L74), [неизвестная цена блокирует следующий chunk](../../../tests/test_stage2_cloud_asr.py#L704), [общие known/reserved по исходникам](../../../tests/test_stage2_sync_api.py#L2401), [блокировка позднего исходника](../../../tests/test_stage2_sync_api.py#L2450), [pending через реальный process/ledger](../../../tests/test_api_final_review_routes.py#L1534). |
+| A6 | Общий chunk planner, Decimal preflight и резерв перед каждой попыткой; общий лимит sync по всем исходникам; `20b7ec4`, `48f5a76`, `ef4bb9c`, `c298c9d`, `c4b8383`, `c9831fe` | [Резерв до dispatch](../../../src/cost_budget.py#L74), [неизвестная цена блокирует следующий chunk](../../../tests/test_stage2_cloud_asr.py#L704), [общие known/reserved по исходникам](../../../tests/test_stage2_sync_api.py#L2401), [блокировка позднего исходника](../../../tests/test_stage2_sync_api.py#L2450), [pending через реальный process/ledger](../../../tests/test_api_final_review_routes.py#L1587). |
 | A7 | Linux runtime job устанавливает runtime+Whisper, разрешает настроенный faster-whisper без загрузки модели и собирает Docker; `bc042f0`, `d230a85` | [CI job](../../../.github/workflows/ci.yml#L13), [smoke](../../../tests/runtime_import_smoke.py), [контракт production job](../../../tests/test_security.py#L401), [проверка результата application resolver](../../../tests/test_security.py#L418). Локальный Docker build прошёл; удалённый CI пока не подтверждён. |
-| A8 | Timer/generation финальной проверки включены в visibility lifecycle; `a847bfb`, `2f68084`, `cafbace` | [Visibility, смена проекта и ровно один refresh](../../../tests/cep_behavior_test.cjs#L1913), [поздний ответ скрытой панели](../../../tests/cep_behavior_test.cjs#L1945). |
+| A8 | Timer/generation финальной проверки включены в visibility lifecycle; `a847bfb`, `2f68084`, `cafbace` | [Visibility, смена проекта и ровно один refresh](../../../tests/cep_behavior_test.cjs#L1979), [поздний ответ скрытой панели](../../../tests/cep_behavior_test.cjs#L2011). |
 
 Денежный guard ограничивает следующие попытки облачного ASR при положительных
 лимите и оценке; лимит `0` отключает enforcement. Уже принятый запрос может
@@ -75,28 +76,39 @@ A9 принят как рекомендация по сопровождению 
 нулевой оценке. Денежные лимиты для LLM/TTS не входили в согласованный объём;
 для смысловой проверки сохранён прежний лимит числа запросов.
 
+Итоговое ревью выявило четыре оставшихся пробела; исправления вошли в
+`867578e`:
+
+| Проверка интеграции | Исправление и доказательство |
+| --- | --- |
+| Длинный общий deadline увеличивал HTTP timeout | Каждый запрос использует меньшее из лимита адаптера 900 с и оставшегося времени задачи. Общий deadline и отмена продолжают действовать. [7200 → 900 с и уменьшение короткого остатка после callback](../../../tests/test_stage2_cloud_asr.py#L829). |
+| Восстановленная задача не показывала фактические расходы | CEP отображает известную `cost_usd`, `reserved_cost_usd` и `cost_pending`, включая нулевую оценку; при отмене/timeout предупреждает о возможном списании за отправленную работу. [Восстановление terminal/pending и реальные сообщения timeout](../../../tests/cep_behavior_test.cjs#L1834), [обновление при polling](../../../tests/cep_behavior_test.cjs#L1879). |
+| Первый успешный Apply блокировал следующий явный Apply | Возвращение в панель повторно проверяет исходный `sequenceId`; новый Apply получает новый `request_id`, Retry незавершённого действия сохраняет прежний. [Успех → неверная секвенция → исходная секвенция → новый Apply](../../../tests/cep_behavior_test.cjs#L2399). |
+| Pending-событие хранило флаг без суммы резерва | Ledger schema 2 сохраняет отдельную десятичную строку `reserved_cost_usd`, включая явный ноль. Schema 1 остаётся читаемой и обновляется при записи. Резерв не входит в подтверждённую `total_cost_usd`; отдельный итог суммирует только pending. [Обновление/разрешение резерва](../../../tests/test_openrouter_usage.py#L97), [final review после следующей задачи и перезагрузки registry](../../../tests/test_api_final_review_routes.py#L1486), [аналогичная проверка sync](../../../tests/test_stage2_sync_api.py#L2552). |
+
 ### Повторные локальные quality gates
 
 Проверка выполнена на Python 3.11.16 в worktree ветки
-`fix/pet-project-audit-fixes`, на ревизии `4c5e2ba` (включая исправление
-гонки начального восстановления `3b734a3`):
+`fix/pet-project-audit-fixes`, на коде ревизии `867578e` (включая итоговые
+исправления HTTP timeout, расходов и повторного Apply):
 
 | Команда | Результат, exit 0 |
 | --- | --- |
-| `.venv/bin/python -m pytest -q --cov=src --cov-report=term --timeout=120` | 1045 passed за 24.56 с; coverage с ветвями 83.60%, порог 79% |
+| `.venv/bin/python -m pytest -q --cov=src --cov-report=term --timeout=120` | 1053 passed за 24.35 с; coverage с ветвями 83.64%, порог 79% |
 | `.venv/bin/ruff check src tests` | All checks passed |
 | `.venv/bin/ruff format --check src tests` | 126 files already formatted |
 | `.venv/bin/mypy src` | No issues found in 59 source files |
 | `npm run lint:cep` | ESLint завершился без ошибок |
-| `node tests/cep_behavior_test.cjs` | Все проверки прошли; 22 final-review behavior cases выведены как PASS |
+| `node tests/cep_behavior_test.cjs` | Все проверки прошли; 25 final-review behavior cases выведены как PASS |
 | `node tests/stage1_behavior_test.cjs` | 9 passed; остаётся предупреждение Node о типе модуля |
+| `HF_HUB_OFFLINE=1 SYNC_WHISPER_BACKEND=faster-whisper .venv/bin/python tests/runtime_import_smoke.py` | Production ASR imports and faster-whisper backend passed; no model loaded |
 | `docker compose --env-file /private/tmp/rough-cut-audit.env config --quiet` | Успешный повтор с временным ignored `.env`, скопированным из `.env.example` для service `env_file`; временный файл удалён |
-| `docker build -t rough-cut-v3:audit-fixes .` | Образ собран: `sha256:20eb8b988d7f9f8386fdee6b10825a01f7d1c1a7e2ebf084f6cf432f0fdacee4`; все слои сборки взяты из cache |
+| `docker build -t rough-cut-v3:audit-fixes .` | Образ собран: `sha256:2cdb9557457145687c36614f41839db35c0f6783c44e9a683fc19d60632325b4`; dependency layers из cache, слои исходников пересобраны |
 
 В исходном прогоне на `2dbf6d4` первый запуск Compose завершился с exit 1:
 отсутствовал требуемый service `env_file: .env` в изолированном worktree. После создания временной конфигурации
 точная команда из плана завершилась с exit 0. В повторной проверке на
-`4c5e2ba` временный `.env` подготовлен заранее; та же команда снова дала exit 0.
+`867578e` временный `.env` подготовлен заранее; та же команда снова дала exit 0.
 Это проверка конфигурации,
 не запуск контейнерного приложения. Удалённый GitHub Actions не запускался
 в рамках этой проверки.
