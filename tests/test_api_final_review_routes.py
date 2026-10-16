@@ -1482,6 +1482,59 @@ def test_real_usage_ledger_keeps_reserved_exposure_pending_once(controller, spen
     _assert_released(services, job_id)
 
 
+@pytest.mark.parametrize("reserve", [0.17, 0.0])
+def test_final_review_pending_reserve_survives_next_job_and_registry_reload(controller, reserve):
+    from openrouter_usage import make_usage_callback, usage_summary
+
+    client, services = controller
+    paths = services._test_paths
+    ledger = paths["work"] / "usage.json"
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(
+        ledger, **context
+    )
+    original_write = services._atomic_write_json_file
+    original_read = services._read_json_safe
+
+    def write(path, payload):
+        original_write(path, payload)
+        if path == paths["final_review_job_status"]:
+            path.write_text(json.dumps(payload))
+
+    services._atomic_write_json_file = write
+    services._read_json_safe = lambda path: (
+        json.loads(path.read_text())
+        if path == paths["final_review_job_status"] and path.exists()
+        else original_read(path)
+    )
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+
+    def transcribe(*_args, **options):
+        options["budget_callback"](
+            {"spent_usd": 0.03, "reserved_usd": reserve, "limit_usd": 1, "cost_pending": True}
+        )
+        raise WhisperCancelledError("cancelled after dispatch")
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert services._FINAL_REVIEW_JOBS[job_id]["status"] == "cancelled"
+    next_job = services._create_final_review_job("demo", paths["final_review_audio"], {})
+    services._update_final_review_job(next_job["id"], status="completed")
+    services._FINAL_REVIEW_JOBS.clear()
+    restored = client.get("/stage2/final-review/latest?project=demo").get_json()["result"]
+    assert restored["id"] == next_job["id"]
+    assert restored["id"] != job_id
+    pending = [
+        event for event in json.loads(ledger.read_text())["events"] if event["status"] == "pending"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["event_id"] == f"final-review-asr:{job_id}:reserved"
+    assert float(pending[0]["reserved_cost_usd"]) == reserve
+    assert pending[0]["cost_usd"] is None
+    assert usage_summary(ledger)["total_cost_usd"] == pytest.approx(0.03)
+    assert usage_summary(ledger)["reserved_cost_usd"] == reserve
+
+
 def test_real_local_process_error_preserves_limit_without_provider_usage(controller, monkeypatch):
     import multiprocessing
     from openrouter_usage import make_usage_callback, usage_summary

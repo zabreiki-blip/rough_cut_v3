@@ -1258,9 +1258,20 @@ class CloudAudioAsrAdapter:
             # the event loop is unable to deliver asyncio's timeout callback.
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 raise TimeoutError("Cloud ASR transcription exceeded its deadline")
+            request_timeout = self.timeout_sec
+            if deadline_monotonic is not None:
+                request_timeout = min(request_timeout, deadline_monotonic - time.monotonic())
+                if request_timeout <= 0:
+                    raise TimeoutError("Cloud ASR transcription exceeded its deadline")
             try:
                 resp = await self._await_cancellable(
-                    client.post(self._chat_url, headers=self._headers(), json=payload), cancel
+                    client.post(
+                        self._chat_url,
+                        headers=self._headers(),
+                        json=payload,
+                        timeout=request_timeout,
+                    ),
+                    cancel,
                 )
             except httpx.HTTPError as exc:
                 if attempt >= self._max_retries:
@@ -1611,7 +1622,7 @@ def transcribe_cloud(
         api_key=api_key,
         chunk_minutes=chunk_minutes if chunk_minutes is not None else DEFAULT_CHUNK_MINUTES,
         overlap_sec=overlap_sec,
-        timeout_sec=timeout_sec if timeout_sec is not None else DEFAULT_TIMEOUT_SEC,
+        timeout_sec=DEFAULT_TIMEOUT_SEC,
     )
     deadline_monotonic = time.monotonic() + timeout_sec if timeout_sec is not None else None
 

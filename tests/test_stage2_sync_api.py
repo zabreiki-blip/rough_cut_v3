@@ -2548,6 +2548,46 @@ def test_sync_budget_retains_cost_and_pending_fields_after_failure_or_cancellati
     assert usage["pending_count"] == 1
 
 
+@pytest.mark.parametrize("reserve", [0.17, 0.0])
+def test_sync_pending_reserve_survives_next_checkpoint_and_registry_reload(
+    sync_api, monkeypatch, reserve
+):
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+
+    def transcribe(_path, **options):
+        options["budget_callback"](
+            {"spent_usd": 0.03, "reserved_usd": reserve, "limit_usd": 1, "cost_pending": True}
+        )
+        raise api.WhisperCancelledError("cancelled after dispatch")
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start", json={"project": "demo", "asr_engine": "cloud"}
+        )
+    job_id = response.get_json()["result"]["job_id"]
+    assert api._SYNC_JOBS[job_id]["status"] == "cancelled"
+    next_job = api._create_sync_job("demo")
+    api._update_sync_job(next_job["id"], status="completed")
+    api._SYNC_JOBS.clear()
+    restored = client.get("/stage2/sync-jobs/status?project=demo").get_json()["result"]
+    assert restored["id"] == next_job["id"]
+    assert restored["id"] != job_id
+    ledger = json.loads(api._project_paths("demo")["openrouter_usage"].read_text())
+    pending = [event for event in ledger["events"] if event["status"] == "pending"]
+    assert len(pending) == 1
+    assert pending[0]["event_id"] == f"sync-asr:{job_id}:budget_1:reserved"
+    assert float(pending[0]["reserved_cost_usd"]) == reserve
+    assert pending[0]["cost_usd"] is None
+    usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
+    assert usage["total_cost_usd"] == pytest.approx(0.03)
+    assert usage["reserved_cost_usd"] == reserve
+
+
 def test_sync_budget_preflight_skips_unselected_and_reusable_sources(sync_api, monkeypatch):
     client = _prepare_budget_sources(sync_api, [60, 1201, 1201])
     monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.06")

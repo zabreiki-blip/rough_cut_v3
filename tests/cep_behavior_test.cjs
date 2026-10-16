@@ -1820,6 +1820,7 @@ function finalReviewJob(status = "running", extra = {}) {
     id: "review-1", project: "demo", status, message: "Provider progress",
     source_sequence: {sequenceId: "sequence-1", durationSeconds: 90},
     estimated_cost_usd: "0.17", cost_limit_usd: 1,
+    cost_usd: 0, reserved_cost_usd: 0, cost_pending: false,
   }, extra);
 }
 
@@ -1828,6 +1829,71 @@ function restoreReview(h, status = "running") {
   h.hooks.restoreFinalReview();
   assert.match(h.requests[0].url, /\/stage2\/final-review\/latest\?project=demo$/);
   h.requests[0].resolve(finalReviewJob(status));
+}
+
+function testFinalReviewRestoredJobsDisplayConfirmedAndPendingCosts() {
+  const cases = [
+    {status: "completed", cost: 0.04, reserve: 0, pending: false, amount: /\$0\.04/},
+    {status: "running", cost: 0.02, reserve: 0.15, pending: true, amount: /\$0\.02/, reserved: /\$0\.15/},
+    {status: "running", cost: null, reserve: 0, pending: true, amount: /неизвестна/i, reserved: /\$0(?:\D|$)/},
+    {status: "cancelled", cost: 0.03, reserve: 0.06, pending: true, amount: /\$0\.03/, reserved: /\$0\.06/, warning: true},
+    {status: "timed_out", cost: 0, reserve: 0, pending: true, amount: /\$0(?:\D|$)/, reserved: /\$0(?:\D|$)/, warning: true},
+    {status: "failed", error: "Final review whole-job deadline exceeded", cost: 0.03, reserve: 0.06, pending: true, amount: /\$0\.03/, reserved: /\$0\.06/, warning: true},
+    {status: "failed", error: "Provider request timeout", cost: 0, reserve: 0, pending: true, amount: /\$0(?:\D|$)/, reserved: /\$0(?:\D|$)/, warning: true},
+    {status: "failed", error: "Cloud ASR transcription exceeded its deadline", cost: 0.03, reserve: 0.06, pending: true, amount: /\$0\.03/, reserved: /\$0\.06/, warning: true},
+    {status: "failed", error: "Whisper transcription exceeded 120 seconds", cost: 0.03, reserve: 0.06, pending: true, amount: /\$0\.03/, reserved: /\$0\.06/, warning: true},
+    {status: "failed", error: "Invalid audio file", cost: 0, reserve: 0, pending: false, amount: /\$0(?:\D|$)/},
+  ];
+  for (const item of cases) {
+    const h = finalReviewHarness();
+    h.element("finalReviewCost").textContent = "Stale preflight estimate $9.99";
+    h.hooks.restoreFinalReview();
+    h.requests[0].resolve(finalReviewJob(item.status, {
+      cost_usd: item.cost, reserved_cost_usd: item.reserve, cost_pending: item.pending, error: item.error,
+    }));
+    const cost = h.element("finalReviewCost").textContent;
+    assert.match(cost, /подтвержд[её]нная стоимость/i,
+      item.status + " recovery must display confirmed accounting instead of the old estimate");
+    assert.match(cost, item.amount);
+    assert.doesNotMatch(cost, /9\.99/);
+    if (item.pending) {
+      assert.match(cost, /ожидает подтверждения/i, "pending cost must remain visible even when reserve is zero");
+      assert.match(cost, /резерв/i);
+      assert.match(cost, item.reserved);
+    } else {
+      assert.doesNotMatch(cost, /ожидает подтверждения/i);
+    }
+    if (item.warning) {
+      assert.match(cost, /уже отправлен/i,
+        (item.error || item.status) + " must warn that provider work may still be billed");
+      assert.match(cost, /провайдер/i);
+      assert.match(cost, /оплачен/i);
+      assert.strictEqual(h.timers.size, 0, item.status + " must stop status polling");
+    } else {
+      assert.doesNotMatch(cost, /уже отправлен/i,
+        "a failure unrelated to timeout must keep its existing accounting message");
+    }
+  }
+}
+
+function testFinalReviewPolledJobRefreshesAccounting() {
+  const h = finalReviewHarness();
+  restoreReview(h);
+  h.fireTimer();
+  h.requests[1].resolve(finalReviewJob("running", {
+    cost_usd: 0.02, reserved_cost_usd: 0.15, cost_pending: true,
+  }));
+  assert.match(h.element("finalReviewCost").textContent, /\$0\.02/);
+  assert.match(h.element("finalReviewCost").textContent, /\$0\.15/);
+  assert.match(h.element("finalReviewCost").textContent, /ожидает подтверждения/i);
+  h.fireTimer();
+  h.requests[2].resolve(finalReviewJob("completed", {
+    cost_usd: 0.12, reserved_cost_usd: 0, cost_pending: false,
+  }));
+  const settled = h.element("finalReviewCost").textContent;
+  assert.match(settled, /\$0\.12/);
+  assert.doesNotMatch(settled, /ожидает подтверждения|\$0\.15/i,
+    "settled polling must replace the previous pending reserve");
 }
 
 function testFinalReviewBackoffAndManualRetry() {
@@ -2330,6 +2396,55 @@ function testFinalReviewExplicitApplyAfterCloneFailureGetsFreshRequestId() {
     "manual transport Retry must reuse the new Apply's request ID");
 }
 
+function testFinalReviewExplicitApplyAfterSuccessRevalidatesSourceAndGetsFreshRequestId() {
+  const h = finalReviewHarness();
+  h.initialize();
+  h.hosts[0].resolve({projects: ["demo"]});
+  h.requests[0].resolve(finalReviewJob("completed"));
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  h.element("applyFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const first = h.requests[1];
+  first.resolve({iteration: {id: "iteration-1"}, corrections: []});
+  h.hosts[h.hosts.length - 1].resolve({draft: {sequenceId: "draft-1", name: "Draft 1"}});
+  assert.match(h.element("finalReviewStatus").textContent, /Draft 1/);
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+
+  // Returning to the panel must revalidate even after a successful Apply.
+  const hostCount = h.hosts.length;
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  h.context.document.hidden = false;
+  h.hooks.handleVisibilityChange();
+  h.requests[2].resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.hosts.length, hostCount + 1,
+    "a completed review must inspect the source again after a previous successful Apply");
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "draft-1"}});
+  assert.strictEqual(h.element("applyFinalReview").disabled, true,
+    "the created draft must not become the source of a later Apply");
+  assert.match(h.element("finalReviewStatus").textContent, /не совпадает/);
+
+  // The user opens the saved source and explicitly refreshes its status.
+  h.element("retryFinalReview").listeners.click();
+  h.requests[3].resolve(finalReviewJob("completed"));
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.element("applyFinalReview").disabled, false);
+  const beforeSecondApply = h.requests.length;
+  h.element("applyFinalReview").listeners.click();
+  assert.strictEqual(h.requests.length, beforeSecondApply,
+    "every explicit Apply must inspect the active source before backend mutation");
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const second = h.requests[4];
+  assert.match(second.url, /\/jobs\/review-1\/apply$/);
+  assert.notStrictEqual(second.body.request_id, first.body.request_id,
+    "a later explicit Apply must request a fresh iteration after a successful Apply");
+  second.fail();
+  h.element("retryFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.requests[5].body.request_id, second.body.request_id,
+    "Retry for the unfinished second Apply must preserve its request ID");
+}
+
 function submitReviewFromWav(h) {
   h.hooks.startFinalReviewFromWav();
   h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
@@ -2454,6 +2569,8 @@ function testFinalReviewInitialRecovery404AndStaleRepliesGateStart() {
 }
 
 for (const test of [
+  testFinalReviewRestoredJobsDisplayConfirmedAndPendingCosts,
+  testFinalReviewPolledJobRefreshesAccounting,
   testFinalReviewStartWaitsForInitialRecoveryBeforeCapturingBaseline,
   testFinalReviewInitialRecovery404AndStaleRepliesGateStart,
   testFinalReviewBackoffAndManualRetry,
@@ -2474,6 +2591,7 @@ for (const test of [
   testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain,
   testFinalReviewHideDuringLayoutResumesCaptureOnce,
   testFinalReviewExplicitApplyAfterCloneFailureGetsFreshRequestId,
+  testFinalReviewExplicitApplyAfterSuccessRevalidatesSourceAndGetsFreshRequestId,
   testFinalReviewUncertainStartRejectsBaselineLatestJob,
   testFinalReviewStartBaselineResetsAndPreservesKnownJobHistory,
 ]) {

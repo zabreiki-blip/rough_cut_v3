@@ -33,7 +33,6 @@
     project: "",
     applyRequestId: "",
     applyBusy: false,
-    applied: false,
     inFlight: false,
     retryAction: "status",
     exportResume: null,
@@ -1683,7 +1682,7 @@
 
   function finalReviewTerminal(status) {
     return status === "completed" || status === "failed" ||
-      status === "interrupted" || status === "cancelled";
+      status === "interrupted" || status === "cancelled" || status === "timed_out";
   }
 
   function finalReviewStatusLabel(status) {
@@ -1694,7 +1693,8 @@
       failed: "ошибка проверки",
       interrupted: "проверка прервана",
       cancelling: "отмена проверки…",
-      cancelled: "проверка отменена"
+      cancelled: "проверка отменена",
+      timed_out: "время проверки истекло"
     };
     return labels[status] || status || "проверка выполняется";
   }
@@ -1745,6 +1745,24 @@
     });
   }
 
+  function renderFinalReviewCost(job) {
+    var confirmed = job.cost_usd;
+    var reserved = job.reserved_cost_usd;
+    var message = "Подтверждённая стоимость: " +
+      (confirmed === null || confirmed === undefined ? "неизвестна" : "$" + confirmed) + ".";
+    if (job.cost_pending || Number(reserved) > 0) {
+      message += " Ожидает подтверждения провайдера: резерв " +
+        (reserved === null || reserved === undefined ? "неизвестен" : "$" + reserved) +
+        ". Итоговая стоимость пока неизвестна.";
+    }
+    var timedOut = job.status === "timed_out" || (job.status === "failed" &&
+      /timeout|timed[\s_-]*out|deadline.*exceeded|exceeded.*deadline|transcription exceeded .* seconds/i.test(String(job.error || "")));
+    if (job.status === "cancelled" || timedOut) {
+      message += " Уже отправленные провайдеру запросы всё ещё могут быть оплачены.";
+    }
+    byId("finalReviewCost").textContent = message;
+  }
+
   function renderFinalReviewJob(job) {
     if (!job || !job.id) {
       finalReviewFailure(new Error("Backend не вернул ID проверки."));
@@ -1766,7 +1784,6 @@
     }
     if (!finalReview.job || finalReview.job.id !== job.id) {
       finalReview.applyRequestId = "";
-      finalReview.applied = false;
     }
     finalReview.job = job;
     finalReview.startUncertain = false;
@@ -1781,9 +1798,10 @@
     byId("cancelFinalReview").hidden = finalReviewTerminal(job.status);
     byId("cancelFinalReview").disabled = job.status === "cancelling";
     byId("applyFinalReview").disabled = true;
+    renderFinalReviewCost(job);
     setFinalReviewStatus(finalReviewStatusLabel(job.status) + (job.message ? ": " + job.message : "") +
       (job.error ? " — " + job.error : ""));
-    if (job.status === "completed" && !finalReview.applied) {
+    if (job.status === "completed") {
       var generation = finalReview.generation;
       inspectFinalReviewSource(generation, function () {
         byId("applyFinalReview").disabled = false;
@@ -1843,7 +1861,6 @@
     finalReview.startUncertain = false;
     finalReview.startBaselineJobId = "";
     finalReview.lastKnownJobId = "";
-    finalReview.applied = false;
     finalReview.retryIndex = 0;
     finalReview.retryAction = "status";
     finalReview.exportResume = null;
@@ -2092,7 +2109,6 @@
     finalReview.job = null;
     finalReview.sourceSequence = null;
     finalReview.applyRequestId = "";
-    finalReview.applied = false;
     finalReview.retryIndex = 0;
     finalReview.exportResume = null;
     finalReview.layoutSequence = null;
@@ -2142,7 +2158,7 @@
 
   function beginFinalReviewApply(reuseRequestId) {
     if (!finalReview.job || finalReview.job.status !== "completed" ||
-        !finalReview.sourceSequence || finalReview.applyBusy || finalReview.applied ||
+        !finalReview.sourceSequence || finalReview.applyBusy ||
         !finalReviewCurrent(finalReview.generation)) return;
     clearFinalReviewTimer();
     var generation = finalReview.generation;
@@ -2175,7 +2191,6 @@
             log("Черновая sequence не создана: " + cloneError.message, cloned, "error");
             return;
           }
-          finalReview.applied = true;
           var corrections = result.corrections || [];
           if (!corrections.length) {
             finalReview.applyBusy = false;

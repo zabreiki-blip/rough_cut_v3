@@ -235,6 +235,7 @@ def run_sync_job(
                             "event_id": f"sync-asr:{job_id}:{source.id}:reserved",
                             "model": selected_model,
                             "cost_usd": None,
+                            "reserved_cost_usd": str(current["reserved"]),
                             "pending": True,
                         }
                     )

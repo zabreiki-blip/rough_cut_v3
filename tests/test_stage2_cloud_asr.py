@@ -825,6 +825,34 @@ def test_deadline_interrupts_http_and_prevents_further_chunks(monkeypatch) -> No
     assert caught.value.reserved_cost_usd == pytest.approx(0.06)
 
 
+@pytest.mark.parametrize("allowance,expected_timeout", [(7200, 900), (30, 30)])
+def test_http_request_timeout_caps_remaining_whole_job_allowance(
+    monkeypatch, allowance, expected_timeout
+) -> None:
+    timeouts = []
+
+    def handler(request):
+        timeouts.append(request.extensions["timeout"]["read"])
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    monkeypatch.setattr(
+        cloud_asr.httpx,
+        "AsyncClient",
+        lambda **kwargs: _RealAsyncClient(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        timeout_sec=allowance,
+        budget_callback=lambda _snapshot: time.sleep(0.02),
+    )
+
+    assert len(timeouts) == 1
+    assert expected_timeout - 1 < timeouts[0] <= expected_timeout
+    if allowance < 900:
+        assert timeouts[0] < allowance - 0.01
+
+
 def test_cancellation_before_start_prevents_http_dispatch(monkeypatch) -> None:
     calls = []
     cancel = asyncio.Event()

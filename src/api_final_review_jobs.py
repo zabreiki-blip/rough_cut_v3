@@ -270,6 +270,7 @@ def run_final_review_job(
         selected_model: str,
         *,
         cost_pending: bool = False,
+        reserved_cost_usd: Any = None,
         allow_unknown: bool = False,
     ) -> None:
         nonlocal usage_recorded, reserved_usage_recorded
@@ -284,6 +285,7 @@ def run_final_review_job(
                     "event_id": f"final-review-asr:{job_id}:reserved",
                     "model": selected_model,
                     "cost_usd": None,
+                    "reserved_cost_usd": reserved_cost_usd,
                     "pending": True,
                 }
             )
@@ -308,6 +310,9 @@ def run_final_review_job(
                     str(model or ""),
                     cost_pending=bool(
                         failed_cost.get("cost_pending", latest.get("cost_pending", False))
+                    ),
+                    reserved_cost_usd=failed_cost.get(
+                        "reserved_cost_usd", latest.get("reserved_cost_usd")
                     ),
                 )
         finally:
@@ -360,6 +365,7 @@ def run_final_review_job(
                 final_cost.get("cost_usd"),
                 str(result.get("model") or model or ""),
                 cost_pending=bool(final_snapshot.get("cost_pending", False)),
+                reserved_cost_usd=final_snapshot.get("reserved_cost_usd"),
                 allow_unknown=True,
             )
         check_stop()

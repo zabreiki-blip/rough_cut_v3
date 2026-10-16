@@ -16,7 +16,7 @@ LOGGER = logging.getLogger(__name__)
 UsageCallback = Callable[[dict[str, Any]], None]
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class UsageLedgerError(RuntimeError):
@@ -86,6 +86,7 @@ def _total(events: list[dict[str, Any]]) -> Decimal:
 
 
 def _save(path: Path, ledger: dict[str, Any]) -> None:
+    ledger["schema_version"] = _SCHEMA_VERSION
     ledger["total_cost_usd"] = str(_total(ledger["events"]))
     atomic_write_json(path, ledger)
 
@@ -139,6 +140,7 @@ def make_usage_callback(
                 operation=operation,
                 model=str(payload.get("model") or model),
                 cost_usd=payload.get("cost_usd"),
+                reserved_cost_usd=payload.get("reserved_cost_usd"),
                 generation_id=str(payload.get("generation_id") or ""),
                 event_id=str(payload.get("event_id") or ""),
                 job_id=job_id,
@@ -159,6 +161,7 @@ def record_usage(
     operation: str,
     model: str,
     cost_usd: Any = None,
+    reserved_cost_usd: Any = None,
     generation_id: str = "",
     event_id: str = "",
     job_id: str = "",
@@ -167,6 +170,7 @@ def record_usage(
     base_url: str = "",
 ) -> None:
     cost = _decimal(cost_usd)
+    reserved = _decimal(reserved_cost_usd)
     if cost is None and not pending:
         return
     generation_id = generation_id.strip()
@@ -181,6 +185,9 @@ def record_usage(
                 existing["status"] = "confirmed"
                 existing["resolved_at"] = _now_iso()
                 existing.pop("next_retry_at", None)
+                existing.pop("reserved_cost_usd", None)
+            elif existing.get("status") == "pending" and reserved is not None:
+                existing["reserved_cost_usd"] = str(reserved)
             _save(path, ledger)
             return
         event: dict[str, Any] = {
@@ -196,6 +203,8 @@ def record_usage(
             "cost_usd": str(cost) if cost is not None else None,
         }
         if cost is None:
+            if reserved is not None:
+                event["reserved_cost_usd"] = str(reserved)
             event.update(
                 {
                     "base_url": base_url.rstrip("/"),
@@ -270,6 +279,7 @@ def reconcile_pending(
                 current["status"] = "confirmed"
                 current["resolved_at"] = _now_iso()
                 current.pop("next_retry_at", None)
+                current.pop("reserved_cost_usd", None)
             else:
                 attempts = int(current.get("retry_count") or 0) + 1
                 current["retry_count"] = attempts
@@ -287,6 +297,16 @@ def usage_summary(path: Path, *, create: bool = True) -> dict[str, Any]:
                 "status": "ok",
                 "total_cost_usd": float(_total(events)),
                 "pending_count": sum(item.get("status") == "pending" for item in events),
+                "reserved_cost_usd": float(
+                    sum(
+                        (
+                            _decimal(item.get("reserved_cost_usd")) or Decimal("0")
+                            for item in events
+                            if item.get("status") == "pending"
+                        ),
+                        Decimal("0"),
+                    )
+                ),
                 "started_at": str(ledger.get("started_at") or ""),
             }
     except UsageLedgerError as exc:
@@ -295,5 +315,6 @@ def usage_summary(path: Path, *, create: bool = True) -> dict[str, Any]:
             "status": "unavailable",
             "total_cost_usd": 0.0,
             "pending_count": 0,
+            "reserved_cost_usd": 0.0,
             "started_at": "",
         }
