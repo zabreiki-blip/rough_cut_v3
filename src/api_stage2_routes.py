@@ -403,11 +403,16 @@ def _stage2_sync_job_start(services: ModuleType):
         # "cloud" is the UI-facing engine choice; "backend" stays available
         # for explicit low-level overrides (tests/tooling) and wins when set.
         backend = "cloud-audio"
+    backend = str(backend or os.getenv("SYNC_WHISPER_BACKEND", "auto")).strip().lower() or "auto"
     try:
         # Freeze auto-selection and aliases before queueing, so a later
         # environment change cannot select a different backend in the worker.
         backend = resolve_backend(backend)
-    except (ValueError, WhisperUnavailableError) as exc:
+    except WhisperUnavailableError:
+        # Durable indexes need no installed ASR backend. Keep the explicit
+        # local selector; the worker resolves it only if transcription is needed.
+        pass
+    except ValueError as exc:
         return services._json_error(str(exc), 400)
     uses_cloud_backend = backend == "cloud-audio"
     # ``model`` is the legacy/local Whisper model-size field from the UI

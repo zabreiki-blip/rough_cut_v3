@@ -8,6 +8,7 @@ from api_final_review_jobs import canonical_decimal_string
 from api_service_contracts import SyncWorkerServices
 from cost_budget import CostBudget, CostBudgetExceeded
 from stage2.cloud_asr import plan_cloud_chunks
+from stage2.whisper_runner import resolve_backend
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
@@ -341,10 +342,19 @@ def run_sync_job(
                         raise FileNotFoundError(
                             f"audio guide not found for sync source {source.id}"
                         )
+                    resolved_backend = resolve_backend(config["backend"])
+                    if resolved_backend != config["backend"]:
+                        config = _transcription_config(
+                            backend=resolved_backend,
+                            model=model,
+                            language=language,
+                        )
                     source_duration = max(0.0, float(source.duration_sec or 0.0))
                     if cloud_source_options is not None:
                         source_duration = float(
-                            (cloud_source_options.get(source.id) or {}).get("duration_sec", source_duration)
+                            (cloud_source_options.get(source.id) or {}).get(
+                                "duration_sec", source_duration
+                            )
                         )
                     _update_sync_job(
                         job_id,

@@ -2818,3 +2818,68 @@ def test_sync_budget_per_chunk_decimal_rounding_matches_dispatch_at_exact_cap(
         assert job["estimated_cost_usd"] == "0.4001999999999999848333333334"
         assert job["status"] == "completed"
         assert dispatched == ["budget_1.wav"]
+
+
+def test_sync_budget_cache_only_auto_job_needs_no_installed_local_backend(sync_api, monkeypatch):
+    from stage2 import whisper_runner
+
+    client = _prepare_budget_sources(sync_api, [60])
+    assert (
+        client.put(
+            "/stage2/sync-sources/budget_1/words",
+            json={"project": "demo", "words": [{"word": "cached", "start": 0, "end": 1}]},
+        ).status_code
+        == 200
+    )
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "auto")
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: [])
+    with (
+        patch.object(
+            api, "transcribe_audio", side_effect=AssertionError("transcription forbidden")
+        ) as transcribe,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["reused_indexes"] == 1
+    assert job["transcribed"] == 0
+    assert job["source_failures"] == []
+    transcribe.assert_not_called()
+
+
+def test_sync_budget_deferred_auto_resolution_stays_local_when_environment_changes(
+    sync_api,
+    monkeypatch,
+):
+    from stage2 import whisper_runner
+
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "auto")
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: [])
+    dispatched = []
+
+    class LocalBackendBecomesAvailableBeforeStart(_ImmediateThread):
+        def start(self):
+            monkeypatch.setattr(whisper_runner, "available_backends", lambda: ["faster-whisper"])
+            monkeypatch.setenv("SYNC_WHISPER_BACKEND", "cloud-audio")
+            super().start()
+
+    def transcribe(_path, **options):
+        dispatched.append(options["backend"])
+        assert whisper_runner.resolve_backend(options["backend"]) == "faster-whisper"
+        assert "cloud_options" not in options
+        return {"backend": "faster-whisper", "words": [{"word": "local", "start": 0, "end": 1}]}
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", LocalBackendBecomesAvailableBeforeStart),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert dispatched == ["faster-whisper"]
+    assert job["status"] == "completed"
+    assert job["transcribed"] == 1
+    assert job["cost_usd"] == 0
