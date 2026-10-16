@@ -1896,6 +1896,30 @@ function testFinalReviewPolledJobRefreshesAccounting() {
     "settled polling must replace the previous pending reserve");
 }
 
+function testFinalReviewExhaustedProviderReadTimeoutPreservesBillingWarning() {
+  // Exact adapter -> whisper_runner -> worker IPC error, including an empty
+  // original httpx.ReadTimeout message. Generic connection errors retain their
+  // prior error text and must not be classified as a timeout by the panel.
+  const prefix = "WhisperTranscriptionError: Облачное распознавание речи не удалось: " +
+    "Ошибка сети при запросе к облачной ASR-модели после 3 попыток: ";
+  for (const detail of ["HTTP timeout (ReadTimeout)", ""]) {
+    const h = finalReviewHarness();
+    h.hooks.restoreFinalReview();
+    h.requests[0].resolve(finalReviewJob("failed", {
+      error: prefix + detail, cost_usd: 0, reserved_cost_usd: 0.18, cost_pending: true,
+    }));
+    const cost = h.element("finalReviewCost").textContent;
+    assert.match(cost, /\$0\.18/);
+    assert.match(cost, /ожидает подтверждения/i);
+    if (detail) {
+      assert.match(cost, /уже отправлен.*оплачен/i);
+    } else {
+      assert.doesNotMatch(cost, /уже отправлен/i);
+    }
+    assert.strictEqual(h.timers.size, 0);
+  }
+}
+
 function testFinalReviewBackoffAndManualRetry() {
   const h = finalReviewHarness();
   restoreReview(h);
@@ -2569,6 +2593,7 @@ function testFinalReviewInitialRecovery404AndStaleRepliesGateStart() {
 }
 
 for (const test of [
+  testFinalReviewExhaustedProviderReadTimeoutPreservesBillingWarning,
   testFinalReviewRestoredJobsDisplayConfirmedAndPendingCosts,
   testFinalReviewPolledJobRefreshesAccounting,
   testFinalReviewStartWaitsForInitialRecoveryBeforeCapturingBaseline,

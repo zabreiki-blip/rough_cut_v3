@@ -1275,8 +1275,15 @@ class CloudAudioAsrAdapter:
                 )
             except httpx.HTTPError as exc:
                 if attempt >= self._max_retries:
+                    detail = str(exc)
+                    if isinstance(exc, httpx.TimeoutException):
+                        # Timeout messages may be empty. Keep the category in
+                        # the text that survives runner wrapping and IPC.
+                        detail = f"HTTP timeout ({type(exc).__name__})" + (
+                            f": {detail}" if detail else ""
+                        )
                     raise CloudAudioAsrError(
-                        f"Ошибка сети при запросе к облачной ASR-модели после {attempt} попыток: {exc}"
+                        f"Ошибка сети при запросе к облачной ASR-модели после {attempt} попыток: {detail}"
                     ) from exc
                 logger.warning(
                     "Облачный ASR: сетевая ошибка (попытка %d/%d), повтор",

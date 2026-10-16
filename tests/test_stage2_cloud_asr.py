@@ -430,6 +430,78 @@ def test_transcribe_cloud_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -
     assert result["cost_usd"] == pytest.approx(0.01)
 
 
+@pytest.mark.parametrize(
+    "error_type,detail",
+    [(httpx.ReadTimeout, "HTTP timeout (ReadTimeout)"), (httpx.ConnectError, "")],
+)
+def test_exhausted_http_retries_preserve_empty_timeout_classification(
+    monkeypatch, error_type, detail
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise error_type("", request=request)
+
+    async def no_sleep(_self, _attempt):
+        pass
+
+    _patch_async_client(monkeypatch, handler)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    with pytest.raises(cloud_asr.CloudAudioAsrError) as caught:
+        transcribe_cloud(
+            Path("unused.wav"), api_key="test-key", max_cost_usd="1", usd_per_minute_estimate="0.06"
+        )
+
+    assert len(calls) == 3
+    assert str(caught.value) == (
+        "Ошибка сети при запросе к облачной ASR-модели после 3 попыток: " + detail
+    )
+    assert caught.value.reserved_cost_usd == pytest.approx(0.18)
+
+
+def test_empty_read_timeout_message_survives_real_runner_and_worker_ipc(tmp_path, monkeypatch):
+    import multiprocessing
+    from stage2.whisper_process import (
+        WhisperProcessError,
+        _shutdown_worker,
+        transcribe_audio_in_process,
+    )
+
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("real HTTP error propagation test requires inherited MockTransport")
+    _shutdown_worker()
+    audio = tmp_path / "guide.wav"
+    audio.write_bytes(b"fixture")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_API_KEY", "test-key")
+
+    def handler(request):
+        raise httpx.ReadTimeout("", request=request)
+
+    async def no_sleep(_self, _attempt):
+        pass
+
+    _patch_async_client(monkeypatch, handler)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    try:
+        with pytest.raises(WhisperProcessError) as caught:
+            transcribe_audio_in_process(
+                audio,
+                backend="cloud-audio",
+                timeout_seconds=5,
+                cloud_options={"max_cost_usd": "1", "usd_per_minute_estimate": "0.06"},
+                _start_method="fork",
+            )
+    finally:
+        _shutdown_worker()
+
+    assert str(caught.value) == (
+        "WhisperTranscriptionError: Облачное распознавание речи не удалось: "
+        "Ошибка сети при запросе к облачной ASR-модели после 3 попыток: HTTP timeout (ReadTimeout)"
+    )
+    assert caught.value.reserved_cost_usd == pytest.approx(0.18)
+
+
 def test_call_model_payload_requests_cost_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     """OpenRouter отдаёт `usage.cost` только если запрос явно попросил об
     этом через `usage.include = True` — без этого `_extract_cost` всегда
