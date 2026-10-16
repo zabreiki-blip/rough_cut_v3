@@ -412,7 +412,7 @@ def run_sync_job(
                     transcription_started_at = time.monotonic()
                     result = transcribe_audio(
                         audio_path,
-                        backend=backend,
+                        backend=config["backend"],
                         model=model,
                         language=language,
                         progress_callback=report_progress,

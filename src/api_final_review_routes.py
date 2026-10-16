@@ -108,8 +108,13 @@ def _estimate_final_review(
             raw_overlap = DEFAULT_OVERLAP_SEC
     overlap_sec = float(str(raw_overlap))
     chunks = plan_cloud_chunks(duration_sec, chunk_minutes, overlap_sec)
-    seconds = sum((Decimal(str(end - start)) for start, end in chunks), Decimal("0"))
-    estimate = seconds * guard.cloud_asr_usd_per_minute / Decimal("60")
+    estimate = sum(
+        (
+            Decimal(str(end - start)) * guard.cloud_asr_usd_per_minute / Decimal("60")
+            for start, end in chunks
+        ),
+        Decimal("0"),
+    )
     amount = _money(estimate, "estimated_cost_usd")
     limit = _money(guard.max_usd_per_job, "cost_limit_usd")
     if limit > 0 and amount <= 0:

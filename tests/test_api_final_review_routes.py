@@ -1243,13 +1243,13 @@ def test_estimate_and_jobs_keep_canonical_decimal_strings(controller, monkeypatc
     client, services = controller
     monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0.060000000000000001')
     result = client.post('/stage2/final-review/estimate', json=_start_payload()).get_json()['result']
-    assert result['estimated_cost_usd'] == '0.1700000000000000028333333333'
+    assert result['estimated_cost_usd'] == '0.1700000000000000028333333334'
     response = client.post('/stage2/final-review/start', json=_start_payload(
-        confirmed_estimate_usd='0.1700000000000000028333333333',
+        confirmed_estimate_usd='0.1700000000000000028333333334',
     ))
     assert response.status_code == 202
     job = services._FINAL_REVIEW_JOBS[response.get_json()['result']['job_id']]
-    assert job['estimated_cost_usd'] == '0.1700000000000000028333333333'
+    assert job['estimated_cost_usd'] == '0.1700000000000000028333333334'
 
 
 @pytest.mark.parametrize('phase', ['words', 'report'])
@@ -1457,4 +1457,71 @@ def test_disabled_guard_tracks_provider_cost_knowledge_through_real_process_and_
     if valid_transcript:
         assert metadata_signals == [provider_cost is None]
     assert job['cost_pending'] is (provider_cost is None)
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize(
+    'limit, expected_status',
+    [
+        ('0.4001999999999999848333333333', 409),
+        ('0.4001999999999999848333333334', 200),
+    ],
+)
+def test_final_review_per_chunk_decimal_rounding_matches_exact_dispatch_cap(
+    controller, monkeypatch, limit, expected_status,
+):
+    from decimal import Decimal
+    from cost_budget import CostBudget
+    from stage2.cloud_asr import plan_cloud_chunks
+
+    client, services = controller
+    audio = services._test_paths['final_review_audio']
+    with wave.open(str(audio), 'wb') as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(1)
+        target.writeframes(b'\0\0' * 2401)
+    services.FullTimeline = SimpleNamespace(
+        from_dict=lambda _payload: SimpleNamespace(total_duration_sec=2401)
+    )
+    monkeypatch.setenv('ROUGH_CUT_MAX_USD_PER_JOB', limit)
+    monkeypatch.setenv('ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE', '0.01')
+    payload = _start_payload(cloud_options={'chunk_minutes': 20, 'overlap_sec': 0.1})
+    estimate = client.post('/stage2/final-review/estimate', json=payload)
+    assert estimate.status_code == expected_status, estimate.get_json()
+    if expected_status == 409:
+        response = client.post('/stage2/final-review/start', json=payload)
+        assert response.status_code == 409
+        assert not services._FINAL_REVIEW_JOBS
+        assert not services._FINAL_REVIEW_ACTIVE_PROJECTS
+        assert not services._test_pending
+        return
+
+    expected_estimate = '0.4001999999999999848333333334'
+    assert estimate.get_json()['result']['estimated_cost_usd'] == expected_estimate
+    payload['confirmed_estimate_usd'] = expected_estimate
+    response = client.post('/stage2/final-review/start', json=payload)
+    assert response.status_code == 202, response.get_json()
+    dispatched = []
+
+    def transcribe(_path, **options):
+        cloud_options = options['cloud_options']
+        budget = CostBudget(
+            Decimal(cloud_options['max_cost_usd']),
+            Decimal(cloud_options['usd_per_minute_estimate']),
+        )
+        for start, end in plan_cloud_chunks(
+            cloud_options['duration_sec'], cloud_options['chunk_minutes'], cloud_options['overlap_sec'],
+        ):
+            budget.reserve_attempt(end - start)
+        dispatched.append(cloud_options['max_cost_usd'])
+        return {'backend': 'cloud-audio', 'backend_metadata': {'cost_usd': 0.1}}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    job_id = response.get_json()['result']['job_id']
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job['status'] == 'completed'
+    assert job['estimated_cost_usd'] == expected_estimate
+    assert dispatched == [limit]
     _assert_released(services, job_id)

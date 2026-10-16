@@ -17,6 +17,7 @@ from api_final_review_jobs import canonical_decimal_string
 from cost_budget import CostGuardConfig
 from export_naming import xml_export_filename
 from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
+from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
 if TYPE_CHECKING:
@@ -325,8 +326,13 @@ def _sync_cloud_preflight(
         if duration_sec <= 0:
             raise ValueError(f"sync WAV duration must be positive for {source.id}")
         chunks = plan_cloud_chunks(duration_sec, DEFAULT_CHUNK_MINUTES, overlap_sec)
-        seconds = sum((Decimal(str(end - start)) for start, end in chunks), Decimal("0"))
-        estimate += seconds * guard.cloud_asr_usd_per_minute / Decimal("60")
+        estimate += sum(
+            (
+                Decimal(str(end - start)) * guard.cloud_asr_usd_per_minute / Decimal("60")
+                for start, end in chunks
+            ),
+            Decimal("0"),
+        )
         source_options[source.id] = {
             "duration_sec": duration_sec,
             "chunk_minutes": DEFAULT_CHUNK_MINUTES,
@@ -397,14 +403,13 @@ def _stage2_sync_job_start(services: ModuleType):
         # "cloud" is the UI-facing engine choice; "backend" stays available
         # for explicit low-level overrides (tests/tooling) and wins when set.
         backend = "cloud-audio"
-    configured_backend = str(backend or os.getenv("SYNC_WHISPER_BACKEND", "auto"))
-    uses_cloud_backend = configured_backend.strip().lower() in {
-        "cloud",
-        "cloud-audio",
-        "openrouter",
-    }
-    if uses_cloud_backend:
-        backend = "cloud-audio"
+    try:
+        # Freeze auto-selection and aliases before queueing, so a later
+        # environment change cannot select a different backend in the worker.
+        backend = resolve_backend(backend)
+    except (ValueError, WhisperUnavailableError) as exc:
+        return services._json_error(str(exc), 400)
+    uses_cloud_backend = backend == "cloud-audio"
     # ``model`` is the legacy/local Whisper model-size field from the UI
     # ("small", "medium", ...).  It is not a cloud provider model ID; using
     # it for Cloud ASR makes the provider reject every transcription.  Keep
