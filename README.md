@@ -190,7 +190,7 @@ matches и таймлайн. Озвучка привязана к стабиль
     LaunchAgent автоматически задаёт `MACOS_CONNECTOR_ENV_FILE` как путь к
     отдельному файлу настроек с правами `0600`, поэтому эту переменную не нужно
     добавлять в проектный `.env`
-- для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper`,
+- для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper|cloud-audio`,
   `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
 - параметры faster-whisper: `SYNC_WHISPER_BEAM_SIZE` и
   `SYNC_WHISPER_BEST_OF` (по умолчанию `5`), `SYNC_WHISPER_BATCH_SIZE`
@@ -218,6 +218,55 @@ matches и таймлайн. Озвучка привязана к стабиль
   локального Premiere CEP file origin
 - `ROUGH_CUT_HOST_PROJECTS_ROOT` — необязательный путь к корню проектов на
   host-машине для преобразования контейнерных путей, возвращаемых в CEP
+
+### Финальная проверка: стоимость и восстановление
+
+После экспорта WAV CEP вызывает `POST /stage2/final-review/estimate` с
+`project` и `audio_path` (WAV внутри проекта). Без обращения к провайдеру
+сервер возвращает `duration`/`duration_sec`, `planned_chunks` с учётом
+перекрытия, точную десятичную строку `estimated_cost_usd`, `cost_limit_usd`
+и `enforced`. Панель показывает оценку до подтверждения. Затем
+`POST /stage2/final-review/start` передаёт её строку без округления в
+`confirmed_estimate_usd`; HTTP 409 при изменившейся оценке требует нового
+подтверждения. Успешный Start возвращает HTTP 202, `job_id` и `status_url`.
+
+`FINAL_REVIEW_TIMEOUT_SECONDS=7200` задаёт срок всей задачи, включая ожидание
+ASR. Истечение срока даёт `failed` с ошибкой timeout. Настройки облачного
+ASR: `ROUGH_CUT_MAX_USD_PER_JOB=0` отключает ограничение стоимости;
+`ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE=0` означает неизвестную оценку.
+Положительный лимит требует положительной цены минуты. Превышение оценки
+отклоняет запуск с HTTP 409. Лимит относится отдельно к final review и к
+каждой sync-задаче целиком по всем её исходникам, включая платные повторы.
+Локальный ASR имеет нулевую облачную оценку. Без включённого лимита показанная
+стоимость служит учёту расходов и не ограничивает оплату.
+
+`GET /stage2/final-review/jobs/<job_id>?project=<project>` возвращает статус,
+`estimated_cost_usd`, `cost_limit_usd`, известную стоимость `cost_usd`,
+неурегулированную оценку `reserved_cost_usd` и флаг `cost_pending`.
+Если провайдер не сообщил фактическую цену, оценка остаётся в резерве;
+`cost_pending=true` сохраняет неизвестность даже при нулевой оценке.
+При отмене или timeout уже принятый провайдером запрос может быть платным:
+последний резерв сохраняется в статусе задачи, а журнал отмечает pending,
+без выдуманной оплаты.
+
+При загрузке панели и смене проекта
+`GET /stage2/final-review/latest?project=<project>` восстанавливает последнюю
+задачу (HTTP 404, если её нет). Для `queued`/`running`/`cancelling` продолжается
+опрос, а завершённый отчёт восстанавливает Apply только после проверки
+совпадения `sequenceId` активной секвенции. После рестарта сервера незавершённая
+задача становится `interrupted`. Ошибки опроса дают задержки 3, 6, 12, 24, 30
+секунд, затем кнопку Retry; повтор опроса сохраняет job ID. При скрытой панели
+опрос приостанавливается и возобновляется при её открытии.
+
+Cancel вызывает `POST /stage2/final-review/jobs/<job_id>/cancel`: активная
+задача отвечает HTTP 202 со статусом `cancelling`, затем `cancelled`;
+завершённая отвечает HTTP 200 со своим прежним статусом.
+`POST /stage2/final-review/jobs/<job_id>/apply` принимает `project` и
+`request_id` (строка до 128 символов). Сетевой повтор одного действия использует
+тот же ID и получает ту же итерацию. Новый явный Apply создаёт новый ID и новую
+итерацию; ID другой задачи вызывает HTTP 409. Старый клиент без ID каждый раз
+создаёт итерацию. Панель клонирует подтверждённую секвенцию и применяет правки
+в копии; API сам по себе подготавливает запись итерации и corrections.
 
 ### macOS Connector (для Docker backend)
 

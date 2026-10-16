@@ -392,3 +392,50 @@ def test_runtime_requests_pin_is_patched() -> None:
 
     assert pins[0] == pins[1]
     assert Version(pins[0]) >= Version("2.32.4")
+
+
+def test_runtime_ci_checks_production_asr_dependencies() -> None:
+    workflow = (ROOT_DIR / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    match = re.search(r"^  runtime-smoke:\n(?P<job>.*?)(?=^  \S|\Z)", workflow, re.M | re.S)
+    assert match is not None, "production dependencies need a separate runtime-smoke job"
+    job = match.group("job")
+    assert "runs-on: ubuntu-latest" in job
+    assert 'python-version: "3.11"' in job
+    assert "cache: pip" in job
+    assert "requirements.txt" in job and "requirements-whisper.txt" in job
+    assert "python -m pip install -r requirements.txt -r requirements-whisper.txt" in job
+    assert "python tests/runtime_import_smoke.py" in job
+    assert "docker build ." in job
+    assert (ROOT_DIR / "tests/runtime_import_smoke.py").is_file()
+
+
+def test_final_review_operator_docs_cover_recovery_and_cost_contracts() -> None:
+    readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+    guide = (ROOT_DIR / "docs/STAGE1_GUIDE.md").read_text(encoding="utf-8")
+    for document in (readme, guide):
+        for contract in (
+            "/stage2/final-review/estimate",
+            "/stage2/final-review/latest?project=",
+            "/stage2/final-review/jobs/<job_id>/cancel",
+            "FINAL_REVIEW_TIMEOUT_SECONDS",
+            "7200",
+            "ROUGH_CUT_MAX_USD_PER_JOB",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE",
+            "confirmed_estimate_usd",
+            "reserved_cost_usd",
+            "cost_pending",
+        ):
+            assert contract in document, f"operator documentation missing {contract}"
+    checklist = (ROOT_DIR / "docs/E2E_PILOT_CHECKLIST.md").read_text(encoding="utf-8")
+    for contract in (
+        "confirmed_estimate_usd",
+        "3, 6, 12, 24, 30",
+        "Retry",
+        "Cancel",
+        "sequenceId",
+        "request_id",
+        "interrupted",
+        "cost_pending",
+    ):
+        assert contract in checklist, f"E2E final review coverage missing {contract}"
+    assert "тихий отказ" not in checklist
