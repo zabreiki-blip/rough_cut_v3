@@ -894,31 +894,37 @@ def test_confirmed_duration_freezes_chunk_boundaries_and_reservations(monkeypatc
 
     async def extract(_self, _path, start, duration):
         extracted.append((start, duration))
-        return b'mp3'
+        return b"mp3"
 
-    monkeypatch.setattr(CloudAudioAsrAdapter, '_probe_duration', lambda *_: 151.0)
-    monkeypatch.setattr(CloudAudioAsrAdapter, '_extract_chunk_mp3', extract)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 151.0)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
     _patch_async_client(
-        monkeypatch, lambda _request: _model_response('[00:01] ГОЛОС 1: Готово', cost=None)
+        monkeypatch, lambda _request: _model_response("[00:01] ГОЛОС 1: Готово", cost=None)
     )
     result = transcribe_cloud(
-        Path('unused.wav'), api_key='test-key', chunk_minutes=1, overlap_sec=10,
-        duration_sec=150.0, max_cost_usd='0.17', usd_per_minute_estimate='0.06',
+        Path("unused.wav"),
+        api_key="test-key",
+        chunk_minutes=1,
+        overlap_sec=10,
+        duration_sec=150.0,
+        max_cost_usd="0.17",
+        usd_per_minute_estimate="0.06",
         budget_callback=snapshots.append,
     )
 
     assert extracted == [(0.0, 60.0), (50.0, 70.0), (110.0, 40.0)]
-    assert result['duration_sec'] == 150.0
-    assert result['reserved_cost_usd'] == pytest.approx(0.17)
-    assert snapshots[-1]['reserved_usd'] == pytest.approx(0.17)
+    assert result["duration_sec"] == 150.0
+    assert result["reserved_cost_usd"] == pytest.approx(0.17)
+    assert snapshots[-1]["reserved_usd"] == pytest.approx(0.17)
 
 
-@pytest.mark.parametrize('duration', [0, -1, float('nan'), float('inf')])
+@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf")])
 def test_confirmed_duration_rejects_invalid_values_before_http(monkeypatch, duration):
     calls = []
     _patch_async_client(
-        monkeypatch, lambda request: calls.append(request) or _model_response('[00:01] ГОЛОС 1: Тест')
+        monkeypatch,
+        lambda request: calls.append(request) or _model_response("[00:01] ГОЛОС 1: Тест"),
     )
-    with pytest.raises(ValueError, match='duration_sec'):
-        transcribe_cloud(Path('unused.wav'), api_key='test-key', duration_sec=duration)
+    with pytest.raises(ValueError, match="duration_sec"):
+        transcribe_cloud(Path("unused.wav"), api_key="test-key", duration_sec=duration)
     assert calls == []

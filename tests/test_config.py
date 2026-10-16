@@ -74,31 +74,36 @@ def test_validate_env_rejects_invalid_final_review_cost_guard() -> None:
         }
     )
     assert any(
-        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in warning
-        and "positive" in warning
+        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in warning and "positive" in warning
         for warning in incomplete_guard
     )
 
 
 def test_validate_env_accepts_disabled_or_complete_cost_guard() -> None:
-    assert validate_env(
-        {
-            "FINAL_REVIEW_TIMEOUT_SECONDS": "7200",
-            "ROUGH_CUT_MAX_USD_PER_JOB": "0",
-            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0",
-            "TTS_PROVIDER": "macos",
-            "ROUGH_CUT_API_TOKEN": "configured",
-        }
-    ) == []
-    assert validate_env(
-        {
-            "FINAL_REVIEW_TIMEOUT_SECONDS": "300",
-            "ROUGH_CUT_MAX_USD_PER_JOB": "2.75",
-            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0.04",
-            "TTS_PROVIDER": "macos",
-            "ROUGH_CUT_API_TOKEN": "configured",
-        }
-    ) == []
+    assert (
+        validate_env(
+            {
+                "FINAL_REVIEW_TIMEOUT_SECONDS": "7200",
+                "ROUGH_CUT_MAX_USD_PER_JOB": "0",
+                "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0",
+                "TTS_PROVIDER": "macos",
+                "ROUGH_CUT_API_TOKEN": "configured",
+            }
+        )
+        == []
+    )
+    assert (
+        validate_env(
+            {
+                "FINAL_REVIEW_TIMEOUT_SECONDS": "300",
+                "ROUGH_CUT_MAX_USD_PER_JOB": "2.75",
+                "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0.04",
+                "TTS_PROVIDER": "macos",
+                "ROUGH_CUT_API_TOKEN": "configured",
+            }
+        )
+        == []
+    )
 
 
 def test_validate_env_rejects_nonfinite_costs_and_cost_guard_boundaries() -> None:
@@ -133,7 +138,6 @@ def test_validate_env_rejects_nonfinite_costs_and_cost_guard_boundaries() -> Non
         }
     )
     assert any(
-        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in warning
-        and "positive" in warning
+        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE" in warning and "positive" in warning
         for warning in missing_estimate
     )

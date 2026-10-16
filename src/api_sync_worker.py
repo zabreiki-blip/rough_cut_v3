@@ -133,13 +133,18 @@ def run_sync_job(
         )
 
     def account_cloud_source(
-        source_id: str, initial_exposure: Decimal, payload: Any, *, snapshot: bool = False,
+        source_id: str,
+        initial_exposure: Decimal,
+        payload: Any,
+        *,
+        snapshot: bool = False,
     ) -> None:
         def value(name: str) -> Any:
             return payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
 
         current = cloud_costs.setdefault(
-            source_id, {"known": Decimal("0"), "reserved": Decimal("0"), "pending": False},
+            source_id,
+            {"known": Decimal("0"), "reserved": Decimal("0"), "pending": False},
         )
         known = value("spent_usd" if snapshot else "cost_usd")
         reserved = value("reserved_usd" if snapshot else "reserved_cost_usd")
@@ -157,9 +162,12 @@ def run_sync_job(
         known_total, reserved_total, pending_total = cloud_totals()
         asr_metrics["asr_cost_usd_total"] = float(known_total)
         _update_sync_job(
-            job_id, persist=should_persist_progress(),
-            cost_usd=float(known_total), reserved_cost_usd=float(reserved_total),
-            cost_pending=pending_total, **asr_metrics,
+            job_id,
+            persist=should_persist_progress(),
+            cost_usd=float(known_total),
+            reserved_cost_usd=float(reserved_total),
+            cost_pending=pending_total,
+            **asr_metrics,
         )
 
     def should_persist_progress(*, force: bool = False) -> bool:
@@ -222,16 +230,23 @@ def run_sync_job(
                 if current is None:
                     return
                 if current["pending"] and not pending_usage_recorded:
-                    asr_usage_callback({
-                        "event_id": f"sync-asr:{job_id}:{source.id}:reserved",
-                        "model": selected_model, "cost_usd": None, "pending": True,
-                    })
+                    asr_usage_callback(
+                        {
+                            "event_id": f"sync-asr:{job_id}:{source.id}:reserved",
+                            "model": selected_model,
+                            "cost_usd": None,
+                            "pending": True,
+                        }
+                    )
                     pending_usage_recorded = True
                 if not usage_recorded and (not current["pending"] or current["known"] > 0):
-                    asr_usage_callback({
-                        "event_id": f"sync-asr:{job_id}:{source.id}",
-                        "model": selected_model, "cost_usd": float(current["known"]),
-                    })
+                    asr_usage_callback(
+                        {
+                            "event_id": f"sync-asr:{job_id}:{source.id}",
+                            "model": selected_model,
+                            "cost_usd": float(current["known"]),
+                        }
+                    )
                     usage_recorded = True
 
             try:
@@ -388,7 +403,9 @@ def run_sync_job(
                     input_audio_signature = audio_signature or _audio_cache_signature(audio_path)
                     cloud_kwargs: dict[str, Any] = {}
                     if cloud_source_options is None and config["backend"] in {
-                        "cloud", "cloud-audio", "openrouter",
+                        "cloud",
+                        "cloud-audio",
+                        "openrouter",
                     }:
                         raise CostBudgetExceeded(
                             "Cloud backend changed since cost preflight; start the sync job again"
@@ -403,10 +420,13 @@ def run_sync_job(
                         initial_exposure = known_total + reserved_total
                         budget = CostBudget(
                             Decimal(options["max_cost_usd"]),
-                            Decimal(options["usd_per_minute_estimate"]), initial_exposure,
+                            Decimal(options["usd_per_minute_estimate"]),
+                            initial_exposure,
                         )
                         chunks = plan_cloud_chunks(
-                            options["duration_sec"], options["chunk_minutes"], options["overlap_sec"],
+                            options["duration_sec"],
+                            options["chunk_minutes"],
+                            options["overlap_sec"],
                         )
                         # Reserve each planned chunk independently so Decimal
                         # addition matches preflight at fractional boundaries.
@@ -415,7 +435,9 @@ def run_sync_job(
                         options["initial_cost_usd"] = canonical_decimal_string(initial_exposure)
 
                         def report_budget(snapshot: dict[str, Any]) -> None:
-                            account_cloud_source(source.id, initial_exposure, snapshot, snapshot=True)
+                            account_cloud_source(
+                                source.id, initial_exposure, snapshot, snapshot=True
+                            )
 
                         cloud_kwargs = {"cloud_options": options, "budget_callback": report_budget}
                         cloud_dispatch = True

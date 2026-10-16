@@ -90,10 +90,12 @@ def _estimate_final_review(
     }
     if backend != "cloud-audio":
         try:
-            result["cost_limit_usd"] = float(_money(
-                environ.get("ROUGH_CUT_MAX_USD_PER_JOB", "").strip() or "0",
-                "ROUGH_CUT_MAX_USD_PER_JOB",
-            ))
+            result["cost_limit_usd"] = float(
+                _money(
+                    environ.get("ROUGH_CUT_MAX_USD_PER_JOB", "").strip() or "0",
+                    "ROUGH_CUT_MAX_USD_PER_JOB",
+                )
+            )
         except ValueError:
             pass  # Cloud-only configuration must not prevent local work.
         return result, {}
@@ -120,8 +122,10 @@ def _estimate_final_review(
     if limit > 0 and amount <= 0:
         raise ValueError("enabled cost limit requires a positive cloud ASR estimate")
     result.update(
-        planned_chunks=len(chunks), estimated_cost_usd=canonical_decimal_string(amount),
-        cost_limit_usd=float(limit), enforced=limit > 0,
+        planned_chunks=len(chunks),
+        estimated_cost_usd=canonical_decimal_string(amount),
+        cost_limit_usd=float(limit),
+        enforced=limit > 0,
     )
     options = {
         "duration_sec": duration_sec,
@@ -144,7 +148,9 @@ def _preflight(
         raise ValueError("cloud_options must be an object")
     estimate, options = _estimate_final_review(
         _wav_duration(audio_path) if duration_sec is None else duration_sec,
-        backend, requested_options, os.environ,
+        backend,
+        requested_options,
+        os.environ,
     )
     return estimate, options, backend
 
@@ -201,11 +207,15 @@ def _start(services: ModuleType):
             409,
         )
     try:
-        estimate, cloud_options, backend = _preflight(audio_path, payload, duration_sec=wav_duration)
+        estimate, cloud_options, backend = _preflight(
+            audio_path, payload, duration_sec=wav_duration
+        )
         if payload.get("confirmed_estimate_usd") is not None:
             confirmed = _money(payload["confirmed_estimate_usd"], "confirmed_estimate_usd")
             if confirmed != Decimal(estimate["estimated_cost_usd"]):
-                return services._json_error("cloud ASR estimate changed; confirm the new estimate", 409)
+                return services._json_error(
+                    "cloud ASR estimate changed; confirm the new estimate", 409
+                )
         deadline = final_review_deadline()
     except OverflowError as exc:
         return services._json_error(str(exc), 409)
@@ -250,8 +260,11 @@ def _start(services: ModuleType):
             if job is not None:
                 try:
                     services._update_final_review_job(
-                        job["id"], status="failed", message="Final review failed to start",
-                        error=str(exc), finished_at=services._utc_now_iso(),
+                        job["id"],
+                        status="failed",
+                        message="Final review failed to start",
+                        error=str(exc),
+                        finished_at=services._utc_now_iso(),
                     )
                 finally:
                     with services._FINAL_REVIEW_JOBS_LOCK:
@@ -326,14 +339,16 @@ def _status(services: ModuleType, job_id: str):
 
 
 def _apply_result(project: str, iteration: dict):
-    return jsonify({
-        "ok": True,
-        "result": {
-            "project": project,
-            "iteration": iteration,
-            "corrections": iteration["corrections"],
-        },
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "result": {
+                "project": project,
+                "iteration": iteration,
+                "corrections": iteration["corrections"],
+            },
+        }
+    )
 
 
 def _apply(services: ModuleType, job_id: str):
@@ -377,15 +392,25 @@ def _apply(services: ModuleType, job_id: str):
             if str(report.get("job_id") or "") != str(job_id):
                 return services._json_error("final review report does not belong to this job", 409)
             if str(report.get("project") or "") != project:
-                return services._json_error("final review report does not belong to this project", 409)
-            if str(report.get("assembly_manifest_id") or "") != str(job.get("assembly_manifest_id") or ""):
+                return services._json_error(
+                    "final review report does not belong to this project", 409
+                )
+            if str(report.get("assembly_manifest_id") or "") != str(
+                job.get("assembly_manifest_id") or ""
+            ):
                 return services._json_error("final review assembly snapshot changed", 409)
             report_sequence = dict(report.get("source_sequence") or {})
             job_sequence = dict(job.get("source_sequence") or {})
-            if str(report_sequence.get("sequenceId") or "") != str(job_sequence.get("sequenceId") or ""):
+            if str(report_sequence.get("sequenceId") or "") != str(
+                job_sequence.get("sequenceId") or ""
+            ):
                 return services._json_error("final review sequence identity changed", 409)
-            corrections = report.get("corrections") if isinstance(report.get("corrections"), list) else []
-            iteration = services._record_final_review_iteration(project, job, corrections, request_id)
+            corrections = (
+                report.get("corrections") if isinstance(report.get("corrections"), list) else []
+            )
+            iteration = services._record_final_review_iteration(
+                project, job, corrections, request_id
+            )
     except FinalReviewRequestConflict as exc:
         return services._json_error(str(exc), 409)
     return _apply_result(project, iteration)

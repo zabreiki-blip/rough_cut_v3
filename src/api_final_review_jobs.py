@@ -85,7 +85,8 @@ def create_final_review_job(
         "transcription_words": 0,
         "deadline_monotonic": (
             payload["deadline_monotonic"]
-            if "deadline_monotonic" in payload else final_review_deadline()
+            if "deadline_monotonic" in payload
+            else final_review_deadline()
         ),
     }
     job_id = str(job["id"])
@@ -134,7 +135,8 @@ def get_latest_final_review_job(
 ) -> dict[str, Any] | None:
     with services._FINAL_REVIEW_JOBS_LOCK:
         candidates = [
-            dict(job) for job in services._FINAL_REVIEW_JOBS.values()
+            dict(job)
+            for job in services._FINAL_REVIEW_JOBS.values()
             if job.get("project") == project
         ]
     if candidates:
@@ -239,7 +241,11 @@ def run_final_review_job(
             cost_usd=snapshot["spent_usd"],
             reserved_cost_usd=snapshot["reserved_usd"],
             cost_limit_usd=snapshot["limit_usd"],
-            **({"cost_pending": bool(snapshot["cost_pending"])} if "cost_pending" in snapshot else {}),
+            **(
+                {"cost_pending": bool(snapshot["cost_pending"])}
+                if "cost_pending" in snapshot
+                else {}
+            ),
         )
 
     def cost_updates(source: Any) -> dict[str, Any]:
@@ -250,37 +256,46 @@ def run_final_review_job(
             value = source.get(field) if isinstance(source, dict) else getattr(source, field, None)
             if value is not None:
                 values[field] = float(value)
-        pending = source.get("cost_pending") if isinstance(source, dict) else getattr(source, "cost_pending", None)
+        pending = (
+            source.get("cost_pending")
+            if isinstance(source, dict)
+            else getattr(source, "cost_pending", None)
+        )
         if pending is not None:
             values["cost_pending"] = bool(pending)
         return values
 
     def record_usage(
-        cost: Any, selected_model: str, *,
-        cost_pending: bool = False, allow_unknown: bool = False,
+        cost: Any,
+        selected_model: str,
+        *,
+        cost_pending: bool = False,
+        allow_unknown: bool = False,
     ) -> None:
         nonlocal usage_recorded, reserved_usage_recorded
         if usage_callback is None:
             return
-        if not reserved_usage_recorded and (
-            cost_pending or (allow_unknown and cost is None)
-        ):
+        if not reserved_usage_recorded and (cost_pending or (allow_unknown and cost is None)):
             # An unresolved reservation is exposure, not confirmed spend.
             # Keep a distinct stable pending event so the real ledger retains
             # it without counting the estimate toward actual provider cost.
-            usage_callback({
-                "event_id": f"final-review-asr:{job_id}:reserved",
-                "model": selected_model,
-                "cost_usd": None,
-                "pending": True,
-            })
+            usage_callback(
+                {
+                    "event_id": f"final-review-asr:{job_id}:reserved",
+                    "model": selected_model,
+                    "cost_usd": None,
+                    "pending": True,
+                }
+            )
             reserved_usage_recorded = True
         if not usage_recorded and cost is not None and (not cost_pending or cost > 0):
-            usage_callback({
-                "event_id": f"final-review-asr:{job_id}",
-                "model": selected_model,
-                "cost_usd": cost,
-            })
+            usage_callback(
+                {
+                    "event_id": f"final-review-asr:{job_id}",
+                    "model": selected_model,
+                    "cost_usd": cost,
+                }
+            )
             usage_recorded = True
 
     def finish_error(exc: Exception, *, cancelled: bool = False) -> None:
@@ -289,8 +304,11 @@ def run_final_review_job(
         try:
             if provider_costs and (backend == "cloud-audio" or "cost_usd" in failed_cost):
                 record_usage(
-                    failed_cost.get("cost_usd", latest.get("cost_usd")), str(model or ""),
-                    cost_pending=bool(failed_cost.get("cost_pending", latest.get("cost_pending", False))),
+                    failed_cost.get("cost_usd", latest.get("cost_usd")),
+                    str(model or ""),
+                    cost_pending=bool(
+                        failed_cost.get("cost_pending", latest.get("cost_pending", False))
+                    ),
                 )
         finally:
             services._update_final_review_job(
@@ -339,7 +357,8 @@ def run_final_review_job(
         final_snapshot = services._update_final_review_job(job_id, **final_cost) or final_cost
         if provider_costs and str(result.get("backend") or backend or "") == "cloud-audio":
             record_usage(
-                final_cost.get("cost_usd"), str(result.get("model") or model or ""),
+                final_cost.get("cost_usd"),
+                str(result.get("model") or model or ""),
                 cost_pending=bool(final_snapshot.get("cost_pending", False)),
                 allow_unknown=True,
             )
@@ -386,7 +405,8 @@ def run_final_review_job(
                 finished_at = services._utc_now_iso()
                 check_stop()
                 current.update(
-                    status="completed", message="Final review completed",
+                    status="completed",
+                    message="Final review completed",
                     finished_at=finished_at,
                     report_path=str(paths["final_review_report"].relative_to(paths["root"])),
                 )

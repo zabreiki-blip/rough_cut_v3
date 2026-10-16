@@ -14,10 +14,12 @@ def test_budget_config_defaults_to_disabled() -> None:
 
 
 def test_budget_config_reads_decimal_values_without_float_rounding() -> None:
-    config = CostGuardConfig.from_environ({
-        "ROUGH_CUT_MAX_USD_PER_JOB": " 0.30 ",
-        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0.10",
-    })
+    config = CostGuardConfig.from_environ(
+        {
+            "ROUGH_CUT_MAX_USD_PER_JOB": " 0.30 ",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "0.10",
+        }
+    )
     budget = CostBudget(config.max_usd_per_job, config.cloud_asr_usd_per_minute)
     for _ in range(3):
         budget.reserve_attempt(60)
@@ -26,9 +28,13 @@ def test_budget_config_reads_decimal_values_without_float_rounding() -> None:
         budget.reserve_attempt(0.01)
 
 
-@pytest.mark.parametrize("name", [
-    "ROUGH_CUT_MAX_USD_PER_JOB", "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE",
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ROUGH_CUT_MAX_USD_PER_JOB",
+        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE",
+    ],
+)
 @pytest.mark.parametrize("value", ["-1", "NaN", "Infinity", "-Infinity", "invalid"])
 def test_budget_config_rejects_invalid_numbers(name: str, value: str) -> None:
     with pytest.raises(ValueError, match=name):
@@ -36,10 +42,12 @@ def test_budget_config_rejects_invalid_numbers(name: str, value: str) -> None:
 
 
 def test_budget_config_treats_blank_values_as_disabled() -> None:
-    config = CostGuardConfig.from_environ({
-        "ROUGH_CUT_MAX_USD_PER_JOB": " ",
-        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "",
-    })
+    config = CostGuardConfig.from_environ(
+        {
+            "ROUGH_CUT_MAX_USD_PER_JOB": " ",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE": "",
+        }
+    )
     assert config.max_usd_per_job == config.cloud_asr_usd_per_minute == Decimal("0")
 
 
@@ -53,7 +61,10 @@ def test_budget_disabled_still_tracks_estimates_and_actuals() -> None:
     reservation = budget.reserve_attempt(6000)
     budget.settle(reservation, "12.50")
     assert budget.snapshot() == {
-        "limit_usd": 0.0, "spent_usd": 12.5, "reserved_usd": 0.0, "total_usd": 12.5,
+        "limit_usd": 0.0,
+        "spent_usd": 12.5,
+        "reserved_usd": 0.0,
+        "total_usd": 12.5,
     }
 
 
@@ -84,7 +95,10 @@ def test_budget_settlement_replaces_estimate_and_releases_headroom() -> None:
     budget.settle(reservation, 0.1)
     budget.reserve_attempt(90)
     assert budget.snapshot() == {
-        "limit_usd": 0.3, "spent_usd": 0.15, "reserved_usd": 0.15, "total_usd": 0.3,
+        "limit_usd": 0.3,
+        "spent_usd": 0.15,
+        "reserved_usd": 0.15,
+        "total_usd": 0.3,
     }
 
 
@@ -93,7 +107,10 @@ def test_budget_unknown_cost_keeps_estimate_reserved() -> None:
     reservation = budget.reserve_attempt(60)
     budget.settle(reservation, None)
     assert budget.snapshot() == {
-        "limit_usd": 0.1, "spent_usd": 0.0, "reserved_usd": 0.1, "total_usd": 0.1,
+        "limit_usd": 0.1,
+        "spent_usd": 0.0,
+        "reserved_usd": 0.1,
+        "total_usd": 0.1,
     }
     with pytest.raises(CostBudgetExceeded):
         budget.reserve_attempt(1)
@@ -163,13 +180,13 @@ def test_budget_rejects_invalid_provider_cost_without_mutation(actual: object) -
 
 
 def test_zero_dollar_reservations_remain_pending_until_actual_zero_is_known():
-    budget = CostBudget(Decimal('0'), Decimal('0'))
+    budget = CostBudget(Decimal("0"), Decimal("0"))
     assert budget.has_pending_reservations is False
     reservation = budget.reserve_attempt(60)
-    assert budget.snapshot()['reserved_usd'] == 0
+    assert budget.snapshot()["reserved_usd"] == 0
     assert budget.has_pending_reservations is True
     budget.settle(reservation, None)
     assert budget.has_pending_reservations is True
     budget.settle(reservation, 0)
-    assert budget.snapshot()['spent_usd'] == 0
+    assert budget.snapshot()["spent_usd"] == 0
     assert budget.has_pending_reservations is False

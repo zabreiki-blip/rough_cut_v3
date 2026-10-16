@@ -79,9 +79,7 @@ def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
                 )
 
     cost_limit = nonnegative_decimal("ROUGH_CUT_MAX_USD_PER_JOB")
-    asr_estimate = nonnegative_decimal(
-        "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE"
-    )
+    asr_estimate = nonnegative_decimal("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE")
     if cost_limit is not None and cost_limit > 0 and (asr_estimate is None or asr_estimate <= 0):
         warnings.append(
             "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE must be positive when "

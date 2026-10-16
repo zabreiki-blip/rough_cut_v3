@@ -315,7 +315,9 @@ def _sync_cloud_preflight(
                 if not isinstance(index.metadata.get(services._TRANSCRIPTION_CACHE_KEY), dict):
                     continue
                 if services._word_index_audio_matches(
-                    index, audio_path, audio_signature=audio_signature,
+                    index,
+                    audio_path,
+                    audio_signature=audio_signature,
                 ):
                     continue
         try:
@@ -430,7 +432,9 @@ def _stage2_sync_job_start(services: ModuleType):
     if uses_cloud_backend:
         try:
             budget_fields, cloud_source_options = _sync_cloud_preflight(
-                services, paths, sources,
+                services,
+                paths,
+                sources,
                 source_ids=source_ids,
                 source_scope=source_scope,
                 force_transcribe=bool(payload.get("force_transcribe", False)),
@@ -454,8 +458,11 @@ def _stage2_sync_job_start(services: ModuleType):
     try:
         job = services._create_sync_job(project)
         services._update_sync_job(
-            job["id"], **budget_fields,
-            cost_usd=0.0, reserved_cost_usd=0.0, cost_pending=False,
+            job["id"],
+            **budget_fields,
+            cost_usd=0.0,
+            reserved_cost_usd=0.0,
+            cost_pending=False,
             cloud_source_options=cloud_source_options,
         )
         worker = services.threading.Thread(

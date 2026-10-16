@@ -534,7 +534,9 @@ def test_cancel_preserves_budget_message_queued_behind_progress() -> None:
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
 @pytest.mark.parametrize("rate", ["0.06", "0"])
-def test_cloud_options_parent_stop_interrupts_provider_http(tmp_path, monkeypatch, stop, rate) -> None:
+def test_cloud_options_parent_stop_interrupts_provider_http(
+    tmp_path, monkeypatch, stop, rate
+) -> None:
     import asyncio
     import httpx
     from stage2 import cloud_asr
@@ -740,21 +742,26 @@ def test_process_forwards_distinct_live_budget_snapshots() -> None:
     snapshots = []
 
     def fake_transcribe(_path, *, budget_callback, **_kwargs):
-        first = {'limit_usd': 1.0, 'spent_usd': 0.0, 'reserved_usd': 0.06, 'total_usd': 0.06}
+        first = {"limit_usd": 1.0, "spent_usd": 0.0, "reserved_usd": 0.06, "total_usd": 0.06}
         budget_callback(first)
         budget_callback(dict(first))
-        budget_callback({'limit_usd': 1.0, 'spent_usd': 0.04, 'reserved_usd': 0.0, 'total_usd': 0.04})
-        return {'words': []}
+        budget_callback(
+            {"limit_usd": 1.0, "spent_usd": 0.04, "reserved_usd": 0.0, "total_usd": 0.04}
+        )
+        return {"words": []}
 
-    with patch('stage2.whisper_process.transcribe_audio', side_effect=fake_transcribe):
+    with patch("stage2.whisper_process.transcribe_audio", side_effect=fake_transcribe):
         transcribe_audio_in_process(
-            'unused.wav', backend='cloud-audio', timeout_seconds=2.0,
-            _start_method='fork', budget_callback=lambda snapshot: snapshots.append(dict(snapshot)),
+            "unused.wav",
+            backend="cloud-audio",
+            timeout_seconds=2.0,
+            _start_method="fork",
+            budget_callback=lambda snapshot: snapshots.append(dict(snapshot)),
         )
 
     assert snapshots == [
-        {'limit_usd': 1.0, 'spent_usd': 0.0, 'reserved_usd': 0.06, 'total_usd': 0.06},
-        {'limit_usd': 1.0, 'spent_usd': 0.04, 'reserved_usd': 0.0, 'total_usd': 0.04},
+        {"limit_usd": 1.0, "spent_usd": 0.0, "reserved_usd": 0.06, "total_usd": 0.06},
+        {"limit_usd": 1.0, "spent_usd": 0.04, "reserved_usd": 0.0, "total_usd": 0.04},
     ]
 
 
@@ -762,35 +769,48 @@ def test_cloud_confirmed_duration_reaches_execution_without_reprobe(tmp_path, mo
     import httpx
     from stage2 import cloud_asr
 
-    calls = multiprocessing.get_context('fork').Value('i', 0)
-    audio = tmp_path / 'audio.wav'
+    calls = multiprocessing.get_context("fork").Value("i", 0)
+    audio = tmp_path / "audio.wav"
     audio.touch()
 
     async def extract(*_args):
-        return b'mp3'
+        return b"mp3"
 
     async def handler(_request):
         with calls.get_lock():
             calls.value += 1
-        return httpx.Response(200, json={
-            'choices': [{'message': {'content': '[00:01] ГОЛОС 1: Готово'}}],
-        })
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "[00:01] ГОЛОС 1: Готово"}}],
+            },
+        )
 
     real_client = httpx.AsyncClient
-    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, '_probe_duration', lambda *_: 151.0)
-    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, '_extract_chunk_mp3', extract)
-    monkeypatch.setattr(cloud_asr.httpx, 'AsyncClient', lambda **_kw: real_client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_probe_duration", lambda *_: 151.0)
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    monkeypatch.setattr(
+        cloud_asr.httpx,
+        "AsyncClient",
+        lambda **_kw: real_client(transport=httpx.MockTransport(handler)),
+    )
     snapshots = []
     result = transcribe_audio_in_process(
-        audio, backend='cloud-audio', timeout_seconds=2, _start_method='fork',
+        audio,
+        backend="cloud-audio",
+        timeout_seconds=2,
+        _start_method="fork",
         cloud_options={
-            'api_key': 'test-key', 'chunk_minutes': 1, 'overlap_sec': 10,
-            'duration_sec': 150.0, 'max_cost_usd': '0.17',
-            'usd_per_minute_estimate': '0.06',
+            "api_key": "test-key",
+            "chunk_minutes": 1,
+            "overlap_sec": 10,
+            "duration_sec": 150.0,
+            "max_cost_usd": "0.17",
+            "usd_per_minute_estimate": "0.06",
         },
         budget_callback=snapshots.append,
     )
     assert calls.value == 3
-    assert result['backend_metadata']['duration_sec'] == 150.0
-    assert result['reserved_cost_usd'] == pytest.approx(0.17)
-    assert snapshots[-1]['reserved_usd'] == pytest.approx(0.17)
+    assert result["backend_metadata"]["duration_sec"] == 150.0
+    assert result["reserved_cost_usd"] == pytest.approx(0.17)
+    assert snapshots[-1]["reserved_usd"] == pytest.approx(0.17)

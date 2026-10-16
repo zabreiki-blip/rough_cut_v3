@@ -263,8 +263,16 @@ def test_final_review_recovery_controls_and_routes() -> None:
     assert 'id="finalReviewCost"' in HTML
     assert '"/stage2/final-review/latest?project="' in PANEL
     assert '"/stage2/final-review/estimate"' in PANEL
-    assert 'confirmed_estimate_usd' in PANEL
-    assert 'request_id' in PANEL
-    assert 'function cancelFinalReview(' in PANEL
-    for status in ("queued", "running", "completed", "failed", "interrupted", "cancelling", "cancelled"):
+    assert "confirmed_estimate_usd" in PANEL
+    assert "request_id" in PANEL
+    assert "function cancelFinalReview(" in PANEL
+    for status in (
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "interrupted",
+        "cancelling",
+        "cancelled",
+    ):
         assert re.search(rf"\b{status}:\s*\"", PANEL)
