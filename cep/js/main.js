@@ -38,7 +38,9 @@
     retryAction: "status",
     exportResume: null,
     layoutSequence: null,
-    startUncertain: false
+    startUncertain: false,
+    lastKnownJobId: "",
+    startBaselineJobId: ""
   };
   var FINAL_REVIEW_RETRY_DELAYS_MS = [3000, 6000, 12000, 24000, 30000];
   var CONFORM_VIDEO_TRACK_INDEX = 0;
@@ -1746,12 +1748,27 @@
       finalReviewFailure(new Error("Backend не вернул ID проверки."));
       return;
     }
+    if (finalReview.startUncertain && String(job.id) === finalReview.startBaselineJobId) {
+      // latest may still refer to the old job while Start is accepting work.
+      // Keep querying latest until a different ID proves the new job exists.
+      clearFinalReviewTimer();
+      finalReview.inFlight = false;
+      finalReview.retryAction = "status";
+      finalReviewStartButtons(true);
+      byId("retryFinalReview").hidden = false;
+      byId("cancelFinalReview").hidden = true;
+      byId("applyFinalReview").disabled = true;
+      setFinalReviewStatus("Новая проверка пока не подтверждена. Найдена предыдущая проверка; повторите запрос статуса.");
+      return;
+    }
     if (!finalReview.job || finalReview.job.id !== job.id) {
       finalReview.applyRequestId = "";
       finalReview.applied = false;
     }
     finalReview.job = job;
     finalReview.startUncertain = false;
+    finalReview.startBaselineJobId = "";
+    finalReview.lastKnownJobId = String(job.id);
     finalReview.sourceSequence = job.source_sequence || null;
     finalReview.retryIndex = 0;
     finalReview.inFlight = false;
@@ -1818,6 +1835,8 @@
     finalReview.project = config().project;
     finalReview.applyRequestId = "";
     finalReview.startUncertain = false;
+    finalReview.startBaselineJobId = "";
+    finalReview.lastKnownJobId = "";
     finalReview.applied = false;
     finalReview.retryIndex = 0;
     finalReview.retryAction = "status";
@@ -1923,12 +1942,14 @@
       payload.confirmed_estimate_usd = amount === undefined ? "0" : amount;
       finalReview.inFlight = true;
       finalReview.startUncertain = true;
+      finalReview.startBaselineJobId = finalReview.lastKnownJobId;
       finalReviewRequest("POST", "/stage2/final-review/start", payload, generation, function (startError, started) {
         if (!finalReviewCurrent(generation)) return;
         finalReview.inFlight = false;
         if (startError) {
           finalReview.startUncertain = Boolean(startError.network || startError.invalidJson ||
             startError.status === 429 || startError.status >= 500);
+          if (!finalReview.startUncertain) finalReview.startBaselineJobId = "";
           finalReviewStartButtons(finalReview.startUncertain);
           setFinalReviewStatus("Финальная проверка не запущена: " + startError.message);
           if (finalReview.startUncertain) {
@@ -1946,6 +1967,8 @@
         }
         var result = started.result || started;
         finalReview.startUncertain = false;
+        finalReview.startBaselineJobId = "";
+        finalReview.lastKnownJobId = String(result.job_id || "");
         finalReview.job = {id: result.job_id, status: "queued", source_sequence: sequence};
         finalReview.sourceSequence = sequence;
         finalReviewStartButtons(false);
@@ -2285,7 +2308,8 @@
           sourceSequence: finalReview.sourceSequence,
           applyRequestId: finalReview.applyRequestId,
           layoutSequence: finalReview.layoutSequence,
-          startUncertain: finalReview.startUncertain
+          startUncertain: finalReview.startUncertain,
+          startBaselineJobId: finalReview.startBaselineJobId
         };
       },
       renderWhisperJob: renderWhisperJob,

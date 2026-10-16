@@ -2320,6 +2320,71 @@ function testFinalReviewExplicitApplyAfterCloneFailureGetsFreshRequestId() {
     "manual transport Retry must reuse the new Apply's request ID");
 }
 
+function submitReviewFromWav(h) {
+  h.hooks.startFinalReviewFromWav();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
+  h.hosts[h.hosts.length - 1].resolve({layout: {entries: []}});
+  const estimate = h.requests[h.requests.length - 1];
+  assert.match(estimate.url, /\/estimate$/);
+  estimate.resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+  const start = h.requests[h.requests.length - 1];
+  assert.match(start.url, /\/start$/);
+  return start;
+}
+
+function testFinalReviewUncertainStartRejectsBaselineLatestJob() {
+  const h = finalReviewHarness();
+  restoreReview(h, "completed");
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.element("applyFinalReview").disabled, false);
+  submitReviewFromWav(h).fail();
+  const hostCount = h.hosts.length;
+  h.hooks.retryFinalReview();
+  assert.match(h.requests[3].url, /\/latest\?project=demo$/);
+  h.requests[3].resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.element("startFinalReview").disabled, true,
+    "latest review-1 is the pre-Start job and cannot confirm a new Start");
+  assert.strictEqual(h.element("startFinalReviewFromWav").disabled, true);
+  assert.strictEqual(h.element("retryFinalReview").hidden, false);
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  assert.strictEqual(h.hooks.getFinalReviewState().startUncertain, true);
+  assert.strictEqual(h.hooks.getFinalReviewState().job, null,
+    "uncertain recovery must not adopt the previous completed job");
+  assert.strictEqual(h.hosts.length, hostCount, "the previous job must not trigger Apply identity checks");
+  assert.strictEqual(h.timers.size, 0, "recovery must not poll review-1");
+  h.hooks.retryFinalReview();
+  assert.match(h.requests[4].url, /\/latest\?project=demo$/);
+  h.requests[4].resolve(finalReviewJob("running", {id: "review-2"}));
+  assert.strictEqual(h.hooks.getFinalReviewState().startUncertain, false);
+  assert.strictEqual(h.hooks.getFinalReviewState().job.id, "review-2");
+  assert.strictEqual(h.element("startFinalReview").disabled, false);
+  assert.strictEqual(h.element("retryFinalReview").hidden, true);
+  assert.strictEqual(h.fireTimer(), 3000);
+  assert.match(h.requests[5].url, /\/jobs\/review-2\?project=demo$/);
+  assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+}
+
+function testFinalReviewStartBaselineResetsAndPreservesKnownJobHistory() {
+  const h = finalReviewHarness();
+  restoreReview(h, "completed");
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  submitReviewFromWav(h).resolve("invalid snapshot", 400);
+  assert.strictEqual(h.hooks.getFinalReviewState().startBaselineJobId, "",
+    "deterministic rejection must reset the pending Start baseline");
+  submitReviewFromWav(h).resolve("temporary failure", 503);
+  h.hooks.retryFinalReview();
+  h.requests[h.requests.length - 1].resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.element("startFinalReview").disabled, true,
+    "a later attempt must still recognize the last known job after deterministic rejection");
+  h.element("projectName").value = "different-project";
+  h.hooks.finalReviewProjectChanged();
+  assert.strictEqual(h.hooks.getFinalReviewState().startBaselineJobId, "",
+    "changing projects must reset the previous project's Start baseline");
+  h.requests[h.requests.length - 1].resolve(finalReviewJob("running", {id: "different-job", project: "different-project"}));
+  assert.strictEqual(h.hooks.getFinalReviewState().job.id, "different-job");
+  assert.strictEqual(h.hooks.getFinalReviewState().startUncertain, false);
+}
+
 for (const test of [
   testFinalReviewBackoffAndManualRetry,
   testFinalReviewRecoveryChecksHostBeforeApply,
@@ -2339,6 +2404,8 @@ for (const test of [
   testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain,
   testFinalReviewHideDuringLayoutResumesCaptureOnce,
   testFinalReviewExplicitApplyAfterCloneFailureGetsFreshRequestId,
+  testFinalReviewUncertainStartRejectsBaselineLatestJob,
+  testFinalReviewStartBaselineResetsAndPreservesKnownJobHistory,
 ]) {
   test();
   console.log("PASS", test.name);
