@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from decimal import Decimal
 import os
@@ -10,7 +11,13 @@ import time
 from typing import Any
 
 from api_service_contracts import FinalReviewJobServices
+from job_runtime import trim_terminal_jobs
 from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
+
+
+FINAL_REVIEW_JOBS_MAX = 200
+FINAL_REVIEW_JOBS_TTL_SECONDS = 24 * 60 * 60
+FINAL_REVIEW_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 
 
 class FinalReviewRequestConflict(ValueError):
@@ -52,6 +59,26 @@ def release_final_review_project(services: FinalReviewJobServices, project: str)
         services._FINAL_REVIEW_JOBS_LOCK,
         services._FINAL_REVIEW_ACTIVE_PROJECTS,
         project,
+    )
+
+
+def trim_final_review_jobs_locked(services: FinalReviewJobServices) -> None:
+    """Bound terminal job history; active jobs are never evicted.
+
+    Caller holds ``_FINAL_REVIEW_JOBS_LOCK``. The per-project status file keeps
+    the latest job on disk, so eviction from memory does not lose it.
+    """
+    try:
+        now = datetime.fromisoformat(services._utc_now_iso())
+    except (TypeError, ValueError):
+        return
+    trim_terminal_jobs(
+        services._FINAL_REVIEW_JOBS,
+        terminal_statuses=FINAL_REVIEW_TERMINAL_STATUSES,
+        now=now,
+        ttl_seconds=FINAL_REVIEW_JOBS_TTL_SECONDS,
+        max_jobs=FINAL_REVIEW_JOBS_MAX,
+        on_evict=lambda job_id: services._FINAL_REVIEW_CANCEL_EVENTS.pop(job_id, None),
     )
 
 
@@ -101,6 +128,7 @@ def create_final_review_job(
             services._FINAL_REVIEW_JOBS.pop(job_id, None)
             services._FINAL_REVIEW_CANCEL_EVENTS.pop(job_id, None)
             raise
+        trim_final_review_jobs_locked(services)
     return dict(job)
 
 
@@ -188,6 +216,8 @@ def update_final_review_job(
                 services._project_paths(str(snapshot["project"]))["final_review_job_status"],
                 snapshot,
             )
+        if snapshot.get("status") in FINAL_REVIEW_TERMINAL_STATUSES:
+            trim_final_review_jobs_locked(services)
         return snapshot
 
 
@@ -417,6 +447,7 @@ def run_final_review_job(
                     report_path=str(paths["final_review_report"].relative_to(paths["root"])),
                 )
                 services._atomic_write_json_file(paths["final_review_job_status"], dict(current))
+                trim_final_review_jobs_locked(services)
     except WhisperCancelledError as exc:
         finish_error(exc, cancelled=True)
     except Exception as exc:

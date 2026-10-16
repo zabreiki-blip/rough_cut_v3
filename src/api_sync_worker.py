@@ -179,6 +179,9 @@ def run_sync_job(
             last_progress_persist_at = now
             return True
 
+    # Not dead code: the cancel/failure handlers below call ``checkpoint_matches``
+    # even when the job stops before matching starts. This no-op is the binding
+    # for that window; it is rebound to the real checkpoint once matching begins.
     def checkpoint_matches() -> None:
         return None
 

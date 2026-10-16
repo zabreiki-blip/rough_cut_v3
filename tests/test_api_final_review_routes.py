@@ -1738,3 +1738,153 @@ def test_final_review_per_chunk_decimal_rounding_matches_exact_dispatch_cap(
     assert job["estimated_cost_usd"] == expected_estimate
     assert dispatched == [limit]
     _assert_released(services, job_id)
+
+
+_OLD_STAMP = "2026-09-07T12:00:00+00:00"  # >24h before the fake clock 2026-09-09T12:00Z
+
+
+def _seed_final_review_jobs(services, jobs: dict[str, dict]) -> None:
+    services._FINAL_REVIEW_JOBS.clear()
+    services._FINAL_REVIEW_JOBS.update(jobs)
+    services._FINAL_REVIEW_CANCEL_EVENTS.clear()
+    for job_id in jobs:
+        services._FINAL_REVIEW_CANCEL_EVENTS[job_id] = threading.Event()
+
+
+def test_final_review_trim_expires_terminal_by_ttl_keeps_active(tmp_path: Path) -> None:
+    services = _job_services(tmp_path)
+    _seed_final_review_jobs(
+        services,
+        {
+            "queued": {"id": "queued", "status": "queued", "created_at": _OLD_STAMP},
+            "running": {"id": "running", "status": "running", "created_at": _OLD_STAMP},
+            "cancelling": {"id": "cancelling", "status": "cancelling", "created_at": _OLD_STAMP},
+            "completed": {
+                "status": "completed",
+                "created_at": _OLD_STAMP,
+                "finished_at": _OLD_STAMP,
+            },
+            "failed": {"status": "failed", "created_at": _OLD_STAMP, "finished_at": _OLD_STAMP},
+            "cancelled": {
+                "status": "cancelled",
+                "created_at": _OLD_STAMP,
+                "finished_at": _OLD_STAMP,
+            },
+            "interrupted": {
+                "status": "interrupted",
+                "created_at": _OLD_STAMP,
+                "finished_at": _OLD_STAMP,
+            },
+            "fresh": {
+                "status": "completed",
+                "created_at": "2026-09-09T11:00:00+00:00",
+                "finished_at": "2026-09-09T11:30:00+00:00",
+            },
+        },
+    )
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        api_final_review_jobs.trim_final_review_jobs_locked(services)
+
+    assert set(services._FINAL_REVIEW_JOBS) == {"queued", "running", "cancelling", "fresh"}
+    assert set(services._FINAL_REVIEW_CANCEL_EVENTS) == {"queued", "running", "cancelling", "fresh"}
+
+
+def test_final_review_trim_caps_oldest_terminal_first_and_keeps_active(
+    tmp_path: Path, monkeypatch
+) -> None:
+    services = _job_services(tmp_path)
+    monkeypatch.setattr(api_final_review_jobs, "FINAL_REVIEW_JOBS_MAX", 5)
+    jobs: dict[str, dict] = {}
+    for index in range(4):
+        jobs[f"active-{index}"] = {
+            "status": "running" if index % 2 else "queued",
+            "created_at": f"2026-09-09T0{index}:00:00+00:00",
+        }
+    for index in range(6):
+        stamp = f"2026-09-09T1{index}:00:00+00:00"
+        jobs[f"done-{index}"] = {"status": "completed", "created_at": stamp, "finished_at": stamp}
+    _seed_final_review_jobs(services, jobs)
+
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        api_final_review_jobs.trim_final_review_jobs_locked(services)
+
+    # 4 active + 1 newest terminal fit the cap of 5; oldest terminals go first.
+    assert set(services._FINAL_REVIEW_JOBS) == {
+        "active-0",
+        "active-1",
+        "active-2",
+        "active-3",
+        "done-5",
+    }
+    assert set(services._FINAL_REVIEW_CANCEL_EVENTS) == set(services._FINAL_REVIEW_JOBS)
+
+
+def test_final_review_trim_never_evicts_active_over_cap(tmp_path: Path, monkeypatch) -> None:
+    services = _job_services(tmp_path)
+    monkeypatch.setattr(api_final_review_jobs, "FINAL_REVIEW_JOBS_MAX", 2)
+    jobs = {
+        f"active-{index}": {"status": "running", "created_at": f"2026-09-09T0{index}:00:00+00:00"}
+        for index in range(4)
+    }
+    jobs["done"] = {
+        "status": "failed",
+        "created_at": "2026-09-09T05:00:00+00:00",
+        "finished_at": "2026-09-09T06:00:00+00:00",
+    }
+    _seed_final_review_jobs(services, jobs)
+
+    with services._FINAL_REVIEW_JOBS_LOCK:
+        api_final_review_jobs.trim_final_review_jobs_locked(services)
+
+    assert set(services._FINAL_REVIEW_JOBS) == {f"active-{index}" for index in range(4)}
+
+
+def test_final_review_create_and_terminal_update_trim_registry(tmp_path: Path, monkeypatch) -> None:
+    services = _job_services(tmp_path)
+    monkeypatch.setattr(api_final_review_jobs, "FINAL_REVIEW_JOBS_MAX", 2)
+    _seed_final_review_jobs(
+        services,
+        {
+            f"done-{index}": {
+                "status": "completed",
+                "created_at": f"2026-09-09T1{index}:00:00+00:00",
+                "finished_at": f"2026-09-09T1{index}:30:00+00:00",
+            }
+            for index in range(3)
+        },
+    )
+    audio = services._test_paths["work"] / "review.wav"
+
+    created = create_final_review_job(services, "demo", audio, {})
+
+    assert set(services._FINAL_REVIEW_JOBS) == {"done-2", created["id"]}
+    assert created["id"] in services._FINAL_REVIEW_CANCEL_EVENTS
+
+    second = create_final_review_job(services, "demo", audio, {})
+    # Both new jobs are active, so the lone terminal record is evicted.
+    assert set(services._FINAL_REVIEW_JOBS) == {created["id"], second["id"]}
+
+    update_final_review_job(
+        services,
+        created["id"],
+        status="completed",
+        finished_at="2026-09-09T11:59:00+00:00",
+    )
+    third = create_final_review_job(services, "demo", audio, {})
+    assert set(services._FINAL_REVIEW_JOBS) == {second["id"], third["id"]}
+
+    update_final_review_job(
+        services,
+        second["id"],
+        status="failed",
+        finished_at="2026-09-09T11:59:30+00:00",
+    )
+    update_final_review_job(
+        services,
+        third["id"],
+        status="cancelled",
+        finished_at="2026-09-09T11:59:40+00:00",
+    )
+    assert set(services._FINAL_REVIEW_JOBS) == {second["id"], third["id"]}
+    fourth = create_final_review_job(services, "demo", audio, {})
+    assert set(services._FINAL_REVIEW_JOBS) == {third["id"], fourth["id"]}

@@ -1017,6 +1017,70 @@ def test_cancelled_queued_sync_worker_releases_project_without_loading_inputs(
         assert created["id"] not in api._SYNC_CANCEL_EVENTS
 
 
+def test_cancel_before_matching_skips_checkpoint_without_error_log(sync_api, caplog) -> None:
+    """The pre-matching ``checkpoint_matches`` fallback must stay a silent no-op.
+
+    Cancellation/failure handlers call ``checkpoint_matches`` even before the
+    real implementation is bound; that path must neither write matches nor log
+    a spurious "Could not checkpoint" error.
+    """
+    _client, _projects = sync_api
+    assert api._reserve_sync_project("demo")
+    created = api._create_sync_job("demo")
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_CANCEL_EVENTS[created["id"]].set()
+
+    with (
+        caplog.at_level("ERROR"),
+        patch.object(api.SyncMatchStore, "replace_all") as replace_all,
+    ):
+        api._run_sync_job(
+            job_id=created["id"],
+            project="demo",
+            backend=None,
+            model=None,
+            language="ru",
+            timecode_mode="relative",
+            rematch_confirmed=False,
+            source_ids=(),
+            source_scope="all",
+            force_transcribe=False,
+            search_window_sec=180.0,
+        )
+
+    replace_all.assert_not_called()
+    assert "Could not checkpoint" not in caplog.text
+    assert api._get_sync_job(created["id"])["status"] == "cancelled"
+
+
+def test_sync_job_checkpoint_persists_matches_through_replace_all(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+
+    original = api.SyncMatchStore.replace_all
+    saved: list[list[str]] = []
+
+    def spy(store, matches):
+        saved.append([item.segment_id for item in matches])
+        return original(store, matches)
+
+    with (
+        patch.object(api.SyncMatchStore, "replace_all", spy),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+
+    assert response.status_code == 200, response.get_json()
+    assert saved, "checkpoint_matches never persisted through match_store.replace_all"
+    assert "stable-sync-uid" in saved[-1]
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+    persisted = store.get("stable-sync-uid")
+    assert persisted is not None
+    assert persisted.status != "confirmed"
+
+
 def test_review_media_scope_excludes_legacy_sources_and_records_model(sync_api) -> None:
     client, projects = sync_api
     _write_confirmed_normalization(projects)
