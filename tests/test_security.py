@@ -398,6 +398,23 @@ def test_runtime_requests_pin_is_patched() -> None:
     assert Version(pins[0]) >= Version("2.32.4")
 
 
+def test_runtime_gunicorn_pin_is_patched() -> None:
+    from packaging.version import Version
+
+    pins = []
+    for filename in ("requirements.txt", "requirements-lock.txt"):
+        matches = [
+            line.split("==", 1)[1]
+            for line in (ROOT_DIR / filename).read_text().splitlines()
+            if line.lower().startswith("gunicorn==")
+        ]
+        assert len(matches) == 1, f"expected one gunicorn pin in {filename}"
+        pins.append(matches[0])
+
+    assert pins[0] == pins[1]
+    assert Version(pins[0]) >= Version("23.0.0")
+
+
 def test_runtime_ci_checks_production_asr_dependencies() -> None:
     workflow = (ROOT_DIR / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     match = re.search(r"^  runtime-smoke:\n(?P<job>.*?)(?=^  \S|\Z)", workflow, re.M | re.S)

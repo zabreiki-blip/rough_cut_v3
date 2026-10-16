@@ -1,7 +1,26 @@
+import json
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_gunicorn_disables_control_socket_in_docker_and_compose() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    cmd_match = re.search(r"^CMD\s+(\[.*\])\s*$", dockerfile, flags=re.MULTILINE)
+    assert cmd_match is not None, "Dockerfile CMD must be a JSON array"
+    argv = json.loads(cmd_match.group(1))
+    assert "--no-control-socket" in argv
+    assert argv.index("--no-control-socket") < argv.index("api:app")
+
+    command_match = re.search(r"^\s+command:\s*(.*)$", compose, flags=re.MULTILINE)
+    assert command_match is not None, "compose service must define command"
+    command = command_match.group(1)
+    assert "--no-control-socket" in command.split()
+    assert command.index("--no-control-socket") < command.index("api:app")
 
 
 def test_apple_silicon_profile_uses_native_mlx() -> None:

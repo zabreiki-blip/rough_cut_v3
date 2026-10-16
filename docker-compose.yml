@@ -30,7 +30,7 @@ services:
     # Single worker by design: see Dockerfile comment above the same
     # gunicorn command for why --workers must stay 1 without an added
     # inter-process lock.
-    command: gunicorn -b 0.0.0.0:8000 --workers 1 --threads 4 --timeout 3600 api:app
+    command: gunicorn -b 0.0.0.0:8000 --workers 1 --threads 4 --timeout 3600 --no-control-socket api:app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
