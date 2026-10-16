@@ -1960,7 +1960,14 @@ function testFinalReviewHideDiscardsInFlightStatusAndResumesOnce() {
   assert.strictEqual(h.requests.length, 2, "stale response must not rearm the resume flag");
 }
 
+function recoverEmptyFinalReview(h) {
+  h.hooks.restoreFinalReview();
+  h.requests[0].resolve("job not found", 404);
+  h.requests.length = 0;
+}
+
 function prepareFinalReviewEstimate(h) {
+  recoverEmptyFinalReview(h);
   const before = h.hooks.getFinalReviewState().generation;
   h.hooks.startFinalReviewFromWav();
   assert.strictEqual(h.hooks.getFinalReviewState().generation, before + 1);
@@ -2078,6 +2085,7 @@ function testFinalReviewStartSuccessPollsExistingJobAndDropsStaleStart() {
 
 function testFinalReviewExportDropsStaleChecksAndDoesNotDoubleSubmit() {
   const h = finalReviewHarness();
+  recoverEmptyFinalReview(h);
   h.hooks.startFinalReview();
   h.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
   assert.match(h.hosts[1].script, /^rcStage2_exportFinalReviewAudio\(/);
@@ -2244,6 +2252,7 @@ function testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain() {
 function testFinalReviewHideDuringLayoutResumesCaptureOnce() {
   for (const fromWav of [true, false]) {
     const h = finalReviewHarness();
+    recoverEmptyFinalReview(h);
     if (fromWav) h.hooks.startFinalReviewFromWav();
     else h.hooks.startFinalReview();
     h.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
@@ -2280,6 +2289,7 @@ function testFinalReviewHideDuringLayoutResumesCaptureOnce() {
     assert.match(h.requests[2].url, /\/jobs\/resumed-review\?project=demo$/);
   }
   const switched = finalReviewHarness();
+  recoverEmptyFinalReview(switched);
   switched.hooks.startFinalReviewFromWav();
   switched.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
   switched.context.document.hidden = true;
@@ -2385,7 +2395,67 @@ function testFinalReviewStartBaselineResetsAndPreservesKnownJobHistory() {
   assert.strictEqual(h.hooks.getFinalReviewState().startUncertain, false);
 }
 
+function testFinalReviewStartWaitsForInitialRecoveryBeforeCapturingBaseline() {
+  const loading = finalReviewHarness();
+  loading.initialize();
+  assert.strictEqual(loading.element("startFinalReview").disabled, true,
+    "Start must also wait while the initial project list is still loading");
+  const loadingHostCount = loading.hosts.length;
+  loading.hooks.startFinalReviewFromWav();
+  assert.strictEqual(loading.hosts.length, loadingHostCount);
+  assert.strictEqual(loading.requests.length, 0);
+
+  const h = finalReviewHarness();
+  h.hooks.finalReviewProjectChanged();
+  assert.strictEqual(h.element("startFinalReview").disabled, true);
+  assert.strictEqual(h.element("startFinalReviewFromWav").disabled, true);
+  h.hooks.startFinalReviewFromWav();
+  h.hooks.startFinalReview();
+  assert.strictEqual(h.hosts.length, 0,
+    "pending initial latest must prevent preparation of another paid Start");
+  assert.strictEqual(h.requests.length, 1, "blocked Start must not duplicate latest");
+  h.requests[0].resolve(finalReviewJob("completed"));
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.element("startFinalReview").disabled, false);
+  submitReviewFromWav(h).fail();
+  h.hooks.retryFinalReview();
+  h.requests[h.requests.length - 1].resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.hooks.getFinalReviewState().startUncertain, true,
+    "the prior job learned during initial recovery cannot confirm an ambiguous new Start");
+  assert.strictEqual(h.hooks.getFinalReviewState().job, null);
+  assert.strictEqual(h.element("startFinalReviewFromWav").disabled, true);
+  assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+}
+
+function testFinalReviewInitialRecovery404AndStaleRepliesGateStart() {
+  const h = finalReviewHarness();
+  h.hooks.finalReviewProjectChanged();
+  const stale = h.requests[0];
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  h.context.document.hidden = false;
+  h.hooks.handleVisibilityChange();
+  stale.resolve("job not found", 404);
+  assert.strictEqual(h.element("startFinalReview").disabled, true,
+    "a stale initial latest response must not unlock Start");
+  h.requests[1].resolve("unauthorized", 401);
+  h.hooks.startFinalReviewFromWav();
+  assert.strictEqual(h.hosts.length, 0, "failed initial recovery must keep Start blocked");
+  h.hooks.retryFinalReview();
+  h.requests[h.requests.length - 1].resolve("job not found", 404);
+  assert.strictEqual(h.element("startFinalReview").disabled, false,
+    "a current latest 404 establishes that the project has no prior job");
+  h.hooks.startFinalReviewFromWav();
+  assert.strictEqual(h.hosts.length, 1, "Start may prepare after a confirmed empty history");
+  h.element("projectName").value = "another-project";
+  h.hooks.finalReviewProjectChanged();
+  assert.strictEqual(h.element("startFinalReviewFromWav").disabled, true,
+    "a different project needs its own initial recovery");
+}
+
 for (const test of [
+  testFinalReviewStartWaitsForInitialRecoveryBeforeCapturingBaseline,
+  testFinalReviewInitialRecovery404AndStaleRepliesGateStart,
   testFinalReviewBackoffAndManualRetry,
   testFinalReviewRecoveryChecksHostBeforeApply,
   testFinalReviewCancelRejectsOlderStatusAndInspection,

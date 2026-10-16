@@ -39,6 +39,7 @@
     exportResume: null,
     layoutSequence: null,
     startUncertain: false,
+    recoveredProject: "",
     lastKnownJobId: "",
     startBaselineJobId: ""
   };
@@ -1675,6 +1676,7 @@
   }
 
   function finalReviewStartButtons(disabled) {
+    disabled = disabled || !config().project || finalReview.recoveredProject !== config().project;
     byId("startFinalReview").disabled = disabled;
     byId("startFinalReviewFromWav").disabled = disabled;
   }
@@ -1748,6 +1750,7 @@
       finalReviewFailure(new Error("Backend не вернул ID проверки."));
       return;
     }
+    finalReview.recoveredProject = finalReview.project;
     if (finalReview.startUncertain && String(job.id) === finalReview.startBaselineJobId) {
       // latest may still refer to the old job while Start is accepting work.
       // Keep querying latest until a different ID proves the new job exists.
@@ -1799,6 +1802,7 @@
     }
     if (finalReview.inFlight || finalReview.applyBusy) return;
     finalReview.project = current.project;
+    if (finalReview.recoveredProject !== current.project) finalReviewStartButtons(true);
     clearFinalReviewTimer();
     finalReview.inFlight = true;
     var generation = finalReview.generation;
@@ -1806,6 +1810,7 @@
       if (!finalReviewCurrent(generation)) return;
       finalReview.inFlight = false;
       if (error && error.status === 404) {
+        finalReview.recoveredProject = current.project;
         finalReviewStartButtons(finalReview.startUncertain);
         byId("retryFinalReview").hidden = !finalReview.startUncertain;
         byId("cancelFinalReview").hidden = true;
@@ -1833,6 +1838,7 @@
     finalReview.job = null;
     finalReview.sourceSequence = null;
     finalReview.project = config().project;
+    finalReview.recoveredProject = "";
     finalReview.applyRequestId = "";
     finalReview.startUncertain = false;
     finalReview.startBaselineJobId = "";
@@ -2067,6 +2073,11 @@
   }
 
   function beginFinalReview(fromWav) {
+    if (!config().project || finalReview.recoveredProject !== config().project) {
+      finalReviewStartButtons(true);
+      setFinalReviewStatus("Дождитесь восстановления финальной проверки проекта или повторите запрос статуса.");
+      return;
+    }
     if (finalReview.startUncertain) {
       setFinalReviewStatus("Не удалось подтвердить запуск. Проверка могла начаться; повторите запрос статуса.");
       return;
@@ -2264,6 +2275,7 @@
 
   function init() {
     loadConfig();
+    finalReviewStartButtons(true);
     bind();
     syncConfigCardOpenState();
     renderWhisperIdle("Введите ключ доступа, чтобы видеть прогресс.");
