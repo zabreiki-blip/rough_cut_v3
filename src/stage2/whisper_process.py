@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import atexit
+from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
+import math
 import multiprocessing
 from multiprocessing.connection import Connection
 import os
@@ -92,7 +95,7 @@ def _configured_timeout(value: float | None) -> float:
         timeout = float(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("SYNC_WHISPER_TIMEOUT_SECONDS must be a positive number") from exc
-    if timeout <= 0:
+    if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("SYNC_WHISPER_TIMEOUT_SECONDS must be a positive number")
     return timeout
 
@@ -136,7 +139,7 @@ def _transcribe_worker(connection: Connection) -> None:
             if command[0] != "transcribe":
                 continue
 
-            _, request_id, audio_path, backend, model, language = command
+            _, request_id, audio_path, backend, model, language, cloud_options = command
 
             def report(
                 processed_sec: float,
@@ -153,6 +156,9 @@ def _transcribe_worker(connection: Connection) -> None:
                     )
                 )
 
+            def report_budget(snapshot: dict[str, float]) -> None:
+                connection.send(("budget", request_id, snapshot))
+
             try:
                 result = transcribe_audio(
                     audio_path,
@@ -160,6 +166,8 @@ def _transcribe_worker(connection: Connection) -> None:
                     model=model,
                     language=language,
                     progress_callback=report,
+                    cloud_options=cloud_options,
+                    budget_callback=report_budget,
                 )
                 connection.send(("result", request_id, result))
             except BaseException as exc:
@@ -171,6 +179,9 @@ def _transcribe_worker(connection: Connection) -> None:
                             type(exc).__name__,
                             str(exc),
                             getattr(exc, "cost_usd", None),
+                            getattr(exc, "reserved_cost_usd", None),
+                            getattr(exc, "cost_limit_usd", None),
+                            getattr(exc, "cost_pending", None),
                         )
                     )
                 except (BrokenPipeError, EOFError, OSError):
@@ -368,17 +379,17 @@ def transcribe_audio_in_process(
     progress_callback: ProgressCallback | None = None,
     cancel_event: Any | None = None,
     timeout_seconds: float | None = None,
+    cloud_options: Mapping[str, Any] | None = None,
+    deadline_monotonic: float | None = None,
+    budget_callback: Callable[[dict[str, float]], None] | None = None,
     _start_method: str = "spawn",
 ) -> dict[str, Any]:
     """Transcribe in a reusable, killable child process.
 
-    Sequential requests with the same backend/model/language/start-method share
-    one process, allowing ``whisper_runner``'s in-process model cache to work.
-    Set ``SYNC_WHISPER_UNLOAD_AFTER_JOB=1`` to trade that warm cache for
-    releasing the worker (and its loaded model) after every successful request.
-    Otherwise a background watchdog releases the worker on its own once it has
-    sat idle past ``SYNC_WHISPER_IDLE_TIMEOUT_SECONDS`` (default 900s, 0
-    disables it), so long-lived sessions do not hold the model in RAM forever.
+    An absolute whole-job deadline includes time queued behind another request.
+    The configured Whisper timeout continues to bound inference itself. Parent
+    cancellation and either deadline terminate even an in-flight cloud request.
+    Matching model configurations reuse a worker unless auto-unload is enabled.
     """
     global _request_number, _worker_last_active, _worker_idle_timeout_seconds
 
@@ -386,17 +397,104 @@ def transcribe_audio_in_process(
     unload_after_job = _unload_after_job()
     idle_timeout = _configured_idle_timeout()
     key = _worker_key(backend, model, language, _start_method)
+    if deadline_monotonic is not None and not math.isfinite(deadline_monotonic):
+        raise ValueError("deadline_monotonic must be finite")
+    is_cloud = key[0] in {"cloud-audio", "cloud", "openrouter"}
+    # Preserve Decimal precision when values cross the process boundary. These
+    # are per-request options, so changing a budget never replaces a warm model.
+    options: dict[str, Any] | None = None
+    last_budget = {"spent_usd": 0.0, "reserved_usd": 0.0, "limit_usd": 0.0}
+    configured_cloud_timeout = timeout
+    if is_cloud:
+        options = {
+            name: str(value) if isinstance(value, Decimal) else value
+            for name, value in (cloud_options or {}).items()
+        }
+        # A warm worker inherited its environment at startup. Resolve mutable
+        # defaults in the parent on every request, including disabled budgets.
+        for option, variable in (
+            ("max_cost_usd", "ROUGH_CUT_MAX_USD_PER_JOB"),
+            ("usd_per_minute_estimate", "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE"),
+        ):
+            if options.get(option) is None:
+                options[option] = os.getenv(variable, "0").strip() or "0"
+        last_budget["spent_usd"] = float(options.get("initial_cost_usd") or 0)
+        last_budget["limit_usd"] = float(options.get("max_cost_usd") or 0)
+        if options.get("timeout_sec") is not None:
+            configured_cloud_timeout = float(options["timeout_sec"])
+            if not math.isfinite(configured_cloud_timeout) or configured_cloud_timeout <= 0:
+                raise ValueError("cloud timeout_sec must be a finite positive number")
+    deadline = deadline_monotonic
+    request_id: int | None = None
+    published_budget: dict[str, float] | None = None
 
-    # One pipe carries one request at a time. Holding the lock until the result
-    # also prevents callers from creating redundant model processes.
-    with _worker_lock:
-        # Queueing behind another project is not inference time. Start the hard
-        # deadline only after this request owns the worker slot.
-        deadline = time.monotonic() + timeout
-        # Read fresh on every request rather than cached at import, matching
-        # the other per-request settings above; the watchdog polls this value.
+    def receive_budget(snapshot: dict[str, float]) -> None:
+        nonlocal last_budget, published_budget
+        last_budget = dict(snapshot)
+        if budget_callback is not None and last_budget != published_budget:
+            published_budget = dict(last_budget)
+            try:
+                budget_callback(dict(last_budget))
+            except Exception:
+                pass
+
+    def attach_budget(error: BaseException) -> BaseException:
+        error.cost_usd = last_budget["spent_usd"]  # type: ignore[attr-defined]
+        error.reserved_cost_usd = last_budget["reserved_usd"]  # type: ignore[attr-defined]
+        error.cost_limit_usd = last_budget["limit_usd"]  # type: ignore[attr-defined]
+        error.cost_pending = bool(last_budget.get("cost_pending", False))  # type: ignore[attr-defined]
+        return error
+
+    def check_stop(worker: _Worker | None = None) -> None:
+        nonlocal last_budget
+        error: BaseException | None = None
+        if cancel_event is not None and cancel_event.is_set():
+            error = WhisperCancelledError("Whisper transcription cancelled")
+        elif deadline is not None and time.monotonic() >= deadline:
+            error = WhisperTimeoutError(f"Whisper transcription exceeded {timeout:g} seconds")
+        if error is not None:
+            if worker is not None:
+                # Stop dispatch first, then retain accounting already written
+                # to the pipe, including updates queued behind UI progress.
+                _stop_process(worker.process)
+                try:
+                    while worker.connection.poll(0):
+                        message = worker.connection.recv()
+                        if message[1] != request_id:
+                            continue
+                        if message[0] == "budget":
+                            receive_budget(message[2])
+                        elif message[0] == "error":
+                            for index, field in enumerate(
+                                ("spent_usd", "reserved_usd", "limit_usd", "cost_pending"), start=4
+                            ):
+                                if len(message) > index and message[index] is not None:
+                                    last_budget[field] = message[index]
+                except (EOFError, OSError):
+                    pass
+                _discard_worker_locked(worker)
+            raise attach_budget(error)
+
+    # Only the lock owner may retire a worker. A queued caller can stop without
+    # disturbing another project's active inference.
+    while True:
+        check_stop()
+        wait = 0.05
+        if deadline is not None:
+            wait = min(wait, max(0.0, deadline - time.monotonic()))
+        if _worker_lock.acquire(timeout=wait):
+            break
+    try:
+        check_stop()
+        inference_deadline = time.monotonic() + timeout
+        deadline = min(deadline, inference_deadline) if deadline is not None else inference_deadline
         _worker_idle_timeout_seconds = idle_timeout
         worker = _get_worker_locked(key)
+        check_stop(worker)
+        # Cloud requests get a cooperative timeout too; the parent remains the
+        # hard stop and kills the child if its request does not return in time.
+        if options is not None:
+            options["timeout_sec"] = min(deadline - time.monotonic(), configured_cloud_timeout)
         _request_number += 1
         request_id = _request_number
         try:
@@ -408,22 +506,20 @@ def transcribe_audio_in_process(
                     backend,
                     model,
                     language,
+                    options,
                 )
             )
         except (BrokenPipeError, EOFError, OSError) as exc:
             _discard_worker_locked(worker)
-            raise WhisperProcessError("Whisper worker IPC connection failed") from exc
+            raise attach_budget(
+                WhisperProcessError("Whisper worker IPC connection failed")
+            ) from exc
 
         while True:
-            if cancel_event is not None and cancel_event.is_set():
-                _discard_worker_locked(worker)
-                raise WhisperCancelledError("Whisper transcription cancelled")
+            check_stop(worker)
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _discard_worker_locked(worker)
-                raise WhisperTimeoutError(f"Whisper transcription exceeded {timeout:g} seconds")
             try:
-                response_ready = worker.connection.poll(min(0.25, remaining))
+                response_ready = worker.connection.poll(min(0.05, max(0.0, remaining)))
             except (EOFError, OSError):
                 response_ready = False
             if response_ready:
@@ -434,49 +530,57 @@ def transcribe_audio_in_process(
                 if not message:
                     exitcode = worker.process.exitcode
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError(
-                        f"Whisper worker exited without a result (exit code {exitcode})"
+                    raise attach_budget(
+                        WhisperProcessError(
+                            f"Whisper worker exited without a result (exit code {exitcode})"
+                        )
                     )
 
                 kind = message[0]
                 message_request_id = message[1]
                 if message_request_id != request_id:
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError("Whisper worker returned an unexpected response")
-                if kind == "progress":
+                    raise attach_budget(
+                        WhisperProcessError("Whisper worker returned an unexpected response")
+                    )
+                if kind == "budget":
+                    receive_budget(message[2])
+                elif kind == "progress":
                     if progress_callback is not None:
                         try:
-                            progress_callback(
-                                float(message[2]),
-                                float(message[3]),
-                                int(message[4]),
-                            )
+                            progress_callback(float(message[2]), float(message[3]), int(message[4]))
                         except Exception:
                             pass
                 elif kind == "result":
+                    check_stop(worker)
                     result = message[2]
                     if unload_after_job:
                         _discard_worker_locked(worker, graceful=True)
                     else:
-                        # Mark the worker idle as of now; the watchdog decides
-                        # later whether it has sat unused long enough to retire.
                         _worker_last_active = time.monotonic()
                     return result
                 elif kind == "error":
                     worker_error = f"{message[2]}: {message[3]}"
                     _discard_worker_locked(worker)
-                    error = WhisperProcessError(worker_error)
-                    if len(message) > 4:
-                        error.cost_usd = message[4]  # type: ignore[attr-defined]
+                    error = attach_budget(WhisperProcessError(worker_error))
+                    for index, field in enumerate(
+                        ("cost_usd", "reserved_cost_usd", "cost_limit_usd", "cost_pending"), start=4
+                    ):
+                        if len(message) > index and message[index] is not None:
+                            setattr(error, field, message[index])
                     raise error
                 else:
                     _discard_worker_locked(worker)
-                    raise WhisperProcessError(
-                        f"Whisper worker returned an unknown message: {kind!r}"
+                    raise attach_budget(
+                        WhisperProcessError(f"Whisper worker returned an unknown message: {kind!r}")
                     )
             elif not worker.process.is_alive():
                 exitcode = worker.process.exitcode
                 _discard_worker_locked(worker)
-                raise WhisperProcessError(
-                    f"Whisper worker exited without a result (exit code {exitcode})"
+                raise attach_budget(
+                    WhisperProcessError(
+                        f"Whisper worker exited without a result (exit code {exitcode})"
+                    )
                 )
+    finally:
+        _worker_lock.release()

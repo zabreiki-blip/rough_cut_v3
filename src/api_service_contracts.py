@@ -20,6 +20,7 @@ class FinalReviewJobServices(Protocol):
     _FINAL_REVIEW_JOBS: dict[str, JsonDict]
     _FINAL_REVIEW_JOBS_LOCK: Any
     _FINAL_REVIEW_ACTIVE_PROJECTS: set[str]
+    _FINAL_REVIEW_CANCEL_EVENTS: dict[str, Any]
     uuid: ModuleType
     FullTimeline: type[FullTimelineModel]
 
@@ -48,6 +49,10 @@ class FinalReviewJobServices(Protocol):
     def _atomic_write_json_file(self, path: Path, payload: JsonDict) -> None: ...
 
     def _read_json_safe(self, path: Path) -> JsonDict: ...
+
+    def _record_final_review_iteration(
+        self, project: str, job: JsonDict, corrections: list[JsonDict], request_id: str = ""
+    ) -> JsonDict: ...
 
     def _make_openrouter_usage_callback(self, project: str, **context: Any) -> UsageCallback: ...
 
@@ -203,6 +208,8 @@ class SyncWorkerServices(Protocol):
     def _sync_stores(self, paths: dict[str, Path]) -> tuple[Any, Any]: ...
 
     def _sync_cancel_event(self, job_id: str) -> Any: ...
+
+    def _get_sync_job(self, job_id: str) -> JsonDict | None: ...
 
     def _update_sync_job(self, job_id: str, **updates: Any) -> JsonDict | None: ...
 

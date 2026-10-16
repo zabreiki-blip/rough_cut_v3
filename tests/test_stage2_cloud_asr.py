@@ -26,6 +26,7 @@ from stage2.cloud_asr import (
     _reconcile_speakers,
     _rescale_stretched_timestamps,
     _stitch_chunk,
+    plan_cloud_chunks,
     parse_speaker_legend,
     parse_transcript,
     transcribe_cloud,
@@ -140,6 +141,39 @@ def test_plan_chunks_zero_duration() -> None:
 def test_plan_chunks_exactly_chunk_length() -> None:
     parts = _plan_chunks_for(20 * 60)
     assert parts == [(0.0, 1200.0)]
+
+
+def test_plan_cloud_chunks_counts_overlap_in_billable_duration() -> None:
+    parts = plan_cloud_chunks(2700.0, 20.0, 60.0)
+    assert parts == [(0.0, 1200.0), (1140.0, 2400.0), (2340.0, 2700.0)]
+    assert sum(end - start for start, end in parts) == 2820.0
+
+
+@pytest.mark.parametrize(
+    ("duration", "chunk_minutes", "overlap", "expected"),
+    [
+        (0.0, 20.0, 60.0, [(0.0, 0.0)]),
+        (600.0, 20.0, 60.0, [(0.0, 600.0)]),
+        (1200.0, 20.0, 60.0, [(0.0, 1200.0)]),
+        (2700.0, 0.0, 60.0, [(0.0, 2700.0)]),
+        (130.0, 1.0, 90.0, [(0.0, 60.0), (0.0, 120.0), (30.0, 130.0)]),
+        (130.0, 1.0, 0.0, [(0.0, 60.0), (60.0, 120.0), (120.0, 130.0)]),
+    ],
+)
+def test_plan_cloud_chunks_preserves_adapter_boundaries(
+    duration: float, chunk_minutes: float, overlap: float, expected: list[tuple[float, float]]
+) -> None:
+    assert plan_cloud_chunks(duration, chunk_minutes, overlap) == expected
+    assert _plan_chunks_for(duration, chunk_minutes=chunk_minutes, overlap_sec=overlap) == expected
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_plan_cloud_chunks_rejects_invalid_inputs(position: int, value: float) -> None:
+    args = [2700.0, 20.0, 60.0]
+    args[position] = value
+    with pytest.raises(ValueError):
+        plan_cloud_chunks(*args)
 
 
 def test_rescale_stretched_timestamps_preserves_relative_position() -> None:
@@ -396,6 +430,78 @@ def test_transcribe_cloud_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -
     assert result["cost_usd"] == pytest.approx(0.01)
 
 
+@pytest.mark.parametrize(
+    "error_type,detail",
+    [(httpx.ReadTimeout, "HTTP timeout (ReadTimeout)"), (httpx.ConnectError, "")],
+)
+def test_exhausted_http_retries_preserve_empty_timeout_classification(
+    monkeypatch, error_type, detail
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise error_type("", request=request)
+
+    async def no_sleep(_self, _attempt):
+        pass
+
+    _patch_async_client(monkeypatch, handler)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    with pytest.raises(cloud_asr.CloudAudioAsrError) as caught:
+        transcribe_cloud(
+            Path("unused.wav"), api_key="test-key", max_cost_usd="1", usd_per_minute_estimate="0.06"
+        )
+
+    assert len(calls) == 3
+    assert str(caught.value) == (
+        "Ошибка сети при запросе к облачной ASR-модели после 3 попыток: " + detail
+    )
+    assert caught.value.reserved_cost_usd == pytest.approx(0.18)
+
+
+def test_empty_read_timeout_message_survives_real_runner_and_worker_ipc(tmp_path, monkeypatch):
+    import multiprocessing
+    from stage2.whisper_process import (
+        WhisperProcessError,
+        _shutdown_worker,
+        transcribe_audio_in_process,
+    )
+
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("real HTTP error propagation test requires inherited MockTransport")
+    _shutdown_worker()
+    audio = tmp_path / "guide.wav"
+    audio.write_bytes(b"fixture")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_API_KEY", "test-key")
+
+    def handler(request):
+        raise httpx.ReadTimeout("", request=request)
+
+    async def no_sleep(_self, _attempt):
+        pass
+
+    _patch_async_client(monkeypatch, handler)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    try:
+        with pytest.raises(WhisperProcessError) as caught:
+            transcribe_audio_in_process(
+                audio,
+                backend="cloud-audio",
+                timeout_seconds=5,
+                cloud_options={"max_cost_usd": "1", "usd_per_minute_estimate": "0.06"},
+                _start_method="fork",
+            )
+    finally:
+        _shutdown_worker()
+
+    assert str(caught.value) == (
+        "WhisperTranscriptionError: Облачное распознавание речи не удалось: "
+        "Ошибка сети при запросе к облачной ASR-модели после 3 попыток: HTTP timeout (ReadTimeout)"
+    )
+    assert caught.value.reserved_cost_usd == pytest.approx(0.18)
+
+
 def test_call_model_payload_requests_cost_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     """OpenRouter отдаёт `usage.cost` только если запрос явно попросил об
     этом через `usage.include = True` — без этого `_extract_cost` всегда
@@ -596,3 +702,329 @@ def test_call_model_cancellation_interrupts_slow_network_request(
         assert time.monotonic() - start < 5.0
 
     asyncio.run(scenario())
+
+
+# Budget accounting is observable at the HTTP boundary: no request can consume
+# headroom that has not already been published as a reservation.
+def test_budget_reserves_before_every_http_attempt(monkeypatch) -> None:
+    snapshots = []
+    reservations_at_http = []
+
+    def handler(_request):
+        reservations_at_http.append(snapshots[-1]["reserved_usd"])
+        if len(reservations_at_http) == 1:
+            return httpx.Response(429, text="retry")
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.02)
+
+    async def no_sleep(self, attempt):
+        pass
+
+    _patch_async_client(monkeypatch, handler)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    result = transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        max_cost_usd="1",
+        usd_per_minute_estimate="0.06",
+        budget_callback=snapshots.append,
+    )
+
+    assert reservations_at_http == pytest.approx([0.06, 0.12])
+    assert result["cost_usd"] == pytest.approx(0.02)
+    assert result["reserved_cost_usd"] == pytest.approx(0.06)
+    assert result["cost_limit_usd"] == 1.0
+    assert result["cost_pending"] is True
+    assert snapshots[-1] == pytest.approx(
+        {
+            "limit_usd": 1.0,
+            "spent_usd": 0.02,
+            "reserved_usd": 0.06,
+            "total_usd": 0.08,
+            "cost_pending": True,
+        }
+    )
+
+
+def test_budget_prevents_retry_when_reservation_would_cross_limit(monkeypatch) -> None:
+    from cost_budget import CostBudgetExceeded
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503, text="retry")
+
+    async def no_sleep(self, attempt):
+        pass
+
+    _patch_async_client(monkeypatch, handler)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    with pytest.raises(CostBudgetExceeded) as caught:
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            max_cost_usd="0.1",
+            usd_per_minute_estimate="0.06",
+        )
+
+    assert len(calls) == 1
+    assert caught.value.cost_usd == 0.0
+    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+    assert caught.value.cost_limit_usd == pytest.approx(0.1)
+
+
+def test_budget_unknown_cost_keeps_reservation_and_blocks_next_chunk(monkeypatch) -> None:
+    from cost_budget import CostBudgetExceeded
+
+    calls = []
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
+
+    def handler(request):
+        calls.append(request)
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=None)
+
+    _patch_async_client(monkeypatch, handler)
+    with pytest.raises(CostBudgetExceeded) as caught:
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            chunk_minutes=1,
+            overlap_sec=0,
+            max_cost_usd="0.09",
+            usd_per_minute_estimate="0.06",
+        )
+
+    assert len(calls) == 1
+    assert caught.value.cost_usd == 0.0
+    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+
+
+def test_budget_actual_cost_replaces_reservation_for_next_chunk(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
+
+    def handler(request):
+        calls.append(request)
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    _patch_async_client(monkeypatch, handler)
+    result = transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        chunk_minutes=1,
+        overlap_sec=0,
+        max_cost_usd="0.08",
+        usd_per_minute_estimate="0.06",
+    )
+
+    assert len(calls) == 2
+    assert result["cost_usd"] == pytest.approx(0.02)
+    assert result["reserved_cost_usd"] == 0.0
+
+
+def test_budget_initial_spend_prevents_first_http_attempt(monkeypatch) -> None:
+    from cost_budget import CostBudgetExceeded
+
+    calls = []
+    _patch_async_client(monkeypatch, lambda request: calls.append(request))
+    with pytest.raises(CostBudgetExceeded) as caught:
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            max_cost_usd="0.1",
+            usd_per_minute_estimate="0.06",
+            initial_cost_usd="0.05",
+        )
+
+    assert len(calls) == 0
+    assert caught.value.cost_usd == pytest.approx(0.05)
+    assert caught.value.reserved_cost_usd == 0.0
+
+
+def test_budget_asr_error_preserves_settled_and_unknown_cost(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
+
+    def handler(request):
+        calls.append(request)
+        return _model_response(
+            "[00:01] ГОЛОС 1: Готово" if len(calls) == 1 else "invalid transcript",
+            cost=0.01 if len(calls) == 1 else None,
+        )
+
+    _patch_async_client(monkeypatch, handler)
+    with pytest.raises(cloud_asr.CloudAudioAsrError) as caught:
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            chunk_minutes=1,
+            overlap_sec=0,
+            max_cost_usd="1",
+            usd_per_minute_estimate="0.06",
+            initial_cost_usd="0.03",
+        )
+
+    assert len(calls) == 2
+    assert caught.value.cost_usd == pytest.approx(0.04)
+    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+    assert caught.value.cost_limit_usd == 1.0
+
+
+def test_deadline_interrupts_http_and_prevents_further_chunks(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
+
+    async def handler(request):
+        calls.append(request)
+        await asyncio.sleep(5)
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    _patch_async_client(monkeypatch, handler)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as caught:
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            chunk_minutes=1,
+            overlap_sec=0,
+            max_cost_usd="1",
+            usd_per_minute_estimate="0.06",
+            timeout_sec=0.05,
+        )
+
+    assert len(calls) == 1
+    assert time.monotonic() - started < 1.0
+    assert caught.value.reserved_cost_usd == pytest.approx(0.06)
+
+
+@pytest.mark.parametrize("allowance,expected_timeout", [(7200, 900), (30, 30)])
+def test_http_request_timeout_caps_remaining_whole_job_allowance(
+    monkeypatch, allowance, expected_timeout
+) -> None:
+    timeouts = []
+
+    def handler(request):
+        timeouts.append(request.extensions["timeout"]["read"])
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    monkeypatch.setattr(
+        cloud_asr.httpx,
+        "AsyncClient",
+        lambda **kwargs: _RealAsyncClient(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        timeout_sec=allowance,
+        budget_callback=lambda _snapshot: time.sleep(0.02),
+    )
+
+    assert len(timeouts) == 1
+    assert expected_timeout - 1 < timeouts[0] <= expected_timeout
+    if allowance < 900:
+        assert timeouts[0] < allowance - 0.01
+
+
+def test_cancellation_before_start_prevents_http_dispatch(monkeypatch) -> None:
+    calls = []
+    cancel = asyncio.Event()
+    cancel.set()
+    _patch_async_client(monkeypatch, lambda request: calls.append(request))
+
+    with pytest.raises(asyncio.CancelledError):
+        transcribe_cloud(Path("unused.wav"), api_key="test-key", cancel=cancel)
+
+    assert len(calls) == 0
+
+
+def test_cancellation_after_first_chunk_prevents_next_http_dispatch(monkeypatch) -> None:
+    calls = []
+    cancel = asyncio.Event()
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
+
+    def handler(request):
+        calls.append(request)
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    _patch_async_client(monkeypatch, handler)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            chunk_minutes=1,
+            overlap_sec=0,
+            cancel=cancel,
+            progress_callback=lambda _: cancel.set(),
+            max_cost_usd="1",
+            usd_per_minute_estimate="0.06",
+        )
+
+    assert len(calls) == 1
+    assert caught.value.cost_usd == pytest.approx(0.01)
+    assert caught.value.reserved_cost_usd == 0.0
+
+
+def test_deadline_expiring_inside_budget_callback_prevents_http_dispatch(monkeypatch) -> None:
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return _model_response("[00:01] ГОЛОС 1: Готово", cost=0.01)
+
+    def blocking_callback(_snapshot):
+        time.sleep(0.08)
+
+    _patch_async_client(monkeypatch, handler)
+    with pytest.raises(TimeoutError):
+        transcribe_cloud(
+            Path("unused.wav"),
+            api_key="test-key",
+            timeout_sec=0.02,
+            max_cost_usd="1",
+            usd_per_minute_estimate="0.06",
+            budget_callback=blocking_callback,
+        )
+
+    assert len(calls) == 0
+
+
+def test_confirmed_duration_freezes_chunk_boundaries_and_reservations(monkeypatch):
+    extracted = []
+    snapshots = []
+
+    async def extract(_self, _path, start, duration):
+        extracted.append((start, duration))
+        return b"mp3"
+
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 151.0)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    _patch_async_client(
+        monkeypatch, lambda _request: _model_response("[00:01] ГОЛОС 1: Готово", cost=None)
+    )
+    result = transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        chunk_minutes=1,
+        overlap_sec=10,
+        duration_sec=150.0,
+        max_cost_usd="0.17",
+        usd_per_minute_estimate="0.06",
+        budget_callback=snapshots.append,
+    )
+
+    assert extracted == [(0.0, 60.0), (50.0, 70.0), (110.0, 40.0)]
+    assert result["duration_sec"] == 150.0
+    assert result["reserved_cost_usd"] == pytest.approx(0.17)
+    assert snapshots[-1]["reserved_usd"] == pytest.approx(0.17)
+
+
+@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf")])
+def test_confirmed_duration_rejects_invalid_values_before_http(monkeypatch, duration):
+    calls = []
+    _patch_async_client(
+        monkeypatch,
+        lambda request: calls.append(request) or _model_response("[00:01] ГОЛОС 1: Тест"),
+    )
+    with pytest.raises(ValueError, match="duration_sec"):
+        transcribe_cloud(Path("unused.wav"), api_key="test-key", duration_sec=duration)
+    assert calls == []

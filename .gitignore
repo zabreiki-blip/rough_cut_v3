@@ -39,3 +39,6 @@ cep/.debug
 
 # Isolated Codex worktrees
 .worktrees/
+
+# Codex SDD workspace and generated task reports
+.superpowers/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from collections.abc import Mapping
 import importlib.util
 from math import isfinite
 import os
@@ -315,6 +316,8 @@ def _transcribe_cloud(
     model: str,
     language: str,
     progress_callback: ProgressCallback | None,
+    cloud_options: Mapping[str, Any] | None = None,
+    budget_callback: Callable[[dict[str, float]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Transcribe via the cloud audio-ASR backend and interpolate word times.
 
@@ -341,6 +344,8 @@ def _transcribe_cloud(
             model=model,
             language=language,
             progress_callback=_on_cloud_progress,
+            budget_callback=budget_callback,
+            **dict(cloud_options or {}),
         )
     except CloudAudioAsrError as exc:
         # CloudAudioAsrError messages (see cloud_asr.py) are already
@@ -348,6 +353,9 @@ def _transcribe_cloud(
         # itself (only its presence/absence) — safe to surface as-is.
         error = WhisperTranscriptionError(f"Облачное распознавание речи не удалось: {exc}")
         error.cost_usd = exc.cost_usd  # type: ignore[attr-defined]
+        error.reserved_cost_usd = getattr(exc, "reserved_cost_usd", None)  # type: ignore[attr-defined]
+        error.cost_limit_usd = getattr(exc, "cost_limit_usd", None)  # type: ignore[attr-defined]
+        error.cost_pending = getattr(exc, "cost_pending", None)  # type: ignore[attr-defined]
         raise error from exc
 
     segments = result.get("segments") or []
@@ -362,6 +370,9 @@ def _transcribe_cloud(
         # kept for later matching work, not consumed by this stage yet.
         "speakers": result.get("speakers") or [],
         "cost_usd": result.get("cost_usd"),
+        "reserved_cost_usd": result.get("reserved_cost_usd"),
+        "cost_limit_usd": result.get("cost_limit_usd"),
+        "cost_pending": result.get("cost_pending"),
         "base_url": result.get("base_url"),
         "timestamp_precision": "interpolated",
         "segment_count": len(segments),
@@ -381,6 +392,8 @@ def transcribe_audio(
     model: str | None = None,
     language: str = "ru",
     progress_callback: ProgressCallback | None = None,
+    cloud_options: Mapping[str, Any] | None = None,
+    budget_callback: Callable[[dict[str, float]], None] | None = None,
 ) -> dict[str, Any]:
     """Transcribe a sequence guide WAV into the canonical word-index format."""
     path = Path(audio_path).resolve()
@@ -407,6 +420,8 @@ def transcribe_audio(
             selected_model,
             language,
             progress_callback,
+            cloud_options,
+            budget_callback,
         )
     else:
         words, backend_meta = _transcribe_openai(path, selected_model, language)
@@ -416,6 +431,9 @@ def transcribe_audio(
             f"{selected} returned no usable word timestamps for {path.name}"
         )
         error.cost_usd = backend_meta.get("cost_usd")  # type: ignore[attr-defined]
+        error.reserved_cost_usd = backend_meta.get("reserved_cost_usd")  # type: ignore[attr-defined]
+        error.cost_limit_usd = backend_meta.get("cost_limit_usd")  # type: ignore[attr-defined]
+        error.cost_pending = backend_meta.get("cost_pending")  # type: ignore[attr-defined]
         raise error
 
     completed_duration = float(backend_meta.get("duration_sec") or words[-1]["end"])
@@ -431,6 +449,9 @@ def transcribe_audio(
     # original reply segments, see _transcribe_cloud) — lift it out here so
     # every backend still shares one generic assembly path.
     top_level_extra: dict[str, Any] = {}
+    if selected == "cloud-audio":
+        for field in ("cost_usd", "reserved_cost_usd", "cost_limit_usd", "cost_pending"):
+            top_level_extra[field] = backend_meta.get(field)
     segments_for_top_level = backend_meta.pop("segments", None)
     if segments_for_top_level is not None:
         top_level_extra["segments"] = segments_for_top_level
