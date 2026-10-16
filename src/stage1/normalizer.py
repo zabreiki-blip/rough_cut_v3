@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from atomic_io import atomic_write_json as _atomic_write_json
 from atomic_io import atomic_write_text as _atomic_write_text
+from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 
 from .config import get_settings
@@ -372,6 +373,14 @@ _LLM_CONFIDENCE_THRESHOLD = 0.65
 # instead of merely leaving them unreachable under their old keys.
 _LLM_CACHE_VERSION = 3
 _LLM_CACHE_MAX_ENTRIES = 2000
+# A single paragraph can be arbitrarily large (a pasted article without line
+# breaks).  The classifier must answer per block uid, so a block cannot be
+# split; instead the LLM sees its head and tail only, which bounds the cost of
+# one request regardless of block size.
+_LLM_BLOCK_TEXT_MAX_CHARS = 8000
+_LLM_BLOCK_HEAD_CHARS = 6000
+_LLM_BLOCK_TAIL_CHARS = 1500
+_LLM_TRUNCATION_MARKER = "\n[... middle of an oversized block omitted ...]\n"
 _OPENROUTER_SYSTEM_PROMPT = "You normalize TV production scripts."
 _OPENROUTER_INSTRUCTIONS = (
     "Classify every scenario paragraph without deleting or merging any item. "
@@ -1970,7 +1979,18 @@ def _apply_llm_results(
             if item.get(key):
                 setattr(block, key, str(item[key]).strip())
         if block.type == BlockType.VOICEOVER.value:
-            block.text_for_tts = str(item.get("text_for_tts", "")).strip() or block.normalized_text
+            if _llm_text_truncated(block):
+                # The model saw only an excerpt, so its text_for_tts would
+                # silently drop the omitted middle. Keep the full local text.
+                block.text_for_tts = block.normalized_text
+            else:
+                block.text_for_tts = (
+                    str(item.get("text_for_tts", "")).strip() or block.normalized_text
+                )
+        if _llm_text_truncated(block):
+            block.warnings.append(
+                "LLM classified a truncated excerpt of this oversized block (head and tail only)"
+            )
         _extract_block_metadata(block)
 
 
@@ -2227,16 +2247,34 @@ def _llm_batches(
     return batches
 
 
+def _llm_text_truncated(block: NormalizedBlock) -> bool:
+    return len(block.original_text) > _LLM_BLOCK_TEXT_MAX_CHARS
+
+
+def _llm_text_excerpt(text: str) -> str:
+    """Head and tail of an oversized block.
+
+    Classification depends on the label/first words (head) and on a trailing
+    timecode or speaker credit (tail); the middle adds cost, not signal.
+    """
+    if len(text) <= _LLM_BLOCK_TEXT_MAX_CHARS:
+        return text
+    return text[:_LLM_BLOCK_HEAD_CHARS] + _LLM_TRUNCATION_MARKER + text[-_LLM_BLOCK_TAIL_CHARS:]
+
+
 def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
     """Return only classification context, avoiding duplicated draft fields."""
-    return {
+    item: dict[str, Any] = {
         "uid": block.uid,
-        "original_text": block.original_text,
+        "original_text": _llm_text_excerpt(block.original_text),
         "original_label": block.original_label,
         "suggested_type": block.suggested_type,
         "suggested_label": block.suggested_label,
         "continuation_of_type": block.continuation_of_type,
     }
+    if _llm_text_truncated(block):
+        item["text_truncated"] = True
+    return item
 
 
 def _openrouter_classifier(
@@ -2254,8 +2292,15 @@ def _openrouter_classifier(
         import requests
     except ImportError as exc:
         raise RuntimeError("requests is not installed") from exc
-    prompt = _OPENROUTER_INSTRUCTIONS + (
-        f"Author hint: {hint or '(none)'}. Items: {json.dumps(blocks, ensure_ascii=False)}"
+    items_json = json.dumps(blocks, ensure_ascii=False)
+    prompt = _OPENROUTER_INSTRUCTIONS + f"Author hint: {hint or '(none)'}. Items: {items_json}"
+    # Every item is answered with its own fields; voiceover items also echo
+    # their text in text_for_tts, so the answer is about as long as the input
+    # plus ~150 characters of JSON per item.
+    max_tokens = resolve_max_tokens(
+        settings,
+        expected_output_chars=len(items_json) + 150 * len(blocks),
+        floor=1024,
     )
     json_body: dict[str, Any] = {
         "model": settings.openrouter_model,
@@ -2265,6 +2310,7 @@ def _openrouter_classifier(
         ],
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
+        "max_tokens": max_tokens,
     }
     if llm_preset == "fast":
         json_body["provider"] = {"sort": "throughput"}
@@ -2294,6 +2340,7 @@ def _openrouter_classifier(
     response.raise_for_status()
     body = response.json()
     report_json_usage(usage_callback, body, model=settings.openrouter_model)
+    raise_if_truncated(body, model=settings.openrouter_model, max_tokens=max_tokens)
     content = body["choices"][0]["message"]["content"]
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)

@@ -30,6 +30,8 @@ class Settings:
     macos_command_timeout: int
     project_name: str
     max_zk_blocks: int
+    # 0 = derive max_tokens per request (see openrouter_limits.resolve_max_tokens).
+    openrouter_max_tokens: int = 0
 
 
 def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
@@ -101,6 +103,8 @@ def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
         warnings.append("MACOS_CONNECTOR_URL must start with http:// or https://")
 
     integer("MAX_ZK_BLOCKS", 1)
+    integer("OPENROUTER_MAX_TOKENS", 1)
+    integer("SYNC_CLOUD_ASR_MAX_TOKENS", 1)
     integer("OPENROUTER_TTS_SAMPLE_RATE", 8000, 192000)
     integer("MACOS_TTS_RATE", 80, 420)
     integer("MACOS_TTS_SAMPLE_RATE", 8000, 192000)
@@ -119,6 +123,14 @@ def get_settings() -> Settings:
         max_blocks = 40
     if max_blocks < 1:
         max_blocks = 40
+
+    max_tokens_raw = os.getenv("OPENROUTER_MAX_TOKENS", "").strip()
+    try:
+        openrouter_max_tokens = int(max_tokens_raw) if max_tokens_raw else 0
+    except ValueError:
+        openrouter_max_tokens = 0
+    if openrouter_max_tokens < 1:
+        openrouter_max_tokens = 0
 
     sample_rate_raw = os.getenv("OPENROUTER_TTS_SAMPLE_RATE", "24000").strip()
     try:
@@ -203,4 +215,5 @@ def get_settings() -> Settings:
         macos_command_timeout=macos_command_timeout,
         project_name=os.getenv("PROJECT_NAME", "rough_cut_v3").strip(),
         max_zk_blocks=max_blocks,
+        openrouter_max_tokens=openrouter_max_tokens,
     )

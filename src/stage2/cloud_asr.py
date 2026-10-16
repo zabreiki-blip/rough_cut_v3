@@ -70,6 +70,7 @@ from typing import Any, Callable
 import httpx
 
 from cost_budget import CostBudget, CostGuardConfig
+from openrouter_limits import finish_reason
 
 from .asr_contract import AsrProgress, AsrRunResult, AsrSegment
 from .text_normalization import fold_russian_text
@@ -105,6 +106,11 @@ DEFAULT_CHUNK_MINUTES = 20.0
 DEFAULT_OVERLAP_SEC = 60.0
 DEFAULT_TIMEOUT_SEC = 900.0
 DEFAULT_MAX_RETRIES = 3
+# Верхняя граница выходных токенов одного запроса к ASR-модели (стоимость
+# запроса с неограниченным ответом/размышлениями не ограничена). Транскрипт
+# 20-минутного фрагмента с таймкодами занимает порядка 10-15 тысяч токенов.
+# Переопределяется SYNC_CLOUD_ASR_MAX_TOKENS.
+DEFAULT_MAX_OUTPUT_TOKENS = 32_768
 # Some audio-capable models occasionally return a consistently stretched
 # timestamp scale (for example, 493 s of segments for a 405 s source). A
 # tiny overrun is normal rounding noise; anything larger is repaired below.
@@ -972,6 +978,15 @@ def plan_cloud_chunks(
     return parts
 
 
+def _resolve_max_output_tokens() -> int:
+    raw = os.getenv("SYNC_CLOUD_ASR_MAX_TOKENS", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_MAX_OUTPUT_TOKENS
+    except ValueError:
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    return value if value > 0 else DEFAULT_MAX_OUTPUT_TOKENS
+
+
 class CloudAudioAsrAdapter:
     """ASR-адаптер поверх облачной модели с аудио-входом.
 
@@ -1021,6 +1036,7 @@ class CloudAudioAsrAdapter:
             except ValueError:
                 self.overlap_sec = DEFAULT_OVERLAP_SEC
         self.timeout_sec = timeout_sec
+        self._max_output_tokens = _resolve_max_output_tokens()
         self._reasoning_effort = reasoning_effort
         self._http_client = http_client
         self._ffmpeg = ffmpeg
@@ -1223,6 +1239,7 @@ class CloudAudioAsrAdapter:
                 }
             ],
             "temperature": 0.0,
+            "max_tokens": self._max_output_tokens,
             # Без этого флага OpenRouter не включает в ответ `usage.cost` —
             # `_extract_cost` всегда получал бы None, и вся отчётность по
             # деньгам (см. CloudAudioAsrError.cost_usd, total_cost ниже)
@@ -1440,6 +1457,18 @@ class CloudAudioAsrAdapter:
                 if cost is not None:
                     total_cost += cost
                     cost_found = True
+                if finish_reason(raw) == "length":
+                    # Ответ обрезан лимитом токенов: повтор заплатил бы за тот
+                    # же обрезанный результат, а принять неполный транскрипт
+                    # нельзя — останавливаемся с понятной подсказкой.
+                    raise CloudAudioAsrError(
+                        f"Ответ облачной ASR-модели для части {idx + 1} из {len(parts)} "
+                        f"обрезан лимитом max_tokens={self._max_output_tokens} "
+                        "(finish_reason=length); повтор не выполнялся, чтобы не платить "
+                        "за тот же результат. Увеличьте SYNC_CLOUD_ASR_MAX_TOKENS "
+                        "и запустите заново.",
+                        cost_usd=total_cost if cost_found else None,
+                    )
 
                 try:
                     transcript_text, legend_text = split_transcript_and_legend(content)

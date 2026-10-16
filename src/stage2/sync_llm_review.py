@@ -13,6 +13,7 @@ from typing import Any, Callable, Sequence
 
 import requests
 
+from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 from stage1.config import Settings, get_settings
 
@@ -90,6 +91,9 @@ def review_candidates_with_llm(
         f"Цитата сценария: {query_text}\n"
         f"Кандидаты: {json.dumps(candidate_payload, ensure_ascii=False)}"
     )
+    # The answer is a one-line JSON object ({"selected_index", "confidence",
+    # "reason"}), a few dozen tokens; the floor leaves room for a verbose reason.
+    max_tokens = resolve_max_tokens(config, expected_output_chars=0, floor=1024)
     response = call(
         f"{config.openrouter_base_url}/chat/completions",
         headers={
@@ -100,6 +104,7 @@ def review_candidates_with_llm(
             "model": config.openrouter_model,
             "temperature": 0,
             "response_format": {"type": "json_object"},
+            "max_tokens": max_tokens,
             "messages": [
                 {
                     "role": "system",
@@ -113,6 +118,7 @@ def review_candidates_with_llm(
     response.raise_for_status()
     body = response.json()
     report_json_usage(usage_callback, body, model=config.openrouter_model)
+    raise_if_truncated(body, model=config.openrouter_model, max_tokens=max_tokens)
     content = body["choices"][0]["message"]["content"]
     decision = _json_object(content)
     try:

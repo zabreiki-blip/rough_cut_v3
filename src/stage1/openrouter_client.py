@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Any, Callable
 
+from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 
 try:
@@ -127,6 +128,11 @@ def analyze_with_openrouter(
 {scenario_text}
 """.strip()
 
+    # The answer repeats every paragraph twice (text_original + text_for_tts)
+    # inside JSON, so the expected size is about twice the input.
+    max_tokens = resolve_max_tokens(
+        settings, expected_output_chars=2 * len(scenario_text), floor=2048
+    )
     payload = {
         "model": settings.openrouter_model,
         "messages": [
@@ -135,6 +141,7 @@ def analyze_with_openrouter(
         ],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
+        "max_tokens": max_tokens,
     }
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
@@ -177,6 +184,8 @@ def analyze_with_openrouter(
 
     data = response.json()
     report_json_usage(usage_callback, data, model=settings.openrouter_model)
+    # After the retry wrapper on purpose: a cut-off answer must not be re-bought.
+    raise_if_truncated(data, model=settings.openrouter_model, max_tokens=max_tokens)
     content = data["choices"][0]["message"]["content"]
     parsed = _extract_json(content if isinstance(content, str) else json.dumps(content))
     items = parsed.get("items", [])
