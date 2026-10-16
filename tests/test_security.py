@@ -431,6 +431,49 @@ def test_runtime_ci_checks_production_asr_dependencies() -> None:
     assert (ROOT_DIR / "tests/runtime_import_smoke.py").is_file()
 
 
+def test_ci_cancels_superseded_runs_and_pins_node_for_npm() -> None:
+    workflow = (ROOT_DIR / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert re.search(
+        r"^concurrency:\n  group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}\n"
+        r"  cancel-in-progress: true$",
+        workflow,
+        re.M,
+    )
+    match = re.search(r"^  verify:\n(?P<job>.*?)(?=^  \S|\Z)", workflow, re.M | re.S)
+    assert match is not None
+    job = match.group("job")
+    node_setup = re.search(
+        r"uses: actions/setup-node@v4\n\s+with:\n\s+node-version: \"(\d+)\"\n\s+cache: npm", job
+    )
+    assert node_setup is not None, "verify must pin a Node major version with npm cache"
+    assert job.index("actions/setup-node@v4") < job.index("npm ci")
+
+
+def test_ci_audits_runtime_dependencies_for_vulnerabilities() -> None:
+    workflow = (ROOT_DIR / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert re.search(r"pip install pip-audit==\d+\.\d+\.\d+", workflow)
+    assert "pip-audit -r requirements.txt -r requirements-whisper.txt" in workflow
+    # Runtime dependencies only: requirements-lock.txt mixes in dev tooling.
+    assert "pip-audit -r requirements-lock.txt" not in workflow
+
+
+def test_dependabot_covers_python_actions_and_npm_weekly() -> None:
+    config = (ROOT_DIR / ".github/dependabot.yml").read_text(encoding="utf-8")
+    assert re.search(r"^version: 2$", config, re.M)
+    blocks = re.split(r"^  - ", config, flags=re.M)[1:]
+    updates = {
+        match.group(1): block
+        for block in blocks
+        if (match := re.search(r'package-ecosystem: "?([\w-]+)"?', block))
+    }
+    assert {"pip", "github-actions", "npm"} <= set(updates)
+    for block in updates.values():
+        assert re.search(r'directory: "/"', block)
+        assert re.search(r"interval: weekly", block)
+    assert "open-pull-requests-limit: 5" in updates["pip"]
+    assert "groups:" in updates["pip"] and "minor" in updates["pip"] and "patch" in updates["pip"]
+
+
 @pytest.mark.parametrize("resolved_backend", ["faster-whisper", "openai-whisper"])
 def test_runtime_smoke_requires_application_faster_whisper_backend(resolved_backend: str) -> None:
     # The verify job intentionally has no ASR dependency. Only replace the external

@@ -9,6 +9,10 @@ permissions:
   pull-requests: read
   security-events: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   runtime-smoke:
     runs-on: ubuntu-latest
@@ -35,6 +39,28 @@ jobs:
 
       - name: Build production Docker image
         run: docker build .
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-whisper.txt
+
+      # Runtime dependencies only (what the Docker image ships). The lock file
+      # also contains dev tooling, so it is deliberately not audited here.
+      - name: Install pip-audit
+        run: python -m pip install pip-audit==2.10.1
+
+      - name: Audit runtime dependencies for known vulnerabilities
+        run: pip-audit -r requirements.txt -r requirements-whisper.txt
 
   verify:
     runs-on: ubuntu-latest
@@ -75,6 +101,13 @@ jobs:
 
       - name: Mypy type check (baseline clean, type regressions block CI)
         run: mypy src
+
+      # Node 24 is the current Active LTS (Node 20 is EOL); eslint 8.57.1
+      # supports ^12.22 || ^14.17 || >=16, and the JS tests are run on Node 24.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
 
       - name: Install JS dev dependencies
         run: npm ci
