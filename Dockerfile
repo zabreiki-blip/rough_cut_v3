@@ -9,11 +9,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends antiword catdoc curl fonts-dejavu-core ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY requirements-whisper.txt .
-RUN pip install --no-cache-dir -r requirements-whisper.txt
+# Reproducible runtime install: requirements-lock.txt is a universal uv lock
+# (requirements.txt + requirements-whisper.txt, Python 3.11, hashes for linux
+# x86_64 and aarch64 wheels). Regenerate it with scripts/lock-deps.
+COPY requirements-lock.txt .
+RUN pip install --no-cache-dir --require-hashes -r requirements-lock.txt
 
 COPY src ./src
 COPY scripts ./scripts

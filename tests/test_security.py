@@ -381,19 +381,27 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def _runtime_pin(name: str) -> str:
-    pins = []
-    for filename in ("requirements.txt", "requirements-lock.txt"):
-        matches = [
-            line.split("==", 1)[1]
-            for line in (ROOT_DIR / filename).read_text().splitlines()
-            if line.lower().startswith(f"{name}==")
-        ]
-        assert len(matches) == 1, f"expected one {name} pin in {filename}"
-        pins.append(matches[0])
+def _lock_versions(filename: str, name: str) -> set[str]:
+    """Versions of ``name`` pinned in a uv-generated hashed lock (marker variants included)."""
+    wanted = name.lower().replace("_", "-")
+    versions = set()
+    for line in (ROOT_DIR / filename).read_text().splitlines():
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)", line)
+        if match and re.sub(r"[-_.]+", "-", match.group(1).lower()) == wanted:
+            versions.add(match.group(2))
+    return versions
 
-    assert pins[0] == pins[1]
-    return pins[0]
+
+def _runtime_pin(name: str) -> str:
+    direct = [
+        line.split("==", 1)[1].strip()
+        for line in (ROOT_DIR / "requirements.txt").read_text().splitlines()
+        if line.lower().startswith(f"{name}==")
+    ]
+    assert len(direct) == 1, f"expected one {name} pin in requirements.txt"
+    # The runtime lock must resolve the direct pin to exactly the same version.
+    assert _lock_versions("requirements-lock.txt", name) == {direct[0]}
+    return direct[0]
 
 
 def test_runtime_requests_pin_is_patched() -> None:
@@ -413,18 +421,7 @@ def test_runtime_flask_pin_is_patched() -> None:
 def test_runtime_gunicorn_pin_is_patched() -> None:
     from packaging.version import Version
 
-    pins = []
-    for filename in ("requirements.txt", "requirements-lock.txt"):
-        matches = [
-            line.split("==", 1)[1]
-            for line in (ROOT_DIR / filename).read_text().splitlines()
-            if line.lower().startswith("gunicorn==")
-        ]
-        assert len(matches) == 1, f"expected one gunicorn pin in {filename}"
-        pins.append(matches[0])
-
-    assert pins[0] == pins[1]
-    assert Version(pins[0]) >= Version("23.0.0")
+    assert Version(_runtime_pin("gunicorn")) >= Version("23.0.0")
 
 
 def test_runtime_ci_checks_production_asr_dependencies() -> None:
@@ -435,8 +432,8 @@ def test_runtime_ci_checks_production_asr_dependencies() -> None:
     assert "runs-on: ubuntu-latest" in job
     assert 'python-version: "3.11"' in job
     assert "cache: pip" in job
-    assert "requirements.txt" in job and "requirements-whisper.txt" in job
-    assert "python -m pip install -r requirements.txt -r requirements-whisper.txt" in job
+    assert "requirements-lock.txt" in job
+    assert "python -m pip install --require-hashes -r requirements-lock.txt" in job
     assert "python tests/runtime_import_smoke.py" in job
     assert "SYNC_WHISPER_BACKEND: faster-whisper" in job
     assert "docker build ." in job
@@ -464,9 +461,13 @@ def test_ci_cancels_superseded_runs_and_pins_node_for_npm() -> None:
 def test_ci_audits_runtime_dependencies_for_vulnerabilities() -> None:
     workflow = (ROOT_DIR / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert re.search(r"pip install pip-audit==\d+\.\d+\.\d+", workflow)
-    assert "pip-audit -r requirements.txt -r requirements-whisper.txt" in workflow
-    # Runtime dependencies only: requirements-lock.txt mixes in dev tooling.
-    assert "pip-audit -r requirements-lock.txt" not in workflow
+    match = re.search(r"^  dependency-audit:\n(?P<job>.*?)(?=^  \S|\Z)", workflow, re.M | re.S)
+    assert match is not None
+    job = match.group("job")
+    # Runtime lock (what Docker ships) and dev lock (what CI verify runs) are both audited.
+    assert "pip-audit --require-hashes --disable-pip -r requirements-lock.txt" in job
+    assert "pip-audit --require-hashes --disable-pip -r requirements-dev-lock.txt" in job
+    assert "continue-on-error" not in job
 
 
 def test_dependabot_covers_python_actions_and_npm_weekly() -> None:

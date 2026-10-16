@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Regenerate the hashed, reproducible dependency locks with uv.
+#
+#   scripts/lock-deps             # re-resolve, keeping versions already locked
+#   scripts/lock-deps --upgrade   # re-resolve to the newest allowed versions
+#
+# Inputs ("what we want"): requirements.txt, requirements-whisper.txt,
+# requirements-dev.txt. Outputs ("what is installed"):
+#   requirements-lock.txt      runtime lock (requirements.txt + requirements-whisper.txt),
+#                              installed by the Dockerfile and the CI runtime-smoke job
+#   requirements-dev-lock.txt  dev lock (requirements-dev.txt), installed by the CI verify job
+#
+# --universal produces one lock valid for every platform (linux x86_64 and aarch64,
+# macOS, Windows) with hashes of all published wheels, so the Docker image builds
+# identically on Intel and Apple Silicon hosts. Target interpreter: Python 3.11.
+# The dev lock is resolved against the runtime lock (-c) so CI tests the same
+# runtime versions that Docker ships.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required: https://docs.astral.sh/uv/getting-started/installation/" >&2
+  exit 1
+fi
+
+COMMON=(--python-version 3.11 --universal --generate-hashes --custom-compile-command scripts/lock-deps "$@")
+
+uv pip compile requirements.txt requirements-whisper.txt "${COMMON[@]}" -o requirements-lock.txt
+uv pip compile requirements-dev.txt -c requirements-lock.txt "${COMMON[@]}" -o requirements-dev-lock.txt

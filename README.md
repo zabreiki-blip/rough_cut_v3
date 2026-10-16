@@ -552,7 +552,7 @@ docker compose config --quiet
 правила Ruff запускаются командой `ruff check src tests`, а форматирование
 блокирующе проверяется командой `ruff format --check src tests`.
 
-`requirements-lock.txt` — полная фиксация версий прямых и транзитивных зависимостей (сгенерирован на Python 3.11 через `pip freeze` после установки `requirements-dev.txt` и `requirements-whisper.txt`). Источник истины для версий — `requirements*.txt`; lock-файл используется для воспроизводимости и диагностики, обновляйте его после любых изменений `requirements-*.txt`.
+Зависимости зафиксированы воспроизводимыми lock-файлами с хэшами (uv, Python 3.11, `--universal`: linux x86_64/aarch64, macOS): `requirements-lock.txt` — runtime (его ставит Docker и CI `runtime-smoke`), `requirements-dev-lock.txt` — dev (CI `verify`). Источник истины для версий — `requirements*.txt`; после любого их изменения запустите `scripts/lock-deps` (или `scripts/lock-deps --upgrade`) и закоммитьте входные файлы вместе с lock-файлами. Подробности — в `docs/DEPENDENCY_POLICY.md`.
 
 ### pre-commit хуки
 
