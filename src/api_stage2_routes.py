@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import wraps
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,10 @@ import wave
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
+from api_final_review_jobs import canonical_decimal_string
+from cost_budget import CostGuardConfig
 from export_naming import xml_export_filename
+from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
 if TYPE_CHECKING:
@@ -270,6 +274,75 @@ def _stage2_sync_source_words(services: ModuleType, source_id: str):
     )
 
 
+def _sync_cloud_preflight(
+    services: ModuleType,
+    paths: dict[str, Path],
+    sources: list[Any],
+    *,
+    source_ids: tuple[str, ...],
+    source_scope: str,
+    force_transcribe: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Freeze the duration and chunk inputs for every selected cloud dispatch."""
+    guard = CostGuardConfig.from_environ(os.environ)
+    try:
+        overlap_sec = float(os.getenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "").strip())
+    except ValueError:
+        overlap_sec = DEFAULT_OVERLAP_SEC
+    estimate = Decimal("0")
+    source_options: dict[str, Any] = {}
+    for source in sources:
+        if source_scope == "review_media" and source.source_kind != "review_media":
+            continue
+        if source_ids and source.id not in source_ids:
+            continue
+        try:
+            audio_path = services._resolve_sync_audio_path(source, paths)
+        except ValueError:
+            continue  # The worker retains its existing per-source diagnostics.
+        if not audio_path.is_file():
+            continue
+        audio_signature = services._audio_cache_signature(audio_path)
+        index_path = services._word_index_path(paths, source.id)
+        if not force_transcribe and index_path.is_file():
+            try:
+                index = services.load_word_index(index_path, source.id)
+            except (OSError, TypeError, ValueError):
+                pass
+            else:
+                # Execution adopts legacy indexes before checking their audio.
+                if not isinstance(index.metadata.get(services._TRANSCRIPTION_CACHE_KEY), dict):
+                    continue
+                if services._word_index_audio_matches(
+                    index, audio_path, audio_signature=audio_signature,
+                ):
+                    continue
+        try:
+            with wave.open(str(audio_path), "rb") as stream:
+                duration_sec = stream.getnframes() / float(stream.getframerate())
+        except (OSError, EOFError, wave.Error, ZeroDivisionError) as exc:
+            raise ValueError(f"invalid sync WAV for {source.id}: {exc}") from exc
+        if duration_sec <= 0:
+            raise ValueError(f"sync WAV duration must be positive for {source.id}")
+        chunks = plan_cloud_chunks(duration_sec, DEFAULT_CHUNK_MINUTES, overlap_sec)
+        seconds = sum((Decimal(str(end - start)) for start, end in chunks), Decimal("0"))
+        estimate += seconds * guard.cloud_asr_usd_per_minute / Decimal("60")
+        source_options[source.id] = {
+            "duration_sec": duration_sec,
+            "chunk_minutes": DEFAULT_CHUNK_MINUTES,
+            "overlap_sec": overlap_sec,
+            "max_cost_usd": str(guard.max_usd_per_job),
+            "usd_per_minute_estimate": str(guard.cloud_asr_usd_per_minute),
+            "audio_signature": audio_signature,
+        }
+    if guard.max_usd_per_job > 0 and estimate > guard.max_usd_per_job:
+        raise OverflowError("estimated cloud ASR cost exceeds the job cost limit")
+    return {
+        "estimated_cost_usd": canonical_decimal_string(estimate),
+        "cost_limit_usd": float(guard.max_usd_per_job),
+    }, source_options
+
+
 def _stage2_sync_job_start(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -319,19 +392,19 @@ def _stage2_sync_job_start(services: ModuleType):
         return services._json_error("search_window_sec must be a positive number", 400)
     if search_window_sec <= 0:
         return services._json_error("search_window_sec must be a positive number", 400)
-    if not services._reserve_sync_project(project):
-        return services._json_error(f"sync job already active for project {project}", 409)
-
     backend = str(payload.get("backend")).strip() if payload.get("backend") is not None else None
     if asr_engine == "cloud" and not backend:
         # "cloud" is the UI-facing engine choice; "backend" stays available
         # for explicit low-level overrides (tests/tooling) and wins when set.
         backend = "cloud-audio"
-    uses_cloud_backend = asr_engine == "cloud" or str(backend or "").lower() in {
+    configured_backend = str(backend or os.getenv("SYNC_WHISPER_BACKEND", "auto"))
+    uses_cloud_backend = configured_backend.strip().lower() in {
         "cloud",
         "cloud-audio",
         "openrouter",
     }
+    if uses_cloud_backend:
+        backend = "cloud-audio"
     # ``model`` is the legacy/local Whisper model-size field from the UI
     # ("small", "medium", ...).  It is not a cloud provider model ID; using
     # it for Cloud ASR makes the provider reject every transcription.  Keep
@@ -342,8 +415,39 @@ def _stage2_sync_job_start(services: ModuleType):
         else None
     )
 
+    budget_fields: dict[str, Any] = {"estimated_cost_usd": "0", "cost_limit_usd": 0.0}
+    cloud_source_options: dict[str, Any] | None = None
+    if uses_cloud_backend:
+        try:
+            budget_fields, cloud_source_options = _sync_cloud_preflight(
+                services, paths, sources,
+                source_ids=source_ids,
+                source_scope=source_scope,
+                force_transcribe=bool(payload.get("force_transcribe", False)),
+            )
+        except OverflowError as exc:
+            return services._json_error(str(exc), 409)
+        except (OSError, TypeError, ValueError) as exc:
+            return services._json_error(str(exc), 400)
+    else:
+        # Report a valid configured cap without validating cloud-only settings
+        # for a local job, matching final-review status behavior.
+        try:
+            local_limit = Decimal(os.getenv("ROUGH_CUT_MAX_USD_PER_JOB", "").strip() or "0")
+            if local_limit.is_finite() and local_limit >= 0:
+                budget_fields["cost_limit_usd"] = float(local_limit)
+        except InvalidOperation:
+            pass
+    if not services._reserve_sync_project(project):
+        return services._json_error(f"sync job already active for project {project}", 409)
+
     try:
         job = services._create_sync_job(project)
+        services._update_sync_job(
+            job["id"], **budget_fields,
+            cost_usd=0.0, reserved_cost_usd=0.0, cost_pending=False,
+            cloud_source_options=cloud_source_options,
+        )
         worker = services.threading.Thread(
             target=services._run_sync_job,
             kwargs={

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TypedDict
+from decimal import Decimal
+from typing import Any, TypedDict
 
+from api_final_review_jobs import canonical_decimal_string
 from api_service_contracts import SyncWorkerServices
+from cost_budget import CostBudget, CostBudgetExceeded
+from stage2.cloud_asr import plan_cloud_chunks
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
@@ -116,6 +120,46 @@ def run_sync_job(
         "asr_timestamp_precision": "",
         "transcription_wall_sec_total": 0.0,
     }
+    job = services._get_sync_job(job_id) or {}
+    cloud_source_options = job.get("cloud_source_options")
+    cloud_costs: dict[str, dict[str, Any]] = {}
+
+    def cloud_totals() -> tuple[Decimal, Decimal, bool]:
+        return (
+            sum((item["known"] for item in cloud_costs.values()), Decimal("0")),
+            sum((item["reserved"] for item in cloud_costs.values()), Decimal("0")),
+            any(item["pending"] for item in cloud_costs.values()),
+        )
+
+    def account_cloud_source(
+        source_id: str, initial_exposure: Decimal, payload: Any, *, snapshot: bool = False,
+    ) -> None:
+        def value(name: str) -> Any:
+            return payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
+
+        current = cloud_costs.setdefault(
+            source_id, {"known": Decimal("0"), "reserved": Decimal("0"), "pending": False},
+        )
+        known = value("spent_usd" if snapshot else "cost_usd")
+        reserved = value("reserved_usd" if snapshot else "reserved_cost_usd")
+        pending = value("cost_pending")
+        if known is not None:
+            # The adapter treats all prior exposure as initial spent. Only
+            # the current source's delta is newly confirmed provider cost.
+            current["known"] = max(Decimal("0"), Decimal(str(known)) - initial_exposure)
+        if reserved is not None:
+            current["reserved"] = Decimal(str(reserved))
+        if pending is not None:
+            current["pending"] = bool(pending)
+        elif reserved is not None:
+            current["pending"] = current["reserved"] > 0
+        known_total, reserved_total, pending_total = cloud_totals()
+        asr_metrics["asr_cost_usd_total"] = float(known_total)
+        _update_sync_job(
+            job_id, persist=should_persist_progress(),
+            cost_usd=float(known_total), reserved_cost_usd=float(reserved_total),
+            cost_pending=pending_total, **asr_metrics,
+        )
 
     def should_persist_progress(*, force: bool = False) -> bool:
         nonlocal last_progress_persist_at
@@ -166,6 +210,29 @@ def run_sync_job(
             selected_for_transcription = not source_ids or source.id in source_ids
             cached_index = None
             audio_path = None
+            initial_exposure = Decimal("0")
+            cloud_dispatch = False
+            usage_recorded = False
+            pending_usage_recorded = False
+
+            def record_cloud_usage(selected_model: str) -> None:
+                nonlocal usage_recorded, pending_usage_recorded
+                current = cloud_costs.get(source.id)
+                if current is None:
+                    return
+                if current["pending"] and not pending_usage_recorded:
+                    asr_usage_callback({
+                        "event_id": f"sync-asr:{job_id}:{source.id}:reserved",
+                        "model": selected_model, "cost_usd": None, "pending": True,
+                    })
+                    pending_usage_recorded = True
+                if not usage_recorded and (not current["pending"] or current["known"] > 0):
+                    asr_usage_callback({
+                        "event_id": f"sync-asr:{job_id}:{source.id}",
+                        "model": selected_model, "cost_usd": float(current["known"]),
+                    })
+                    usage_recorded = True
+
             try:
                 should_force = force_transcribe and selected_for_transcription
                 config = _transcription_config(backend=backend, model=model, language=language)
@@ -275,6 +342,10 @@ def run_sync_job(
                             f"audio guide not found for sync source {source.id}"
                         )
                     source_duration = max(0.0, float(source.duration_sec or 0.0))
+                    if cloud_source_options is not None:
+                        source_duration = float(
+                            (cloud_source_options.get(source.id) or {}).get("duration_sec", source_duration)
+                        )
                     _update_sync_job(
                         job_id,
                         message="Transcribing audio",
@@ -305,6 +376,39 @@ def run_sync_job(
                         )
 
                     input_audio_signature = audio_signature or _audio_cache_signature(audio_path)
+                    cloud_kwargs: dict[str, Any] = {}
+                    if cloud_source_options is None and config["backend"] in {
+                        "cloud", "cloud-audio", "openrouter",
+                    }:
+                        raise CostBudgetExceeded(
+                            "Cloud backend changed since cost preflight; start the sync job again"
+                        )
+                    if cloud_source_options is not None:
+                        options = dict(cloud_source_options.get(source.id) or {})
+                        if options.pop("audio_signature", None) != input_audio_signature:
+                            raise CostBudgetExceeded(
+                                "Cloud source changed since cost preflight; start the sync job again"
+                            )
+                        known_total, reserved_total, _pending = cloud_totals()
+                        initial_exposure = known_total + reserved_total
+                        budget = CostBudget(
+                            Decimal(options["max_cost_usd"]),
+                            Decimal(options["usd_per_minute_estimate"]), initial_exposure,
+                        )
+                        chunks = plan_cloud_chunks(
+                            options["duration_sec"], options["chunk_minutes"], options["overlap_sec"],
+                        )
+                        # Reserve each planned chunk independently so Decimal
+                        # addition matches preflight at fractional boundaries.
+                        for start, end in chunks:
+                            budget.reserve_attempt(end - start)
+                        options["initial_cost_usd"] = canonical_decimal_string(initial_exposure)
+
+                        def report_budget(snapshot: dict[str, Any]) -> None:
+                            account_cloud_source(source.id, initial_exposure, snapshot, snapshot=True)
+
+                        cloud_kwargs = {"cloud_options": options, "budget_callback": report_budget}
+                        cloud_dispatch = True
                     transcription_started_at = time.monotonic()
                     result = transcribe_audio(
                         audio_path,
@@ -314,9 +418,13 @@ def run_sync_job(
                         progress_callback=report_progress,
                         cancel_event=cancel_event,
                         timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
+                        **cloud_kwargs,
                     )
                     result_backend_metadata = result.get("backend_metadata") or {}
-                    if str(result.get("backend") or backend or "") == "cloud-audio":
+                    if cloud_dispatch:
+                        account_cloud_source(source.id, initial_exposure, result_backend_metadata)
+                        record_cloud_usage(str(result.get("model") or model or ""))
+                    elif str(result.get("backend") or backend or "") == "cloud-audio":
                         asr_usage_callback(
                             {
                                 "event_id": f"sync-asr:{job_id}:{source.id}",
@@ -331,9 +439,10 @@ def run_sync_job(
                         )
                     asr_metrics["transcription_wall_sec_total"] += transcription_wall_sec
                     asr_metrics["asr_backend_used"] = str(result.get("backend") or backend or "")
-                    asr_metrics["asr_cost_usd_total"] += float(
-                        result_backend_metadata.get("cost_usd") or 0.0
-                    )
+                    if not cloud_dispatch:
+                        asr_metrics["asr_cost_usd_total"] += float(
+                            result_backend_metadata.get("cost_usd") or 0.0
+                        )
                     asr_metrics["asr_timestamp_precision"] = str(
                         result_backend_metadata.get("timestamp_precision") or "word"
                     )
@@ -354,7 +463,10 @@ def run_sync_job(
                 indexes.append(index)
             except Exception as exc:
                 failed_cost = getattr(exc, "cost_usd", None)
-                if failed_cost is not None:
+                if cloud_dispatch:
+                    account_cloud_source(source.id, initial_exposure, exc)
+                    record_cloud_usage(str(model or ""))
+                elif failed_cost is not None:
                     asr_usage_callback(
                         {
                             "event_id": f"sync-asr:{job_id}:{source.id}",
@@ -366,6 +478,8 @@ def run_sync_job(
                     cancel_event is not None and cancel_event.is_set()
                 ):
                     raise _JobCancelled("Sync job cancelled") from exc
+                if isinstance(exc, CostBudgetExceeded):
+                    raise
                 if (
                     cached_index is not None
                     and audio_path is not None
