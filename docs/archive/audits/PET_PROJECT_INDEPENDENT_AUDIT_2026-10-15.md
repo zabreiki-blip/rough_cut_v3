@@ -50,7 +50,7 @@ CEP-панель, политика зависимостей, Docker/CI и свя
 
 ## Статус исправлений — 16 октября 2026
 
-Проверен полный diff `c25ab3f..2dbf6d4` (33 файла): код, тесты,
+Проверен полный diff `c25ab3f..3b734a3` (33 файла): код, тесты,
 конфигурация и операторская документация. Исправления выполнены по
 [согласованному дизайну](../../superpowers/specs/2026-10-15-pet-project-audit-fixes-design.md)
 и [плану](../../superpowers/plans/2026-10-15-pet-project-audit-fixes.md).
@@ -61,8 +61,8 @@ A9 принят как рекомендация по сопровождению 
 | ID | Реализация и коммиты | Проверяющее доказательство |
 | --- | --- | --- |
 | A1 | `requests==2.32.4` в обоих пинах; `90380e9`, `2c5f6df` | [Проверка совпадения и минимальной безопасной версии](../../../tests/test_security.py#L384); полный Python gate ниже. |
-| A2 | CEP повторы через 3/6/12/24/30 с и ручной Retry с прежним job ID; `a847bfb`, `2f68084`, `cafbace` | [Behavior: backoff, исчерпание повторов и восстановление](../../../tests/cep_behavior_test.cjs#L1833). Повтор опроса не вызывает Start. |
-| A3 | Серверный latest, восстановление source sequence, проверка активного `sequenceId`; те же CEP-коммиты и `ef4bb9c` | [Latest и orphan recovery](../../../tests/test_api_final_review_routes.py#L939), [восстановление и проверка host перед Apply](../../../tests/cep_behavior_test.cjs#L1857). |
+| A2 | CEP повторы через 3/6/12/24/30 с и ручной Retry с прежним job ID; `a847bfb`, `2f68084`, `cafbace`, `3b734a3` | [Behavior: backoff, исчерпание повторов и восстановление](../../../tests/cep_behavior_test.cjs#L1833). Повтор опроса не вызывает Start. [Start ждёт initial recovery, затем сохраняет baseline при неоднозначном ответе](../../../tests/cep_behavior_test.cjs#L2398). |
+| A3 | Серверный latest, восстановление source sequence, проверка активного `sequenceId`; `a847bfb`, `2f68084`, `cafbace`, `3b734a3`, `ef4bb9c` | [Latest и orphan recovery](../../../tests/test_api_final_review_routes.py#L939), [восстановление и проверка host перед Apply](../../../tests/cep_behavior_test.cjs#L1857), [initial recovery: текущий 404 разрешает Start, ошибочный/устаревший ответ и смена проекта сохраняют блокировку](../../../tests/cep_behavior_test.cjs#L2430). |
 | A4 | Cancel, общий deadline с учётом очереди, killable ASR, сохранение стоимости и освобождение проекта; `48f5a76`, `029f94a`, `ef4bb9c`, `3db5b0d`, `c9cc214` | [Отмена до ASR](../../../tests/test_api_final_review_routes.py#L1073), [отмена в очереди](../../../tests/test_stage2_whisper_process.py#L425), [deadline очереди](../../../tests/test_stage2_whisper_process.py#L459), [остановка активного HTTP](../../../tests/test_stage2_whisper_process.py#L537), [сохранение spent/reserved](../../../tests/test_api_final_review_routes.py#L1170). |
 | A5 | Lock проекта на allocation/history и `request_id`: replay одного действия, новый ID для нового Apply; `aab4bca` | [Replay](../../../tests/test_api_final_review_routes.py#L486), [replay после нового отчёта](../../../tests/test_api_final_review_routes.py#L537), [конкурентные Apply сохраняют обе итерации](../../../tests/test_api_final_review_routes.py#L582). |
 | A6 | Общий chunk planner, Decimal preflight и резерв перед каждой попыткой; общий лимит sync по всем исходникам; `20b7ec4`, `48f5a76`, `ef4bb9c`, `c298c9d`, `c4b8383`, `c9831fe` | [Резерв до dispatch](../../../src/cost_budget.py#L74), [неизвестная цена блокирует следующий chunk](../../../tests/test_stage2_cloud_asr.py#L704), [общие known/reserved по исходникам](../../../tests/test_stage2_sync_api.py#L2401), [блокировка позднего исходника](../../../tests/test_stage2_sync_api.py#L2450), [pending через реальный process/ledger](../../../tests/test_api_final_review_routes.py#L1534). |
@@ -78,23 +78,26 @@ A9 принят как рекомендация по сопровождению 
 ### Повторные локальные quality gates
 
 Проверка выполнена на Python 3.11.16 в worktree ветки
-`fix/pet-project-audit-fixes`, на ревизии `2dbf6d4`:
+`fix/pet-project-audit-fixes`, на ревизии `4c5e2ba` (включая исправление
+гонки начального восстановления `3b734a3`):
 
 | Команда | Результат, exit 0 |
 | --- | --- |
-| `.venv/bin/python -m pytest -q --cov=src --cov-report=term --timeout=120` | 1045 passed за 29.13 с; coverage с ветвями 83.60%, порог 79% |
+| `.venv/bin/python -m pytest -q --cov=src --cov-report=term --timeout=120` | 1045 passed за 24.56 с; coverage с ветвями 83.60%, порог 79% |
 | `.venv/bin/ruff check src tests` | All checks passed |
 | `.venv/bin/ruff format --check src tests` | 126 files already formatted |
 | `.venv/bin/mypy src` | No issues found in 59 source files |
 | `npm run lint:cep` | ESLint завершился без ошибок |
-| `node tests/cep_behavior_test.cjs` | Все проверки прошли; 20 новых final-review behavior cases выведены как PASS |
+| `node tests/cep_behavior_test.cjs` | Все проверки прошли; 22 final-review behavior cases выведены как PASS |
 | `node tests/stage1_behavior_test.cjs` | 9 passed; остаётся предупреждение Node о типе модуля |
 | `docker compose --env-file /private/tmp/rough-cut-audit.env config --quiet` | Успешный повтор с временным ignored `.env`, скопированным из `.env.example` для service `env_file`; временный файл удалён |
-| `docker build -t rough-cut-v3:audit-fixes .` | Образ собран: `sha256:20eb8b988d7f9f8386fdee6b10825a01f7d1c1a7e2ebf084f6cf432f0fdacee4`; слои установки зависимостей взяты из cache |
+| `docker build -t rough-cut-v3:audit-fixes .` | Образ собран: `sha256:20eb8b988d7f9f8386fdee6b10825a01f7d1c1a7e2ebf084f6cf432f0fdacee4`; все слои сборки взяты из cache |
 
-Первый запуск Compose завершился с exit 1: отсутствовал требуемый service
-`env_file: .env` в изолированном worktree. После создания временной конфигурации
-точная команда из плана завершилась с exit 0. Это проверка конфигурации,
+В исходном прогоне на `2dbf6d4` первый запуск Compose завершился с exit 1:
+отсутствовал требуемый service `env_file: .env` в изолированном worktree. После создания временной конфигурации
+точная команда из плана завершилась с exit 0. В повторной проверке на
+`4c5e2ba` временный `.env` подготовлен заранее; та же команда снова дала exit 0.
+Это проверка конфигурации,
 не запуск контейнерного приложения. Удалённый GitHub Actions не запускался
 в рамках этой проверки.
 
@@ -137,7 +140,10 @@ pet-проекта это может быть допустимым выборо�
    Apply сериализован и поддерживает повтор запроса по `request_id`.
 3. CEP восстанавливает задачу, проверяет sequence перед Apply, управляет Retry,
    Cancel и visibility; неопределённый ответ Start переводится в recovery.
-4. Добавлены production runtime smoke/Docker job и документация оператора.
+4. В `3b734a3` Start заблокирован до первого достоверного latest для проекта;
+   неоднозначный ответ Start больше не может принять старую задачу за новую
+   из-за отсутствующего baseline.
+5. Добавлены production runtime smoke/Docker job и документация оператора.
    Форматирование интеграции зафиксировано в `2dbf6d4`.
 
 **Ручной пилот F1–F4 остаётся pending.** Нужно выполнить
