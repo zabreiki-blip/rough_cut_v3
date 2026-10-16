@@ -1711,3 +1711,518 @@ testMarkerNameIndexCaching();
 testWhisperPollingAndEta();
 testVisibilityPausesBackgroundPolling();
 testVisibilityRaceDiscardsStaleInFlightRequests();
+
+
+// The panel runs unchanged in a VM. Only the external CEP, XHR and timer
+// boundaries are controlled, so races can be resolved in a deliberate order.
+function finalReviewHarness() {
+  const elements = {};
+  const requests = [];
+  const hosts = [];
+  const timers = new Map();
+  const confirmations = [];
+  const events = {};
+  const storage = {
+    "roughCutStage2.project": "demo",
+    "roughCutStage2.projectsRoot": "/projects",
+  };
+  let timerId = 0;
+  class Element {
+    constructor() {
+      this.value = "";
+      this.textContent = "";
+      this.disabled = false;
+      this.hidden = false;
+      this.listeners = {};
+      this.style = {};
+      this.children = [];
+      this.firstChild = null;
+    }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    appendChild(child) { this.children.push(child); this.firstChild = this.children[0]; }
+    removeChild(child) { this.children = this.children.filter((item) => item !== child); this.firstChild = this.children[0] || null; }
+    setAttribute() {}
+    removeAttribute() {}
+  }
+  class XHR {
+    open(method, url) { this.method = method; this.url = url; }
+    setRequestHeader() {}
+    send(body) {
+      const xhr = this;
+      requests.push({
+        method: this.method,
+        url: this.url,
+        body: body && JSON.parse(body),
+        resolve(result, status = 200) {
+          xhr.readyState = 4;
+          xhr.status = status;
+          xhr.responseText = JSON.stringify(status < 300 ? {ok: true, result} : {ok: false, error: result});
+          xhr.onreadystatechange();
+        },
+        fail() { xhr.onerror(); },
+        nonJson(status) {
+          xhr.readyState = 4; xhr.status = status; xhr.responseText = "<html>Backend down</html>";
+          xhr.onreadystatechange();
+        },
+      });
+    }
+  }
+  const context = {
+    console, Date, JSON, Math, Array, Error, isFinite, encodeURIComponent,
+    decodeURIComponent, XMLHttpRequest: XHR, __ROUGH_CUT_TEST_MODE__: true,
+    document: {
+      readyState: "loading", hidden: false,
+      addEventListener(name, callback) { events[name] = callback; },
+      createElement() { return new Element(); },
+      getElementById(id) { return elements[id] || (elements[id] = new Element()); },
+    },
+    localStorage: {getItem(key) { return storage[key] || null; }, setItem(key, value) { storage[key] = value; }},
+    setTimeout(callback, delay) {
+      const id = ++timerId;
+      timers.set(id, {callback, delay});
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    confirm(message) { confirmations.push(message); return context.acceptConfirmation; },
+    acceptConfirmation: true,
+    CSInterface: function () {
+      this.evalScript = function (script, callback) {
+        hosts.push({script, resolve(result) { callback(JSON.stringify(Object.assign({ok: true}, result))); }});
+      };
+    },
+  };
+  context.window = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(root, "cep", "js", "main.js"), "utf8"), context);
+  const element = (id) => context.document.getElementById(id);
+  element("projectName").value = "demo";
+  element("apiBaseUrl").value = "http://localhost:8000";
+  element("apiToken").value = "memory-only-token";
+  element("projectsRoot").value = "/projects";
+  element("applyFinalReview").disabled = true;
+  element("retryFinalReview").hidden = true;
+  element("cancelFinalReview").hidden = true;
+  return {
+    context, hooks: context.__ROUGH_CUT_TEST_HOOKS__, requests, hosts, timers,
+    confirmations, element, initialize() { events.DOMContentLoaded(); },
+    fireTimer() {
+      assert.strictEqual(timers.size, 1, "only one final-review timer may be armed");
+      const [id, timer] = timers.entries().next().value;
+      timers.delete(id);
+      timer.callback();
+      return timer.delay;
+    },
+  };
+}
+
+function finalReviewJob(status = "running", extra = {}) {
+  return Object.assign({
+    id: "review-1", project: "demo", status, message: "Provider progress",
+    source_sequence: {sequenceId: "sequence-1", durationSeconds: 90},
+    estimated_cost_usd: "0.17", cost_limit_usd: 1,
+  }, extra);
+}
+
+function restoreReview(h, status = "running") {
+  assert.strictEqual(typeof h.hooks.restoreFinalReview, "function", "final-review recovery must be exposed");
+  h.hooks.restoreFinalReview();
+  assert.match(h.requests[0].url, /\/stage2\/final-review\/latest\?project=demo$/);
+  h.requests[0].resolve(finalReviewJob(status));
+}
+
+function testFinalReviewBackoffAndManualRetry() {
+  const h = finalReviewHarness();
+  restoreReview(h);
+  assert.strictEqual(h.fireTimer(), 3000);
+  for (const delay of [3000, 6000, 12000, 24000, 30000]) {
+    const req = h.requests[h.requests.length - 1];
+    assert.match(req.url, /\/jobs\/review-1\?project=demo$/);
+    req.fail();
+    assert.strictEqual(h.fireTimer(), delay);
+  }
+  h.requests[h.requests.length - 1].fail();
+  assert.strictEqual(h.timers.size, 0, "retry exhaustion must stop polling");
+  assert.strictEqual(h.element("retryFinalReview").hidden, false);
+  assert.strictEqual(h.hooks.getFinalReviewState().job.id, "review-1");
+  const before = h.requests.length;
+  h.hooks.retryFinalReview();
+  h.hooks.retryFinalReview();
+  assert.strictEqual(h.requests.length, before + 1, "manual Retry must issue exactly one status request");
+  h.requests[h.requests.length - 1].resolve(finalReviewJob());
+  assert.strictEqual(h.hooks.getFinalReviewState().retryIndex, 0);
+  assert.strictEqual(h.element("retryFinalReview").hidden, true);
+  assert.ok(h.requests.every((r) => r.method === "GET"), "recovery and Retry never start provider work");
+}
+
+function testFinalReviewRecoveryChecksHostBeforeApply() {
+  const h = finalReviewHarness();
+  restoreReview(h, "completed");
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  assert.match(h.hosts[0].script, /^rcStage2_inspectActiveSequence\(/);
+  h.hosts[0].resolve({sequence: {sequenceId: "wrong-sequence"}});
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  assert.match(h.element("finalReviewStatus").textContent, /sequence-1/);
+  assert.match(h.element("finalReviewStatus").textContent, /не совпадает/);
+  h.hooks.applyFinalReview();
+  assert.strictEqual(h.requests.length, 1, "sequence mismatch must block the Apply API too");
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.requests.length, 2, "Apply must inspect again before sending the mutation");
+  assert.match(h.requests[1].url, /\/apply$/);
+  assert.ok(h.requests.every((r) => !/\/start$/.test(r.url)));
+
+  for (const status of ["failed", "interrupted", "cancelled"]) {
+    const terminal = finalReviewHarness();
+    restoreReview(terminal, status);
+    assert.strictEqual(terminal.timers.size, 0, status + " must be terminal for polling");
+    assert.strictEqual(terminal.element("applyFinalReview").disabled, true);
+    assert.strictEqual(terminal.hosts.length, 0);
+  }
+}
+
+function testFinalReviewCancelRejectsOlderStatusAndInspection() {
+  const h = finalReviewHarness();
+  restoreReview(h);
+  h.fireTimer();
+  const stale = h.requests[1];
+  const before = h.hooks.getFinalReviewState().generation;
+  h.hooks.cancelFinalReview();
+  assert.strictEqual(h.hooks.getFinalReviewState().generation, before + 1);
+  const cancel = h.requests[2];
+  assert.strictEqual(cancel.method, "POST");
+  assert.match(cancel.url, /\/jobs\/review-1\/cancel\?project=demo$/);
+  assert.match(h.element("finalReviewStatus").textContent, /отмен/);
+  stale.resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.hosts.length, 0);
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  cancel.resolve(finalReviewJob("cancelling"), 202);
+  assert.match(h.element("finalReviewStatus").textContent, /отмен/);
+  h.fireTimer();
+  h.requests[3].resolve(finalReviewJob("cancelled"));
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.element("cancelFinalReview").hidden, true);
+
+  const completed = finalReviewHarness();
+  restoreReview(completed, "completed");
+  const oldInspection = completed.hosts[0];
+  completed.hooks.finalReviewProjectChanged();
+  oldInspection.resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(completed.element("applyFinalReview").disabled, true);
+}
+
+function testFinalReviewVisibilityAndProjectGeneration() {
+  const h = finalReviewHarness();
+  restoreReview(h);
+  const oldTimer = h.timers.values().next().value;
+  const generation = h.hooks.getFinalReviewState().generation;
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.hooks.getFinalReviewState().generation, generation + 1);
+  assert.strictEqual(h.hooks.getFinalReviewState().visible, false);
+  oldTimer.callback();
+  assert.strictEqual(h.requests.length, 1, "a cleared stale timer must be inert");
+  h.context.document.hidden = false;
+  h.hooks.handleVisibilityChange();
+  h.hooks.handleVisibilityChange();
+  assert.strictEqual(h.requests.length, 2, "show must perform exactly one immediate status refresh");
+  const oldRequest = h.requests[1];
+  const beforeProject = h.hooks.getFinalReviewState().generation;
+  h.element("projectName").value = "another-project";
+  h.hooks.finalReviewProjectChanged();
+  assert.strictEqual(h.hooks.getFinalReviewState().generation, beforeProject + 1);
+  assert.strictEqual(h.hooks.getFinalReviewState().job, null);
+  assert.match(h.requests[2].url, /latest\?project=another-project$/);
+  oldRequest.resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.hosts.length, 0);
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  h.requests[2].resolve("job not found", 404);
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.element("retryFinalReview").hidden, true);
+}
+
+function testFinalReviewHideDiscardsInFlightStatusAndResumesOnce() {
+  const h = finalReviewHarness();
+  h.hooks.restoreFinalReview();
+  const stale = h.requests[0];
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  h.context.document.hidden = false;
+  h.hooks.handleVisibilityChange();
+  assert.strictEqual(h.requests.length, 2);
+  stale.resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.hosts.length, 0);
+  assert.strictEqual(h.timers.size, 0);
+  h.requests[1].resolve(finalReviewJob());
+  assert.strictEqual(h.timers.size, 1);
+  h.hooks.handleVisibilityChange();
+  assert.strictEqual(h.requests.length, 2, "stale response must not rearm the resume flag");
+}
+
+function prepareFinalReviewEstimate(h) {
+  const before = h.hooks.getFinalReviewState().generation;
+  h.hooks.startFinalReviewFromWav();
+  assert.strictEqual(h.hooks.getFinalReviewState().generation, before + 1);
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
+  h.hosts[1].resolve({layout: {entries: []}});
+  assert.strictEqual(h.requests.length, 1, "Estimate must be the first backend request");
+  assert.match(h.requests[0].url, /\/final-review\/estimate$/);
+  assert.strictEqual(h.confirmations.length, 0, "confirmation must wait for Estimate");
+}
+
+function testFinalReviewEstimateConfirmationAnd409() {
+  const h = finalReviewHarness();
+  prepareFinalReviewEstimate(h);
+  const exact = "0.1700000000000000028333333333";
+  h.requests[0].resolve({estimated_cost_usd: exact, enforced: false});
+  assert.strictEqual(h.confirmations.length, 1);
+  assert.ok(h.confirmations[0].includes(exact));
+  assert.match(h.element("finalReviewCost").textContent, /не.*лимит/i);
+  assert.match(h.requests[1].url, /\/final-review\/start$/);
+  assert.strictEqual(h.requests[1].body.confirmed_estimate_usd, exact);
+  h.requests[1].resolve("cloud ASR estimate changed; confirm the new estimate", 409);
+  assert.strictEqual(h.requests.length, 3, "stale estimate must obtain a fresh Estimate");
+  assert.match(h.requests[2].url, /\/estimate$/);
+  h.context.acceptConfirmation = false;
+  h.requests[2].resolve({estimated_cost_usd: "0.2", enforced: true, cost_limit_usd: 1});
+  assert.strictEqual(h.confirmations.length, 2);
+  assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1, "declined new estimate cannot start work");
+  assert.strictEqual(h.element("startFinalReviewFromWav").disabled, false);
+  for (const estimate of [{estimated_cost_usd: "0", enforced: true}, {enforced: true}]) {
+    const unknown = finalReviewHarness();
+    prepareFinalReviewEstimate(unknown);
+    unknown.context.acceptConfirmation = false;
+    unknown.requests[0].resolve(estimate);
+    assert.match(unknown.element("finalReviewCost").textContent, /не.*лимит/i);
+    assert.strictEqual(unknown.requests.length, 1);
+  }
+}
+
+function testFinalReviewStartAndEstimateDiscardStaleCallbacks() {
+  const h = finalReviewHarness();
+  restoreReview(h);
+  h.fireTimer();
+  const staleStatus = h.requests[1];
+  h.hooks.startFinalReviewFromWav();
+  staleStatus.resolve(finalReviewJob("completed"));
+  assert.strictEqual(h.hosts.length, 1, "stale completion cannot trigger host validation after Start");
+  assert.strictEqual(h.timers.size, 0);
+  const staleInspect = h.hosts[0];
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  staleInspect.resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.hosts.length, 1, "stale source inspection cannot continue Start");
+
+  const estimate = finalReviewHarness();
+  prepareFinalReviewEstimate(estimate);
+  estimate.hooks.finalReviewProjectChanged();
+  estimate.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true});
+  assert.strictEqual(estimate.confirmations.length, 0, "old project cannot show a cost confirmation");
+  assert.ok(estimate.requests.every((r) => !/\/start$/.test(r.url)));
+}
+
+function testFinalReviewApplyNetworkRetryKeepsRequestIdAndSequenceGuard() {
+  const h = finalReviewHarness();
+  restoreReview(h, "completed");
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.element("applyFinalReview").disabled, false);
+  h.hooks.applyFinalReview();
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  h.hosts[1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const firstApply = h.requests[1];
+  assert.ok(firstApply.body.request_id, "one logical Apply needs a backend idempotency key");
+  firstApply.fail();
+  assert.strictEqual(h.element("retryFinalReview").hidden, false);
+  h.hooks.retryFinalReview();
+  assert.match(h.hosts[2].script, /^rcStage2_inspectActiveSequence\(/);
+  h.hosts[2].resolve({sequence: {sequenceId: "sequence-1"}});
+  const retriedApply = h.requests[2];
+  assert.strictEqual(retriedApply.body.request_id, firstApply.body.request_id);
+  assert.strictEqual(retriedApply.body.project, "demo");
+  retriedApply.resolve({iteration: {id: "iteration-1"}, corrections: []});
+  assert.match(h.hosts[3].script, /^rcStage2_cloneActiveSequence\(/);
+  h.hosts[3].resolve({draft: {sequenceId: "draft-1", name: "Draft"}});
+  assert.match(h.element("finalReviewStatus").textContent, /Draft/);
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+}
+
+function testFinalReviewStartSuccessPollsExistingJobAndDropsStaleStart() {
+  const h = finalReviewHarness();
+  prepareFinalReviewEstimate(h);
+  h.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+  h.requests[1].resolve({job_id: "started-review"}, 202);
+  assert.strictEqual(h.requests.length, 3);
+  assert.match(h.requests[2].url, /\/jobs\/started-review\?project=demo$/);
+  h.requests[2].resolve(finalReviewJob("running", {id: "started-review"}));
+  assert.strictEqual(h.hooks.getFinalReviewState().job.id, "started-review");
+  assert.strictEqual(h.fireTimer(), 3000);
+  assert.match(h.requests[3].url, /\/jobs\/started-review\?project=demo$/);
+
+  const stale = finalReviewHarness();
+  prepareFinalReviewEstimate(stale);
+  stale.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+  stale.context.document.hidden = true;
+  stale.hooks.handleVisibilityChange();
+  stale.requests[1].resolve({job_id: "old-start"}, 202);
+  assert.strictEqual(stale.requests.length, 2, "stale Start must not begin status polling");
+  assert.strictEqual(stale.hooks.getFinalReviewState().job, null);
+  stale.context.document.hidden = false;
+  stale.hooks.handleVisibilityChange();
+  assert.match(stale.requests[2].url, /\/latest\?project=demo$/);
+  stale.requests[2].resolve(finalReviewJob("running", {id: "old-start"}));
+  assert.strictEqual(stale.hooks.getFinalReviewState().job.id, "old-start");
+  assert.strictEqual(stale.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+}
+
+function testFinalReviewExportDropsStaleChecksAndDoesNotDoubleSubmit() {
+  const h = finalReviewHarness();
+  h.hooks.startFinalReview();
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
+  assert.match(h.hosts[1].script, /^rcStage2_exportFinalReviewAudio\(/);
+  h.hosts[1].resolve({job: {outputPath: "/projects/demo/work/final_review.wav", jobId: "export-1"}});
+  assert.strictEqual(h.fireTimer(), 1000);
+  const stale = h.hosts[2];
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  assert.strictEqual(h.timers.size, 0);
+  stale.resolve({file: {exists: true, size: 500, modifiedMs: 100}});
+  assert.strictEqual(h.timers.size, 0);
+  assert.strictEqual(h.requests.length, 0);
+  h.context.document.hidden = false;
+  h.hooks.handleVisibilityChange();
+  h.hooks.handleVisibilityChange();
+  for (let i = 0; i < 4; i++) {
+    h.fireTimer();
+    h.hosts[h.hosts.length - 1].resolve({file: {exists: true, size: 500, modifiedMs: 100}});
+  }
+  assert.strictEqual(h.timers.size, 0);
+  assert.match(h.hosts[h.hosts.length - 1].script, /^rcStage2_captureAssemblyLayout\(/);
+  h.hosts[h.hosts.length - 1].resolve({layout: {entries: []}});
+  assert.strictEqual(h.requests.length, 1);
+  assert.match(h.requests[0].url, /\/estimate$/);
+}
+
+function testFinalReviewApplyDropsStaleMutationAndHostCallbacks() {
+  const h = finalReviewHarness();
+  restoreReview(h, "completed");
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  h.hooks.applyFinalReview();
+  h.hosts[1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const staleApply = h.requests[1];
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  staleApply.resolve({iteration: {id: "old-iteration"}, corrections: []});
+  assert.strictEqual(h.hosts.length, 2, "stale backend Apply must not clone a sequence");
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+
+  const clone = finalReviewHarness();
+  restoreReview(clone, "completed");
+  clone.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  clone.hooks.applyFinalReview();
+  clone.hosts[1].resolve({sequence: {sequenceId: "sequence-1"}});
+  clone.requests[1].resolve({iteration: {id: "old-iteration"}, corrections: [{block_uid: "block-1"}]});
+  clone.hooks.finalReviewProjectChanged();
+  clone.hosts[2].resolve({draft: {sequenceId: "old-draft", name: "Old draft"}});
+  assert.strictEqual(clone.hosts.length, 3, "stale Clone must not conform a sequence");
+  assert.strictEqual(clone.element("applyFinalReview").disabled, true);
+}
+
+function testFinalReviewMissingStoredSourceNeverEnablesApply() {
+  const h = finalReviewHarness();
+  h.hooks.restoreFinalReview();
+  h.requests[0].resolve(finalReviewJob("completed", {source_sequence: {}}));
+  h.hosts[0].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.element("applyFinalReview").disabled, true);
+  h.hooks.applyFinalReview();
+  h.hosts[1].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.requests.length, 1);
+}
+
+function testFinalReviewProjectLoadRecoversAndRefreshPreservesApplyRequest() {
+  const h = finalReviewHarness();
+  h.initialize();
+  assert.match(h.hosts[0].script, /^rcStage2_listProjects\(/);
+  h.hosts[0].resolve({projects: ["demo"]});
+  const latest = h.requests.find((r) => /\/final-review\/latest\?/.test(r.url));
+  assert.ok(latest, "loading projects must recover the selected project's job");
+  latest.resolve(finalReviewJob("completed"));
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  h.element("applyFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const apply = h.requests[h.requests.length - 1];
+  apply.fail();
+  const requestId = apply.body.request_id;
+  h.element("refreshProjects").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({projects: ["demo"]});
+  assert.strictEqual(h.hooks.getFinalReviewState().applyRequestId, requestId,
+    "refreshing the same project must preserve the failed Apply's request ID");
+  h.element("retryFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.requests[h.requests.length - 1].body.request_id, requestId);
+}
+
+function testFinalReviewHiddenProjectLoadRecoversOnShow() {
+  const h = finalReviewHarness();
+  h.context.document.hidden = true;
+  h.hooks.handleVisibilityChange();
+  h.element("projectName").value = "hidden-project";
+  h.hooks.finalReviewProjectChanged();
+  assert.strictEqual(h.requests.length, 0);
+  h.context.document.hidden = false;
+  h.hooks.handleVisibilityChange();
+  assert.strictEqual(h.requests.length, 1, "a project loaded while hidden must recover on show");
+  assert.match(h.requests[0].url, /latest\?project=hidden-project$/);
+}
+
+function testFinalReviewTransientHttpErrorsBackOff() {
+  for (const status of [429, 500, 503]) {
+    const h = finalReviewHarness();
+    restoreReview(h);
+    h.fireTimer();
+    h.requests[1].resolve("temporarily unavailable", status);
+    assert.strictEqual(h.fireTimer(), 3000);
+  }
+  const proxy = finalReviewHarness();
+  restoreReview(proxy);
+  proxy.fireTimer();
+  proxy.requests[1].nonJson(502);
+  assert.strictEqual(proxy.timers.size, 1, "an HTML proxy failure must still be transient");
+  assert.strictEqual(proxy.fireTimer(), 3000);
+}
+
+function testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain() {
+  const h = finalReviewHarness();
+  prepareFinalReviewEstimate(h);
+  h.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+  h.requests[1].fail();
+  assert.strictEqual(h.element("retryFinalReview").hidden, false, "lost Start response must expose status recovery");
+  h.hooks.retryFinalReview();
+  assert.match(h.requests[2].url, /\/latest\?project=demo$/);
+  h.requests[2].resolve(finalReviewJob("running", {id: "accepted-but-response-lost"}));
+  assert.strictEqual(h.hooks.getFinalReviewState().job.id, "accepted-but-response-lost");
+  assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+}
+
+for (const test of [
+  testFinalReviewBackoffAndManualRetry,
+  testFinalReviewRecoveryChecksHostBeforeApply,
+  testFinalReviewCancelRejectsOlderStatusAndInspection,
+  testFinalReviewVisibilityAndProjectGeneration,
+  testFinalReviewHideDiscardsInFlightStatusAndResumesOnce,
+  testFinalReviewEstimateConfirmationAnd409,
+  testFinalReviewStartAndEstimateDiscardStaleCallbacks,
+  testFinalReviewApplyNetworkRetryKeepsRequestIdAndSequenceGuard,
+  testFinalReviewStartSuccessPollsExistingJobAndDropsStaleStart,
+  testFinalReviewExportDropsStaleChecksAndDoesNotDoubleSubmit,
+  testFinalReviewApplyDropsStaleMutationAndHostCallbacks,
+  testFinalReviewMissingStoredSourceNeverEnablesApply,
+  testFinalReviewProjectLoadRecoversAndRefreshPreservesApplyRequest,
+  testFinalReviewHiddenProjectLoadRecoversOnShow,
+  testFinalReviewTransientHttpErrorsBackOff,
+  testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain,
+]) {
+  test();
+  console.log("PASS", test.name);
+}
