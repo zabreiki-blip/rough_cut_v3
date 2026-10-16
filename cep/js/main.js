@@ -36,7 +36,9 @@
     applied: false,
     inFlight: false,
     retryAction: "status",
-    exportResume: null
+    exportResume: null,
+    layoutSequence: null,
+    startUncertain: false
   };
   var FINAL_REVIEW_RETRY_DELAYS_MS = [3000, 6000, 12000, 24000, 30000];
   var CONFORM_VIDEO_TRACK_INDEX = 0;
@@ -469,6 +471,7 @@
         }
         var parseError = new Error(message);
         parseError.status = xhr.status;
+        parseError.invalidJson = true;
         finish(parseError);
         return;
       }
@@ -768,7 +771,8 @@
     // cancelled, so bump the generation counter to let their callbacks
     // detect the pause once they finally resolve.
     pollGeneration += 1;
-    finalReview.resume = Boolean(finalReview.job || finalReview.inFlight || finalReview.exportResume);
+    finalReview.resume = Boolean(finalReview.job || finalReview.inFlight || finalReview.exportResume ||
+      finalReview.layoutSequence || finalReview.startUncertain);
     invalidateFinalReview();
     finalReview.visible = false;
     if (whisperPollTimer) {
@@ -787,7 +791,9 @@
     finalReview.visible = true;
     if (finalReview.resume) {
       finalReview.resume = false;
-      if (finalReview.exportResume) {
+      if (finalReview.layoutSequence) {
+        captureFinalReviewLayout(finalReview.layoutSequence);
+      } else if (finalReview.exportResume) {
         finalReview.exportResume();
       } else if (finalReview.job) {
         pollFinalReviewJob();
@@ -1745,6 +1751,7 @@
       finalReview.applied = false;
     }
     finalReview.job = job;
+    finalReview.startUncertain = false;
     finalReview.sourceSequence = job.source_sequence || null;
     finalReview.retryIndex = 0;
     finalReview.inFlight = false;
@@ -1782,10 +1789,12 @@
       if (!finalReviewCurrent(generation)) return;
       finalReview.inFlight = false;
       if (error && error.status === 404) {
-        finalReviewStartButtons(false);
-        byId("retryFinalReview").hidden = true;
+        finalReviewStartButtons(finalReview.startUncertain);
+        byId("retryFinalReview").hidden = !finalReview.startUncertain;
         byId("cancelFinalReview").hidden = true;
-        setFinalReviewStatus("Для проекта пока нет финальной проверки.");
+        setFinalReviewStatus(finalReview.startUncertain ?
+          "Запуск пока не подтверждён. Проверка могла начаться; повторите запрос статуса." :
+          "Для проекта пока нет финальной проверки.");
         return;
       }
       if (error) { finalReviewFailure(error); return; }
@@ -1797,7 +1806,7 @@
     if (finalReview.project !== config().project) {
       finalReviewProjectChanged();
     } else if (!finalReview.job && !finalReview.inFlight &&
-               !finalReview.applyBusy && !finalReview.exportResume) {
+               !finalReview.applyBusy && !finalReview.exportResume && !finalReview.layoutSequence) {
       restoreFinalReview();
     }
   }
@@ -1808,10 +1817,12 @@
     finalReview.sourceSequence = null;
     finalReview.project = config().project;
     finalReview.applyRequestId = "";
+    finalReview.startUncertain = false;
     finalReview.applied = false;
     finalReview.retryIndex = 0;
     finalReview.retryAction = "status";
     finalReview.exportResume = null;
+    finalReview.layoutSequence = null;
     finalReview.resume = false;
     finalReviewStartButtons(false);
     byId("retryFinalReview").hidden = true;
@@ -1840,7 +1851,7 @@
     byId("retryFinalReview").hidden = true;
     finalReview.retryIndex = 0;
     if (finalReview.retryAction === "apply") {
-      applyFinalReview();
+      beginFinalReviewApply(true);
     } else if (finalReview.job) {
       pollFinalReviewJob();
     } else {
@@ -1853,6 +1864,7 @@
         !finalReviewCurrent(finalReview.generation)) return;
     invalidateFinalReview();
     finalReview.exportResume = null;
+    finalReview.layoutSequence = null;
     finalReview.retryIndex = 0;
     finalReview.retryAction = "status";
     byId("retryFinalReview").hidden = true;
@@ -1910,13 +1922,16 @@
       if (!finalReviewCurrent(generation)) return;
       payload.confirmed_estimate_usd = amount === undefined ? "0" : amount;
       finalReview.inFlight = true;
+      finalReview.startUncertain = true;
       finalReviewRequest("POST", "/stage2/final-review/start", payload, generation, function (startError, started) {
         if (!finalReviewCurrent(generation)) return;
         finalReview.inFlight = false;
         if (startError) {
-          finalReviewStartButtons(false);
+          finalReview.startUncertain = Boolean(startError.network || startError.invalidJson ||
+            startError.status === 429 || startError.status >= 500);
+          finalReviewStartButtons(finalReview.startUncertain);
           setFinalReviewStatus("Финальная проверка не запущена: " + startError.message);
-          if (startError.network) {
+          if (finalReview.startUncertain) {
             setFinalReviewStatus("Не удалось подтвердить запуск. Проверка могла начаться; повторите запрос статуса.");
             finalReview.retryAction = "status";
             byId("retryFinalReview").hidden = false;
@@ -1930,6 +1945,7 @@
           return;
         }
         var result = started.result || started;
+        finalReview.startUncertain = false;
         finalReview.job = {id: result.job_id, status: "queued", source_sequence: sequence};
         finalReview.sourceSequence = sequence;
         finalReviewStartButtons(false);
@@ -1948,6 +1964,29 @@
       toSeconds: duration
     }, function (error, response) {
       callback(error, response && (response.layout || response));
+    });
+  }
+
+  function captureFinalReviewLayout(sequence) {
+    var generation = finalReview.generation;
+    if (!finalReviewCurrent(generation)) return;
+    finalReview.layoutSequence = sequence;
+    finalReview.inFlight = true;
+    setFinalReviewStatus("Создаю manifest собранной sequence…");
+    inspectFinalReviewLayout(sequence, function (error, layout) {
+      if (!finalReviewCurrent(generation)) return;
+      finalReview.layoutSequence = null;
+      finalReview.inFlight = false;
+      if (!error && layout && layout.sequence &&
+          String(layout.sequence.sequenceId) !== String(sequence.sequenceId)) {
+        error = new Error("Активная sequence не совпадает с сохранённой sequence «" + sequence.sequenceId + "».");
+      }
+      if (error) {
+        finalReviewStartButtons(false);
+        setFinalReviewStatus("Не удалось создать manifest sequence: " + error.message);
+        return;
+      }
+      submitFinalReview(sequence, layout, generation);
     });
   }
 
@@ -1977,15 +2016,7 @@
           exportFinished = true;
           finalReview.exportResume = null;
           clearFinalReviewTimer();
-          inspectFinalReviewLayout(sequence, function (layoutError, layout) {
-            if (!finalReviewCurrent(generation)) return;
-            if (layoutError) {
-              finalReviewStartButtons(false);
-              setFinalReviewStatus("Не удалось создать manifest sequence: " + layoutError.message);
-              return;
-            }
-            submitFinalReview(sequence, layout, generation);
-          });
+          captureFinalReviewLayout(sequence);
           return;
         }
         if (attempts >= 1800) {
@@ -2013,6 +2044,10 @@
   }
 
   function beginFinalReview(fromWav) {
+    if (finalReview.startUncertain) {
+      setFinalReviewStatus("Не удалось подтвердить запуск. Проверка могла начаться; повторите запрос статуса.");
+      return;
+    }
     var outputPath = finalReviewOutputPath();
     if (!outputPath) {
       setFinalReviewStatus("Укажите каталог projects и проект для финальной проверки.");
@@ -2026,6 +2061,7 @@
     finalReview.applied = false;
     finalReview.retryIndex = 0;
     finalReview.exportResume = null;
+    finalReview.layoutSequence = null;
     finalReview.resume = false;
     finalReview.retryAction = "status";
     finalReviewStartButtons(true);
@@ -2046,16 +2082,7 @@
       finalReview.sourceSequence = sequence;
       finalReview.inFlight = true;
       if (fromWav) {
-        inspectFinalReviewLayout(sequence, function (layoutError, layout) {
-          if (!finalReviewCurrent(generation)) return;
-          finalReview.inFlight = false;
-          if (layoutError) {
-            finalReviewStartButtons(false);
-            setFinalReviewStatus("Не удалось создать manifest sequence: " + layoutError.message);
-            return;
-          }
-          submitFinalReview(sequence, layout, generation);
-        });
+        captureFinalReviewLayout(sequence);
       } else {
         setFinalReviewStatus("Экспортирую звук собранного таймлайна из Premiere…");
         callHost("exportFinalReview", {outputPath: outputPath, expectedSequenceId: sequence.sequenceId, overwrite: true}, function (exportError, exported) {
@@ -2076,13 +2103,17 @@
   function startFinalReview() { beginFinalReview(false); }
 
   function applyFinalReview() {
+    beginFinalReviewApply(false);
+  }
+
+  function beginFinalReviewApply(reuseRequestId) {
     if (!finalReview.job || finalReview.job.status !== "completed" ||
         !finalReview.sourceSequence || finalReview.applyBusy || finalReview.applied ||
         !finalReviewCurrent(finalReview.generation)) return;
     clearFinalReviewTimer();
     var generation = finalReview.generation;
     finalReview.applyBusy = true;
-    if (!finalReview.applyRequestId) {
+    if (!reuseRequestId || !finalReview.applyRequestId) {
       finalReview.applyRequestId = "cep-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
     }
     byId("retryFinalReview").hidden = true;
@@ -2252,7 +2283,9 @@
           resume: finalReview.resume,
           job: finalReview.job,
           sourceSequence: finalReview.sourceSequence,
-          applyRequestId: finalReview.applyRequestId
+          applyRequestId: finalReview.applyRequestId,
+          layoutSequence: finalReview.layoutSequence,
+          startUncertain: finalReview.startUncertain
         };
       },
       renderWhisperJob: renderWhisperJob,

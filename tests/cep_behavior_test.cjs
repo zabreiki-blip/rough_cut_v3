@@ -2193,16 +2193,131 @@ function testFinalReviewTransientHttpErrorsBackOff() {
 }
 
 function testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain() {
+  for (const failure of ["network", 429, 500, 503, "proxy-502", "proxy-200"]) {
+    const h = finalReviewHarness();
+    prepareFinalReviewEstimate(h);
+    h.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+    if (failure === "network") h.requests[1].fail();
+    else if (failure === "proxy-502") h.requests[1].nonJson(502);
+    else if (failure === "proxy-200") h.requests[1].nonJson(200);
+    else h.requests[1].resolve("temporary Start response failure", failure);
+    assert.strictEqual(h.element("retryFinalReview").hidden, false,
+      failure + " Start failure must expose status recovery");
+    assert.strictEqual(h.element("startFinalReview").disabled, true,
+      failure + " Start failure must not invite another provider Start");
+    assert.strictEqual(h.element("startFinalReviewFromWav").disabled, true);
+    assert.match(h.element("finalReviewStatus").textContent, /могла начаться/);
+    const hostCount = h.hosts.length;
+    h.hooks.startFinalReviewFromWav();
+    assert.strictEqual(h.hosts.length, hostCount, "ambiguous Start cannot enter preparation again");
+    h.hooks.retryFinalReview();
+    h.hooks.retryFinalReview();
+    assert.strictEqual(h.requests.length, 3);
+    assert.match(h.requests[2].url, /\/latest\?project=demo$/);
+    h.requests[2].resolve(finalReviewJob("running", {id: "accepted-but-response-lost"}));
+    assert.strictEqual(h.hooks.getFinalReviewState().job.id, "accepted-but-response-lost");
+    assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+  }
+  const absent = finalReviewHarness();
+  prepareFinalReviewEstimate(absent);
+  absent.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+  absent.requests[1].resolve("temporary failure", 503);
+  absent.hooks.retryFinalReview();
+  absent.requests[2].resolve("job not found", 404);
+  assert.strictEqual(absent.element("startFinalReview").disabled, true,
+    "latest 404 cannot prove an ambiguous Start request has stopped processing");
+  assert.strictEqual(absent.element("retryFinalReview").hidden, false);
+  absent.context.document.hidden = true;
+  absent.hooks.handleVisibilityChange();
+  absent.context.document.hidden = false;
+  absent.hooks.handleVisibilityChange();
+  assert.match(absent.requests[3].url, /\/latest\?project=demo$/);
+
+  const validation = finalReviewHarness();
+  prepareFinalReviewEstimate(validation);
+  validation.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+  validation.requests[1].resolve("invalid snapshot", 400);
+  assert.strictEqual(validation.element("startFinalReview").disabled, false);
+  assert.strictEqual(validation.element("retryFinalReview").hidden, true);
+}
+
+function testFinalReviewHideDuringLayoutResumesCaptureOnce() {
+  for (const fromWav of [true, false]) {
+    const h = finalReviewHarness();
+    if (fromWav) h.hooks.startFinalReviewFromWav();
+    else h.hooks.startFinalReview();
+    h.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
+    if (!fromWav) {
+      h.hosts[1].resolve({job: {outputPath: "/projects/demo/work/final_review.wav", jobId: "export-1"}});
+      for (let i = 0; i < 4; i++) {
+        h.fireTimer();
+        h.hosts[h.hosts.length - 1].resolve({file: {exists: true, size: 500, modifiedMs: 100}});
+      }
+    }
+    const staleLayout = h.hosts[h.hosts.length - 1];
+    assert.match(staleLayout.script, /^rcStage2_captureAssemblyLayout\(/);
+    h.context.document.hidden = true;
+    h.hooks.handleVisibilityChange();
+    staleLayout.resolve({layout: {entries: ["stale"]}});
+    assert.strictEqual(h.requests.length, 0, "hidden layout must not advance to Estimate/Start");
+    const hostCount = h.hosts.length;
+    h.context.document.hidden = false;
+    h.hooks.handleVisibilityChange();
+    h.hooks.handleVisibilityChange();
+    assert.strictEqual(h.hosts.length, hostCount + 1,
+      (fromWav ? "WAV" : "export") + " layout capture must resume exactly once on show");
+    const resumedLayout = h.hosts[h.hosts.length - 1];
+    assert.match(resumedLayout.script, /^rcStage2_captureAssemblyLayout\(/);
+    staleLayout.resolve({layout: {entries: ["late-stale"]}});
+    assert.strictEqual(h.requests.length, 0);
+    resumedLayout.resolve({layout: {entries: ["fresh"]}});
+    assert.strictEqual(h.requests.length, 1);
+    assert.match(h.requests[0].url, /\/estimate$/);
+    assert.deepStrictEqual(h.requests[0].body.assembly_layout, {entries: ["fresh"]});
+    h.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
+    assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+    h.requests[1].resolve({job_id: "resumed-review"}, 202);
+    assert.match(h.requests[2].url, /\/jobs\/resumed-review\?project=demo$/);
+  }
+  const switched = finalReviewHarness();
+  switched.hooks.startFinalReviewFromWav();
+  switched.hosts[0].resolve({sequence: {sequenceId: "sequence-1", durationSeconds: 90}});
+  switched.context.document.hidden = true;
+  switched.hooks.handleVisibilityChange();
+  switched.context.document.hidden = false;
+  switched.hooks.handleVisibilityChange();
+  switched.hosts[switched.hosts.length - 1].resolve({layout: {
+    sequence: {sequenceId: "other-sequence"}, fromSeconds: 0, toSeconds: 90, video: [], audio: [],
+  }});
+  assert.strictEqual(switched.requests.length, 0,
+    "switching active sequences while hidden must block a resumed layout from reaching Start");
+  assert.strictEqual(switched.element("startFinalReviewFromWav").disabled, false);
+  assert.match(switched.element("finalReviewStatus").textContent, /не совпадает/);
+
+}
+
+function testFinalReviewExplicitApplyAfterCloneFailureGetsFreshRequestId() {
   const h = finalReviewHarness();
-  prepareFinalReviewEstimate(h);
-  h.requests[0].resolve({estimated_cost_usd: "0.17", enforced: true, cost_limit_usd: 1});
-  h.requests[1].fail();
-  assert.strictEqual(h.element("retryFinalReview").hidden, false, "lost Start response must expose status recovery");
-  h.hooks.retryFinalReview();
-  assert.match(h.requests[2].url, /\/latest\?project=demo$/);
-  h.requests[2].resolve(finalReviewJob("running", {id: "accepted-but-response-lost"}));
-  assert.strictEqual(h.hooks.getFinalReviewState().job.id, "accepted-but-response-lost");
-  assert.strictEqual(h.requests.filter((r) => /\/start$/.test(r.url)).length, 1);
+  h.initialize();
+  h.hosts[0].resolve({projects: ["demo"]});
+  h.requests[0].resolve(finalReviewJob("completed"));
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  h.element("applyFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const first = h.requests[1];
+  first.resolve({iteration: {id: "iteration-1"}, corrections: []});
+  h.hosts[h.hosts.length - 1].resolve({ok: false, error: "Clone failed before mutation"});
+  assert.strictEqual(h.element("applyFinalReview").disabled, false);
+  h.element("applyFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  const second = h.requests[2];
+  assert.notStrictEqual(second.body.request_id, first.body.request_id,
+    "a new explicit Apply after a Clone failure must create another iteration request");
+  second.fail();
+  h.element("retryFinalReview").listeners.click();
+  h.hosts[h.hosts.length - 1].resolve({sequence: {sequenceId: "sequence-1"}});
+  assert.strictEqual(h.requests[3].body.request_id, second.body.request_id,
+    "manual transport Retry must reuse the new Apply's request ID");
 }
 
 for (const test of [
@@ -2222,6 +2337,8 @@ for (const test of [
   testFinalReviewHiddenProjectLoadRecoversOnShow,
   testFinalReviewTransientHttpErrorsBackOff,
   testFinalReviewAmbiguousStartRetryRecoversWithoutStartingAgain,
+  testFinalReviewHideDuringLayoutResumesCaptureOnce,
+  testFinalReviewExplicitApplyAfterCloneFailureGetsFreshRequestId,
 ]) {
   test();
   console.log("PASS", test.name);
