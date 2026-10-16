@@ -61,16 +61,41 @@ import os
 import random
 import re
 import subprocess
+import time
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
+from cost_budget import CostBudget, CostGuardConfig
+
 from .asr_contract import AsrProgress, AsrRunResult, AsrSegment
 from .text_normalization import fold_russian_text
 
 logger = logging.getLogger(__name__)
+
+
+def _publish_budget(
+    budget: CostBudget, callback: Callable[[dict[str, float]], None] | None
+) -> None:
+    if callback is not None:
+        try:
+            snapshot = budget.snapshot()
+            snapshot["cost_pending"] = budget.has_pending_reservations
+            callback(snapshot)
+        except Exception:
+            logger.debug("Cloud ASR budget callback failed", exc_info=True)
+
+
+def _attach_budget(error: BaseException, budget: CostBudget) -> None:
+    snapshot = budget.snapshot()
+    error.cost_usd = snapshot["spent_usd"]  # type: ignore[attr-defined]
+    error.reserved_cost_usd = snapshot["reserved_usd"]  # type: ignore[attr-defined]
+    error.cost_limit_usd = snapshot["limit_usd"]  # type: ignore[attr-defined]
+    error.cost_pending = budget.has_pending_reservations  # type: ignore[attr-defined]
+
 
 DEFAULT_MODEL = "google/gemini-3.7-flash"
 DEFAULT_CHUNK_MINUTES = 20.0
@@ -919,6 +944,34 @@ def _probe_duration(
         ) from exc
 
 
+def plan_cloud_chunks(
+    duration_sec: float, chunk_minutes: float, overlap_sec: float
+) -> list[tuple[float, float]]:
+    """Return absolute chunk boundaries, including repeated overlap audio."""
+    for name, value in (
+        ("duration_sec", duration_sec),
+        ("chunk_minutes", chunk_minutes),
+        ("overlap_sec", overlap_sec),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+
+    chunk_len = chunk_minutes * 60
+    if duration_sec <= 0:
+        return [(0.0, 0.0)]
+    if duration_sec <= chunk_len or chunk_len <= 0:
+        return [(0.0, duration_sec)]
+
+    parts: list[tuple[float, float]] = []
+    count = math.ceil(duration_sec / chunk_len)
+    for i in range(count):
+        nominal_start = i * chunk_len
+        nominal_end = min((i + 1) * chunk_len, duration_sec)
+        start = 0.0 if i == 0 else max(0.0, nominal_start - overlap_sec)
+        parts.append((start, nominal_end))
+    return parts
+
+
 class CloudAudioAsrAdapter:
     """ASR-адаптер поверх облачной модели с аудио-входом.
 
@@ -1004,20 +1057,7 @@ class CloudAudioAsrAdapter:
 
     def _plan_chunks(self, duration_sec: float) -> list[tuple[float, float]]:
         """Части файла (начало, конец) в абсолютных секундах с перекрытием."""
-        chunk_len = self.chunk_minutes * 60
-        if duration_sec <= 0:
-            return [(0.0, 0.0)]
-        if duration_sec <= chunk_len or chunk_len <= 0:
-            return [(0.0, duration_sec)]
-
-        parts: list[tuple[float, float]] = []
-        count = math.ceil(duration_sec / chunk_len)
-        for i in range(count):
-            nominal_start = i * chunk_len
-            nominal_end = min((i + 1) * chunk_len, duration_sec)
-            start = 0.0 if i == 0 else max(0.0, nominal_start - self.overlap_sec)
-            parts.append((start, nominal_end))
-        return parts
+        return plan_cloud_chunks(duration_sec, self.chunk_minutes, self.overlap_sec)
 
     def _probe_duration(self, media_path: Path) -> float:
         try:
@@ -1147,6 +1187,10 @@ class CloudAudioAsrAdapter:
                 await task
             raise asyncio.CancelledError("Распознавание отменено пользователем")
         finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             if not cancel_task.done():
                 cancel_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1159,6 +1203,10 @@ class CloudAudioAsrAdapter:
         *,
         prompt: str,
         cancel: asyncio.Event | None = None,
+        budget: CostBudget | None = None,
+        duration_sec: float = 0.0,
+        budget_callback: Callable[[dict[str, float]], None] | None = None,
+        deadline_monotonic: float | None = None,
     ) -> tuple[str, float | None, dict]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -1197,14 +1245,45 @@ class CloudAudioAsrAdapter:
             attempt += 1
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError("Распознавание отменено пользователем")
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("Cloud ASR transcription exceeded its deadline")
+            reservation_id = None
+            if budget is not None:
+                reservation_id = budget.reserve_attempt(duration_sec)
+                _publish_budget(budget, budget_callback)
+            # A callback can request cancellation before this paid attempt.
+            if cancel is not None and cancel.is_set():
+                raise asyncio.CancelledError("Распознавание отменено пользователем")
+            # Synchronous callbacks can consume the remaining allowance while
+            # the event loop is unable to deliver asyncio's timeout callback.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("Cloud ASR transcription exceeded its deadline")
+            request_timeout = self.timeout_sec
+            if deadline_monotonic is not None:
+                request_timeout = min(request_timeout, deadline_monotonic - time.monotonic())
+                if request_timeout <= 0:
+                    raise TimeoutError("Cloud ASR transcription exceeded its deadline")
             try:
                 resp = await self._await_cancellable(
-                    client.post(self._chat_url, headers=self._headers(), json=payload), cancel
+                    client.post(
+                        self._chat_url,
+                        headers=self._headers(),
+                        json=payload,
+                        timeout=request_timeout,
+                    ),
+                    cancel,
                 )
             except httpx.HTTPError as exc:
                 if attempt >= self._max_retries:
+                    detail = str(exc)
+                    if isinstance(exc, httpx.TimeoutException):
+                        # Timeout messages may be empty. Keep the category in
+                        # the text that survives runner wrapping and IPC.
+                        detail = f"HTTP timeout ({type(exc).__name__})" + (
+                            f": {detail}" if detail else ""
+                        )
                     raise CloudAudioAsrError(
-                        f"Ошибка сети при запросе к облачной ASR-модели после {attempt} попыток: {exc}"
+                        f"Ошибка сети при запросе к облачной ASR-модели после {attempt} попыток: {detail}"
                     ) from exc
                 logger.warning(
                     "Облачный ASR: сетевая ошибка (попытка %d/%d), повтор",
@@ -1243,6 +1322,12 @@ class CloudAudioAsrAdapter:
                 ) from exc
             break
 
+        usage = data.get("usage") or {}
+        cost = self._extract_cost(usage)
+        if budget is not None and reservation_id is not None:
+            budget.settle(reservation_id, cost)
+            _publish_budget(budget, budget_callback)
+
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -1254,8 +1339,6 @@ class CloudAudioAsrAdapter:
             # Некоторые провайдеры возвращают content частями (list of parts).
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
 
-        usage = data.get("usage") or {}
-        cost = self._extract_cost(usage)
         return str(content), cost, data
 
     # -- низкоуровневый прогон -------------------------------------------------
@@ -1267,6 +1350,10 @@ class CloudAudioAsrAdapter:
         language: str = "ru",
         on_progress: Callable[[AsrProgress], None] | None = None,
         cancel: asyncio.Event | None = None,
+        budget: CostBudget | None = None,
+        budget_callback: Callable[[dict[str, float]], None] | None = None,
+        deadline_monotonic: float | None = None,
+        duration_sec: float | None = None,
     ) -> AsrRunResult:
         self._require_available()
         audio_path = Path(audio_path)
@@ -1275,7 +1362,14 @@ class CloudAudioAsrAdapter:
         # вызванный напрямую внутри этой корутины, он блокировал бы event
         # loop на всё это время. asyncio.to_thread выносит блокирующий вызов
         # в отдельный поток.
-        duration_sec = await asyncio.to_thread(self._probe_duration, audio_path)
+        if duration_sec is None:
+            duration_sec = await asyncio.to_thread(self._probe_duration, audio_path)
+        else:
+            # A final-review preflight has already accepted this WAV duration.
+            # Reprobing can move chunk boundaries and alter confirmed cost.
+            duration_sec = float(duration_sec)
+            if not math.isfinite(duration_sec) or duration_sec <= 0:
+                raise ValueError("duration_sec must be a finite positive number")
         parts = self._plan_chunks(duration_sec)
         chunk_len = self.chunk_minutes * 60
 
@@ -1317,7 +1411,14 @@ class CloudAudioAsrAdapter:
                 )
                 try:
                     content, cost, raw = await self._call_model(
-                        client, audio_b64, prompt=prompt, cancel=cancel
+                        client,
+                        audio_b64,
+                        prompt=prompt,
+                        cancel=cancel,
+                        budget=budget,
+                        duration_sec=part_end - part_start,
+                        budget_callback=budget_callback,
+                        deadline_monotonic=deadline_monotonic,
                     )
                 except CloudAudioAsrError as exc:
                     # Ретраи внутри _call_model уже исчерпаны для ЭТОГО чанка —
@@ -1490,6 +1591,13 @@ def transcribe_cloud(
     api_key: str | None = None,
     chunk_minutes: float | None = None,
     overlap_sec: float | None = None,
+    cancel: asyncio.Event | None = None,
+    max_cost_usd: Decimal | str | float | None = None,
+    usd_per_minute_estimate: Decimal | str | float | None = None,
+    initial_cost_usd: Decimal | str | float | None = None,
+    timeout_sec: float | None = None,
+    budget_callback: Callable[[dict[str, float]], None] | None = None,
+    duration_sec: float | None = None,
 ) -> dict[str, Any]:
     """Синхронный публичный вход в облачный ASR-адаптер (этап 1: только сам
     адаптер, без интеграции в whisper_runner/UI — см. docstring модуля).
@@ -1499,16 +1607,54 @@ def transcribe_cloud(
     который уже умеет разбирать `src/stage2/sync_transcript.ingest_word_index`
     (линейная интерполяция слов внутри сегмента по его границам).
     """
+    settings = dict(os.environ)
+    if max_cost_usd is not None:
+        settings["ROUGH_CUT_MAX_USD_PER_JOB"] = str(max_cost_usd)
+    if usd_per_minute_estimate is not None:
+        settings["ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE"] = str(usd_per_minute_estimate)
+    guard = CostGuardConfig.from_environ(settings)
+    budget = CostBudget(
+        guard.max_usd_per_job,
+        guard.cloud_asr_usd_per_minute,
+        Decimal(str(initial_cost_usd if initial_cost_usd is not None else "0")),
+    )
+    if timeout_sec is not None:
+        timeout_sec = float(timeout_sec)
+        if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+            raise ValueError("timeout_sec must be a finite positive number")
+
     adapter = CloudAudioAsrAdapter(
         model=model or DEFAULT_MODEL,
         language=language,
         api_key=api_key,
         chunk_minutes=chunk_minutes if chunk_minutes is not None else DEFAULT_CHUNK_MINUTES,
         overlap_sec=overlap_sec,
+        timeout_sec=DEFAULT_TIMEOUT_SEC,
     )
-    result = asyncio.run(
-        adapter.transcribe_words(Path(audio_path), language=language, on_progress=progress_callback)
-    )
+    deadline_monotonic = time.monotonic() + timeout_sec if timeout_sec is not None else None
+
+    async def run() -> AsrRunResult:
+        if cancel is not None and cancel.is_set():
+            raise asyncio.CancelledError("Распознавание отменено пользователем")
+        return await asyncio.wait_for(
+            adapter.transcribe_words(
+                Path(audio_path),
+                language=language,
+                on_progress=progress_callback,
+                cancel=cancel,
+                budget=budget,
+                budget_callback=budget_callback,
+                deadline_monotonic=deadline_monotonic,
+                duration_sec=duration_sec,
+            ),
+            timeout=timeout_sec,
+        )
+
+    try:
+        result = asyncio.run(run())
+    except BaseException as exc:
+        _attach_budget(exc, budget)
+        raise
 
     segments = [
         {
@@ -1521,6 +1667,7 @@ def transcribe_cloud(
         for seg in result.segments
     ]
 
+    snapshot = budget.snapshot()
     return {
         "segments": segments,
         "speakers": result.speakers,
@@ -1528,6 +1675,9 @@ def transcribe_cloud(
         "model": result.model,
         "backend": result.backend,
         "duration_sec": result.duration_sec,
-        "cost_usd": result.cost_usd,
+        "cost_usd": snapshot["spent_usd"],
+        "reserved_cost_usd": snapshot["reserved_usd"],
+        "cost_limit_usd": snapshot["limit_usd"],
+        "cost_pending": budget.has_pending_reservations,
         "base_url": str(result.params.get("base_url") or ""),
     }

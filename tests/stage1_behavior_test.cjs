@@ -115,7 +115,42 @@ async function loadModules() {
   const core = await import(moduleUrl("core.js"));
   const normalization = await import(moduleUrl("normalization.js"));
   const sync = await import(moduleUrl("sync.js"));
-  return { state, core, normalization, sync };
+  const tts = await import(moduleUrl("tts.js"));
+  return { state, core, normalization, sync, tts };
+}
+
+function testRestoredSpeakerDirectory({ state, tts }) {
+  const base = `projects/${state.project}/speaker`;
+  assert.strictEqual(
+    tts.restoredSpeakerDirectory(`/Users/mac/Documents/AI/rough_cut_v3/${base}`), base,
+  );
+  assert.strictEqual(
+    tts.restoredSpeakerDirectory(`/app/${base}/revisions/rev_0005`), base,
+  );
+  assert.strictEqual(
+    tts.restoredSpeakerDirectory(`/app/${base}/draft`), `${base}/draft`,
+  );
+  assert.strictEqual(tts.restoredSpeakerDirectory("/tmp/unrelated/speaker"), null);
+  assert.strictEqual(tts.restoredSpeakerDirectory(`/app/${base}/../elsewhere`), null);
+}
+
+async function testPhraseTtsTimeout({ core, tts }) {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+  const requestedTimeouts = [];
+  try {
+    window.setTimeout = (_callback, delay) => { requestedTimeouts.push(delay); return 1; };
+    window.clearTimeout = () => {};
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result: {} }) });
+    await core.postJSON("/stage1/tts-phrase", {}, tts.PHRASE_TTS_TIMEOUT_MS);
+    await core.postJSON("/stage1/tts-jobs/start", {});
+    assert.deepStrictEqual(requestedTimeouts, [20 * 60 * 1000, core.FETCH_TIMEOUT_MS]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    window.setTimeout = originalSetTimeout;
+    window.clearTimeout = originalClearTimeout;
+  }
 }
 
 function testComputeEtaSeconds({ core }) {
@@ -560,6 +595,8 @@ async function main() {
     ["testRenderEtaCells", () => testRenderEtaCells(modules)],
     ["testCloudDisablesLocalWhisperModel", () => testCloudDisablesLocalWhisperModel(modules)],
     ["testHasUnsavedChangesAndBeforeunload", () => testHasUnsavedChangesAndBeforeunload(modules)],
+    ["testRestoredSpeakerDirectory", () => testRestoredSpeakerDirectory(modules)],
+    ["testPhraseTtsTimeout", () => testPhraseTtsTimeout(modules)],
     ["testConfirmDialog", () => testConfirmDialog(modules)],
     ["testSyncMatchSpeakerFilterHint", () => testSyncMatchSpeakerFilterHint(modules)],
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],

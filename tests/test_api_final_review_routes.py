@@ -1,11 +1,16 @@
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+import json
 import threading
+import time
 import uuid
+import wave
 
 from flask import Flask
 import pytest
 
+import api_final_review_jobs
 from api_final_review_jobs import (
     create_final_review_job,
     load_persisted_final_review_job,
@@ -26,6 +31,7 @@ from api_final_review_routes import (
 )
 from job_runtime import get_job, release_project, reserve_project, update_job
 from stage2.models import FullTimeline
+from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
 
 
 def _error(message: str, status: int):
@@ -59,6 +65,7 @@ def test_final_review_apply_rejects_report_from_another_job(tmp_path: Path) -> N
     app = Flask(__name__)
     report_path = tmp_path / "final_review_report.json"
     services = SimpleNamespace(
+        _project_transition_lock=lambda _project: threading.RLock(),
         _get_final_review_job=lambda _job_id: {
             "id": "job-new",
             "project": "demo",
@@ -208,6 +215,9 @@ def test_final_review_start_rejects_stale_duration(tmp_path: Path, monkeypatch) 
 
 
 def test_final_review_start_creates_job_and_worker(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_final_review_routes, "resolve_backend", lambda _backend: "cloud-audio", raising=False
+    )
     app = Flask(__name__)
     root = tmp_path / "demo"
     work = root / "work"
@@ -338,6 +348,7 @@ def test_final_review_apply_records_matching_report(tmp_path: Path) -> None:
         "assembly_manifest_id": "manifest-1",
     }
     services = SimpleNamespace(
+        _project_transition_lock=lambda _project: threading.RLock(),
         _get_final_review_job=lambda _job_id: job,
         _resolve_project_name=lambda _value: "demo",
         _project_paths=lambda _project: {"final_review_report": tmp_path / "report.json"},
@@ -349,7 +360,7 @@ def test_final_review_apply_records_matching_report(tmp_path: Path) -> None:
             "corrections": [{"block_uid": "b1"}],
         },
         _record_final_review_iteration=lambda *args: (
-            recorded.append(args) or {"id": "iteration_0001"}
+            recorded.append(args) or {"id": "iteration_0001", "corrections": args[2]}
         ),
         _json_error=_error,
     )
@@ -373,6 +384,7 @@ def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path
         "assembly_manifest_id": "manifest-1",
     }
     services = SimpleNamespace(
+        _project_transition_lock=lambda _project: threading.RLock(),
         _get_final_review_job=lambda _job_id: None,
         _load_persisted_final_review_job=lambda project: job if project == "demo" else None,
         _resolve_project_name=lambda value: value,
@@ -385,7 +397,7 @@ def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path
             "corrections": [],
         },
         _record_final_review_iteration=lambda *args: (
-            recorded.append(args) or {"id": "iteration_0001"}
+            recorded.append(args) or {"id": "iteration_0001", "corrections": args[2]}
         ),
         _json_error=_error,
     )
@@ -395,6 +407,241 @@ def test_final_review_apply_restores_completed_checkpoint_after_restart(tmp_path
 
     assert response.status_code == 200
     assert response.get_json()["result"]["iteration"]["id"] == "iteration_0001"
+
+
+@pytest.fixture
+def apply_controller(tmp_path: Path, monkeypatch):
+    """Keep the registered route, API facade, lock, and JSON persistence real."""
+    import api
+
+    paths = {
+        "final_review_report": tmp_path / "report.json",
+        "final_review_iterations": tmp_path / "iterations.json",
+    }
+    job = {
+        "id": "job-1",
+        "project": "demo",
+        "status": "completed",
+        "source_sequence": {"sequenceId": "sequence-1"},
+        "assembly_manifest_id": "manifest-1",
+    }
+    jobs = {"job-1": job, "job-2": {**job, "id": "job-2"}}
+
+    def publish_report(job_id="job-1", corrections=None):
+        paths["final_review_report"].write_text(
+            json.dumps(
+                {
+                    **jobs[job_id],
+                    "job_id": job_id,
+                    "corrections": [{"block_uid": "b1"}] if corrections is None else corrections,
+                }
+            )
+        )
+
+    publish_report()
+    monkeypatch.setattr(api, "_project_paths", lambda _project: paths)
+    monkeypatch.setattr(api, "_resolve_project_name", lambda value: value)
+    monkeypatch.setattr(api, "_get_final_review_job", jobs.get)
+    app = Flask(__name__)
+    register_final_review_routes(app, api)
+    return SimpleNamespace(api=api, app=app, paths=paths, publish_report=publish_report)
+
+
+@pytest.mark.parametrize("request_id", ["x" * 129, None, 1, True, [], {}])
+def test_final_review_apply_rejects_invalid_request_id(apply_controller, request_id):
+    state = apply_controller
+    with state.app.test_client() as client:
+        response = client.post(
+            "/stage2/final-review/jobs/job-1/apply",
+            json={
+                "project": "demo",
+                "request_id": request_id,
+            },
+        )
+    assert response.status_code == 400
+    assert "request_id" in response.get_json()["error"]
+    assert not state.paths["final_review_iterations"].exists()
+
+
+@pytest.mark.parametrize("extra", [{}, {"request_id": ""}, {"request_id": " \t "}])
+def test_final_review_apply_without_request_id_creates_new_iteration(apply_controller, extra):
+    state = apply_controller
+    with state.app.test_client() as client:
+        responses = [
+            client.post(
+                "/stage2/final-review/jobs/job-1/apply",
+                json={
+                    "project": "demo",
+                    **extra,
+                },
+            )
+            for _ in range(2)
+        ]
+    assert [response.status_code for response in responses] == [200, 200]
+    items = json.loads(state.paths["final_review_iterations"].read_text())["iterations"]
+    assert [item["id"] for item in items] == ["iteration_0001", "iteration_0002"]
+    assert all("request_id" not in item for item in items)
+
+
+def test_final_review_apply_replays_same_job_and_trimmed_request_id(apply_controller):
+    state = apply_controller
+    request_id = "x" * 128
+    with state.app.test_client() as client:
+        first = client.post(
+            "/stage2/final-review/jobs/job-1/apply",
+            json={
+                "project": "demo",
+                "request_id": f" {request_id} ",
+            },
+        )
+        original_history = state.paths["final_review_iterations"].read_bytes()
+        state.publish_report(corrections=[{"block_uid": "changed"}])
+        replay = client.post(
+            "/stage2/final-review/jobs/job-1/apply",
+            json={
+                "project": "demo",
+                "request_id": request_id,
+            },
+        )
+    assert first.status_code == replay.status_code == 200
+    assert replay.get_json() == first.get_json()
+    assert first.get_json()["result"]["iteration"]["request_id"] == request_id
+    assert state.paths["final_review_iterations"].read_bytes() == original_history
+
+
+def test_final_review_apply_rejects_request_id_reused_for_another_job(apply_controller):
+    state = apply_controller
+    with state.app.test_client() as client:
+        first = client.post(
+            "/stage2/final-review/jobs/job-1/apply",
+            json={
+                "project": "demo",
+                "request_id": "apply-1",
+            },
+        )
+        assert first.status_code == 200
+        original_history = state.paths["final_review_iterations"].read_bytes()
+        state.publish_report("job-2")
+        conflict = client.post(
+            "/stage2/final-review/jobs/job-2/apply",
+            json={
+                "project": "demo",
+                "request_id": "apply-1",
+            },
+        )
+    assert conflict.status_code == 409
+    assert "request_id" in conflict.get_json()["error"]
+    assert state.paths["final_review_iterations"].read_bytes() == original_history
+
+
+def test_final_review_apply_replays_after_a_newer_report_replaces_current_report(apply_controller):
+    state = apply_controller
+    with state.app.test_client() as client:
+        first = client.post(
+            "/stage2/final-review/jobs/job-1/apply",
+            json={
+                "project": "demo",
+                "request_id": "apply-1",
+            },
+        )
+        assert first.status_code == 200
+        original_history = state.paths["final_review_iterations"].read_bytes()
+        state.publish_report("job-2")
+        replay = client.post(
+            "/stage2/final-review/jobs/job-1/apply",
+            json={
+                "project": "demo",
+                "request_id": "apply-1",
+            },
+        )
+    assert replay.status_code == 200
+    assert replay.get_json() == first.get_json()
+    assert state.paths["final_review_iterations"].read_bytes() == original_history
+
+
+def test_final_review_apply_different_request_ids_preserve_intentional_repeat(apply_controller):
+    state = apply_controller
+    with state.app.test_client() as client:
+        responses = [
+            client.post(
+                "/stage2/final-review/jobs/job-1/apply",
+                json={
+                    "project": "demo",
+                    "request_id": request_id,
+                },
+            )
+            for request_id in ("apply-1", "apply-2")
+        ]
+    assert [response.status_code for response in responses] == [200, 200]
+    items = json.loads(state.paths["final_review_iterations"].read_text())["iterations"]
+    assert [item["id"] for item in items] == ["iteration_0001", "iteration_0002"]
+    assert [item["request_id"] for item in items] == ["apply-1", "apply-2"]
+    assert items[0]["corrections"] == items[1]["corrections"] == [{"block_uid": "b1"}]
+
+
+def test_final_review_apply_concurrent_iterations_preserve_both_entries(
+    apply_controller, monkeypatch
+):
+    state = apply_controller
+    api = state.api
+    start = threading.Barrier(2)
+    contender_reached_history = threading.Event()
+    counter_lock = threading.Lock()
+    counts = {"lock": 0, "read": 0}
+    real_get_job = api._get_final_review_job
+    real_read = api._read_json_safe
+    real_project_lock = api._project_transition_lock
+
+    def synchronized_job(job_id):
+        start.wait(timeout=5)
+        return real_get_job(job_id)
+
+    def observed_project_lock(project):
+        with counter_lock:
+            counts["lock"] += 1
+            if counts["lock"] == 2:
+                contender_reached_history.set()
+        return real_project_lock(project)
+
+    def synchronized_history_read(path):
+        result = real_read(path)
+        if path == state.paths["final_review_iterations"]:
+            with counter_lock:
+                counts["read"] += 1
+                first_reader = counts["read"] == 1
+            if first_reader:
+                # Wait for a competing lock attempt (serialized implementation),
+                # or its history read (the original lost-update implementation).
+                assert contender_reached_history.wait(timeout=5)
+            else:
+                contender_reached_history.set()
+        return result
+
+    monkeypatch.setattr(api, "_get_final_review_job", synchronized_job)
+    monkeypatch.setattr(api, "_project_transition_lock", observed_project_lock)
+    monkeypatch.setattr(api, "_read_json_safe", synchronized_history_read)
+
+    def apply(request_id):
+        with state.app.test_client() as client:
+            response = client.post(
+                "/stage2/final-review/jobs/job-1/apply",
+                json={
+                    "project": "demo",
+                    "request_id": request_id,
+                },
+            )
+        return response.status_code, response.get_json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(apply, ("apply-1", "apply-2")))
+    assert [status for status, _ in results] == [200, 200]
+    assert {body["result"]["iteration"]["id"] for _, body in results} == {
+        "iteration_0001",
+        "iteration_0002",
+    }
+    items = json.loads(state.paths["final_review_iterations"].read_text())["iterations"]
+    assert [item["id"] for item in items] == ["iteration_0001", "iteration_0002"]
+    assert {item["request_id"] for item in items} == {"apply-1", "apply-2"}
 
 
 @pytest.mark.parametrize(
@@ -439,6 +686,7 @@ def test_final_review_apply_guard_branches(tmp_path: Path, case: str, expected_e
     services = SimpleNamespace(
         _get_final_review_job=lambda _job_id: job,
         _resolve_project_name=resolve_project,
+        _project_transition_lock=lambda _project: threading.RLock(),
         _project_paths=lambda _project: {"final_review_report": tmp_path / "report.json"},
         _read_json_safe=lambda _path: report,
         _json_error=_error,
@@ -483,6 +731,10 @@ def _job_services(tmp_path: Path, *, transcribe=None):
         _FINAL_REVIEW_JOBS=jobs,
         _FINAL_REVIEW_JOBS_LOCK=threading.RLock(),
         _FINAL_REVIEW_ACTIVE_PROJECTS=active,
+        _FINAL_REVIEW_CANCEL_EVENTS={"job-1": threading.Event()},
+        threading=threading,
+        time=time,
+        WhisperCancelledError=WhisperCancelledError,
         uuid=uuid,
         FullTimeline=SimpleNamespace(from_dict=lambda payload: payload),
         _project_transition_lock=lambda _project: threading.RLock(),
@@ -596,3 +848,893 @@ def test_final_review_worker_records_cloud_cost_and_failure_cost(tmp_path: Path)
     assert failed._FINAL_REVIEW_JOBS["job-1"]["status"] == "failed"
     assert failed._test_usage[0]["cost_usd"] == 0.5
     assert "demo" not in failed._FINAL_REVIEW_ACTIVE_PROJECTS
+
+
+@pytest.fixture
+def controller(tmp_path, monkeypatch):
+    """Real registry/routes/files with only external transcription and threads deferred."""
+    services = _job_services(tmp_path)
+    paths = services._test_paths
+    audio = paths["work"] / "review.wav"
+    with wave.open(str(audio), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(1)
+        target.writeframes(b"\0\0" * 150)
+    paths["final_review_audio"] = audio
+    (paths["work"] / "full_timeline.json").write_text("{}")
+    services._FINAL_REVIEW_JOBS.clear()
+    services._FINAL_REVIEW_ACTIVE_PROJECTS.clear()
+    services._FINAL_REVIEW_CANCEL_EVENTS.clear()
+    services.FullTimeline = SimpleNamespace(
+        from_dict=lambda _payload: SimpleNamespace(total_duration_sec=150)
+    )
+    services._resolve_project_name = lambda value: (
+        value if value == "demo" else (_ for _ in ()).throw(ValueError("project is required"))
+    )
+    services._ensure_project = services._project_paths
+    services._normalization_required = lambda _project: None
+    services._json_error = _error
+    services._reserve_final_review_project = lambda project: reserve_project(
+        services._FINAL_REVIEW_JOBS_LOCK, services._FINAL_REVIEW_ACTIVE_PROJECTS, project
+    )
+    services.build_assembly_manifest = lambda **_options: {"manifest_id": "manifest-1"}
+    services.attach_scenario_revision = lambda *_args: None
+    services._create_final_review_job = lambda project, audio, payload: create_final_review_job(
+        services, project, audio, payload
+    )
+    services._get_final_review_job = lambda job_id: get_job(
+        services._FINAL_REVIEW_JOBS_LOCK, services._FINAL_REVIEW_JOBS, job_id
+    )
+    services._get_latest_final_review_job = lambda project: (
+        api_final_review_jobs.get_latest_final_review_job(services, project)
+    )
+    services._cancel_final_review_job = lambda job_id: (
+        api_final_review_jobs.cancel_final_review_job(services, job_id)
+    )
+    services._load_persisted_final_review_job = lambda project: load_persisted_final_review_job(
+        services, project
+    )
+    services._run_final_review_job = lambda **options: run_final_review_job(services, **options)
+    pending = []
+
+    class DeferredThread:
+        def __init__(self, *, target, kwargs, daemon):
+            self.target, self.kwargs = target, kwargs
+            pending.append(self)
+
+        def start(self):
+            pass
+
+    services.threading = SimpleNamespace(Thread=DeferredThread, Event=threading.Event)
+    services._test_pending = pending
+    monkeypatch.setattr(api_final_review_routes, "_stable_wav", lambda _path: True)
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.setenv("FINAL_REVIEW_TIMEOUT_SECONDS", "10")
+    app = Flask(__name__)
+    register_final_review_routes(app, services)
+    return app.test_client(), services
+
+
+def _start_payload(**updates):
+    return {
+        "project": "demo",
+        "backend": "cloud-audio",
+        "cloud_options": {"chunk_minutes": 1, "overlap_sec": 10},
+        **updates,
+    }
+
+
+def _run_pending(services):
+    pending = services._test_pending[-1]
+    pending.target(**pending.kwargs)
+
+
+def _assert_released(services, job_id):
+    assert "demo" not in services._FINAL_REVIEW_ACTIVE_PROJECTS
+    assert job_id not in services._FINAL_REVIEW_CANCEL_EVENTS
+
+
+def test_latest_selects_newest_matching_memory_job_then_persisted(controller):
+    client, services = controller
+    services._FINAL_REVIEW_JOBS.update(
+        {
+            "new": {
+                "id": "new",
+                "project": "demo",
+                "status": "running",
+                "created_at": "2026-10-15",
+            },
+            "old": {
+                "id": "old",
+                "project": "demo",
+                "status": "completed",
+                "created_at": "2026-10-14",
+            },
+            "other": {"id": "other", "project": "other", "created_at": "2026-10-16"},
+        }
+    )
+    assert (
+        client.get("/stage2/final-review/latest?project=demo").get_json()["result"]["id"] == "new"
+    )
+    services._FINAL_REVIEW_JOBS.clear()
+    services._read_json_safe = lambda _path: {
+        "id": "disk",
+        "project": "demo",
+        "status": "cancelling",
+        "cost_usd": 0.02,
+        "reserved_cost_usd": 0.06,
+    }
+    result = client.get("/stage2/final-review/latest?project=demo").get_json()["result"]
+    assert result["id"] == "disk"
+    assert result["status"] == "interrupted"
+    assert result["reserved_cost_usd"] == 0.06
+    services._read_json_safe = lambda _path: {}
+    assert client.get("/stage2/final-review/latest?project=demo").status_code == 404
+
+
+@pytest.mark.parametrize("project", ["", "../bad"])
+def test_latest_rejects_missing_or_invalid_project(controller, project):
+    client, _services = controller
+    assert (
+        client.get("/stage2/final-review/latest", query_string={"project": project}).status_code
+        == 400
+    )
+
+
+def test_estimate_counts_overlap_and_start_uses_identical_options(controller):
+    client, services = controller
+    estimate = client.post("/stage2/final-review/estimate", json=_start_payload())
+    assert estimate.status_code == 200
+    assert estimate.get_json()["result"] == {
+        "duration": 150.0,
+        "duration_sec": 150.0,
+        "planned_chunks": 3,
+        "estimated_cost_usd": "0.17",
+        "cost_limit_usd": 1.0,
+        "enforced": True,
+    }
+    assert services._FINAL_REVIEW_JOBS == {}
+    response = client.post(
+        "/stage2/final-review/start", json=_start_payload(confirmed_estimate_usd=0.17)
+    )
+    assert response.status_code == 202
+    job_id = response.get_json()["result"]["job_id"]
+    queued = client.get(f"/stage2/final-review/jobs/{job_id}").get_json()["result"]
+    assert queued["estimated_cost_usd"] == "0.17"
+    assert queued["cost_limit_usd"] == 1.0
+    assert queued["cost_usd"] == 0.0
+    observed = {}
+
+    def transcribe(_path, **options):
+        observed.update(options)
+        running = client.get(f"/stage2/final-review/jobs/{job_id}").get_json()["result"]
+        assert running["status"] == "running"
+        assert running["estimated_cost_usd"] == "0.17"
+        assert running["cost_limit_usd"] == 1.0
+        assert running["cost_usd"] == 0.0
+        return {"backend": "cloud-audio", "backend_metadata": {"cost_usd": 0.12}}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    result = client.get(f"/stage2/final-review/jobs/{job_id}").get_json()["result"]
+    assert result["status"] == "completed"
+    assert result["estimated_cost_usd"] == "0.17"
+    assert result["cost_usd"] == 0.12
+    assert observed["cloud_options"]["chunk_minutes"] == 1
+    assert observed["cloud_options"]["overlap_sec"] == 10
+    assert str(observed["cloud_options"]["max_cost_usd"]) == "1"
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize("endpoint", ["estimate", "start"])
+@pytest.mark.parametrize("rate,limit,status", [("0", "1", 400), ("0.06", "0.16", 409)])
+def test_preflight_blocks_unknown_or_over_budget_before_acceptance(
+    controller, monkeypatch, endpoint, rate, limit, status
+):
+    client, services = controller
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", rate)
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", limit)
+    response = client.post(f"/stage2/final-review/{endpoint}", json=_start_payload())
+    assert response.status_code == status
+    assert services._FINAL_REVIEW_JOBS == {}
+    assert services._FINAL_REVIEW_ACTIVE_PROJECTS == set()
+    assert services._test_usage == []
+
+
+def test_start_rejects_changed_confirmation_and_invalid_estimate(controller):
+    client, services = controller
+    assert (
+        client.post(
+            "/stage2/final-review/start", json=_start_payload(confirmed_estimate_usd="0.16")
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            "/stage2/final-review/start", json=_start_payload(confirmed_estimate_usd="NaN")
+        ).status_code
+        == 400
+    )
+    assert not services._test_pending
+
+
+def test_estimate_disabled_guard_allows_unknown_cost(controller, monkeypatch):
+    client, _services = controller
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0")
+    response = client.post("/stage2/final-review/estimate", json=_start_payload())
+    assert response.status_code == 200
+    assert response.get_json()["result"]["enforced"] is False
+    assert response.get_json()["result"]["estimated_cost_usd"] == "0"
+
+
+def test_cancel_queued_job_prevents_transcription_and_releases_project(controller):
+    client, services = controller
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+    cancelled = client.post(f"/stage2/final-review/jobs/{job_id}/cancel")
+    assert cancelled.status_code == 202
+    assert cancelled.get_json()["result"]["status"] == "cancelling"
+    services.transcribe_audio = lambda *_a, **_k: pytest.fail("cancelled job reached transcription")
+    _run_pending(services)
+    result = client.get(f"/stage2/final-review/jobs/{job_id}").get_json()["result"]
+    assert result["status"] == "cancelled"
+    assert not any(
+        path == services._test_paths["final_review_report"] for path, _ in services._test_writes
+    )
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "interrupted"])
+def test_terminal_cancel_is_unchanged_and_idempotent(controller, status):
+    client, services = controller
+    job = {
+        "id": "terminal",
+        "project": "demo",
+        "status": status,
+        "message": "existing",
+        "cost_usd": 0.04,
+    }
+    services._FINAL_REVIEW_JOBS["terminal"] = dict(job)
+    before = list(services._test_writes)
+    for _attempt in range(2):
+        response = client.post("/stage2/final-review/jobs/terminal/cancel")
+        assert response.status_code == 200
+        assert response.get_json()["result"] == job
+    assert services._test_writes == before
+    assert client.post("/stage2/final-review/jobs/absent/cancel").status_code == 404
+
+
+def test_cancel_after_transcription_prevents_artifact_writes_and_retains_spend(controller):
+    client, services = controller
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+
+    def transcribe(_path, **options):
+        assert options["cancel_event"] is services._FINAL_REVIEW_CANCEL_EVENTS[job_id]
+        client.post(f"/stage2/final-review/jobs/{job_id}/cancel")
+        return {"backend": "cloud-audio", "backend_metadata": {"cost_usd": 0.07}}
+
+    services.transcribe_audio = transcribe
+    services.save_word_index = lambda *_args: pytest.fail("cancelled job wrote word index")
+    _run_pending(services)
+    job = client.get(f"/stage2/final-review/jobs/{job_id}").get_json()["result"]
+    assert job["status"] == "cancelled"
+    assert job["cost_usd"] == 0.07
+    assert services._test_usage[-1]["cost_usd"] == 0.07
+    _assert_released(services, job_id)
+
+
+def test_whole_job_deadline_starts_before_worker_queue(controller, monkeypatch):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+    clock[0] = 106.0
+    observed = {}
+
+    def transcribe(_path, **options):
+        observed.update(options)
+        return {"backend": "local"}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert observed["deadline_monotonic"] == 110.0
+    assert services._FINAL_REVIEW_JOBS[job_id]["status"] == "completed"
+    _assert_released(services, job_id)
+
+
+def test_expired_queue_deadline_fails_before_transcription(controller, monkeypatch):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+    clock[0] = 111.0
+    services.transcribe_audio = lambda *_a, **_k: pytest.fail("expired job reached transcription")
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == "failed"
+    assert "deadline" in job["error"].lower()
+    assert job["estimated_cost_usd"] == "0.17"
+    assert job["cost_usd"] == 0
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize(
+    "exception,status", [(WhisperTimeoutError, "failed"), (WhisperCancelledError, "cancelled")]
+)
+def test_process_stop_retains_spent_and_reserved_cost(controller, exception, status):
+    client, services = controller
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+
+    def transcribe(*_args, **_options):
+        error = exception("stopped")
+        error.cost_usd, error.reserved_cost_usd, error.cost_limit_usd = 0.03, 0.06, 1.0
+        raise error
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == status
+    assert job["cost_usd"] == 0.03
+    assert job["reserved_cost_usd"] == 0.06
+    assert job["cost_limit_usd"] == 1.0
+    assert job["estimated_cost_usd"] == "0.17"
+    assert services._test_usage[-1]["cost_usd"] == 0.03
+    _assert_released(services, job_id)
+
+
+def test_progress_persists_latest_budget_at_bounded_cadence(controller, monkeypatch):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+
+    def transcribe(_path, *, progress_callback, budget_callback, **_options):
+        budget_callback(
+            {"spent_usd": 0.02, "reserved_usd": 0.06, "limit_usd": 1.0, "total_usd": 0.08}
+        )
+        before = len(services._test_writes)
+        for processed in range(1, 101):
+            progress_callback(float(processed), 150.0, processed)
+        assert len(services._test_writes) <= before + 1
+        clock[0] += 1.1
+        progress_callback(120.0, 150.0, 42)
+        persisted = services._test_writes[-1][1]
+        assert persisted["transcription_processed_sec"] == 120.0
+        assert persisted["transcription_duration_sec"] == 150.0
+        assert persisted["cost_usd"] == 0.02
+        assert persisted["reserved_cost_usd"] == 0.06
+        assert persisted["cost_limit_usd"] == 1.0
+        raise RuntimeError("after progress")
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == "failed"
+    assert job["cost_usd"] == 0.02
+    assert job["reserved_cost_usd"] == 0.06
+    _assert_released(services, job_id)
+
+
+def test_local_preflight_ignores_cloud_rate_configuration(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "not-a-rate")
+    monkeypatch.setattr("stage2.whisper_runner.available_backends", lambda: ["faster-whisper"])
+    payload = _start_payload(backend="faster-whisper")
+    response = client.post("/stage2/final-review/estimate", json=payload)
+    assert response.status_code == 200
+    assert response.get_json()["result"] == {
+        "duration": 150.0,
+        "duration_sec": 150.0,
+        "planned_chunks": 0,
+        "estimated_cost_usd": "0",
+        "cost_limit_usd": 1.0,
+        "enforced": False,
+    }
+    assert client.post("/stage2/final-review/start", json=payload).status_code == 202
+    assert services._test_pending[-1].kwargs["backend"] == "faster-whisper"
+
+
+def test_worker_start_failure_marks_job_failed_and_cleans_runtime(controller):
+    client, services = controller
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread capacity exhausted")
+
+    services.threading.Thread = FailingThread
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    assert response.status_code == 500
+    job = next(iter(services._FINAL_REVIEW_JOBS.values()))
+    assert job["status"] == "failed"
+    assert "thread capacity" in job["error"]
+    _assert_released(services, job["id"])
+
+
+def test_manifest_conflict_still_returns_409_and_releases_project(controller):
+    client, services = controller
+    services.build_assembly_manifest = lambda **_options: (_ for _ in ()).throw(
+        ValueError("snapshot changed")
+    )
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    assert response.status_code == 409
+    assert not services._FINAL_REVIEW_ACTIVE_PROJECTS
+    assert not services._FINAL_REVIEW_CANCEL_EVENTS
+
+
+def test_cancel_during_report_generation_prevents_artifact_commit(controller):
+    client, services = controller
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+    artifacts = []
+    services.save_word_index = lambda path, _index: artifacts.append(path)
+
+    def review(_timeline, _index):
+        client.post(f"/stage2/final-review/jobs/{job_id}/cancel")
+        return {"corrections": []}
+
+    services.review_rendered_timeline = review
+    _run_pending(services)
+    assert services._FINAL_REVIEW_JOBS[job_id]["status"] == "cancelled"
+    assert artifacts == []
+    assert not any(
+        path == services._test_paths["final_review_report"] for path, _ in services._test_writes
+    )
+    _assert_released(services, job_id)
+
+
+def test_unknown_cloud_usage_stays_pending_in_usage_ledger(controller):
+    client, services = controller
+    client.post("/stage2/final-review/start", json=_start_payload())
+    services.transcribe_audio = lambda *_a, **_k: {
+        "backend": "cloud-audio",
+        "backend_metadata": {"cost_usd": None, "reserved_cost_usd": 0.17},
+    }
+    _run_pending(services)
+    assert services._test_usage[-1]["cost_usd"] is None
+    job = next(iter(services._FINAL_REVIEW_JOBS.values()))
+    assert job["cost_usd"] == 0
+    assert job["reserved_cost_usd"] == 0.17
+
+
+def test_cancel_restored_terminal_checkpoint_is_idempotent(controller):
+    client, services = controller
+    checkpoint = {"id": "disk", "project": "demo", "status": "completed", "cost_usd": 0.04}
+    services._read_json_safe = lambda _path: checkpoint
+    response = client.post("/stage2/final-review/jobs/disk/cancel?project=demo")
+    assert response.status_code == 200
+    assert response.get_json()["result"] == checkpoint
+    assert services._test_writes == []
+
+
+def test_local_failure_does_not_add_provider_usage(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setattr("stage2.whisper_runner.available_backends", lambda: ["faster-whisper"])
+    client.post("/stage2/final-review/start", json=_start_payload(backend="faster-whisper"))
+    services.transcribe_audio = lambda *_a, **_k: (_ for _ in ()).throw(
+        RuntimeError("local inference failed")
+    )
+    _run_pending(services)
+    job = next(iter(services._FINAL_REVIEW_JOBS.values()))
+    assert job["status"] == "failed"
+    assert services._test_usage == []
+    _assert_released(services, job["id"])
+
+
+def test_accepted_wav_duration_is_frozen_in_cloud_execution_options(controller):
+    client, services = controller
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    assert response.status_code == 202
+    observed = {}
+
+    def transcribe(_path, **options):
+        observed.update(options)
+        return {"backend": "cloud-audio"}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert observed["cloud_options"]["duration_sec"] == 150.0
+
+
+def test_stale_confirmation_detects_rate_change_below_float_precision(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.060000000000000001")
+    first = client.post("/stage2/final-review/estimate", json=_start_payload())
+    assert first.status_code == 200
+    confirmed = first.get_json()["result"]["estimated_cost_usd"]
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.060000000000000002")
+    response = client.post(
+        "/stage2/final-review/start", json=_start_payload(confirmed_estimate_usd=confirmed)
+    )
+    assert response.status_code == 409
+    assert services._FINAL_REVIEW_JOBS == {}
+
+
+def test_estimate_and_jobs_keep_canonical_decimal_strings(controller, monkeypatch):
+    client, services = controller
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.060000000000000001")
+    result = client.post("/stage2/final-review/estimate", json=_start_payload()).get_json()[
+        "result"
+    ]
+    assert result["estimated_cost_usd"] == "0.1700000000000000028333333334"
+    response = client.post(
+        "/stage2/final-review/start",
+        json=_start_payload(
+            confirmed_estimate_usd="0.1700000000000000028333333334",
+        ),
+    )
+    assert response.status_code == 202
+    job = services._FINAL_REVIEW_JOBS[response.get_json()["result"]["job_id"]]
+    assert job["estimated_cost_usd"] == "0.1700000000000000028333333334"
+
+
+@pytest.mark.parametrize("phase", ["words", "report"])
+def test_deadline_during_artifact_write_never_completes(controller, monkeypatch, phase):
+    client, services = controller
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+    paths = services._test_paths
+    if phase == "words":
+        services.save_word_index = lambda *_args: clock.__setitem__(0, 111.0)
+    else:
+        original_write = services._atomic_write_json_file
+
+        def write(path, payload):
+            original_write(path, payload)
+            if path == paths["final_review_report"]:
+                clock[0] = 111.0
+
+        services._atomic_write_json_file = write
+    _run_pending(services)
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == "failed"
+    assert "deadline" in job["error"].lower()
+    if phase == "words":
+        assert not any(path == paths["final_review_report"] for path, _ in services._test_writes)
+    assert not any(payload.get("status") == "completed" for _path, payload in services._test_writes)
+    _assert_released(services, job_id)
+
+
+def test_cancel_during_word_artifact_write_stops_before_report(controller):
+    client, services = controller
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+    services.save_word_index = lambda *_args: services._FINAL_REVIEW_CANCEL_EVENTS[job_id].set()
+    _run_pending(services)
+    assert services._FINAL_REVIEW_JOBS[job_id]["status"] == "cancelled"
+    assert not any(
+        path == services._test_paths["final_review_report"] for path, _ in services._test_writes
+    )
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize(
+    "spent,reserved,stop",
+    [
+        (None, 0.17, "completed"),
+        (0.03, 0.06, "completed"),
+        (0.03, 0.06, "after-result"),
+        (0.03, 0.06, "cancelled"),
+    ],
+)
+def test_real_usage_ledger_keeps_reserved_exposure_pending_once(controller, spent, reserved, stop):
+    import json
+    from decimal import Decimal
+    from openrouter_usage import make_usage_callback, usage_summary
+
+    client, services = controller
+    ledger = services._test_paths["work"] / "usage.json"
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(
+        ledger, **context
+    )
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+
+    def transcribe(*_args, **_options):
+        if stop == "cancelled":
+            error = WhisperCancelledError("stopped with a reservation")
+            error.cost_usd, error.reserved_cost_usd, error.cost_limit_usd = spent, reserved, 1.0
+            error.cost_pending = True
+            raise error
+        return {
+            "backend": "cloud-audio",
+            "backend_metadata": {
+                "cost_usd": spent,
+                "reserved_cost_usd": reserved,
+                "cost_limit_usd": 1.0,
+                "cost_pending": True,
+            },
+        }
+
+    services.transcribe_audio = transcribe
+    if stop == "after-result":
+        services.review_rendered_timeline = lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("report failed")
+        )
+    _run_pending(services)
+    summary = usage_summary(ledger)
+    assert summary["pending_count"] == 1
+    assert summary["total_cost_usd"] == (spent or 0)
+    data = json.loads(ledger.read_text())
+    pending = [event for event in data["events"] if event["status"] == "pending"]
+    assert len(pending) == 1
+    assert pending[0]["event_id"] == f"final-review-asr:{job_id}:reserved"
+    assert pending[0]["cost_usd"] is None
+    confirmed = [event for event in data["events"] if event["status"] == "confirmed"]
+    if spent:
+        assert len(confirmed) == 1
+        assert confirmed[0]["event_id"] == f"final-review-asr:{job_id}"
+        assert Decimal(confirmed[0]["cost_usd"]) == Decimal("0.03")
+    else:
+        assert confirmed == []
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize("reserve", [0.17, 0.0])
+def test_final_review_pending_reserve_survives_next_job_and_registry_reload(controller, reserve):
+    from openrouter_usage import make_usage_callback, usage_summary
+
+    client, services = controller
+    paths = services._test_paths
+    ledger = paths["work"] / "usage.json"
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(
+        ledger, **context
+    )
+    original_write = services._atomic_write_json_file
+    original_read = services._read_json_safe
+
+    def write(path, payload):
+        original_write(path, payload)
+        if path == paths["final_review_job_status"]:
+            path.write_text(json.dumps(payload))
+
+    services._atomic_write_json_file = write
+    services._read_json_safe = lambda path: (
+        json.loads(path.read_text())
+        if path == paths["final_review_job_status"] and path.exists()
+        else original_read(path)
+    )
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    job_id = response.get_json()["result"]["job_id"]
+
+    def transcribe(*_args, **options):
+        options["budget_callback"](
+            {"spent_usd": 0.03, "reserved_usd": reserve, "limit_usd": 1, "cost_pending": True}
+        )
+        raise WhisperCancelledError("cancelled after dispatch")
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert services._FINAL_REVIEW_JOBS[job_id]["status"] == "cancelled"
+    next_job = services._create_final_review_job("demo", paths["final_review_audio"], {})
+    services._update_final_review_job(next_job["id"], status="completed")
+    services._FINAL_REVIEW_JOBS.clear()
+    restored = client.get("/stage2/final-review/latest?project=demo").get_json()["result"]
+    assert restored["id"] == next_job["id"]
+    assert restored["id"] != job_id
+    pending = [
+        event for event in json.loads(ledger.read_text())["events"] if event["status"] == "pending"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["event_id"] == f"final-review-asr:{job_id}:reserved"
+    assert float(pending[0]["reserved_cost_usd"]) == reserve
+    assert pending[0]["cost_usd"] is None
+    assert usage_summary(ledger)["total_cost_usd"] == pytest.approx(0.03)
+    assert usage_summary(ledger)["reserved_cost_usd"] == reserve
+
+
+def test_real_local_process_error_preserves_limit_without_provider_usage(controller, monkeypatch):
+    import multiprocessing
+    from openrouter_usage import make_usage_callback, usage_summary
+    from stage2.whisper_process import WhisperProcessError, transcribe_audio_in_process
+
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("process-shaped local error regression requires fork")
+    client, services = controller
+    monkeypatch.setattr("stage2.whisper_runner.available_backends", lambda: ["faster-whisper"])
+    ledger = services._test_paths["work"] / "usage.json"
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(
+        ledger, **context
+    )
+    response = client.post(
+        "/stage2/final-review/start", json=_start_payload(backend="faster-whisper")
+    )
+    job_id = response.get_json()["result"]["job_id"]
+    process_errors = []
+
+    def transcribe(path, **options):
+        try:
+            return transcribe_audio_in_process(
+                path.with_name("missing.wav"),
+                timeout_seconds=2,
+                _start_method="fork",
+                **options,
+            )
+        except WhisperProcessError as error:
+            process_errors.append(error)
+            raise
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    assert len(process_errors) == 1
+    assert process_errors[0].cost_usd == 0
+    assert process_errors[0].reserved_cost_usd == 0
+    assert process_errors[0].cost_limit_usd == 0
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == "failed"
+    assert job["cost_limit_usd"] == 1.0
+    assert job["cost_usd"] == 0
+    assert job["reserved_cost_usd"] == 0
+    assert not ledger.exists()
+    assert usage_summary(ledger, create=False)["pending_count"] == 0
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize("provider_cost", [None, 0])
+@pytest.mark.parametrize("valid_transcript", [True, False])
+def test_disabled_guard_tracks_provider_cost_knowledge_through_real_process_and_ledger(
+    controller, monkeypatch, provider_cost, valid_transcript
+):
+    import json
+    import multiprocessing
+    import httpx
+    from openrouter_usage import make_usage_callback, usage_summary
+    from stage2 import cloud_asr
+    from stage2.whisper_process import _shutdown_worker, transcribe_audio_in_process
+
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("full cloud accounting regression requires inherited mock HTTP transport")
+    _shutdown_worker()
+    client, services = controller
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_API_KEY", "test-key")
+    ledger = services._test_paths["work"] / "usage.json"
+    services._make_openrouter_usage_callback = lambda _project, **context: make_usage_callback(
+        ledger, **context
+    )
+    actual_client = httpx.AsyncClient
+
+    async def extract(*_args):
+        return b"mp3"
+
+    async def handler(_request):
+        content = "[00:01] ГОЛОС 1: Готово" if valid_transcript else "invalid transcript"
+        response = {"choices": [{"message": {"content": content}}]}
+        if provider_cost is not None:
+            response["usage"] = {"cost": provider_cost}
+        return httpx.Response(200, json=response)
+
+    monkeypatch.setattr(cloud_asr.CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    monkeypatch.setattr(
+        cloud_asr.httpx,
+        "AsyncClient",
+        lambda **_kwargs: actual_client(transport=httpx.MockTransport(handler)),
+    )
+    response = client.post("/stage2/final-review/start", json=_start_payload())
+    assert response.status_code == 202
+    job_id = response.get_json()["result"]["job_id"]
+    process_signals = []
+    metadata_signals = []
+
+    def transcribe(path, **options):
+        try:
+            result = transcribe_audio_in_process(
+                path, timeout_seconds=2, _start_method="fork", **options
+            )
+        except Exception as error:
+            process_signals.append(getattr(error, "cost_pending", None))
+            raise
+        process_signals.append(result.get("cost_pending"))
+        metadata_signals.append(result["backend_metadata"].get("cost_pending"))
+        return result
+
+    services.transcribe_audio = transcribe
+    try:
+        _run_pending(services)
+    finally:
+        _shutdown_worker()
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == ("completed" if valid_transcript else "failed")
+    assert job["cost_usd"] == 0
+    assert job["reserved_cost_usd"] == 0
+    assert usage_summary(ledger)["pending_count"] == (1 if provider_cost is None else 0)
+    events = json.loads(ledger.read_text())["events"]
+    if provider_cost is None:
+        assert len(events) == 1
+        assert events[0]["status"] == "pending"
+        assert events[0]["cost_usd"] is None
+        assert events[0]["event_id"] == f"final-review-asr:{job_id}:reserved"
+    else:
+        assert len(events) == 1
+        assert events[0]["status"] == "confirmed"
+        assert float(events[0]["cost_usd"]) == 0
+    assert process_signals == [provider_cost is None]
+    if valid_transcript:
+        assert metadata_signals == [provider_cost is None]
+    assert job["cost_pending"] is (provider_cost is None)
+    _assert_released(services, job_id)
+
+
+@pytest.mark.parametrize(
+    "limit, expected_status",
+    [
+        ("0.4001999999999999848333333333", 409),
+        ("0.4001999999999999848333333334", 200),
+    ],
+)
+def test_final_review_per_chunk_decimal_rounding_matches_exact_dispatch_cap(
+    controller,
+    monkeypatch,
+    limit,
+    expected_status,
+):
+    from decimal import Decimal
+    from cost_budget import CostBudget
+    from stage2.cloud_asr import plan_cloud_chunks
+
+    client, services = controller
+    audio = services._test_paths["final_review_audio"]
+    with wave.open(str(audio), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(1)
+        target.writeframes(b"\0\0" * 2401)
+    services.FullTimeline = SimpleNamespace(
+        from_dict=lambda _payload: SimpleNamespace(total_duration_sec=2401)
+    )
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", limit)
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.01")
+    payload = _start_payload(cloud_options={"chunk_minutes": 20, "overlap_sec": 0.1})
+    estimate = client.post("/stage2/final-review/estimate", json=payload)
+    assert estimate.status_code == expected_status, estimate.get_json()
+    if expected_status == 409:
+        response = client.post("/stage2/final-review/start", json=payload)
+        assert response.status_code == 409
+        assert not services._FINAL_REVIEW_JOBS
+        assert not services._FINAL_REVIEW_ACTIVE_PROJECTS
+        assert not services._test_pending
+        return
+
+    expected_estimate = "0.4001999999999999848333333334"
+    assert estimate.get_json()["result"]["estimated_cost_usd"] == expected_estimate
+    payload["confirmed_estimate_usd"] = expected_estimate
+    response = client.post("/stage2/final-review/start", json=payload)
+    assert response.status_code == 202, response.get_json()
+    dispatched = []
+
+    def transcribe(_path, **options):
+        cloud_options = options["cloud_options"]
+        budget = CostBudget(
+            Decimal(cloud_options["max_cost_usd"]),
+            Decimal(cloud_options["usd_per_minute_estimate"]),
+        )
+        for start, end in plan_cloud_chunks(
+            cloud_options["duration_sec"],
+            cloud_options["chunk_minutes"],
+            cloud_options["overlap_sec"],
+        ):
+            budget.reserve_attempt(end - start)
+        dispatched.append(cloud_options["max_cost_usd"])
+        return {"backend": "cloud-audio", "backend_metadata": {"cost_usd": 0.1}}
+
+    services.transcribe_audio = transcribe
+    _run_pending(services)
+    job_id = response.get_json()["result"]["job_id"]
+    job = services._FINAL_REVIEW_JOBS[job_id]
+    assert job["status"] == "completed"
+    assert job["estimated_cost_usd"] == expected_estimate
+    assert dispatched == [limit]
+    _assert_released(services, job_id)

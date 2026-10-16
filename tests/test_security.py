@@ -4,11 +4,15 @@ import base64
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+import pytest
 
 import api
 import macos_connector
@@ -375,3 +379,83 @@ class ContainerSecurityConfigurationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_runtime_requests_pin_is_patched() -> None:
+    from packaging.version import Version
+
+    pins = []
+    for filename in ("requirements.txt", "requirements-lock.txt"):
+        matches = [
+            line.split("==", 1)[1]
+            for line in (ROOT_DIR / filename).read_text().splitlines()
+            if line.lower().startswith("requests==")
+        ]
+        assert len(matches) == 1, f"expected one Requests pin in {filename}"
+        pins.append(matches[0])
+
+    assert pins[0] == pins[1]
+    assert Version(pins[0]) >= Version("2.32.4")
+
+
+def test_runtime_ci_checks_production_asr_dependencies() -> None:
+    workflow = (ROOT_DIR / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    match = re.search(r"^  runtime-smoke:\n(?P<job>.*?)(?=^  \S|\Z)", workflow, re.M | re.S)
+    assert match is not None, "production dependencies need a separate runtime-smoke job"
+    job = match.group("job")
+    assert "runs-on: ubuntu-latest" in job
+    assert 'python-version: "3.11"' in job
+    assert "cache: pip" in job
+    assert "requirements.txt" in job and "requirements-whisper.txt" in job
+    assert "python -m pip install -r requirements.txt -r requirements-whisper.txt" in job
+    assert "python tests/runtime_import_smoke.py" in job
+    assert "SYNC_WHISPER_BACKEND: faster-whisper" in job
+    assert "docker build ." in job
+    assert (ROOT_DIR / "tests/runtime_import_smoke.py").is_file()
+
+
+@pytest.mark.parametrize("resolved_backend", ["faster-whisper", "openai-whisper"])
+def test_runtime_smoke_requires_application_faster_whisper_backend(resolved_backend: str) -> None:
+    # The verify job intentionally has no ASR dependency. Only replace the external
+    # import and resolver result; execute the smoke's real acceptance check.
+    with (
+        patch.dict(sys.modules, {"faster_whisper": SimpleNamespace()}),
+        patch("stage2.whisper_runner.resolve_backend", return_value=resolved_backend),
+    ):
+        if resolved_backend == "faster-whisper":
+            runpy.run_path(str(ROOT_DIR / "tests/runtime_import_smoke.py"), run_name="__main__")
+        else:
+            with pytest.raises(AssertionError, match="faster-whisper"):
+                runpy.run_path(str(ROOT_DIR / "tests/runtime_import_smoke.py"), run_name="__main__")
+
+
+def test_final_review_operator_docs_cover_recovery_and_cost_contracts() -> None:
+    readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+    guide = (ROOT_DIR / "docs/STAGE1_GUIDE.md").read_text(encoding="utf-8")
+    for document in (readme, guide):
+        for contract in (
+            "/stage2/final-review/estimate",
+            "/stage2/final-review/latest?project=",
+            "/stage2/final-review/jobs/<job_id>/cancel",
+            "FINAL_REVIEW_TIMEOUT_SECONDS",
+            "7200",
+            "ROUGH_CUT_MAX_USD_PER_JOB",
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE",
+            "confirmed_estimate_usd",
+            "reserved_cost_usd",
+            "cost_pending",
+        ):
+            assert contract in document, f"operator documentation missing {contract}"
+    checklist = (ROOT_DIR / "docs/E2E_PILOT_CHECKLIST.md").read_text(encoding="utf-8")
+    for contract in (
+        "confirmed_estimate_usd",
+        "3, 6, 12, 24, 30",
+        "Retry",
+        "Cancel",
+        "sequenceId",
+        "request_id",
+        "interrupted",
+        "cost_pending",
+    ):
+        assert contract in checklist, f"E2E final review coverage missing {contract}"
+    assert "тихий отказ" not in checklist

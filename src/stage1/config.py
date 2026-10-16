@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+from decimal import Decimal, InvalidOperation
 from collections.abc import Mapping
 
 
@@ -48,6 +49,42 @@ def validate_env(environ: Mapping[str, str] | None = None) -> list[str]:
         if value < minimum or (maximum is not None and value > maximum):
             range_text = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
             warnings.append(f"{name} must be {range_text}; the value will be adjusted")
+
+    def nonnegative_decimal(name: str) -> Decimal | None:
+        raw = str(env.get(name, "")).strip()
+        if not raw:
+            return None
+        try:
+            value = Decimal(raw)
+        except InvalidOperation:
+            warnings.append(f"{name} must be a non-negative decimal; the default will be used")
+            return None
+        if not value.is_finite() or value < 0:
+            warnings.append(f"{name} must be a non-negative decimal; the default will be used")
+            return None
+        return value
+
+    final_review_timeout = str(env.get("FINAL_REVIEW_TIMEOUT_SECONDS", "")).strip()
+    if final_review_timeout:
+        try:
+            deadline = int(final_review_timeout)
+        except ValueError:
+            warnings.append(
+                "FINAL_REVIEW_TIMEOUT_SECONDS must be a positive integer; the default 7200 will be used"
+            )
+        else:
+            if deadline <= 0:
+                warnings.append(
+                    "FINAL_REVIEW_TIMEOUT_SECONDS must be a positive integer; the default 7200 will be used"
+                )
+
+    cost_limit = nonnegative_decimal("ROUGH_CUT_MAX_USD_PER_JOB")
+    asr_estimate = nonnegative_decimal("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE")
+    if cost_limit is not None and cost_limit > 0 and (asr_estimate is None or asr_estimate <= 0):
+        warnings.append(
+            "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE must be positive when "
+            "ROUGH_CUT_MAX_USD_PER_JOB is positive"
+        )
 
     provider = str(env.get("TTS_PROVIDER", "openrouter")).strip().lower()
     if provider not in {"openrouter", "macos"}:

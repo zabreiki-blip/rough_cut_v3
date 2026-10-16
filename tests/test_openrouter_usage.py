@@ -93,6 +93,31 @@ def test_pending_tts_is_resolved_from_generation_metadata(tmp_path: Path) -> Non
     assert calls[0]["kwargs"]["params"] == {"id": "gen-tts"}
 
 
+@pytest.mark.parametrize("reserve", ["0.17", "0"])
+def test_pending_callback_persists_latest_reserve_separately_from_confirmed_spend(
+    tmp_path: Path, reserve: str
+) -> None:
+    path = tmp_path / "usage.json"
+    # Existing version-1 ledgers remain writable without losing history.
+    path.write_text(json.dumps({"schema_version": 1, "events": []}))
+    callback = make_usage_callback(path, stage="assembly", operation="asr", job_id="job-1")
+    callback({"event_id": "pending-1", "pending": True, "reserved_cost_usd": "0.20"})
+    callback({"event_id": "pending-1", "pending": True, "reserved_cost_usd": reserve})
+    callback({"event_id": "known-1", "cost_usd": "0.03"})
+
+    ledger = json.loads(path.read_text())
+    assert ledger["schema_version"] == 2
+    pending = next(event for event in ledger["events"] if event["status"] == "pending")
+    assert pending["reserved_cost_usd"] == reserve
+    assert pending["cost_usd"] is None
+    assert usage_summary(path)["total_cost_usd"] == pytest.approx(0.03)
+    assert usage_summary(path)["reserved_cost_usd"] == pytest.approx(float(reserve))
+
+    callback({"event_id": "pending-1", "cost_usd": "0.04"})
+    assert usage_summary(path)["total_cost_usd"] == pytest.approx(0.07)
+    assert usage_summary(path)["reserved_cost_usd"] == 0
+
+
 def test_corrupt_ledger_is_reported_and_not_overwritten(tmp_path: Path) -> None:
     path = tmp_path / "openrouter_usage.json"
     path.write_text("not-json", encoding="utf-8")

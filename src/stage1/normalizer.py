@@ -118,13 +118,35 @@ _TIMECODE_TOKEN = (
 _TIMECODE = re.compile(rf"({_TIMECODE_TOKEN})")
 _SYNC_METADATA = re.compile(
     r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*"
-    rf"(.{{2,160}}?)(?:,\s*|:\s*|\s+)({_TIMECODE_TOKEN})"
+    # The role fragment must stop at the first sentence-ending punctuation:
+    # a genuine speaker credit's role is a short noun phrase ("режиссер
+    # сериала", "поэт, издатель") and never spans a period or ellipsis. This
+    # keeps the pattern from matching ordinary prose that happens to contain
+    # an early comma and a timecode further along the same sentence (e.g.
+    # "То, что получилось у нас, это живая история... 00:03:04 Мы делали...").
+    rf"([^.…!?\n]{{2,160}}?)(?:,\s*|:\s*|\s+)({_TIMECODE_TOKEN})"
     r"[.\s–\-]*(.*)$",
     re.DOTALL,
 )
-_SYNC_LABEL_METADATA = re.compile(r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*(.{2,160})$")
+_SYNC_LABEL_METADATA = re.compile(
+    # The role, like in `_SYNC_METADATA` above, must not cross a
+    # sentence-ending boundary: a real "Name, role" credit's role is always
+    # a short noun phrase, never prose that happens to start with a comma
+    # (e.g. "То, что получилось у нас, это живая история...").
+    r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*([^.…!?\n]{2,160})$"
+)
 _SYNC_NAME_ONLY_LABEL = re.compile(
     r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*$"
+)
+# A paragraph that is *only* a sync label, with no colon and no quote --
+# e.g. "Синх Сторожевой" -- names the interviewee in the genitive case ahead
+# of a separate paragraph carrying the actual (often mid-sentence-timecoded)
+# quote. Recognized independently of the generic marker machinery below,
+# which requires an exact alias match and cannot absorb a trailing name.
+_SYNC_LABEL_ONLY_MARKER = re.compile(
+    r"^\s*(?:Синх|СНХ|Синхрон)\s+"
+    r"([А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)*)\s*$",
+    re.IGNORECASE,
 )
 _SYNC_CONTINUATION_NOTE = re.compile(r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE)
 _EDITORIAL_TIMECODE_PREFIX = re.compile(
@@ -827,17 +849,34 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
         _validate_structure(value)
     except NormalizationValidationError as exc:
         errors.extend(exc.errors)
+    blocks_by_uid = {block.uid: block for block in value.blocks}
     for block in value.blocks:
+        if block.absorbed_by_uid:
+            target = blocks_by_uid.get(block.absorbed_by_uid)
+            if (
+                block.type not in {BlockType.VOICEOVER.value, BlockType.TECHNICAL.value}
+                or target is None
+                or target.uid == block.uid
+                or target.type != BlockType.VOICEOVER.value
+                or target.absorbed_by_uid
+            ):
+                errors.append(f"Block {block.order} has an invalid absorbed-by link")
+            if block.text_for_tts.strip():
+                errors.append(f"Block {block.order} is absorbed but still has TTS text")
         if block.type == BlockType.UNKNOWN.value:
             errors.append(f"Block {block.order} has unknown type")
-        if block.type == BlockType.VOICEOVER.value and not block.text_for_tts.strip():
+        if (
+            block.type == BlockType.VOICEOVER.value
+            and not block.absorbed_by_uid
+            and not block.text_for_tts.strip()
+        ):
             errors.append(f"Voiceover block {block.order} has empty TTS text")
         if (
             block.type == BlockType.VOICEOVER.value
             and clean_voiceover_tts_text(block.text_for_tts) != block.text_for_tts.strip()
         ):
             errors.append(f"Voiceover block {block.order} contains a speech-direction cue")
-        if block.type == BlockType.VOICEOVER.value:
+        if block.type == BlockType.VOICEOVER.value and not block.absorbed_by_uid:
             label, content = _split_label(block.original_text)
             marked_cue = normalize_marker(label) in _BUILTIN_MARKERS and (
                 _EDITORIAL_VOICEOVER_CUE.match(content)
@@ -846,6 +885,10 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
             if _EDITORIAL_VOICEOVER_CUE.match(block.original_text.strip()) or marked_cue:
                 errors.append(f"Voiceover block {block.order} contains an editorial cue")
         if block.type == BlockType.SYNC.value:
+            if not block.speaker.strip():
+                errors.append(f"Sync block {block.order} has no speaker")
+            elif re.search(r"\b(?:читает|по[её]т)\s*$", block.speaker, re.IGNORECASE):
+                errors.append(f"Sync block {block.order} has a direction instead of a speaker")
             if block.original_text.strip().endswith(":") and not _TIMECODE.search(
                 block.original_text
             ):
@@ -1038,14 +1081,27 @@ def _annotate_continuation_context(
     blocks: list[NormalizedBlock], video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
 ) -> None:
     previous: NormalizedBlock | None = None
-    previous_sync: NormalizedBlock | None = None
     for block in blocks:
         if (
             previous is not None
             and block.type == BlockType.UNKNOWN.value
             and not block.original_label
             and previous.type == BlockType.SYNC.value
-            and _looks_like_sync_continuation(block.original_text)
+            and (
+                _looks_like_sync_continuation(block.original_text)
+                # A label-only carrier ("Синх Сторожевой") is immediately
+                # followed by the actual quote, whose timecode is often
+                # buried mid-sentence rather than leading the paragraph.
+                # Restricted to that specific carrier form (not just any
+                # sync block with a speaker) so an ordinary voiceover/cue
+                # paragraph that merely mentions a timecode somewhere in
+                # its text, after an unrelated sync, is not swept in too.
+                or (
+                    previous.speaker
+                    and _SYNC_LABEL_ONLY_MARKER.match(previous.original_text.strip())
+                    and _TIMECODE.search(block.original_text)
+                )
+            )
         ):
             block.continuation_of_type = BlockType.SYNC.value
             if not block.suggested_type:
@@ -1083,17 +1139,19 @@ def _annotate_continuation_context(
                 DecisionSource.BUILTIN_RULE.value,
                 0.9,
             )
-        # A scenario editor often marks the next quote only as "СНХ" (or
-        # leaves a bare timecode) after naming the interviewee once. Treat it
-        # as another independently searchable edit from that interview, not as
-        # a chronological continuation of the previous source range.
+        # A bare timecoded quote can inherit the interviewee only from the
+        # immediately preceding sync. A cue or narration in between makes
+        # that attribution uncertain and requires an explicit speaker.
         if block.type == BlockType.SYNC.value:
-            if block.speaker:
-                previous_sync = block
-            elif previous_sync is not None:
+            if (
+                not block.speaker
+                and previous is not None
+                and previous.type == BlockType.SYNC.value
+                and previous.speaker
+            ):
                 block.continuation_of_type = BlockType.SYNC.value
-                block.speaker = previous_sync.speaker
-                block.role = previous_sync.role
+                block.speaker = previous.speaker
+                block.role = previous.role
         previous = block
 
 
@@ -1331,6 +1389,50 @@ def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
     return bool(re.match(rf"^\s*[-–—]\s*{_TIMECODE_TOKEN}", after))
 
 
+# Closed set of common pronouns/conjunctions that can start a sentence and
+# therefore satisfy `_SYNC_NAME_ONLY_LABEL`/`_SYNC_LABEL_METADATA` purely by
+# capitalization, without being an actual speaker name (e.g. "То, что
+# получилось у нас, это живая история... 00:03:04 Мы делали...").
+_SYNC_CANDIDATE_STOPWORDS = {
+    "то",
+    "это",
+    "она",
+    "он",
+    "они",
+    "мы",
+    "вы",
+    "я",
+    "но",
+    "и",
+    "а",
+    "да",
+    "нет",
+    "там",
+    "тут",
+    "так",
+    "кто",
+    "что",
+    "его",
+    "её",
+    "их",
+    "тот",
+    "та",
+    "те",
+    "этот",
+}
+
+
+def _looks_like_plausible_sync_credit(candidate: str) -> bool:
+    """Reject a speaker-name/credit match whose first word is a bare
+    sentence-leading pronoun or conjunction rather than a plausible name.
+    Used only where the candidate was carved out of free-form prose (as
+    opposed to an already-isolated label), so a real multi-word name such as
+    "Мария Смольникова" is unaffected.
+    """
+    first_word = candidate.split(",", 1)[0].strip().split(" ")[:1]
+    return not first_word or first_word[0].casefold() not in _SYNC_CANDIDATE_STOPWORDS
+
+
 def _starts_with_unambiguous_timecode(text: str) -> bool:
     """Recognize a bare timecode without mistaking a prose-leading date for one."""
     stripped = text.lstrip()
@@ -1399,12 +1501,16 @@ def _split_label(text: str) -> tuple[str, str]:
         content = speaker.group(2).strip()
         sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
         if (
-            _SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate)
-        ) and _TIMECODE.match(sync_content):
+            (_SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate))
+            and _looks_like_plausible_sync_credit(candidate)
+            and _TIMECODE.match(sync_content)
+        ):
             return candidate, content
     clear_speaker = _CLEAR_SPEAKER_CREDIT.match(text)
-    if clear_speaker and not re.match(
-        r"^(?:голос|зк|зтм|титр)\b", clear_speaker.group("speaker"), re.IGNORECASE
+    if (
+        clear_speaker
+        and not re.match(r"^(?:голос|зк|зтм|титр)\b", clear_speaker.group("speaker"), re.IGNORECASE)
+        and _looks_like_plausible_sync_credit(clear_speaker.group("speaker"))
     ):
         content = clear_speaker.group("content").strip()
         credit = clear_speaker.group("speaker").strip()
@@ -1422,7 +1528,9 @@ def _split_label(text: str) -> tuple[str, str]:
     )
     if timecoded_speaker:
         candidate = timecoded_speaker.group(1).strip()
-        if _SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate):
+        if (
+            _SYNC_LABEL_METADATA.match(candidate) or _SYNC_NAME_ONLY_LABEL.match(candidate)
+        ) and _looks_like_plausible_sync_credit(candidate):
             return candidate, timecoded_speaker.group(2).strip()
     generic = re.match(r"^\s*([^:\n]{1,60}?)\s*:\s*(.+)$", text, flags=re.DOTALL)
     if generic:
@@ -1448,6 +1556,17 @@ def _classify_by_rules(
 ) -> None:
     marker = normalize_marker(block.original_label)
     stripped = block.original_text.strip()
+    label_only_sync = _SYNC_LABEL_ONLY_MARKER.match(stripped)
+    if label_only_sync:
+        # A label-only paragraph ("Синх Сторожевой") carries no quote of its
+        # own: it only announces the interviewee for the paragraph(s) that
+        # follow. Treat it as a (contentless) sync block so the speaker is
+        # available for continuation inheritance in
+        # ``_annotate_continuation_context``.
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+        block.speaker = label_only_sync.group(1).strip()
+        block.text_for_tts = ""
+        return
     if marker:
         exact = memory.resolve_exact(marker)
         if exact and exact.get("conflict"):
@@ -1620,13 +1739,14 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         elif name_only_match and _TIMECODE.match(fragment_source):
             block.speaker = block.original_label.strip()
             has_sync_metadata = True
-        elif (
-            block.continuation_of_type == BlockType.SYNC.value
-            and block.speaker
-            and _starts_with_unambiguous_timecode(fragment_source)
-        ):
-            # The preceding labelled sync supplied the interviewee.  Keep a
-            # bare timecoded paragraph as its own searchable source range.
+        elif block.continuation_of_type == BlockType.SYNC.value and block.speaker:
+            # The preceding labelled sync supplied the interviewee. Keep a
+            # timecoded paragraph as its own searchable source range --
+            # whether the timecode leads the paragraph (the older supported
+            # form) or sits mid-sentence (e.g. after a label-only "Синх
+            # <Фамилия>" carrier). ``_extract_sync_fragments`` below is a
+            # no-op when the text has no timecode at all, so this is safe
+            # even for a purely connective continuation paragraph.
             has_sync_metadata = True
         elif (
             block.original_label
@@ -1754,6 +1874,32 @@ def _canonicalize_timecode(value: str) -> str:
     return value
 
 
+def _llm_sync_suggestion_has_signal(block: NormalizedBlock, item: dict[str, Any]) -> bool:
+    """Decide whether a block has any real sync signal worth trusting an
+    LLM's "sync" verdict for: a timecode (in the source text or in what the
+    LLM itself returned), a recognizable speaker label/credit, or an
+    inherited speaker from an adjoining sync block. A plain narrated
+    sentence with none of these is never a sync, no matter what the LLM
+    guessed -- see `_apply_llm_results`.
+    """
+    if _TIMECODE.search(block.original_text):
+        return True
+    if str(item.get("timecode_start") or "").strip():
+        return True
+    if str(item.get("speaker") or "").strip():
+        return True
+    label = block.original_label
+    if label and (
+        _EXPLICIT_SYNC_LABEL.match(label)
+        or _SYNC_LABEL_METADATA.match(label)
+        or _SYNC_NAME_ONLY_LABEL.match(label)
+    ):
+        return True
+    if _SYNC_LABEL_ONLY_MARKER.match(block.original_text.strip()):
+        return True
+    return block.continuation_of_type == BlockType.SYNC.value
+
+
 def _apply_llm_results(
     blocks: list[NormalizedBlock],
     results: list[dict[str, Any]],
@@ -1775,6 +1921,18 @@ def _apply_llm_results(
         except (TypeError, ValueError):
             block.warnings.append(f"LLM returned invalid confidence {item.get('confidence')!r}")
             continue
+        if target_type == BlockType.SYNC.value and not _llm_sync_suggestion_has_signal(block, item):
+            # Never trust an LLM "sync" label on faith: a real sync always
+            # has a timecode somewhere, a recognizable speaker credit/label,
+            # or inherits one from an adjoining sync block. A plain ZK-style
+            # announcement sentence has none of those, so fall back to
+            # whatever type the block would have received without this LLM
+            # suggestion (the same unknown/technical-heuristic path used for
+            # a low-confidence or explicitly "unknown" result below).
+            block.warnings.append(
+                "LLM sync suggestion rejected: no timecode or recognizable speaker label"
+            )
+            target_type = BlockType.UNKNOWN.value
         if confidence < _LLM_CONFIDENCE_THRESHOLD or target_type == BlockType.UNKNOWN.value:
             # The LLM is unsure (or explicitly punted with "unknown"). Give
             # the builtin technical-cue heuristics one more chance before
@@ -2176,7 +2334,11 @@ def _validate_structure(scenario: NormalizedScenario) -> None:
 
 
 def _prepared_projection(scenario: NormalizedScenario) -> dict[str, Any]:
-    voiceovers = [block for block in scenario.blocks if block.type == BlockType.VOICEOVER.value]
+    voiceovers = [
+        block
+        for block in scenario.blocks
+        if block.type == BlockType.VOICEOVER.value and not block.absorbed_by_uid
+    ]
     return {
         "source": scenario.source,
         "used_llm": any(block.source == DecisionSource.LLM.value for block in scenario.blocks),
@@ -2214,6 +2376,8 @@ def _raw_projection(scenario: NormalizedScenario) -> str:
     }
     lines: list[str] = []
     for block in scenario.blocks:
+        if block.absorbed_by_uid:
+            continue
         counters[block.type] = counters.get(block.type, 0) + 1
         prefix = prefixes[block.type]
         lines.append(f"{prefix}{counters[block.type]}: {block.normalized_text}")

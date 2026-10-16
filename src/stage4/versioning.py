@@ -810,9 +810,9 @@ def _execution_plan(
         status = change["status"]
         if status in reusable:
             reuse_uids.append(_block_uid(block))
-            reuse_tts += int(block.get("type") == "voiceover")
+            reuse_tts += int(block.get("type") == "voiceover" and not block.get("absorbed_by_uid"))
             reuse_matches += int(block.get("type") == "sync")
-        elif block.get("type") == "voiceover":
+        elif block.get("type") == "voiceover" and not block.get("absorbed_by_uid"):
             new_tts += 1
         elif block.get("type") == "sync":
             rematch += 1

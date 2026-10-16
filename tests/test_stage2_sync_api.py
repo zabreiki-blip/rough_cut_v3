@@ -2192,7 +2192,12 @@ def test_sync_job_start_accepts_cloud_engine_and_forwards_cloud_backend(
 
 def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backend(
     sync_api,
+    monkeypatch,
 ) -> None:
+    from stage2 import whisper_runner
+
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "auto")
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: ["faster-whisper"])
     client, projects = sync_api
     _write_confirmed_normalization(projects)
     assert _post_source(client).status_code == 201
@@ -2240,8 +2245,7 @@ def test_sync_job_start_defaults_to_local_engine_without_activating_cloud_backen
     assert response.status_code == 200, response.get_json()
     job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
     assert job["asr_engine"] == "local"
-    assert captured_backend["backend"] is None
-    assert captured_backend["backend"] != "cloud-audio"
+    assert captured_backend["backend"] == "faster-whisper"
     assert captured_backend["model"] == "medium"
 
 
@@ -2298,3 +2302,670 @@ def test_sync_job_records_asr_cost_precision_and_wall_duration_metrics(
     assert job["transcription_wall_sec_total"] >= 0.0
     usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
     assert usage["total_cost_usd"] == pytest.approx(0.02)
+
+
+def _prepare_budget_sources(sync_api, durations):
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    for number, duration in enumerate(durations, 1):
+        source_id = f"budget_{number}"
+        assert _post_source(client, source_id).status_code == 201
+        response = client.put(
+            f"/stage2/sync-sources/{source_id}/audio",
+            data={
+                "project": "demo",
+                "audio": (BytesIO(_wav_bytes(duration, sample_rate=10)), "guide.wav"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 200
+    return client
+
+
+def _budget_transcript(cost_usd, reserved_cost_usd=0, cost_pending=False):
+    return {
+        "backend": "cloud-audio",
+        "model": "cloud-model",
+        "language": "ru",
+        "backend_metadata": {
+            "cost_usd": cost_usd,
+            "reserved_cost_usd": reserved_cost_usd,
+            "cost_pending": cost_pending,
+            "timestamp_precision": "interpolated",
+        },
+        "words": [{"word": "маленькая", "start": 0.0, "end": 0.5}],
+    }
+
+
+def test_sync_budget_preflight_sums_canonical_wav_durations_with_overlap(
+    sync_api,
+    monkeypatch,
+) -> None:
+    client = _prepare_budget_sources(sync_api, [1201, 61])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1.3220")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "60")
+    options = []
+
+    def transcribe(_path, **kwargs):
+        options.append(kwargs["cloud_options"])
+        return _budget_transcript(0)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    # 1201 + 60 repeated overlap + 61 = 1322 billed seconds at $0.001/sec.
+    assert job["estimated_cost_usd"] == "1.322"
+    assert job["transcription_duration_sec"] == 61
+    assert job["cost_limit_usd"] == pytest.approx(1.322)
+    assert job["cost_usd"] == 0
+    assert job["reserved_cost_usd"] == 0
+    assert job["cost_pending"] is False
+    assert [item["duration_sec"] for item in options] == [1201.0, 61.0]
+    assert all(item["chunk_minutes"] == 20 for item in options)
+    assert all(item["overlap_sec"] == 60 for item in options)
+    assert all(item["max_cost_usd"] == "1.3220" for item in options)
+    assert all(item["usd_per_minute_estimate"] == "0.06" for item in options)
+
+
+def test_sync_cost_limit_rejects_aggregate_before_reserving_or_creating_worker(
+    sync_api,
+    monkeypatch,
+) -> None:
+    client = _prepare_budget_sources(sync_api, [1201, 61])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1.3")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "60")
+    with (
+        patch.object(api, "_reserve_sync_project", side_effect=AssertionError("reserved")),
+        patch.object(api, "_create_sync_job", side_effect=AssertionError("created")),
+        patch.object(api.threading, "Thread", side_effect=AssertionError("worker created")),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    assert response.status_code == 409
+    assert "cost limit" in response.get_json()["error"]
+    assert not api._SYNC_ACTIVE_PROJECTS
+    assert not api._SYNC_JOBS
+
+
+def test_sync_budget_counts_each_source_delta_and_prior_unresolved_exposure(
+    sync_api,
+    monkeypatch,
+) -> None:
+    client = _prepare_budget_sources(sync_api, [60, 60, 60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    initials = []
+    results = [
+        _budget_transcript(0.1, 0.2, True),
+        _budget_transcript(0.5, 0.1, True),
+        _budget_transcript(0.65),
+    ]
+
+    def transcribe(_path, **kwargs):
+        cloud_options = kwargs["cloud_options"]
+        assert cloud_options["max_cost_usd"] == "1"
+        initials.append(cloud_options["initial_cost_usd"])
+        if len(initials) == 2:
+            kwargs["budget_callback"](
+                {
+                    "spent_usd": 0.45,
+                    "reserved_usd": 0.15,
+                    "limit_usd": 1,
+                    "cost_pending": True,
+                }
+            )
+        return results[len(initials) - 1]
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert initials == ["0", "0.3", "0.6"]
+    assert job["status"] == "completed"
+    assert job["cost_usd"] == pytest.approx(0.35)
+    assert job["asr_cost_usd_total"] == pytest.approx(0.35)
+    assert job["reserved_cost_usd"] == pytest.approx(0.3)
+    assert job["cost_pending"] is True
+    usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
+    assert usage["total_cost_usd"] == pytest.approx(0.35)
+    assert usage["pending_count"] == 2
+
+
+def test_sync_cost_limit_stops_before_dispatching_a_later_source(
+    sync_api,
+    monkeypatch,
+) -> None:
+    client = _prepare_budget_sources(sync_api, [60, 60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.2")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    dispatched = []
+
+    def transcribe(path, **_kwargs):
+        dispatched.append(Path(path).name)
+        return _budget_transcript(0.18)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert dispatched == ["budget_1.wav"]
+    assert job["status"] == "failed"
+    assert "cost limit" in job["error"]
+    assert job["cost_usd"] == pytest.approx(0.18)
+    assert job["reserved_cost_usd"] == 0
+    assert job["cost_pending"] is False
+    assert not api._SYNC_ACTIVE_PROJECTS
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+@pytest.mark.parametrize("accounting", ["exception", "callback"])
+def test_sync_budget_retains_cost_and_pending_fields_after_failure_or_cancellation(
+    sync_api,
+    monkeypatch,
+    status,
+    accounting,
+) -> None:
+    client = _prepare_budget_sources(sync_api, [60, 60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+
+    def transcribe(path, **kwargs):
+        if Path(path).name == "budget_1.wav":
+            return _budget_transcript(0.05)
+        exception = (
+            api.WhisperCancelledError("cancelled")
+            if status == "cancelled"
+            else RuntimeError("provider failed")
+        )
+        if accounting == "exception":
+            exception.cost_usd = 0.09
+            exception.reserved_cost_usd = 0.03
+            exception.cost_pending = True
+        else:
+            kwargs["budget_callback"](
+                {
+                    "spent_usd": 0.09,
+                    "reserved_usd": 0.03,
+                    "limit_usd": 1,
+                    "cost_pending": True,
+                }
+            )
+        raise exception
+
+    original_load_normalization = api.load_normalization
+    normalization_reads = 0
+
+    def load_normalization(path):
+        nonlocal normalization_reads
+        normalization_reads += 1
+        if normalization_reads > 1:
+            raise RuntimeError("matching failed")
+        return original_load_normalization(path)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api, "load_normalization", side_effect=load_normalization),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == status
+    assert job["cost_usd"] == pytest.approx(0.09)
+    assert job["reserved_cost_usd"] == pytest.approx(0.03)
+    assert job["cost_limit_usd"] == 1
+    assert job["cost_pending"] is True
+    assert job["asr_cost_usd_total"] == pytest.approx(0.09)
+    persisted = json.loads((sync_api[1] / "demo/work/sync_job_status.json").read_text())
+    assert persisted["cost_usd"] == pytest.approx(0.09)
+    assert persisted["reserved_cost_usd"] == pytest.approx(0.03)
+    assert persisted["cost_pending"] is True
+    usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
+    assert usage["total_cost_usd"] == pytest.approx(0.09)
+    assert usage["pending_count"] == 1
+
+
+@pytest.mark.parametrize("reserve", [0.17, 0.0])
+def test_sync_pending_reserve_survives_next_checkpoint_and_registry_reload(
+    sync_api, monkeypatch, reserve
+):
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+
+    def transcribe(_path, **options):
+        options["budget_callback"](
+            {"spent_usd": 0.03, "reserved_usd": reserve, "limit_usd": 1, "cost_pending": True}
+        )
+        raise api.WhisperCancelledError("cancelled after dispatch")
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start", json={"project": "demo", "asr_engine": "cloud"}
+        )
+    job_id = response.get_json()["result"]["job_id"]
+    assert api._SYNC_JOBS[job_id]["status"] == "cancelled"
+    next_job = api._create_sync_job("demo")
+    api._update_sync_job(next_job["id"], status="completed")
+    api._SYNC_JOBS.clear()
+    restored = client.get("/stage2/sync-jobs/status?project=demo").get_json()["result"]
+    assert restored["id"] == next_job["id"]
+    assert restored["id"] != job_id
+    ledger = json.loads(api._project_paths("demo")["openrouter_usage"].read_text())
+    pending = [event for event in ledger["events"] if event["status"] == "pending"]
+    assert len(pending) == 1
+    assert pending[0]["event_id"] == f"sync-asr:{job_id}:budget_1:reserved"
+    assert float(pending[0]["reserved_cost_usd"]) == reserve
+    assert pending[0]["cost_usd"] is None
+    usage = client.get("/stage1/openrouter-usage?project=demo").get_json()["result"]
+    assert usage["total_cost_usd"] == pytest.approx(0.03)
+    assert usage["reserved_cost_usd"] == reserve
+
+
+def test_sync_budget_preflight_skips_unselected_and_reusable_sources(sync_api, monkeypatch):
+    client = _prepare_budget_sources(sync_api, [60, 1201, 1201])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.06")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    assert (
+        client.put(
+            "/stage2/sync-sources/budget_2/words",
+            json={"project": "demo", "words": [{"word": "cached", "start": 0, "end": 1}]},
+        ).status_code
+        == 200
+    )
+    with (
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0.01)),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud", "source_ids": ["budget_1", "budget_2"]},
+        )
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["estimated_cost_usd"] == "0.06"
+    assert job["transcribed"] == 1
+    assert job["reused_indexes"] == 1
+
+
+@pytest.mark.parametrize("limit, expected_limit", [("invalid", 0), ("1", 1)])
+def test_sync_budget_cloud_configuration_does_not_block_local_asr(
+    sync_api,
+    monkeypatch,
+    limit,
+    expected_limit,
+):
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", limit)
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "invalid")
+    options = []
+
+    def transcribe(_path, **kwargs):
+        options.append(kwargs)
+        return {"backend": "faster-whisper", "words": [{"word": "local", "start": 0, "end": 1}]}
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["cost_limit_usd"] == expected_limit
+    assert "cloud_options" not in options[0]
+    assert "budget_callback" not in options[0]
+
+
+def test_sync_cost_limit_checks_cloud_backend_selected_by_environment(sync_api, monkeypatch):
+    client = _prepare_budget_sources(sync_api, [60, 60])
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "cloud")
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    with patch.object(api.threading, "Thread"):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 409
+    assert not api._SYNC_ACTIVE_PROJECTS
+    assert not api._SYNC_JOBS
+
+
+def test_sync_budget_explicit_local_backend_ignores_cloud_engine_configuration(
+    sync_api,
+    monkeypatch,
+):
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "invalid")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "invalid")
+    options = []
+
+    def transcribe(_path, **kwargs):
+        options.append(kwargs)
+        return {"backend": "faster-whisper", "words": [{"word": "local", "start": 0, "end": 1}]}
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={
+                "project": "demo",
+                "asr_engine": "cloud",
+                "backend": "faster-whisper",
+                "model": "medium",
+            },
+        )
+    assert response.status_code == 200, response.get_json()
+    assert options[0]["backend"] == "faster-whisper"
+    assert options[0]["model"] == "medium"
+    assert "cloud_options" not in options[0]
+
+
+def test_sync_budget_exact_fractional_overlap_limit_is_accepted_at_dispatch(sync_api, monkeypatch):
+    client = _prepare_budget_sources(sync_api, [1210.3])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1.210399999999999864")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "0.1")
+    dispatched = []
+
+    def transcribe(path, **_kwargs):
+        dispatched.append(Path(path).name)
+        return _budget_transcript(0.1)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["estimated_cost_usd"] == "1.210399999999999864"
+    assert job["status"] == "completed"
+    assert dispatched == ["budget_1.wav"]
+
+
+def test_sync_budget_freezes_cloud_backend_and_options_before_worker_start(sync_api, monkeypatch):
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "cloud")
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "20")
+    dispatched = []
+
+    class ConfigurationChangesBeforeStart(_ImmediateThread):
+        def start(self):
+            monkeypatch.setenv("SYNC_WHISPER_BACKEND", "faster-whisper")
+            monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "invalid")
+            monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "invalid")
+            monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "invalid")
+            super().start()
+
+    def transcribe(_path, **kwargs):
+        dispatched.append(kwargs)
+        return _budget_transcript(0.03)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", ConfigurationChangesBeforeStart),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert dispatched[0]["backend"] == "cloud-audio"
+    assert dispatched[0]["cloud_options"] == {
+        "max_cost_usd": "1",
+        "usd_per_minute_estimate": "0.06",
+        "initial_cost_usd": "0",
+        "duration_sec": 60,
+        "chunk_minutes": 20,
+        "overlap_sec": 20,
+    }
+
+
+def test_sync_budget_local_job_cannot_switch_to_cloud_after_preflight(sync_api, monkeypatch):
+    from stage2 import whisper_runner
+
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: ["faster-whisper"])
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "auto")
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.01")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    dispatched = []
+
+    class BackendChangesBeforeStart(_ImmediateThread):
+        def start(self):
+            monkeypatch.setenv("SYNC_WHISPER_BACKEND", "cloud-audio")
+            super().start()
+
+    def transcribe(_path, **kwargs):
+        dispatched.append(kwargs)
+        return {"backend": "faster-whisper", "words": [{"word": "local", "start": 0, "end": 1}]}
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", BackendChangesBeforeStart),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert dispatched[0]["backend"] == "faster-whisper"
+    assert "cloud_options" not in dispatched[0]
+    assert job["status"] == "completed"
+    assert job["cost_usd"] == 0
+
+
+def test_sync_budget_keeps_missing_audio_as_an_isolated_source_failure(sync_api, monkeypatch):
+    client = _prepare_budget_sources(sync_api, [60])
+    assert _post_source(client, "missing_audio").status_code == 201
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    dispatched = []
+
+    def transcribe(path, **_kwargs):
+        dispatched.append(Path(path).name)
+        return _budget_transcript(0.03)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert dispatched == ["budget_1.wav"]
+    assert job["source_failures"][0]["source_id"] == "missing_audio"
+    assert job["source_failures"][0]["error"]
+    assert job["cost_usd"] == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize("requested_backend", [None, "auto", "faster"])
+def test_sync_budget_freezes_checked_local_backend_during_worker_audio_signature(
+    sync_api,
+    monkeypatch,
+    requested_backend,
+):
+    from stage2 import whisper_runner
+
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "faster-whisper")
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "0.01")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: ["faster-whisper"])
+    original_config = api._transcription_config
+    original_signature = api._audio_cache_signature
+    checked_backends = []
+    dispatches = []
+
+    def transcription_config(**options):
+        config = original_config(**options)
+        checked_backends.append(config["backend"])
+        return config
+
+    def audio_signature(path):
+        # The worker checked its configuration before reading this signature.
+        monkeypatch.setenv("SYNC_WHISPER_BACKEND", "cloud-audio")
+        return original_signature(path)
+
+    def transcribe(_path, **options):
+        effective_backend = whisper_runner.resolve_backend(options["backend"])
+        dispatches.append((options["backend"], effective_backend))
+        assert "cloud_options" not in options
+        return {
+            "backend": effective_backend,
+            "words": [{"word": "local", "start": 0, "end": 1}],
+        }
+
+    payload = {"project": "demo"}
+    if requested_backend is not None:
+        payload["backend"] = requested_backend
+    with (
+        patch.object(api, "_transcription_config", side_effect=transcription_config),
+        patch.object(api, "_audio_cache_signature", side_effect=audio_signature),
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json=payload)
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert checked_backends == ["faster-whisper"]
+    assert dispatches == [("faster-whisper", "faster-whisper")]
+    assert job["status"] == "completed"
+    assert job["cost_usd"] == 0
+
+
+@pytest.mark.parametrize(
+    "limit, expected_http_status",
+    [
+        ("0.4001999999999999848333333333", 409),
+        ("0.4001999999999999848333333334", 200),
+    ],
+)
+def test_sync_budget_per_chunk_decimal_rounding_matches_dispatch_at_exact_cap(
+    sync_api,
+    monkeypatch,
+    limit,
+    expected_http_status,
+):
+    client = _prepare_budget_sources(sync_api, [2401])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", limit)
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.01")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "0.1")
+    dispatched = []
+
+    def transcribe(path, **_options):
+        dispatched.append(Path(path).name)
+        return _budget_transcript(0.1)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    assert response.status_code == expected_http_status, response.get_json()
+    if expected_http_status == 409:
+        assert dispatched == []
+        assert not api._SYNC_JOBS
+        assert not api._SYNC_ACTIVE_PROJECTS
+    else:
+        job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+        assert job["estimated_cost_usd"] == "0.4001999999999999848333333334"
+        assert job["status"] == "completed"
+        assert dispatched == ["budget_1.wav"]
+
+
+def test_sync_budget_cache_only_auto_job_needs_no_installed_local_backend(sync_api, monkeypatch):
+    from stage2 import whisper_runner
+
+    client = _prepare_budget_sources(sync_api, [60])
+    assert (
+        client.put(
+            "/stage2/sync-sources/budget_1/words",
+            json={"project": "demo", "words": [{"word": "cached", "start": 0, "end": 1}]},
+        ).status_code
+        == 200
+    )
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "auto")
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: [])
+    with (
+        patch.object(
+            api, "transcribe_audio", side_effect=AssertionError("transcription forbidden")
+        ) as transcribe,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["reused_indexes"] == 1
+    assert job["transcribed"] == 0
+    assert job["source_failures"] == []
+    transcribe.assert_not_called()
+
+
+def test_sync_budget_deferred_auto_resolution_stays_local_when_environment_changes(
+    sync_api,
+    monkeypatch,
+):
+    from stage2 import whisper_runner
+
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("SYNC_WHISPER_BACKEND", "auto")
+    monkeypatch.setattr(whisper_runner, "available_backends", lambda: [])
+    dispatched = []
+
+    class LocalBackendBecomesAvailableBeforeStart(_ImmediateThread):
+        def start(self):
+            monkeypatch.setattr(whisper_runner, "available_backends", lambda: ["faster-whisper"])
+            monkeypatch.setenv("SYNC_WHISPER_BACKEND", "cloud-audio")
+            super().start()
+
+    def transcribe(_path, **options):
+        dispatched.append(options["backend"])
+        assert whisper_runner.resolve_backend(options["backend"]) == "faster-whisper"
+        assert "cloud_options" not in options
+        return {"backend": "faster-whisper", "words": [{"word": "local", "start": 0, "end": 1}]}
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", LocalBackendBecomesAvailableBeforeStart),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert dispatched == ["faster-whisper"]
+    assert job["status"] == "completed"
+    assert job["transcribed"] == 1
+    assert job["cost_usd"] == 0

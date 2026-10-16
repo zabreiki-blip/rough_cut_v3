@@ -176,9 +176,14 @@
         <div class="card-body grid">
           <p class="section-copy">Экспортирует звук собранной sequence, сверяет речь с утверждённым сценарием и создаёт исправленную копию только для безопасных правок границ.</p>
           <div id="finalReviewStatus" class="operation-status" aria-live="polite">Откройте собранную sequence для проверки.</div>
+          <p id="finalReviewCost" class="hint" aria-live="polite">Перед запуском появится оценка стоимости и запрос подтверждения. Неизвестная стоимость — не лимит расходов.</p>
           <button id="startFinalReview" class="button button-primary full-width">Проверить собранный таймлайн</button>
           <button id="startFinalReviewFromWav" class="button button-secondary full-width">Запустить проверку из готового WAV</button>
           <button id="applyFinalReview" class="button button-secondary full-width" disabled>Создать исправленную итерацию</button>
+          <div class="button-row">
+            <button id="retryFinalReview" class="button button-secondary" type="button" hidden>Повторить запрос</button>
+            <button id="cancelFinalReview" class="button button-secondary" type="button" hidden>Остановить проверку</button>
+          </div>
         </div>
       </section>
 

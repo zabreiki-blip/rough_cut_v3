@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from functools import wraps
+import os
+from pathlib import Path
 from types import ModuleType
 
 from flask import Flask, jsonify, request
@@ -32,7 +34,18 @@ def _revision_speaker_dir(
     one-off operation.  The UI's historical default (``speaker/``) is
     redirected so V2 never publishes positional aliases into V1's folder.
     """
-    requested = services._abs_path(payload.get("speaker_dir", ""), paths["speaker"], paths["root"])
+    speaker_value = payload.get("speaker_dir", "")
+    host_projects_root = os.getenv("ROUGH_CUT_HOST_PROJECTS_ROOT", "").strip()
+    if speaker_value and host_projects_root:
+        try:
+            relative = Path(speaker_value).relative_to(
+                Path(host_projects_root) / paths["root"].name
+            )
+        except ValueError:
+            pass
+        else:
+            speaker_value = str(paths["root"] / relative)
+    requested = services._abs_path(speaker_value, paths["speaker"], paths["root"])
     # A restored TTS job may still supply the previous revision's alias dir.
     # Its prepared scenario is current, so writing there would leave the
     # active revision incomplete and make its asset manifest inconsistent.
