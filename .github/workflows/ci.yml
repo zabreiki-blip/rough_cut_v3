@@ -30,6 +30,7 @@ jobs:
       - name: Import production ASR without loading a model
         env:
           HF_HUB_OFFLINE: "1"
+          SYNC_WHISPER_BACKEND: faster-whisper
         run: python tests/runtime_import_smoke.py
 
       - name: Build production Docker image

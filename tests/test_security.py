@@ -4,11 +4,15 @@ import base64
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+import pytest
 
 import api
 import macos_connector
@@ -405,8 +409,24 @@ def test_runtime_ci_checks_production_asr_dependencies() -> None:
     assert "requirements.txt" in job and "requirements-whisper.txt" in job
     assert "python -m pip install -r requirements.txt -r requirements-whisper.txt" in job
     assert "python tests/runtime_import_smoke.py" in job
+    assert "SYNC_WHISPER_BACKEND: faster-whisper" in job
     assert "docker build ." in job
     assert (ROOT_DIR / "tests/runtime_import_smoke.py").is_file()
+
+
+@pytest.mark.parametrize("resolved_backend", ["faster-whisper", "openai-whisper"])
+def test_runtime_smoke_requires_application_faster_whisper_backend(resolved_backend: str) -> None:
+    # The verify job intentionally has no ASR dependency. Only replace the external
+    # import and resolver result; execute the smoke's real acceptance check.
+    with (
+        patch.dict(sys.modules, {"faster_whisper": SimpleNamespace()}),
+        patch("stage2.whisper_runner.resolve_backend", return_value=resolved_backend),
+    ):
+        if resolved_backend == "faster-whisper":
+            runpy.run_path(str(ROOT_DIR / "tests/runtime_import_smoke.py"), run_name="__main__")
+        else:
+            with pytest.raises(AssertionError, match="faster-whisper"):
+                runpy.run_path(str(ROOT_DIR / "tests/runtime_import_smoke.py"), run_name="__main__")
 
 
 def test_final_review_operator_docs_cover_recovery_and_cost_contracts() -> None:

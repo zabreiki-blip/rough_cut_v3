@@ -11,8 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import faster_whisper  # noqa: E402, F401
 import stage2.cloud_asr  # noqa: E402, F401
-import stage2.whisper_runner  # noqa: E402, F401
+import stage2.whisper_runner  # noqa: E402
 
 
 if __name__ == "__main__":
-    print("Production ASR imports passed; no model loaded.")
+    backend = stage2.whisper_runner.resolve_backend()
+    assert backend == "faster-whisper", f"Expected faster-whisper, resolved {backend!r}"
+    print("Production ASR imports and faster-whisper backend passed; no model loaded.")
