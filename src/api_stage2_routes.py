@@ -14,7 +14,7 @@ import wave
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from api_final_review_jobs import canonical_decimal_string
-from cost_budget import CostGuardConfig
+from cost_budget import LLM_TTS_ENV_NAMES, CostGuardConfig
 from export_naming import xml_export_filename
 from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
@@ -464,6 +464,9 @@ def _stage2_sync_job_start(services: ModuleType):
             reserved_cost_usd=0.0,
             cost_pending=False,
             cloud_source_options=cloud_source_options,
+            # Frozen like the ASR options: later environment edits do not change
+            # the budget of a queued job. Validated by the worker.
+            llm_cost_env={name: os.environ.get(name, "") for name in LLM_TTS_ENV_NAMES},
         )
         worker = services.threading.Thread(
             target=services._run_sync_job,

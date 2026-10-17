@@ -18,6 +18,7 @@ import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
+from cost_budget import CostBudget, CostBudgetExceeded
 from env_utils import env_int
 
 from .config import get_settings
@@ -329,6 +330,7 @@ def _synthesize_openrouter_wav(
     *,
     tts_model: str | None = None,
     tts_style: str = "",
+    budget: CostBudget | None = None,
 ) -> bytes:
     """Synthesize through OpenRouter's dedicated OpenAI-compatible TTS endpoint."""
     try:
@@ -362,6 +364,10 @@ def _synthesize_openrouter_wav(
         "Accept": "audio/pcm",
     }
 
+    # Reserve before every HTTP attempt (this function is one attempt; the
+    # callers' retry loops call it again). The estimate covers the text that
+    # is actually sent, including director's notes.
+    reservation_id = budget.reserve_tts_attempt(input_text) if budget is not None else None
     response = requests.post(
         f"{settings.openrouter_base_url}/audio/speech",
         headers=headers,
@@ -378,6 +384,10 @@ def _synthesize_openrouter_wav(
             error.status_code = response.status_code  # type: ignore[attr-defined]
             raise error
 
+        if budget is not None and reservation_id is not None:
+            # The speech endpoint reports no cost; book the estimate. The real
+            # charge is reconciled later through the generation id below.
+            budget.settle(reservation_id, None, estimate_if_unknown=True)
         audio_bytes = response.content
         response_headers = getattr(response, "headers", {})
         generation_id = str(response_headers.get("X-Generation-Id") or "").strip()
@@ -479,6 +489,8 @@ def _synthesize_macos_connector_wav(text: str, settings, voice: str) -> bytes:
 
 
 def _is_retryable_tts_error(provider: str, exc: Exception) -> bool:
+    if isinstance(exc, CostBudgetExceeded):
+        return False
     msg = str(exc).lower()
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
@@ -617,6 +629,7 @@ def _synthesize_wav_bytes(
     *,
     tts_model: str | None = None,
     tts_style: str = "",
+    budget: CostBudget | None = None,
 ) -> bytes:
     if provider == "openrouter":
         return _synthesize_openrouter_wav(
@@ -626,6 +639,7 @@ def _synthesize_wav_bytes(
             usage_callback,
             tts_model=tts_model,
             tts_style=tts_style,
+            budget=budget,
         )
     if provider == "macos":
         if shutil.which("say") is None:
@@ -882,6 +896,7 @@ def _synthesize_with_retry(
     usage_callback: Callable[[dict[str, Any]], None] | None,
     tts_model: str | None = None,
     tts_style: str = "",
+    budget: CostBudget | None = None,
 ) -> _SynthesisResult:
     """Synthesize with retries.
 
@@ -906,6 +921,7 @@ def _synthesize_with_retry(
                 usage_callback,
                 tts_model=tts_model,
                 tts_style="" if retry_without_style else tts_style,
+                budget=budget,
             )
             _raise_if_cancelled(cancel_check)
             style_degraded = retry_without_style and bool(tts_style)
@@ -1017,6 +1033,7 @@ def synthesize_tts(
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
     tts_model: str | None = None,
     tts_style: str | None = None,
+    budget: CostBudget | None = None,
 ) -> dict:
     payload = read_json(prepared_path)
     items = payload.get("items", [])
@@ -1097,6 +1114,7 @@ def synthesize_tts(
                     usage_callback,
                     resolved_model,
                     resolved_style,
+                    budget,
                 )
                 for index, _, _, text, _, _, _, _ in pending
             }
@@ -1233,6 +1251,7 @@ def synthesize_phrase(
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
     tts_model: str | None = None,
     tts_style: str | None = None,
+    budget: CostBudget | None = None,
 ) -> dict:
     phrase = (text or "").strip()
     if not phrase:
@@ -1308,6 +1327,7 @@ def synthesize_phrase(
                 usage_callback,
                 tts_model=resolved_model,
                 tts_style="" if retry_without_style else resolved_style,
+                budget=budget,
             )
             wav_bytes = _apply_tempo(wav_bytes, speed)
             _atomic_write_bytes(out_file, wav_bytes, validate_wav=True)

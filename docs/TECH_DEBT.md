@@ -48,7 +48,8 @@
 
 | ID | Pri | Долг | Что сделать |
 |----|-----|------|-------------|
-| D24 | P2 | B5.2: нет бюджетного резерва для LLM/TTS (есть только у cloud ASR через `cost_budget.py`); `max_tokens` ограничивает один запрос, но не сумму за job | Резерв до отправки и сверка по `usage_callback`, дефолт `limit=0` |
+| D24 | P2 | Остаток: бюджет LLM/TTS подключён к job-раннерам (TTS, нормализация, sync-обзор), но синхронные ручки без бюджета: `src/api_stage1_routes.py` (legacy analyze, sync normalization/generate, sync tts/generate, tts phrase) и `src/stage4/versioning.py` `generate_normalization`; параметр `budget` у `analyze_script`/`synthesize_phrase` не пробрасывается | Передавать `CostBudget.for_llm_tts(os.environ)` на запрос или перевести ручки на jobs |
+| D25 | P3 | Точность учёта LLM/TTS: брони неудачных HTTP-попыток (429/5xx/таймаут) не освобождаются, `cost_pending` может висеть (согласовано с ASR); TTS закрывается по оценке без реконсиляции по `X-Generation-Id`, оценка в `cost_usd` неотличима от факта; `llm_cost_env` хранится в записи job и попадает в status-JSON | Освобождать/реконсилировать брони неудачных попыток; помечать оценочную стоимость; не отдавать `llm_cost_env` в status-JSON |
 
 ## Отложенный рефакторинг (после пилота F1–F4)
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from decimal import Decimal
 from io import BytesIO
 import json
 import os
@@ -7,12 +9,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import time
+from typing import Any
 from unittest.mock import patch
 import wave
 
 import pytest
 
 import api
+import api_sync_worker
+from cost_budget import CostBudget
 from stage2.sync_llm_review import SemanticDecision
 from stage2.sync_matcher import SyncMatcher
 from stage2.sync_models import SyncAlternative, SyncMatch, SyncSource, WordIndex, WordTimestamp
@@ -3117,3 +3122,141 @@ def test_sync_budget_deferred_auto_resolution_stays_local_when_environment_chang
     assert job["status"] == "completed"
     assert job["transcribed"] == 1
     assert job["cost_usd"] == 0
+
+
+def _start_low_confidence_llm_job(
+    client,
+    projects: Path,
+    review: Any = None,
+    *,
+    patch_review: bool = True,
+    sync_blocks: int = 1,
+) -> dict:
+    path = _write_confirmed_normalization(projects)
+    if sync_blocks > 1:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        first = data["blocks"][0]
+        for number in range(1, sync_blocks):
+            data["blocks"].append(
+                {**first, "uid": f"extra-sync-uid-{number}", "order": 10 + number}
+            )
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert _post_source(client).status_code == 201
+    assert (
+        client.put(
+            "/stage2/sync-sources/vasilieva_01/words",
+            json={
+                "project": "demo",
+                "words": [
+                    {"word": "тестовая", "start": 10.0, "end": 10.4},
+                    {"word": "расшифровка", "start": 10.4, "end": 10.8},
+                ],
+            },
+        ).status_code
+        == 200
+    )
+    settings = api.get_settings()
+    settings.openrouter_api_key = "test-key"
+
+    def low_match(_matcher, request):
+        return SyncMatch(
+            segment_id=request.segment_id,
+            query_text=request.text,
+            speaker=request.speaker,
+            source_id="vasilieva_01",
+            source_in_sec=10.0,
+            source_out_sec=15.0,
+            confidence=0.63,
+            status="needs_review",
+            matched_text="первый буквальный кандидат",
+            strategy="full_transcript",
+            alternatives=[
+                SyncAlternative("vasilieva_01", 20.0, 26.0, 0.55, "второй смысловой кандидат"),
+            ],
+        )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(api, "get_settings", return_value=settings))
+        stack.enter_context(patch.object(api.SyncMatcher, "match", low_match))
+        if patch_review:
+            stack.enter_context(patch.object(api, "review_candidates_with_llm", side_effect=review))
+        stack.enter_context(patch.object(api.threading, "Thread", _ImmediateThread))
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code == 200, response.get_json()
+    return client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+
+
+def test_sync_job_hands_one_budget_to_llm_review_and_publishes_cost(
+    sync_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.1")
+    monkeypatch.setenv("ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE", "1")
+    client, projects = sync_api
+    budgets: list[Any] = []
+
+    def review(*_args, **kwargs):
+        budget = kwargs.get("budget")
+        budgets.append(budget)
+        reservation = budget.reserve_llm_attempt([{"role": "user", "content": ""}], 1000)
+        budget.settle(reservation, "0.5")
+        return SemanticDecision(1, 0.92, "тот же смысл", "test/model")
+
+    job = _start_low_confidence_llm_job(client, projects, review)
+
+    assert job["status"] == "completed"
+    assert len(budgets) == 1
+    assert budgets[0].limit_usd == 5
+    assert job["llm_cost_usd"] == 0.5
+    assert job["cost_usd"] == 0.5
+
+
+def test_sync_job_completes_without_review_when_asr_spend_already_exceeds_limit(
+    sync_api, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.1")
+    monkeypatch.setenv("ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE", "0")
+    client, projects = sync_api
+    original = CostBudget.for_llm_tts.__func__  # type: ignore[attr-defined]
+
+    def with_asr_spend(cls, environ, _initial=Decimal("0")):
+        return original(cls, environ, Decimal("5"))
+
+    with (
+        patch("stage2.sync_llm_review.requests.post") as post,
+        patch.object(CostBudget, "for_llm_tts", classmethod(with_asr_spend)),
+        caplog.at_level("WARNING", logger=api_sync_worker.logger.name),
+    ):
+        job = _start_low_confidence_llm_job(client, projects, patch_review=False)
+
+    post.assert_not_called()
+    assert job["status"] == "completed"
+    assert "job cost limit" in job["llm_budget_error"]
+    assert job.get("segment_failures", []) == []
+    assert any("LLM review" in r.getMessage() for r in caplog.records)
+
+
+def test_sync_job_stops_review_and_completes_when_budget_exceeded_midway(
+    sync_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.1")
+    monkeypatch.setenv("ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE", "1")
+    client, projects = sync_api
+    calls: list[int] = []
+
+    def review(*_args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:
+            kwargs["budget"].reserve_llm_attempt([{"role": "user", "content": ""}], 5000)
+        return SemanticDecision(1, 0.92, "тот же смысл", "test/model")
+
+    job = _start_low_confidence_llm_job(client, projects, review, sync_blocks=3)
+
+    assert job["status"] == "completed"
+    assert len(calls) == 2
+    assert "job cost limit" in job["llm_budget_error"]
+    assert job["llm_reviewed"] == 1
+    assert job.get("segment_failures", []) == []
+    assert job["done"] == job["total"]

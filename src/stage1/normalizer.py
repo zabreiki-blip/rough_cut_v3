@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from atomic_io import atomic_write_json as _atomic_write_json
 from atomic_io import atomic_write_text as _atomic_write_text
+from cost_budget import CostBudget, CostBudgetExceeded
 from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 
@@ -417,6 +418,7 @@ def generate_normalization(
     classifier: LLMClassifier | None = None,
     llm_preset: str = "standard",
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    budget: CostBudget | None = None,
 ) -> dict[str, Any]:
     llm_preset = normalize_llm_preset(llm_preset)
     with _path_lock(output_path):
@@ -429,6 +431,7 @@ def generate_normalization(
             classifier=classifier,
             llm_preset=llm_preset,
             usage_callback=usage_callback,
+            budget=budget,
         )
 
 
@@ -442,6 +445,7 @@ def _generate_normalization_unlocked(
     classifier: LLMClassifier | None = None,
     llm_preset: str = "standard",
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    budget: CostBudget | None = None,
 ) -> dict[str, Any]:
     """Create and persist a complete, ordered normalization draft."""
     input_path = Path(input_path)
@@ -520,20 +524,18 @@ def _generate_normalization_unlocked(
         if unresolved and use_llm:
             if classifier is not None:
                 llm = classifier
-            elif llm_preset == "standard" and usage_callback is None:
+            elif llm_preset == "standard" and usage_callback is None and budget is None:
                 # Keep the legacy call shape: integrations and tests may patch
                 # this classifier with a two-argument callable.
                 llm = _openrouter_classifier
-            elif usage_callback is None:
-                llm = lambda batch, author_hint: _openrouter_classifier(
-                    batch, author_hint, llm_preset=llm_preset
-                )
             else:
+                llm_kwargs: dict[str, Any] = {"llm_preset": llm_preset}
+                if usage_callback is not None:
+                    llm_kwargs["usage_callback"] = usage_callback
+                if budget is not None:
+                    llm_kwargs["budget"] = budget
                 llm = lambda batch, author_hint: _openrouter_classifier(
-                    batch,
-                    author_hint,
-                    llm_preset=llm_preset,
-                    usage_callback=usage_callback,
+                    batch, author_hint, **llm_kwargs
                 )
             batches = _llm_batches(unresolved)
             payloads = [[_llm_input(block) for block in batch] for batch in batches]
@@ -581,6 +583,11 @@ def _generate_normalization_unlocked(
                                 payloads[index],
                                 results,
                             )
+                        except CostBudgetExceeded:
+                            # A spent job budget is a hard stop, not a batch warning:
+                            # drop queued batches so no new paid call starts.
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            raise
                         except Exception as exc:
                             logger.exception("LLM batch %d classification failed", index)
                             batch_results[index] = (None, exc)
@@ -596,6 +603,8 @@ def _generate_normalization_unlocked(
                             payloads[index],
                             results,
                         )
+                    except CostBudgetExceeded:
+                        raise
                     except Exception as exc:
                         logger.exception("LLM batch %d classification failed", index)
                         batch_results[index] = (None, exc)
@@ -2283,6 +2292,7 @@ def _openrouter_classifier(
     *,
     llm_preset: str = "standard",
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    budget: CostBudget | None = None,
 ) -> list[dict[str, Any]]:
     llm_preset = normalize_llm_preset(llm_preset)
     settings = get_settings()
@@ -2311,6 +2321,8 @@ def _openrouter_classifier(
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
         "max_tokens": max_tokens,
+        # Without this flag OpenRouter omits ``usage.cost`` from the answer.
+        "usage": {"include": True},
     }
     if llm_preset == "fast":
         json_body["provider"] = {"sort": "throughput"}
@@ -2323,7 +2335,12 @@ def _openrouter_classifier(
         "timeout": 120,
     }
     response = None
+    reservation_id: str | None = None
     for attempt in range(3):
+        # Reserve before every HTTP attempt; CostBudgetExceeded is not a
+        # RequestException, so the retry handling below never swallows it.
+        if budget is not None:
+            reservation_id = budget.reserve_llm_attempt(json_body["messages"], max_tokens)
         try:
             response = requests.post(
                 f"{settings.openrouter_base_url}/chat/completions", **request_kwargs
@@ -2339,6 +2356,8 @@ def _openrouter_classifier(
     assert response is not None
     response.raise_for_status()
     body = response.json()
+    if budget is not None and reservation_id is not None:
+        budget.settle_response(reservation_id, body)
     report_json_usage(usage_callback, body, model=settings.openrouter_model)
     raise_if_truncated(body, model=settings.openrouter_model, max_tokens=max_tokens)
     content = body["choices"][0]["message"]["content"]

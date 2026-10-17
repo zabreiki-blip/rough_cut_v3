@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Any, Callable
 
+from cost_budget import CostBudget
 from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 
@@ -107,6 +108,7 @@ def analyze_with_openrouter(
     settings: Settings,
     scenario_text: str,
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    budget: CostBudget | None = None,
 ) -> list[NarrationBlock]:
     if requests is None:
         raise RuntimeError("requests is not installed. Install dependencies from requirements.txt.")
@@ -142,13 +144,21 @@ def analyze_with_openrouter(
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
         "max_tokens": max_tokens,
+        # Without this flag OpenRouter omits ``usage.cost`` from the answer.
+        "usage": {"include": True},
     }
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
     }
 
+    reservation_ids: list[str] = []
+
     def _do_request():
+        # Every HTTP attempt, retries included, is reserved before dispatch.
+        # CostBudgetExceeded is not retryable and propagates to the caller.
+        if budget is not None:
+            reservation_ids.append(budget.reserve_llm_attempt(payload["messages"], max_tokens))
         resp = requests.post(
             f"{settings.openrouter_base_url}/chat/completions",
             headers=headers,
@@ -183,6 +193,9 @@ def analyze_with_openrouter(
         response = _do_request()
 
     data = response.json()
+    if budget is not None and reservation_ids:
+        # Only the answered attempt is settled; failed attempts stay reserved.
+        budget.settle_response(reservation_ids[-1], data)
     report_json_usage(usage_callback, data, model=settings.openrouter_model)
     # After the retry wrapper on purpose: a cut-off answer must not be re-bought.
     raise_if_truncated(data, model=settings.openrouter_model, max_tokens=max_tokens)

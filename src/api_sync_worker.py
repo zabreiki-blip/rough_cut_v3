@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, TypedDict
@@ -10,6 +11,8 @@ from job_runtime import asr_slot
 from cost_budget import CostBudget, CostBudgetExceeded
 from stage2.cloud_asr import plan_cloud_chunks
 from stage2.whisper_runner import resolve_backend
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
@@ -170,6 +173,24 @@ def run_sync_job(
             cost_pending=pending_total,
             **asr_metrics,
         )
+
+    # The semantic-review budget starts from the cloud ASR exposure of this job,
+    # so a single job limit covers ASR and LLM spend together.
+    llm_budget_state: dict[str, Any] = {"budget": None, "initial": Decimal("0")}
+
+    def llm_cost_fields() -> dict[str, Any]:
+        llm_budget = llm_budget_state["budget"]
+        if llm_budget is None:
+            return {}
+        snapshot = llm_budget.snapshot()
+        known_total, reserved_total, pending_total = cloud_totals()
+        llm_spent = max(0.0, snapshot["spent_usd"] - float(llm_budget_state["initial"]))
+        return {
+            "cost_usd": float(known_total) + llm_spent,
+            "reserved_cost_usd": float(reserved_total) + snapshot["reserved_usd"],
+            "cost_pending": pending_total or llm_budget.has_pending_reservations,
+            "llm_cost_usd": llm_spent,
+        }
 
     def should_persist_progress(*, force: bool = False) -> bool:
         nonlocal last_progress_persist_at
@@ -603,6 +624,25 @@ def run_sync_job(
             llm_review_limit = max(0, int(os.getenv("SYNC_LLM_REVIEW_MAX_BLOCKS", "30")))
         except ValueError:
             llm_review_limit = 30
+        if llm_review_enabled:
+            known_total, reserved_total, _pending = cloud_totals()
+            # Prefer the settings frozen at job start; fall back to the environment
+            # for callers that bypass the start route.
+            llm_cost_env = job.get("llm_cost_env")
+            if not isinstance(llm_cost_env, dict):
+                llm_cost_env = os.environ
+            try:
+                llm_budget_state["budget"] = CostBudget.for_llm_tts(
+                    llm_cost_env, known_total + reserved_total
+                )
+                llm_budget_state["initial"] = known_total + reserved_total
+            except ValueError as exc:
+                # Fail closed: without a valid budget no paid review call is made.
+                llm_review_enabled = False
+                logger.warning(
+                    "Sync job=%s: LLM review disabled, invalid cost settings: %s", job_id, exc
+                )
+                _update_sync_job(job_id, llm_budget_error=str(exc))
         llm_reviewed = 0
         llm_review_failures: list[dict[str, str]] = []
         checkpoint_state = {"dirty": False}
@@ -781,6 +821,7 @@ def run_sync_job(
                             candidates=semantic_candidates,
                             settings=settings,
                             usage_callback=semantic_usage_callback,
+                            budget=llm_budget_state["budget"],
                         )
                         llm_reviewed += 1
                         if decision is not None:
@@ -792,6 +833,14 @@ def run_sync_job(
                                 reason=decision.reason,
                                 model=decision.model,
                             )
+                    except CostBudgetExceeded as exc:
+                        # The review is an optional improvement: stop paid calls and
+                        # finish with deterministic matching for the remaining segments.
+                        llm_review_enabled = False
+                        logger.warning(
+                            "Sync job=%s: LLM review stopped, job budget exceeded: %s", job_id, exc
+                        )
+                        _update_sync_job(job_id, llm_budget_error=str(exc))
                     except Exception as exc:
                         llm_reviewed += 1
                         llm_review_failures.append(
@@ -809,6 +858,8 @@ def run_sync_job(
                 existing[segment_id] = match
                 rematched_this_run.add(segment_id)
                 checkpoint_state["dirty"] = True
+            except CostBudgetExceeded:
+                raise
             except Exception as exc:
                 segment_failures.append(
                     {
@@ -828,6 +879,7 @@ def run_sync_job(
                 segment_failures=list(segment_failures),
                 llm_reviewed=llm_reviewed,
                 llm_review_failures=list(llm_review_failures),
+                **llm_cost_fields(),
             )
 
         checkpoint_matches()
@@ -844,6 +896,7 @@ def run_sync_job(
             segment_failures=segment_failures,
             llm_reviewed=llm_reviewed,
             llm_review_failures=llm_review_failures,
+            **llm_cost_fields(),
             **asr_metrics,
             **summary,
         )
@@ -876,6 +929,7 @@ def run_sync_job(
             message="Failed",
             error=str(exc),
             finished_at=_utc_now_iso(),
+            **llm_cost_fields(),
         )
     finally:
         _release_sync_project(project)

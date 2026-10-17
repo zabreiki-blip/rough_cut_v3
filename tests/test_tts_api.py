@@ -333,6 +333,7 @@ class TtsManifestSyncTests(unittest.TestCase):
             usage_callback=None,
             tts_model=None,
             tts_style="",
+            budget=None,
         ):
             # Resynthesize zk1 exactly like stage1.gemini_tts does: write the
             # content-addressed asset, materialize the mutable alias and its

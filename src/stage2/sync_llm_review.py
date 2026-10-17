@@ -13,6 +13,7 @@ from typing import Any, Callable, Sequence
 
 import requests
 
+from cost_budget import CostBudget
 from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 from stage1.config import Settings, get_settings
@@ -59,6 +60,7 @@ def review_candidates_with_llm(
     request_fn: Callable[..., Any] | None = None,
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
     timeout_seconds: float = 45.0,
+    budget: CostBudget | None = None,
 ) -> SemanticDecision | None:
     """Choose a semantic match from verified transcript candidates.
 
@@ -94,6 +96,17 @@ def review_candidates_with_llm(
     # The answer is a one-line JSON object ({"selected_index", "confidence",
     # "reason"}), a few dozen tokens; the floor leaves room for a verbose reason.
     max_tokens = resolve_max_tokens(config, expected_output_chars=0, floor=1024)
+    messages = [
+        {
+            "role": "system",
+            "content": "Выбирай только индекс из переданного списка или -1.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    # Reserve before dispatch; CostBudgetExceeded propagates to the caller.
+    reservation_id = (
+        budget.reserve_llm_attempt(messages, max_tokens) if budget is not None else None
+    )
     response = call(
         f"{config.openrouter_base_url}/chat/completions",
         headers={
@@ -105,18 +118,16 @@ def review_candidates_with_llm(
             "temperature": 0,
             "response_format": {"type": "json_object"},
             "max_tokens": max_tokens,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Выбирай только индекс из переданного списка или -1.",
-                },
-                {"role": "user", "content": prompt},
-            ],
+            # Without this flag OpenRouter omits ``usage.cost`` from the answer.
+            "usage": {"include": True},
+            "messages": messages,
         },
         timeout=timeout_seconds,
     )
     response.raise_for_status()
     body = response.json()
+    if budget is not None and reservation_id is not None:
+        budget.settle_response(reservation_id, body)
     report_json_usage(usage_callback, body, model=config.openrouter_model)
     raise_if_truncated(body, model=config.openrouter_model, max_tokens=max_tokens)
     content = body["choices"][0]["message"]["content"]

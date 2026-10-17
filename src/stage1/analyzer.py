@@ -10,6 +10,8 @@ import os
 import re
 from typing import Any, Callable, Iterable
 
+from cost_budget import CostBudget, CostBudgetExceeded
+
 from .config import Settings, get_settings
 from .io_utils import (
     extract_marked_blocks_from_docx,
@@ -804,6 +806,7 @@ def analyze_script(
     raw_output_path: Path,
     use_llm: bool = True,
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    budget: CostBudget | None = None,
 ) -> dict:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -874,21 +877,24 @@ def analyze_script(
 
                 if pending:
                     with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
-                        if usage_callback is None:
-                            futures = {
-                                idx: pool.submit(analyze_with_openrouter, settings, chunks[idx])
-                                for idx in pending
-                            }
-                        else:
-                            futures = {
-                                idx: pool.submit(
-                                    analyze_with_openrouter,
-                                    settings,
-                                    chunks[idx],
-                                    usage_callback,
-                                )
-                                for idx in pending
-                            }
+                        # Optional arguments are forwarded only when set so that the
+                        # historic two-argument call shape stays valid.
+                        llm_args: list[Any] = []
+                        llm_kwargs: dict[str, Any] = {}
+                        if usage_callback is not None:
+                            llm_args.append(usage_callback)
+                        if budget is not None:
+                            llm_kwargs["budget"] = budget
+                        futures = {
+                            idx: pool.submit(
+                                analyze_with_openrouter,
+                                settings,
+                                chunks[idx],
+                                *llm_args,
+                                **llm_kwargs,
+                            )
+                            for idx in pending
+                        }
                         # Consume in source order so output and error reporting stay stable.
                         for idx in pending:
                             try:
@@ -896,6 +902,12 @@ def analyze_script(
                                 chunk_results[idx] = result_blocks
                                 chunk_success[idx] = True
                                 _cache_llm_blocks(cache_path, cache, cache_keys[idx], result_blocks)
+                            except CostBudgetExceeded:
+                                # A spent job budget stops the job instead of
+                                # degrading chunks to the fallback extractor; drop
+                                # queued chunks so no new paid call starts.
+                                pool.shutdown(wait=False, cancel_futures=True)
+                                raise
                             except Exception as exc:
                                 llm_errors.append(f"chunk {idx + 1}: {type(exc).__name__}: {exc}")
                                 chunk_results[idx] = _fallback_blocks(chunks[idx])

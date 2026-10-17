@@ -1,15 +1,30 @@
-"""Decimal-backed cost reservations local to one sequential ASR job."""
+"""Decimal-backed cost reservations local to one job (cloud ASR, LLM, TTS)."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import Any
 from uuid import uuid4
+
+from openrouter_usage import extract_cost
 
 
 class CostBudgetExceeded(RuntimeError):
     """The next estimated provider attempt would exceed the job limit."""
+
+
+# Environment variables that configure a job budget for LLM/TTS spend.
+LLM_TTS_ENV_NAMES = (
+    "ROUGH_CUT_MAX_USD_PER_JOB",
+    "ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE",
+    "ROUGH_CUT_TTS_USD_PER_1K_CHARS_ESTIMATE",
+)
+
+# Rough prompt size model for providers that do not report it before dispatch.
+_CHARS_PER_TOKEN = 4
 
 
 def _nonnegative_decimal(value: object, name: str) -> Decimal:
@@ -26,6 +41,27 @@ def _nonnegative_decimal(value: object, name: str) -> Decimal:
 class CostGuardConfig:
     max_usd_per_job: Decimal
     cloud_asr_usd_per_minute: Decimal
+    llm_usd_per_1k_tokens: Decimal = Decimal("0")
+    tts_usd_per_1k_chars: Decimal = Decimal("0")
+
+    @classmethod
+    def for_llm_tts(cls, environ: Mapping[str, str]) -> CostGuardConfig:
+        """Config for LLM/TTS jobs: the cloud ASR rate is neither read nor required."""
+        limit_name = "ROUGH_CUT_MAX_USD_PER_JOB"
+        llm_name = "ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE"
+        tts_name = "ROUGH_CUT_TTS_USD_PER_1K_CHARS_ESTIMATE"
+        return cls(
+            max_usd_per_job=_nonnegative_decimal(
+                environ.get(limit_name, "").strip() or "0", limit_name
+            ),
+            cloud_asr_usd_per_minute=Decimal("0"),
+            llm_usd_per_1k_tokens=_nonnegative_decimal(
+                environ.get(llm_name, "").strip() or "0", llm_name
+            ),
+            tts_usd_per_1k_chars=_nonnegative_decimal(
+                environ.get(tts_name, "").strip() or "0", tts_name
+            ),
+        )
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> CostGuardConfig:
@@ -35,7 +71,32 @@ class CostGuardConfig:
         rate = _nonnegative_decimal(environ.get(rate_name, "").strip() or "0", rate_name)
         if limit > 0 and rate == 0:
             raise ValueError(f"{rate_name} must be positive when {limit_name} is positive")
-        return cls(max_usd_per_job=limit, cloud_asr_usd_per_minute=rate)
+        llm_name = "ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE"
+        tts_name = "ROUGH_CUT_TTS_USD_PER_1K_CHARS_ESTIMATE"
+        llm_rate = _nonnegative_decimal(environ.get(llm_name, "").strip() or "0", llm_name)
+        tts_rate = _nonnegative_decimal(environ.get(tts_name, "").strip() or "0", tts_name)
+        return cls(
+            max_usd_per_job=limit,
+            cloud_asr_usd_per_minute=rate,
+            llm_usd_per_1k_tokens=llm_rate,
+            tts_usd_per_1k_chars=tts_rate,
+        )
+
+
+def messages_text_chars(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Count the text characters of chat messages (plain or multi-part content)."""
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, Sequence):
+            for part in content:
+                if isinstance(part, Mapping):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
 
 
 class CostBudget:
@@ -43,7 +104,8 @@ class CostBudget:
 
     A zero limit disables enforcement while retaining accounting. Unknown
     provider costs remain reserved, so subsequent attempts cannot reuse that
-    headroom. Instances belong to a single job and require sequential access.
+    headroom. One instance belongs to a single job; all state changes are
+    serialized by a lock because LLM and TTS calls run in thread pools.
     """
 
     def __init__(
@@ -51,17 +113,64 @@ class CostBudget:
         limit_usd: Decimal,
         usd_per_minute: Decimal,
         initial_spent_usd: Decimal = Decimal("0"),
+        *,
+        llm_usd_per_1k_tokens: Decimal = Decimal("0"),
+        tts_usd_per_1k_chars: Decimal = Decimal("0"),
+        require_asr_rate: bool = True,
     ) -> None:
         self.limit_usd = _nonnegative_decimal(limit_usd, "limit_usd")
         self.usd_per_minute = _nonnegative_decimal(usd_per_minute, "usd_per_minute")
+        self.llm_usd_per_1k_tokens = _nonnegative_decimal(
+            llm_usd_per_1k_tokens, "llm_usd_per_1k_tokens"
+        )
+        self.tts_usd_per_1k_chars = _nonnegative_decimal(
+            tts_usd_per_1k_chars, "tts_usd_per_1k_chars"
+        )
         self._spent_usd = _nonnegative_decimal(initial_spent_usd, "initial_spent_usd")
-        if self.limit_usd > 0 and self.usd_per_minute == 0:
+        if require_asr_rate and self.limit_usd > 0 and self.usd_per_minute == 0:
             raise ValueError("usd_per_minute must be positive when limit_usd is positive")
         self._reservations: dict[str, Decimal] = {}
+        self._lock = threading.RLock()
+
+    @classmethod
+    def from_config(
+        cls, config: CostGuardConfig, initial_spent_usd: Decimal = Decimal("0")
+    ) -> CostBudget:
+        return cls(
+            config.max_usd_per_job,
+            config.cloud_asr_usd_per_minute,
+            initial_spent_usd,
+            llm_usd_per_1k_tokens=config.llm_usd_per_1k_tokens,
+            tts_usd_per_1k_chars=config.tts_usd_per_1k_chars,
+        )
+
+    @classmethod
+    def for_llm_tts(
+        cls, environ: Mapping[str, str], initial_spent_usd: Decimal = Decimal("0")
+    ) -> CostBudget:
+        """Budget of a job that pays only for LLM/TTS (no cloud ASR rate needed)."""
+        config = CostGuardConfig.for_llm_tts(environ)
+        return cls(
+            config.max_usd_per_job,
+            config.cloud_asr_usd_per_minute,
+            initial_spent_usd,
+            llm_usd_per_1k_tokens=config.llm_usd_per_1k_tokens,
+            tts_usd_per_1k_chars=config.tts_usd_per_1k_chars,
+            require_asr_rate=False,
+        )
 
     def estimate_seconds(self, seconds: float) -> Decimal:
         duration = _nonnegative_decimal(seconds, "seconds")
         return duration * self.usd_per_minute / Decimal("60")
+
+    def estimate_llm(self, prompt_chars: int, max_tokens: int) -> Decimal:
+        """Estimate one chat attempt: prompt tokens (chars / 4, rounded up) + output cap."""
+        prompt_tokens = -(-max(0, int(prompt_chars)) // _CHARS_PER_TOKEN)
+        tokens = prompt_tokens + max(0, int(max_tokens))
+        return Decimal(tokens) / Decimal("1000") * self.llm_usd_per_1k_tokens
+
+    def estimate_tts(self, chars: int) -> Decimal:
+        return Decimal(max(0, int(chars))) / Decimal("1000") * self.tts_usd_per_1k_chars
 
     def _reserved_usd(self) -> Decimal:
         return sum(self._reservations.values(), Decimal("0"))
@@ -69,33 +178,64 @@ class CostBudget:
     @property
     def has_pending_reservations(self) -> bool:
         """Unknown provider cost stays pending even when its estimate is zero."""
-        return bool(self._reservations)
+        with self._lock:
+            return bool(self._reservations)
+
+    def _reserve(self, estimate: Decimal, what: str) -> str:
+        with self._lock:
+            projected_total = self._spent_usd + self._reserved_usd() + estimate
+            if self.limit_usd > 0 and projected_total > self.limit_usd:
+                raise CostBudgetExceeded(
+                    f"{what} would exceed the job cost limit of ${self.limit_usd}"
+                )
+            reservation_id = uuid4().hex
+            self._reservations[reservation_id] = estimate
+            return reservation_id
 
     def reserve_attempt(self, seconds: float) -> str:
-        estimate = self.estimate_seconds(seconds)
-        projected_total = self._spent_usd + self._reserved_usd() + estimate
-        if self.limit_usd > 0 and projected_total > self.limit_usd:
-            raise CostBudgetExceeded(
-                f"Cloud ASR attempt would exceed the job cost limit of ${self.limit_usd}"
-            )
-        reservation_id = uuid4().hex
-        self._reservations[reservation_id] = estimate
-        return reservation_id
+        return self._reserve(self.estimate_seconds(seconds), "Cloud ASR attempt")
 
-    def settle(self, reservation_id: str, actual_usd: object) -> None:
-        # Validate the ID even when provider usage is absent.
-        self._reservations[reservation_id]
-        if actual_usd is None:
-            return
-        actual = _nonnegative_decimal(actual_usd, "actual_usd")
-        del self._reservations[reservation_id]
-        self._spent_usd += actual
+    def reserve_llm_attempt(self, messages: Sequence[Mapping[str, Any]], max_tokens: int) -> str:
+        estimate = self.estimate_llm(messages_text_chars(messages), max_tokens)
+        return self._reserve(estimate, "LLM request")
+
+    def reserve_tts_attempt(self, text: str) -> str:
+        return self._reserve(self.estimate_tts(len(text)), "TTS request")
+
+    def settle(
+        self,
+        reservation_id: str,
+        actual_usd: object,
+        *,
+        estimate_if_unknown: bool = False,
+    ) -> None:
+        """Replace a reservation by the actual cost.
+
+        Without a known cost the reservation stays pending (ASR behaviour) unless
+        ``estimate_if_unknown`` asks to book the estimate as spent instead.
+        """
+        with self._lock:
+            # Validate the ID even when provider usage is absent.
+            estimate = self._reservations[reservation_id]
+            if actual_usd is None:
+                if not estimate_if_unknown:
+                    return
+                actual = estimate
+            else:
+                actual = _nonnegative_decimal(actual_usd, "actual_usd")
+            del self._reservations[reservation_id]
+            self._spent_usd += actual
+
+    def settle_response(self, reservation_id: str, body: Mapping[str, Any]) -> None:
+        """Settle an LLM reservation by ``usage.cost`` or, if absent, by its estimate."""
+        self.settle(reservation_id, extract_cost(body), estimate_if_unknown=True)
 
     def snapshot(self) -> dict[str, float]:
-        reserved = self._reserved_usd()
-        return {
-            "limit_usd": float(self.limit_usd),
-            "spent_usd": float(self._spent_usd),
-            "reserved_usd": float(reserved),
-            "total_usd": float(self._spent_usd + reserved),
-        }
+        with self._lock:
+            reserved = self._reserved_usd()
+            return {
+                "limit_usd": float(self.limit_usd),
+                "spent_usd": float(self._spent_usd),
+                "reserved_usd": float(reserved),
+                "total_usd": float(self._spent_usd + reserved),
+            }

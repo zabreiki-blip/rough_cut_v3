@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from api_service_contracts import NormalizationJobServices, TtsJobServices
+from cost_budget import CostBudget
 from stage4.revision_assets import merge_voiceover_manifest_item
 
 
@@ -281,7 +283,10 @@ def run_tts_job(
             increments={"retry_count": 1} if event == "item_retrying" else None,
         )
 
+    budget: CostBudget | None = None
     try:
+        # One budget per job, shared by every (concurrent) TTS attempt.
+        budget = CostBudget.for_llm_tts(os.environ)
         services._update_tts_job(
             job_id,
             status="running",
@@ -315,6 +320,7 @@ def run_tts_job(
             ),
             tts_model=tts_model,
             tts_style=tts_style,
+            budget=budget,
         )
         services._save_voiceover_revision_assets(project, result)
         total = int(result.get("items_total") or 0)
@@ -341,6 +347,7 @@ def run_tts_job(
             gender=str(result.get("gender", "")),
             dry_run=bool(result.get("dry_run", False)),
             style_degraded_ids=list(result.get("style_degraded_ids") or []),
+            cost_budget=budget.snapshot(),
             result=result,
         )
     except services.TtsCancelledError:
@@ -366,6 +373,7 @@ def run_tts_job(
             error=str(exc),
             last_error=str(exc),
             finished_at=services._utc_now_iso(),
+            **({"cost_budget": budget.snapshot()} if budget is not None else {}),
         )
     finally:
         if acquired:
@@ -508,7 +516,9 @@ def run_normalization_job(
         message="Normalizing scenario",
         started_at=services._utc_now_iso(),
     )
+    budget: CostBudget | None = None
     try:
+        budget = CostBudget.for_llm_tts(os.environ)
         result = services.generate_normalization(
             input_path,
             output_path,
@@ -522,12 +532,14 @@ def run_normalization_job(
                 operation="normalize",
                 job_id=job_id,
             ),
+            budget=budget,
         )
         services._update_normalization_job(
             job_id,
             status="completed",
             message="Completed",
             finished_at=services._utc_now_iso(),
+            cost_budget=budget.snapshot(),
             result=result,
         )
     except Exception as exc:
@@ -542,6 +554,7 @@ def run_normalization_job(
             message="Failed",
             error=str(exc),
             finished_at=services._utc_now_iso(),
+            **({"cost_budget": budget.snapshot()} if budget is not None else {}),
         )
     finally:
         services._release_normalization_project(project)
