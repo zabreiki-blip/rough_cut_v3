@@ -429,7 +429,7 @@ def test_runtime_ci_checks_production_asr_dependencies() -> None:
     match = re.search(r"^  runtime-smoke:\n(?P<job>.*?)(?=^  \S|\Z)", workflow, re.M | re.S)
     assert match is not None, "production dependencies need a separate runtime-smoke job"
     job = match.group("job")
-    assert "runs-on: ubuntu-latest" in job
+    assert "runs-on: ubuntu-24.04" in job
     assert 'python-version: "3.11"' in job
     assert "cache: pip" in job
     assert "requirements-lock.txt" in job
