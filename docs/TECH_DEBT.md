@@ -43,7 +43,6 @@
 | D13 | P3 | requests закреплён на 2.33.1: 2.34.x добавляет inline-типы, mypy даёт 17 ошибок (`normalizer.py` ~2329, `openrouter_client.py` 15-17) | Поправить типизацию и обновить |
 | D14 | P3 | Dependabot не перегенерирует hashed lock-файлы | На ветке Dependabot запускать `scripts/lock-deps`; тест согласованности упадёт иначе |
 | D15 | P3 | Нативный macOS-путь на Python 3.12 ставится из `requirements*.txt`, не из lock; CI на 3.12 не гоняется. `setup-macos-apple-silicon` принимает 3.10–3.13, политика говорит 3.11/3.12 | Согласовать диапазон; при желании lock под 3.12 |
-| D16 | P3 | В локальном `.venv` остались `pre_commit` и уязвимый `virtualenv` 21.7.4 (в lock их нет) | `pip uninstall pre_commit virtualenv` |
 
 ## Не реализовано из плана
 
