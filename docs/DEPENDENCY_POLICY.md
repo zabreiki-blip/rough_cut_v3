@@ -37,6 +37,27 @@ and Windows; a platform-specific lock would break the image build on the other
 architecture. Python-version dependent pins (`av`, `numpy`) are selected by
 markers; the image and CI target Python 3.11.
 
+## Supported Python versions
+
+- **3.11** is the reference version: the Docker image (`python:3.11-slim`),
+  CI and both locks (`--python-version 3.11`) use it. The pinned wheels and
+  hashes were resolved for 3.11.
+- **3.12** is supported for the native macOS Apple Silicon path
+  (`scripts/setup-macos-apple-silicon`, README), which installs from
+  `requirements.txt` and `requirements-macos-apple-silicon.txt`, not from the
+  locks. The universal lock also carries environment markers for Python >= 3.12
+  (for example the `av` and `numpy` pins), so it stays installable there, but
+  CI does not exercise 3.12.
+
+Do not raise or lower either version without updating the Dockerfile, the CI
+matrix, `scripts/lock-deps` and this section together.
+
+## Local hygiene
+
+`scripts/clean-pyc` removes `__pycache__` directories and `*.pyc` files under
+`src/`, `tests/` and `scripts/` only (never `.venv`, `projects/` or `data/`).
+Run it after switching Python versions to avoid stale bytecode.
+
 Update procedure (never edit lock files by hand):
 
 1. Change the version or range in the relevant `requirements*.txt` file.

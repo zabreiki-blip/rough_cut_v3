@@ -100,3 +100,61 @@ def test_asr_concurrency_limit_documented() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "ROUGH_CUT_MAX_ASR_JOBS" in env_example
     assert "ROUGH_CUT_MAX_ASR_JOBS" in readme
+
+
+CONTAINER_SCRIPTS = ("analyze-script", "synthesize-tts", "validate-stage1")
+
+
+def test_dockerfile_copies_only_container_entrypoint_scripts() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    copy_lines = [line.split()[1:] for line in dockerfile.splitlines() if line.startswith("COPY ")]
+    sources = [src for *srcs, _dst in copy_lines for src in srcs]
+    assert "scripts" not in [s.rstrip("/").removeprefix("./") for s in sources]
+    assert "scripts/" not in sources
+    for name in CONTAINER_SCRIPTS:
+        assert f"scripts/{name}" in sources
+        assert (ROOT / "scripts" / name).is_file()
+    copied_scripts = {s for s in sources if s.startswith("scripts/")}
+    assert copied_scripts == {f"scripts/{name}" for name in CONTAINER_SCRIPTS}
+
+
+def test_one_off_brik_scripts_are_archived_not_shipped() -> None:
+    names = (
+        "finish_brik_normalization.py",
+        "finish_brik_tts.py",
+        "repair_brik_revision.py",
+        "repair_brik_louella_sync.py",
+    )
+    for name in names:
+        assert not (ROOT / "scripts" / name).exists()
+        assert (ROOT / "docs" / "archive" / "scripts" / name).is_file()
+    assert not list((ROOT / "scripts").glob("*brik*"))
+
+
+def test_clean_pyc_removes_caches_only_in_source_trees(tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+
+    (tmp_path / "scripts").mkdir()
+    shutil.copy(ROOT / "scripts" / "clean-pyc", tmp_path / "scripts" / "clean-pyc")
+    doomed = [
+        tmp_path / "src" / "pkg" / "__pycache__" / "a.cpython-311.pyc",
+        tmp_path / "tests" / "__pycache__" / "b.pyc",
+        tmp_path / "scripts" / "__pycache__" / "c.pyc",
+        tmp_path / "src" / "loose.pyc",
+    ]
+    kept = [
+        tmp_path / ".venv" / "lib" / "__pycache__" / "d.pyc",
+        tmp_path / "projects" / "p" / "__pycache__" / "e.pyc",
+        tmp_path / "src" / "keep.py",
+    ]
+    for path in doomed + kept:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+
+    subprocess.run(["bash", str(tmp_path / "scripts" / "clean-pyc")], check=True)
+
+    assert not any(path.exists() for path in doomed)
+    assert all(path.exists() for path in kept)
+    assert not (tmp_path / "src" / "pkg" / "__pycache__").exists()

@@ -424,3 +424,40 @@ def test_missing_timeline_error_contract(client) -> None:
         "ok": False,
         "error": "full_timeline.json not found — run Build first",
     }
+
+
+def _load_route_generator():
+    import importlib.machinery
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "gen-api-routes"
+    loader = importlib.machinery.SourceFileLoader("gen_api_routes", str(path))
+    spec = importlib.util.spec_from_loader("gen_api_routes", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_readme_api_routes_block_matches_generator() -> None:
+    generator = _load_route_generator()
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert generator.BEGIN in readme and generator.END in readme
+    start = readme.index(generator.BEGIN)
+    end = readme.index(generator.END) + len(generator.END)
+    assert readme[start:end] == generator.render_block(), (
+        "README.md API routes block drifted; run scripts/gen-api-routes --write"
+    )
+    assert generator.main(["--check"]) == 0
+
+
+def test_route_generator_lists_every_route_sorted() -> None:
+    generator = _load_route_generator()
+    table = generator.render_table()
+    paths = [line.split("|")[2].strip().strip("`") for line in table.splitlines()[2:]]
+
+    assert paths == sorted(paths)
+    expected = {rule.rule for rule in api.app.url_map.iter_rules() if rule.endpoint != "static"}
+    assert set(paths) == expected
+    assert "/static/<path:filename>" not in paths

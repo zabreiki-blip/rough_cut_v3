@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Generate the Markdown table of Flask routes embedded in README.md.
+
+Usage:
+    scripts/gen-api-routes            print the table to stdout
+    scripts/gen-api-routes --write    update the block in README.md
+    scripts/gen-api-routes --check    exit 1 if README.md differs (no changes)
+
+The block lives between ``<!-- api-routes:begin -->`` and
+``<!-- api-routes:end -->``; everything outside the markers is left alone.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
+BEGIN = "<!-- api-routes:begin -->"
+END = "<!-- api-routes:end -->"
+IGNORED_METHODS = {"HEAD", "OPTIONS"}
+
+
+def render_table() -> str:
+    """Return the sorted route table as Markdown (without markers)."""
+    sys.path.insert(0, str(ROOT / "src"))
+    import api  # noqa: PLC0415 - needs sys.path set up above
+
+    methods: dict[str, set[str]] = defaultdict(set)
+    endpoints: dict[str, set[str]] = defaultdict(set)
+    for rule in api.app.url_map.iter_rules():
+        if rule.endpoint == "static":
+            continue
+        methods[rule.rule].update(rule.methods - IGNORED_METHODS)
+        endpoints[rule.rule].add(rule.endpoint)
+
+    lines = ["| Метод | Путь | Endpoint |", "| --- | --- | --- |"]
+    for path in sorted(methods):
+        method_text = ", ".join(sorted(methods[path]))
+        endpoint_text = ", ".join(f"`{name}`" for name in sorted(endpoints[path]))
+        lines.append(f"| {method_text} | `{path}` | {endpoint_text} |")
+    return "\n".join(lines)
+
+
+def render_block() -> str:
+    return f"{BEGIN}\n{render_table()}\n{END}"
+
+
+def _split(text: str) -> tuple[str, str, str]:
+    start = text.find(BEGIN)
+    end = text.find(END)
+    if start == -1 or end == -1 or end < start:
+        raise SystemExit(f"README.md must contain {BEGIN} ... {END}")
+    return text[:start], text[start : end + len(END)], text[end + len(END) :]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write", action="store_true", help="update README.md")
+    mode.add_argument("--check", action="store_true", help="exit 1 on drift")
+    args = parser.parse_args(argv)
+
+    if not (args.write or args.check):
+        print(render_table())
+        return 0
+
+    text = README.read_text(encoding="utf-8")
+    head, current, tail = _split(text)
+    expected = render_block()
+    if args.check:
+        if current != expected:
+            print(
+                "README.md API routes block is out of date; "
+                "run scripts/gen-api-routes --write",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    if current != expected:
+        README.write_text(head + expected + tail, encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

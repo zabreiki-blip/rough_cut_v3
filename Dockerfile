@@ -16,7 +16,9 @@ COPY requirements-lock.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements-lock.txt
 
 COPY src ./src
-COPY scripts ./scripts
+# Only the CLI wrappers used inside the container; the rest of scripts/ is
+# host-side tooling (setup, macOS, lock-deps) and is not shipped in the image.
+COPY scripts/analyze-script scripts/synthesize-tts scripts/validate-stage1 ./scripts/
 
 RUN chmod +x ./scripts/analyze-script ./scripts/synthesize-tts ./scripts/validate-stage1 \
     && mkdir -p /app/projects /app/data /app/.cache/huggingface \

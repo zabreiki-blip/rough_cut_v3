@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Remove Python bytecode caches (__pycache__ directories and *.pyc files) from
+# src/, tests/ and scripts/ only. Never touches .venv, projects/, data/ or
+# anything outside the repository.
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+for dir in src tests scripts; do
+  target="${ROOT_DIR}/${dir}"
+  [[ -d "${target}" ]] || continue
+  find "${target}" -type d -name __pycache__ -prune -exec rm -rf {} +
+  find "${target}" -type f -name '*.pyc' -delete
+done
+echo "Removed __pycache__ and *.pyc under src/, tests/, scripts/."

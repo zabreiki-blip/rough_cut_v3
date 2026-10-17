@@ -178,6 +178,10 @@ matches и таймлайн. Озвучка привязана к стабиль
   повторяется (повтор оплатил бы тот же результат) и завершается ошибкой —
   увеличьте значение. Блок нормализации длиннее 8000 символов отправляется в
   классификатор только головой и хвостом (полный текст остаётся локально)
+- `OPENROUTER_MODEL` (по умолчанию `openai/gpt-4o-mini`) — модель анализа и
+  нормализации; `OPENROUTER_BASE_URL` (по умолчанию `https://openrouter.ai/api/v1`) —
+  базовый URL OpenRouter, общий для чата, TTS и облачного ASR
+- `FFMPEG_TIMEOUT_SECONDS=180` — таймаут подгонки темпа Gemini TTS через ffmpeg (30–3600 с)
 - `TTS_PROVIDER=openrouter|macos` (в веб-интерфейсе OpenRouter-модель выбирается отдельно)
 - `TTS_GENDER=female|male` (пол голоса по умолчанию)
 - `TTS_MAX_WORKERS=3` ограничивает параллельные запросы синтеза (`1–4`)
@@ -193,10 +197,16 @@ matches и таймлайн. Озвучка привязана к стабиль
   - поле «Интонация / стиль / формат ролика» передаёт Gemini режиссёрский prompt,
     а для MAI сопоставляет описание с Azure style; изменение поля инвалидирует TTS-кэш
 - для macOS (бесплатно, локально): `MACOS_TTS_VOICE_FEMALE`, `MACOS_TTS_VOICE_MALE`, `MACOS_TTS_RATE` (по умолчанию `Milena/Yuri`)
+  - `MACOS_TTS_VOICE` — голос по умолчанию (`Milena`), если не задан голос по полу;
+    `MACOS_TTS_SAMPLE_RATE` — частота WAV в Гц (по умолчанию `24000`, диапазон `8000–192000`)
   - для коннектора macOS: обязательный `MACOS_CONNECTOR_TOKEN`, а также `MACOS_CONNECTOR_URL`, `MACOS_CONNECTOR_TIMEOUT`, `MACOS_CONNECTOR_BIND`, `MACOS_CONNECTOR_PORT`;
     LaunchAgent автоматически задаёт `MACOS_CONNECTOR_ENV_FILE` как путь к
     отдельному файлу настроек с правами `0600`, поэтому эту переменную не нужно
     добавлять в проектный `.env`
+    - `MACOS_COMMAND_TIMEOUT` — таймаут одной команды `say`/конвертации на стороне
+      коннектора в секундах (по умолчанию `900`);
+      `MACOS_CONNECTOR_MAX_REQUEST_BODY_BYTES` — лимит JSON-запроса к коннектору
+      (по умолчанию 256 КиБ)
 - для Stage 2 sync: `SYNC_WHISPER_BACKEND=auto|mlx-whisper|faster-whisper|openai-whisper|cloud-audio`,
   `SYNC_WHISPER_MODEL`, `SYNC_WHISPER_DEVICE`, `SYNC_WHISPER_COMPUTE_TYPE`;
 - параметры faster-whisper: `SYNC_WHISPER_BEAM_SIZE` и
@@ -212,6 +222,14 @@ matches и таймлайн. Озвучка привязана к стабиль
   минут; `0` отключает авто-выгрузку и держит воркер в памяти бессрочно, как
   раньше) — это не мешает тёплому старту при частых запросах, но не даёт
   модели бесконечно занимать RAM во время долгой открытой сессии Premiere.
+- `SYNC_CLOUD_ASR_API_KEY` — отдельный ключ облачного ASR (`SYNC_WHISPER_BACKEND=cloud-audio`);
+  если пуст, используется `OPENROUTER_API_KEY`
+- `ROUGH_CUT_MAX_REQUEST_BODY_BYTES` — потолок тела запроса Flask; автоматически
+  поднимается выше `SYNC_AUDIO_MAX_BYTES` на размер multipart-заголовков
+- `ROUGH_CUT_BIND` (по умолчанию `127.0.0.1`) и `ROUGH_CUT_PORT` (`8000`) — адрес
+  публикации порта Docker-контейнера на host
+- `SYNC_WHISPER_DOCKER_DEVICE` (`cpu`) и `SYNC_WHISPER_DOCKER_COMPUTE_TYPE` (`int8`) —
+  значения `SYNC_WHISPER_DEVICE`/`SYNC_WHISPER_COMPUTE_TYPE` внутри контейнера
 - `SYNC_AUDIO_MAX_BYTES` — потоковый лимит фактически прочитанных байт WAV
   (по умолчанию 4 ГБ), работающий и без `Content-Length`
 - `SYNC_CLOUD_ASR_OVERLAP_SEC` — перекрытие соседних фрагментов облачного ASR
@@ -414,56 +432,81 @@ flask --app api run --host 0.0.0.0 --port 8000
 curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage1/status?project=my_project
 ```
 
-Эндпоинты:
-- `GET /` — стартовая страница: создать проект / выбрать проект.
-- `GET|POST /projects` — список и создание проектов.
-- `DELETE /projects/<project>` — удалить проект.
-- `GET /project/<project>` — UI первого этапа для конкретного проекта.
-- `GET /health`
-- `GET /stage1/status?project=<project>`
-- `POST /stage1/normalization/generate`
-- `POST /stage1/normalization/reset`
-- `GET|PUT /stage1/normalization`
-- `POST /stage1/normalization-jobs/start`
-- `GET /stage1/normalization-jobs/<job_id>`
-- `GET /stage1/normalization-jobs/status?project=<project>`
-- `POST /stage1/normalization/confirm/preview` — показать варианты обучения по ручным исправлениям
-- `POST /stage1/normalization/confirm`
-- `GET|POST /stage1/normalization/memory`
-- `PATCH|DELETE /stage1/normalization/memory/<rule_id>`
-- `POST /stage1/analyze`
-- `POST /stage1/tts`
-- `POST /stage1/tts-jobs/start` (асинхронный запуск TTS с live-прогрессом)
-- `GET /stage1/tts-jobs/<job_id>` (получение статуса job)
-- `GET /stage1/tts-jobs/status?project=<project>` (последняя задача, включая checkpoint после рестарта)
-- `POST /stage1/tts-jobs/<job_id>/cancel` (остановка после текущего внешнего вызова)
-- `POST /stage1/tts-phrase` (озвучка одной фразы)
-- `POST /stage1/validate`
-- `POST /stage2/build`
-- `GET /stage2/export/xml?project=<project>`
-- `GET|POST|DELETE /stage2/sync-sources`
-- `GET|PUT /stage2/sync-sources/<source_id>/audio`
-- `PUT /stage2/sync-sources/<source_id>/words`
-- `POST /stage2/sync-jobs/start`
-- `GET /stage2/sync-jobs/<job_id>`
-- `GET /stage2/sync-jobs/status?project=<project>`
-- `POST /stage2/sync-jobs/<job_id>/cancel` (сохраняет готовые индексы и совпадения)
-- `GET|PATCH /stage2/sync-matches`
-- `PATCH /stage2/sync-matches/<block_uid>`
-- `GET /stage2/timeline?project=<project>`
-- `POST /stage3/jobs/scan/start`
-- `POST /stage3/jobs/prepare/start`
-- `GET /stage3/jobs/<job_id>`
-- `GET /stage3/jobs/status?project=<project>`
-- `POST /stage3/media/scan` — синхронный fallback сканирования.
-- `POST /stage3/timeline/prepare` — синхронный fallback подготовки.
-- `GET /stage3/export/xml?project=<project>`
-- `GET /stage4/inbox?project=<project>` — найденные сценарии и просмотровки
-- `GET /stage4/revisions?project=<project>` — история и состояние целостности
-- `POST /stage4/revisions/import` — создать редакцию из нового сценария
-- `GET /stage4/diffs/<diff_id>?project=<project>` — получить сохранённый diff
-- `POST /stage4/revisions/<revision_id>/activate` — открыть редакцию
-- `POST /stage4/revisions/<revision_id>/reconcile` — восстановить рассогласованный проект
+Эндпоинты (таблица генерируется из `api.app.url_map`; не редактируйте её
+вручную, обновляйте командой `scripts/gen-api-routes --write`, а
+`scripts/gen-api-routes --check` и тест `tests/test_api_route_contract.py`
+ловят расхождение):
+
+<!-- api-routes:begin -->
+| Метод | Путь | Endpoint |
+| --- | --- | --- |
+| GET | `/` | `project_home` |
+| GET | `/health` | `health` |
+| GET | `/project/<project>` | `project_dashboard` |
+| GET, POST | `/projects` | `create_project`, `list_projects` |
+| DELETE | `/projects/<project>` | `delete_project` |
+| GET | `/speaker/<project>/<path:filename>` | `speaker_file` |
+| POST | `/stage1/analyze` | `stage1_analyze` |
+| GET, PUT | `/stage1/normalization` | `stage1_normalization_get`, `stage1_normalization_save` |
+| GET | `/stage1/normalization-jobs/<job_id>` | `stage1_normalization_job_get` |
+| POST | `/stage1/normalization-jobs/start` | `stage1_normalization_job_start` |
+| GET | `/stage1/normalization-jobs/status` | `stage1_normalization_job_status` |
+| POST | `/stage1/normalization/confirm` | `stage1_normalization_confirm` |
+| POST | `/stage1/normalization/confirm/preview` | `stage1_normalization_learning_preview` |
+| POST | `/stage1/normalization/generate` | `stage1_normalization_generate` |
+| GET, POST | `/stage1/normalization/memory` | `stage1_normalization_memory_create`, `stage1_normalization_memory_get` |
+| DELETE, PATCH | `/stage1/normalization/memory/<int:rule_id>` | `stage1_normalization_memory_delete`, `stage1_normalization_memory_update` |
+| POST | `/stage1/normalization/reset` | `stage1_normalization_reset` |
+| GET | `/stage1/openrouter-usage` | `stage1_openrouter_usage` |
+| GET | `/stage1/status` | `stage1_status` |
+| POST | `/stage1/tts` | `stage1_tts` |
+| GET | `/stage1/tts-jobs/<job_id>` | `stage1_tts_job_status` |
+| POST | `/stage1/tts-jobs/<job_id>/cancel` | `stage1_tts_job_cancel` |
+| POST | `/stage1/tts-jobs/start` | `stage1_tts_job_start` |
+| GET | `/stage1/tts-jobs/status` | `stage1_tts_job_status_alias` |
+| POST | `/stage1/tts-phrase` | `stage1_tts_phrase` |
+| POST | `/stage1/tts/clear` | `stage1_tts_clear` |
+| POST | `/stage1/validate` | `stage1_validate` |
+| POST | `/stage2/build` | `stage2_build` |
+| GET | `/stage2/export/xml` | `stage2_export_xml` |
+| POST | `/stage2/final-review/estimate` | `final_review_estimate` |
+| GET | `/stage2/final-review/jobs/<job_id>` | `final_review_status` |
+| POST | `/stage2/final-review/jobs/<job_id>/apply` | `final_review_apply` |
+| POST | `/stage2/final-review/jobs/<job_id>/cancel` | `final_review_cancel` |
+| GET | `/stage2/final-review/latest` | `final_review_latest` |
+| POST | `/stage2/final-review/start` | `final_review_start` |
+| GET | `/stage2/sync-jobs/<job_id>` | `stage2_sync_job_status` |
+| POST | `/stage2/sync-jobs/<job_id>/cancel` | `stage2_sync_job_cancel` |
+| POST | `/stage2/sync-jobs/start` | `stage2_sync_job_start` |
+| GET | `/stage2/sync-jobs/status` | `stage2_sync_job_status_alias` |
+| GET, PATCH | `/stage2/sync-matches` | `stage2_sync_matches` |
+| PATCH | `/stage2/sync-matches/<block_uid>` | `stage2_sync_matches` |
+| DELETE, GET, POST | `/stage2/sync-sources` | `stage2_sync_sources` |
+| GET, PUT | `/stage2/sync-sources/<source_id>/audio` | `stage2_sync_source_audio` |
+| PUT | `/stage2/sync-sources/<source_id>/words` | `stage2_sync_source_words` |
+| GET | `/stage2/timeline` | `stage2_timeline` |
+| GET | `/stage3/export/xml` | `stage3_export_xml` |
+| GET | `/stage3/jobs/<job_id>` | `stage3_job_status` |
+| POST | `/stage3/jobs/prepare/start` | `stage3_prepare_job_start` |
+| POST | `/stage3/jobs/scan/start` | `stage3_scan_job_start` |
+| GET | `/stage3/jobs/status` | `stage3_job_status_alias` |
+| POST | `/stage3/media/scan` | `stage3_media_scan` |
+| POST | `/stage3/timeline/prepare` | `stage3_timeline_prepare` |
+| GET | `/stage4/diffs/<diff_id>` | `stage4_diff_get` |
+| GET | `/stage4/inbox` | `stage4_inbox` |
+| GET | `/stage4/revisions` | `stage4_revisions_list` |
+| POST | `/stage4/revisions/<revision_id>/activate` | `stage4_revision_activate` |
+| POST | `/stage4/revisions/<revision_id>/reconcile` | `stage4_revision_reconcile` |
+| POST | `/stage4/revisions/import` | `stage4_revision_import` |
+| GET | `/system/readiness` | `system_readiness` |
+<!-- api-routes:end -->
+
+Долгие операции (нормализация, TTS, sync, Stage 3, финальная проверка)
+запускаются асинхронно через `.../start`; статус читается по
+`.../<job_id>` или `.../status?project=<project>` (после рестарта показывается
+последний checkpoint), остановка — `.../<job_id>/cancel` (после текущего
+внешнего вызова; sync сохраняет готовые индексы и совпадения). Синхронные
+`POST /stage3/media/scan` и `POST /stage3/timeline/prepare` — fallback.
 
 Последний статус TTS и sync атомарно сохраняется в каталоге `work` проекта.
 После рестарта незавершённая задача показывается как `interrupted`: повторный
