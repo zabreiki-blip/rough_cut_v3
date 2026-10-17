@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+import os
 import threading
 from typing import Any
 
@@ -129,3 +131,53 @@ def trim_terminal_jobs(
     for job_id in sorted(terminal_ids(), key=lambda job_id: (stamp(job_id), job_id))[:drop_count]:
         evict(job_id)
     return evicted
+
+
+def asr_concurrency_limit(env: Mapping[str, str] | None = None) -> int:
+    """Return the global ASR job cap from ``ROUGH_CUT_MAX_ASR_JOBS`` (default 1).
+
+    Non-integer or non-positive values fall back to 1 rather than disabling
+    the limit, so a typo can never make transcription unbounded.
+    """
+    source = os.environ if env is None else env
+    try:
+        value = int(str(source.get("ROUGH_CUT_MAX_ASR_JOBS", "1")).strip())
+    except (TypeError, ValueError):
+        return 1
+    return value if value >= 1 else 1
+
+
+@contextmanager
+def asr_slot(
+    semaphore: Any,
+    *,
+    check_stop: Callable[[], None],
+    on_wait: Callable[[], object] | None = None,
+    on_acquired: Callable[[], object] | None = None,
+) -> Iterator[None]:
+    """Hold one global ASR slot for the body, waiting cancel-aware.
+
+    ``check_stop`` must raise to abort (cancel/deadline); it runs before every
+    acquire attempt, so a job cancelled while queued never takes a slot and
+    never reaches the transcription call. ``on_wait`` fires once when the slot
+    is not immediately free, ``on_acquired`` once after a wait. The slot is
+    released only when it was actually acquired, even if the body or a hook
+    raises.
+    """
+    waited = False
+    while True:
+        check_stop()
+        if semaphore.acquire(timeout=0.25):
+            break
+        if not waited:
+            waited = True
+            if on_wait is not None:
+                on_wait()
+    try:
+        if waited:
+            if on_acquired is not None:
+                on_acquired()
+            check_stop()
+        yield
+    finally:
+        semaphore.release()

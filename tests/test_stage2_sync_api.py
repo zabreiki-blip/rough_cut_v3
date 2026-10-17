@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import time
 from unittest.mock import patch
 import wave
@@ -1491,6 +1492,89 @@ def test_job_transcribes_only_missing_indexes_and_isolates_source_failure(sync_a
     assert job["transcription_words"] == 3
     assert job["source_failures"][0]["source_id"] == "broken_01"
     assert client.get("/stage2/sync-matches?project=demo").get_json()["result"]["matched"] == 1
+
+
+def _sync_asr_setup(client, projects):
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    audio = client.put(
+        "/stage2/sync-sources/vasilieva_01/audio",
+        data={"project": "demo", "audio": (BytesIO(_wav_bytes()), "guide.wav")},
+        content_type="multipart/form-data",
+    )
+    assert audio.status_code == 200
+
+
+def test_sync_job_releases_asr_slot_when_transcription_raises(sync_api) -> None:
+    client, projects = sync_api
+    _sync_asr_setup(client, projects)
+    semaphore = threading.Semaphore(1)
+    with (
+        patch.object(api, "_ASR_SEMAPHORE", semaphore),
+        patch.object(api, "transcribe_audio", side_effect=RuntimeError("asr boom")),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert response.status_code in {200, 202}
+    assert semaphore.acquire(blocking=False)
+    semaphore.release()
+
+
+def test_sync_job_holds_asr_slot_only_during_transcription(sync_api) -> None:
+    client, projects = sync_api
+    _sync_asr_setup(client, projects)
+    semaphore = threading.Semaphore(1)
+    held_during_call: list[bool] = []
+
+    def fake_transcribe(path, **_kwargs):
+        held_during_call.append(not semaphore.acquire(blocking=False))
+        return {"model": "m", "language": "ru", "words": []}
+
+    with (
+        patch.object(api, "_ASR_SEMAPHORE", semaphore),
+        patch.object(api, "transcribe_audio", side_effect=fake_transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    assert held_during_call == [True]
+    assert semaphore.acquire(blocking=False)
+
+
+def test_sync_job_cancelled_while_waiting_for_asr_slot_skips_transcription(sync_api) -> None:
+    client, projects = sync_api
+    _sync_asr_setup(client, projects)
+
+    class BusySemaphore:
+        """A slot that never frees up; the first wait triggers a user cancel."""
+
+        def __init__(self) -> None:
+            self.acquired = 0
+            self.released = 0
+
+        def acquire(self, blocking=True, timeout=None):
+            with api._SYNC_JOBS_LOCK:
+                for event in api._SYNC_CANCEL_EVENTS.values():
+                    event.set()
+            return False
+
+        def release(self) -> None:
+            self.released += 1
+
+    busy = BusySemaphore()
+    with (
+        patch.object(api, "_ASR_SEMAPHORE", busy),
+        patch.object(
+            api,
+            "transcribe_audio",
+            side_effect=AssertionError("cancelled job reached transcription"),
+        ),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    job_id = response.get_json()["result"]["job_id"]
+    job = client.get(f"/stage2/sync-jobs/status?job_id={job_id}").get_json()["result"]
+    assert job["status"] == "cancelled"
+    assert busy.released == 0
 
 
 def test_job_matches_and_builds_each_fragment_of_one_speaker_block(sync_api) -> None:

@@ -734,6 +734,7 @@ def _job_services(tmp_path: Path, *, transcribe=None):
         _FINAL_REVIEW_CANCEL_EVENTS={"job-1": threading.Event()},
         threading=threading,
         time=time,
+        _ASR_SEMAPHORE=threading.Semaphore(1),
         WhisperCancelledError=WhisperCancelledError,
         uuid=uuid,
         FullTimeline=SimpleNamespace(from_dict=lambda payload: payload),
@@ -848,6 +849,75 @@ def test_final_review_worker_records_cloud_cost_and_failure_cost(tmp_path: Path)
     assert failed._FINAL_REVIEW_JOBS["job-1"]["status"] == "failed"
     assert failed._test_usage[0]["cost_usd"] == 0.5
     assert "demo" not in failed._FINAL_REVIEW_ACTIVE_PROJECTS
+
+
+def _run_final_review(services, **updates):
+    options = {
+        "job_id": "job-1",
+        "project": "demo",
+        "audio_path": services._test_paths["work"] / "review.wav",
+        "language": "ru",
+        "backend": None,
+        "model": None,
+        "source_sequence": {},
+    }
+    options.update(updates)
+    run_final_review_job(services, **options)
+
+
+def test_final_review_waits_for_asr_slot_and_reports_waiting(tmp_path: Path) -> None:
+    calls: list[str] = []
+    services = _job_services(
+        tmp_path,
+        transcribe=lambda _path, **_o: calls.append("t") or {"backend": "local", "language": "ru"},
+    )
+    assert services._ASR_SEMAPHORE.acquire(blocking=False)  # another job owns the slot
+    worker = threading.Thread(target=_run_final_review, args=(services,))
+    worker.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if services._FINAL_REVIEW_JOBS["job-1"].get("asr_waiting"):
+            break
+        time.sleep(0.05)
+    job = services._FINAL_REVIEW_JOBS["job-1"]
+    assert job["asr_waiting"] is True
+    assert job["message"] == "Waiting for an ASR slot"
+    assert calls == []
+    services._ASR_SEMAPHORE.release()
+    worker.join(10)
+    assert calls == ["t"]
+    assert services._FINAL_REVIEW_JOBS["job-1"]["status"] == "completed"
+    assert services._FINAL_REVIEW_JOBS["job-1"]["asr_waiting"] is False
+    assert services._ASR_SEMAPHORE.acquire(blocking=False)
+
+
+def test_final_review_cancel_while_waiting_for_asr_slot_skips_transcription(
+    tmp_path: Path,
+) -> None:
+    services = _job_services(
+        tmp_path, transcribe=lambda *_a, **_k: pytest.fail("cancelled job reached transcription")
+    )
+    assert services._ASR_SEMAPHORE.acquire(blocking=False)
+    worker = threading.Thread(target=_run_final_review, args=(services,))
+    worker.start()
+    time.sleep(0.4)
+    services._FINAL_REVIEW_CANCEL_EVENTS["job-1"].set()
+    worker.join(10)
+    assert not worker.is_alive()
+    assert services._FINAL_REVIEW_JOBS["job-1"]["status"] == "cancelled"
+    # The slot owned by the other job is untouched by the cancelled waiter.
+    assert not services._ASR_SEMAPHORE.acquire(blocking=False)
+    services._ASR_SEMAPHORE.release()
+
+
+def test_final_review_releases_asr_slot_when_transcription_raises(tmp_path: Path) -> None:
+    services = _job_services(
+        tmp_path, transcribe=lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("asr boom"))
+    )
+    _run_final_review(services)
+    assert services._FINAL_REVIEW_JOBS["job-1"]["status"] == "failed"
+    assert services._ASR_SEMAPHORE.acquire(blocking=False)
+    services._ASR_SEMAPHORE.release()
 
 
 @pytest.fixture

@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from api_service_contracts import FinalReviewJobServices
-from job_runtime import trim_terminal_jobs
+from job_runtime import asr_slot, trim_terminal_jobs
 from stage2.whisper_process import WhisperCancelledError, WhisperTimeoutError
 
 
@@ -352,6 +352,7 @@ def run_final_review_job(
                 message="Final review cancelled" if cancelled else "Final review failed",
                 error="" if cancelled else str(exc),
                 finished_at=services._utc_now_iso(),
+                **({"asr_waiting": False} if latest.get("asr_waiting") else {}),
                 **failed_cost,
             )
 
@@ -375,17 +376,29 @@ def run_final_review_job(
             started_at=services._utc_now_iso(),
         )
         check_stop()
-        result = services.transcribe_audio(
-            audio_path,
-            backend=backend,
-            model=model,
-            language=language,
-            cancel_event=cancel_event,
-            deadline_monotonic=deadline,
-            cloud_options=cloud_options,
-            progress_callback=progress,
-            budget_callback=budget,
-        )
+        # The slot covers only the ASR call. Waiting honours cancel and the
+        # whole-job deadline, and a stopped waiter never takes a slot.
+        with asr_slot(
+            services._ASR_SEMAPHORE,
+            check_stop=check_stop,
+            on_wait=lambda: services._update_final_review_job(
+                job_id, message="Waiting for an ASR slot", asr_waiting=True
+            ),
+            on_acquired=lambda: services._update_final_review_job(
+                job_id, message="Transcribing rendered timeline", asr_waiting=False
+            ),
+        ):
+            result = services.transcribe_audio(
+                audio_path,
+                backend=backend,
+                model=model,
+                language=language,
+                cancel_event=cancel_event,
+                deadline_monotonic=deadline,
+                cloud_options=cloud_options,
+                progress_callback=progress,
+                budget_callback=budget,
+            )
         result_backend_metadata = result.get("backend_metadata") or {}
         final_cost = cost_updates(result_backend_metadata)
         final_cost.update(cost_updates(result))

@@ -42,7 +42,14 @@ from api_stage3_routes import register_stage3_routes
 from api_stage4_routes import register_stage4_routes
 from api_sync_worker import run_sync_job
 from atomic_io import atomic_write_json
-from job_runtime import JobRegistry, get_job, release_project, reserve_project, update_job
+from job_runtime import (
+    JobRegistry,
+    asr_concurrency_limit,
+    get_job,
+    release_project,
+    reserve_project,
+    update_job,
+)
 from openrouter_usage import make_usage_callback, reconcile_pending, usage_summary
 from inbox_service import discover_project_inbox
 from logging_config import configure_logging
@@ -211,6 +218,10 @@ _TTS_JOBS_MAX = 200
 _TTS_JOBS_TTL_SECONDS = 24 * 60 * 60
 _TTS_CONCURRENT_MAX = 3
 _TTS_SEMAPHORE = threading.Semaphore(_TTS_CONCURRENT_MAX)
+# Global cap on simultaneous ASR transcriptions (sync + final review, local or
+# cloud). Held only around the transcribe_audio call, never the whole job.
+_ASR_CONCURRENT_MAX = asr_concurrency_limit()
+_ASR_SEMAPHORE = threading.Semaphore(_ASR_CONCURRENT_MAX)
 _TTS_ACTIVE_PROJECTS = _TTS_RUNTIME.active_projects
 _TTS_CANCEL_EVENTS = _TTS_RUNTIME.cancel_events
 _SOURCE_HASH_CACHE: dict[str, tuple[int, int, str]] = {}

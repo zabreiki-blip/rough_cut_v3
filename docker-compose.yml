@@ -19,6 +19,15 @@ services:
       # XMEML is imported by Premiere on the macOS host, so exported file URLs
       # must use the host checkout path rather than /app inside the container.
       - ROUGH_CUT_HOST_PROJECTS_ROOT=${PWD}/projects
+    # Resource ceiling for one Whisper-heavy container. Memory: Whisper medium
+    # int8 on CPU needs about 2-3 GB, the rest covers ffmpeg, audio/WAV
+    # buffers, gunicorn threads and the page cache for bind mounts.
+    # CPUs: 0 = no limit. Any other value must not exceed the number of CPUs
+    # available to Docker (Docker Desktop: Settings > Resources), otherwise the
+    # container fails to start ("range of CPUs is from 0.01 to N").
+    # SYNC_WHISPER_CPU_THREADS (default 8) is a separate setting.
+    mem_limit: ${ROUGH_CUT_MEM_LIMIT:-8g}
+    cpus: ${ROUGH_CUT_CPUS:-0}
     ports:
       - "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}:8000"
     extra_hosts:

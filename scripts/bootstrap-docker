@@ -28,6 +28,23 @@ if [[ ! -f .env ]]; then
 fi
 
 mkdir -p projects data
+
+# The image runs as uid 10001. Docker Desktop (macOS) translates bind-mount
+# ownership, but on Linux the host owner must be able to hand write access to
+# that uid. Only warn: this script never runs sudo.
+if [[ "$(uname -s)" == "Linux" ]]; then
+  for data_dir in projects data; do
+    owner_uid="$(stat -c '%u' "${data_dir}" 2>/dev/null || true)"
+    if [[ -n "${owner_uid}" && "${owner_uid}" != "10001" ]] \
+      && ! getfacl -p "${data_dir}" 2>/dev/null | grep -q '^user:10001:rw'; then
+      echo "WARNING: ${data_dir}/ is owned by uid ${owner_uid}, but the container runs as uid 10001." >&2
+      echo "         The API cannot write there until you run one of (not executed automatically):" >&2
+      echo "           sudo chown -R 10001:10001 projects data" >&2
+      echo "           sudo setfacl -R -m u:10001:rwX -d -m u:10001:rwX projects data" >&2
+      break
+    fi
+  done
+fi
 docker compose config --quiet
 docker compose build stage1-api
 docker compose up -d stage1-api

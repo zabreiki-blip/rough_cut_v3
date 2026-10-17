@@ -536,6 +536,13 @@ Docker устанавливает `faster-whisper` и хранит модели 
 конфигурации, платформы и версий backend; новый индекс атомарно заменяет старый
 только после успешного распознавания.
 
+Одновременно выполняется не более `ROUGH_CUT_MAX_ASR_JOBS` (по умолчанию 1;
+мусор или значение < 1 → 1) распознаваний на весь процесс — и для sync, и для
+финальной проверки, локальных и облачных. Лишние задания ждут слот (статус
+`Waiting for an ASR slot`, поле `asr_waiting`) и отменяются без запуска ASR;
+слот держится только на время самого распознавания. Локальный Whisper при этом
+всё равно сериализован одним worker-процессом.
+
 ## Тесты
 
 ```bash
@@ -614,6 +621,35 @@ scripts/install-cep-macos
 
 После этого в CEP-настройках укажите каталог `projects` этой машины, URL backend
 и новый `ROUGH_CUT_API_TOKEN` из её `.env`.
+
+### Ресурсы и права на `projects/`, `data/`
+
+Контейнер ограничен `mem_limit: ${ROUGH_CUT_MEM_LIMIT:-8g}` и
+`cpus: ${ROUGH_CUT_CPUS:-0}` (переопределяются в `.env`). Whisper medium int8
+на CPU занимает ≈ 2–3 ГБ; остальное — запас под ffmpeg и WAV-буферы.
+`ROUGH_CUT_CPUS=0` — без лимита CPU. **Предупреждение:** ненулевое значение не
+может превышать число CPU, доступных Docker (Docker Desktop: Settings > Resources;
+часто это 4). Иначе `docker compose up` падает с ошибкой «range of CPUs is from
+0.01 to N». `SYNC_WHISPER_CPU_THREADS` (по умолчанию 8) — отдельная настройка
+числа потоков Whisper, она не задаёт лимит контейнера. На Docker Desktop лимит
+памяти работает внутри VM: значение выше памяти VM не вредит, но реально доступна
+только память VM.
+
+Процесс в образе работает под `roughcut` (uid/gid 10001). На macOS (Docker
+Desktop) владелец bind-mount транслируется автоматически. На Linux каталоги
+`projects/` и `data/` должны быть доступны на запись uid 10001, иначе API не
+сможет сохранять проекты. `scripts/bootstrap-docker` проверяет это и печатает
+подсказку (sudo сам не вызывает):
+
+```bash
+sudo chown -R 10001:10001 projects data
+# или, сохранив владельца-хоста (нужен пакет acl):
+sudo setfacl -R -m u:10001:rwX -d -m u:10001:rwX projects data
+```
+
+Не меняйте `user:` в `docker-compose.yml` на uid хоста: /app и named volume
+`whisper_cache` принадлежат 10001, и запись кэша моделей сломается. При rootless
+Docker или `userns-remap` uid смещается — подберите владельца по subuid-диапазону.
 
 ### Apple Silicon M1–M4: Metal/MLX
 

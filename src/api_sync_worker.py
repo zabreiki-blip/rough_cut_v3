@@ -6,6 +6,7 @@ from typing import Any, TypedDict
 
 from api_final_review_jobs import canonical_decimal_string
 from api_service_contracts import SyncWorkerServices
+from job_runtime import asr_slot
 from cost_budget import CostBudget, CostBudgetExceeded
 from stage2.cloud_asr import plan_cloud_chunks
 from stage2.whisper_runner import resolve_backend
@@ -444,18 +445,36 @@ def run_sync_job(
                             )
 
                         cloud_kwargs = {"cloud_options": options, "budget_callback": report_budget}
-                        cloud_dispatch = True
                     transcription_started_at = time.monotonic()
-                    result = transcribe_audio(
-                        audio_path,
-                        backend=config["backend"],
-                        model=model,
-                        language=language,
-                        progress_callback=report_progress,
-                        cancel_event=cancel_event,
-                        timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
-                        **cloud_kwargs,
-                    )
+                    # The global ASR slot covers only the transcription call;
+                    # matching and persistence run outside it. A job cancelled
+                    # while queued raises _JobCancelled without taking a slot.
+                    with asr_slot(
+                        services._ASR_SEMAPHORE,
+                        check_stop=ensure_not_cancelled,
+                        on_wait=lambda: _update_sync_job(
+                            job_id, message="Waiting for an ASR slot", asr_waiting=True
+                        ),
+                        on_acquired=lambda: _update_sync_job(
+                            job_id, message="Transcribing audio", asr_waiting=False
+                        ),
+                    ):
+                        # Marked only once the call really starts: a job
+                        # cancelled while queued for a slot dispatched nothing,
+                        # so it must not be accounted as cloud spend.
+                        cloud_dispatch = cloud_source_options is not None
+                        result = transcribe_audio(
+                            audio_path,
+                            backend=config["backend"],
+                            model=model,
+                            language=language,
+                            progress_callback=report_progress,
+                            cancel_event=cancel_event,
+                            timeout_seconds=(
+                                app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None
+                            ),
+                            **cloud_kwargs,
+                        )
                     result_backend_metadata = result.get("backend_metadata") or {}
                     if cloud_dispatch:
                         account_cloud_source(source.id, initial_exposure, result_backend_metadata)

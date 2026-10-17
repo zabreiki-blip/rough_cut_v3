@@ -58,3 +58,45 @@ def test_macos_cep_installer_never_overwrites_existing_target() -> None:
     assert '[[ -e "${TARGET}" || -L "${TARGET}" ]]' in installer
     assert "Move it aside manually" in installer
     assert 'ln -s "${ROOT_DIR}/cep" "${TARGET}"' in installer
+
+
+def test_compose_has_parameterized_resource_limits() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert re.search(r"^\s+mem_limit:\s*\$\{ROUGH_CUT_MEM_LIMIT:-[^}]+\}\s*$", compose, re.M)
+    # Default 0 = no CPU limit: a fixed default above the Docker CPU count
+    # makes `docker compose up` fail with "range of CPUs is from 0.01 to N".
+    assert re.search(r"^\s+cpus:\s*\$\{ROUGH_CUT_CPUS:-0\}\s*$", compose, re.M)
+    assert "SYNC_WHISPER_CPU_THREADS=${SYNC_WHISPER_CPU_THREADS:-8}" in compose
+    assert "ROUGH_CUT_MEM_LIMIT" in env_example
+    assert "ROUGH_CUT_CPUS" in env_example
+
+
+def test_compose_keeps_image_uid_for_named_cache_volume() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    # Overriding `user:` with the host uid would break writes to /app and the
+    # whisper_cache volume, both owned by the image user.
+    assert not re.search(r"^\s+user:", compose, re.M)
+    assert "--uid 10001" in dockerfile
+
+
+def test_bootstrap_warns_about_linux_bind_mount_ownership_without_sudo() -> None:
+    bootstrap = (ROOT / "scripts/bootstrap-docker").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert '"$(uname -s)" == "Linux"' in bootstrap
+    assert "chown -R 10001:10001 projects data" in bootstrap
+    assert "setfacl" in bootstrap
+    assert not re.search(r"^\s*sudo\s", bootstrap, re.M), "bootstrap must never run sudo"
+    assert "10001" in readme
+    assert "ROUGH_CUT_MEM_LIMIT" in readme
+
+
+def test_asr_concurrency_limit_documented() -> None:
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "ROUGH_CUT_MAX_ASR_JOBS" in env_example
+    assert "ROUGH_CUT_MAX_ASR_JOBS" in readme

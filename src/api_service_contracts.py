@@ -21,6 +21,7 @@ class FinalReviewJobServices(Protocol):
     _FINAL_REVIEW_JOBS_LOCK: Any
     _FINAL_REVIEW_ACTIVE_PROJECTS: set[str]
     _FINAL_REVIEW_CANCEL_EVENTS: dict[str, Any]
+    _ASR_SEMAPHORE: Any
     uuid: ModuleType
     FullTimeline: type[FullTimelineModel]
 
@@ -194,6 +195,7 @@ class SyncWorkerServices(Protocol):
     threading: ModuleType
     time: ModuleType
     _JobCancelled: type[Exception]
+    _ASR_SEMAPHORE: Any
     WhisperCancelledError: type[Exception]
     AlignmentRequest: Any
     MatcherConfig: Any
