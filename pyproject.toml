@@ -13,7 +13,7 @@ source = ["src"]
 show_missing = true
 skip_covered = true
 precision = 1
-fail_under = 79.0
+fail_under = 85.0
 
 [tool.ruff]
 target-version = "py311"
