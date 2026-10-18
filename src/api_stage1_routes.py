@@ -7,6 +7,7 @@ from types import ModuleType
 
 from flask import Flask, jsonify, request
 
+from cost_budget import CostBudget, CostBudgetExceeded
 from stage1.normalizer import invalidate_video_cue_seed_cache
 
 
@@ -77,6 +78,8 @@ def _stage1_analyze(services: ModuleType):
     raw_default = paths["raw"]
 
     try:
+        # One budget per request; invalid configuration fails closed (400) before any call.
+        budget = CostBudget.for_llm_tts(os.environ)
         input_path = services._abs_path(
             payload.get("input_path", input_default),
             services.ROOT_DIR / input_default,
@@ -100,7 +103,10 @@ def _stage1_analyze(services: ModuleType):
             usage_callback=services._make_openrouter_usage_callback(
                 project, stage="normalization", operation="legacy_analyze"
             ),
+            budget=budget,
         )
+    except CostBudgetExceeded as exc:
+        return services._json_error(str(exc), 409)
     except ValueError as exc:
         return services._json_error(str(exc), 400)
     except FileNotFoundError as exc:
@@ -216,6 +222,7 @@ def _stage1_openrouter_usage(services: ModuleType):
 def _stage1_normalization_generate(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
+        budget = CostBudget.for_llm_tts(os.environ)
         project = services._resolve_project_name(payload.get("project"))
         paths = services._ensure_project(project)
         input_files = services._discover_input_files(paths["input"], project)
@@ -236,6 +243,7 @@ def _stage1_normalization_generate(services: ModuleType):
             usage_callback=services._make_openrouter_usage_callback(
                 project, stage="normalization", operation="normalize"
             ),
+            budget=budget,
         )
     except Exception as exc:
         return services._normalization_exception(exc)
@@ -481,6 +489,7 @@ def _stage1_tts(services: ModuleType):
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
     try:
+        budget = CostBudget.for_llm_tts(os.environ)
         prepared_path = services._confirmed_prepared_path(payload, paths)
         speaker_dir = _revision_speaker_dir(
             services,
@@ -505,8 +514,11 @@ def _stage1_tts(services: ModuleType):
             ),
             tts_model=tts_model,
             tts_style=tts_style,
+            budget=budget,
         )
         services._save_voiceover_revision_assets(project, result)
+    except CostBudgetExceeded as exc:
+        return services._json_error(str(exc), 409)
     except ValueError as exc:
         return services._json_error(str(exc), 400)
     except FileNotFoundError as exc:
@@ -771,6 +783,7 @@ def _stage1_tts_phrase(services: ModuleType):
     if not services._reserve_tts_project(project):
         return services._json_error(f"TTS already active for project {project}", 409)
     try:
+        budget = CostBudget.for_llm_tts(os.environ)
         normalized = services._read_json_safe(paths["normalized"])
         speaker_dir = _revision_speaker_dir(
             services, payload, paths, normalized.get("scenario_revision_id")
@@ -789,7 +802,10 @@ def _stage1_tts_phrase(services: ModuleType):
             ),
             tts_model=tts_model,
             tts_style=tts_style,
+            budget=budget,
         )
+    except CostBudgetExceeded as exc:
+        return services._json_error(str(exc), 409)
     except ValueError as exc:
         return services._json_error(str(exc), 400)
     except FileNotFoundError as exc:

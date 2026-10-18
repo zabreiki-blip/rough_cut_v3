@@ -16,6 +16,7 @@ from typing import Any, Callable
 import unicodedata
 
 from atomic_io import atomic_write_json
+from cost_budget import CostBudget
 from stage4.revision_assets import (
     activation_intent_path,
     create_revision_asset_snapshots,
@@ -847,6 +848,7 @@ def import_revision(
     use_llm: bool = False,
     hint: str = "",
     usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    budget: CostBudget | None = None,
 ) -> dict[str, Any]:
     baseline = ensure_baseline(project, project_paths)
     integrity = inspect_revision_state(project_paths)
@@ -900,6 +902,7 @@ def import_revision(
         use_llm=use_llm,
         hint=hint,
         usage_callback=usage_callback,
+        **({"budget": budget} if budget is not None else {}),
     )
     parent_normalized = _read_json(storage["scenarios"] / str(parent["normalized_snapshot"]))
     old_blocks = list(parent_normalized.get("blocks", []))

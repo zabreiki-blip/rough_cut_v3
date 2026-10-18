@@ -68,6 +68,7 @@ from project_service import (
 # Extracted route and worker modules resolve the symbols below through this
 # compatibility facade at call time. Tests and integrations also patch them on
 # ``api``, so they are intentionally retained without direct local references.
+from cost_budget import CostBudgetExceeded
 from stage1.analyzer import analyze_script
 from stage1.config import get_settings, validate_env
 from stage1.gemini_tts import (
@@ -794,6 +795,8 @@ def _normalization_exception(exc: Exception):
         return _json_error(str(exc) or "normalization revision conflict", 409)
     if isinstance(exc, SourceChangedError):
         return _json_error(str(exc) or "normalization source changed", 409)
+    if isinstance(exc, CostBudgetExceeded):
+        return _json_error(str(exc), 409)
     if isinstance(exc, NormalizationValidationError):
         return jsonify(
             {

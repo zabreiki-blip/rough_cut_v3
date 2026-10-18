@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import ModuleType
 
 from flask import Flask, jsonify, request
 
+from cost_budget import CostBudget, CostBudgetExceeded
 from stage4.versioning import (
     RevisionStateConflictError,
     activate_revision,
@@ -75,6 +77,8 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
                         f"Дождитесь завершения {active_job} перед импортом редакции",
                         409,
                     )
+                # One LLM budget per import request; bad config fails closed (400).
+                budget = CostBudget.for_llm_tts(os.environ)
                 result = import_revision(
                     project,
                     paths,
@@ -88,8 +92,9 @@ def register_stage4_routes(app: Flask, services: ModuleType) -> None:
                         stage="normalization",
                         operation="revision_normalize",
                     ),
+                    budget=budget,
                 )
-        except RevisionStateConflictError as exc:
+        except (RevisionStateConflictError, CostBudgetExceeded) as exc:
             return services._json_error(str(exc), 409)
         except (FileNotFoundError, ValueError) as exc:
             return services._json_error(str(exc), 400)
