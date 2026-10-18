@@ -60,4 +60,3 @@
 | D20 | P3 | `cep/js/main.js` (2364 строки) и `cep/host.jsx` (3632) — монолиты | Заморожено (CEP вне scope); B17 |
 | D21 | P3 | Крупные модули: `normalizer.py`, `api.py`, `cloud_asr.py` | AUDIT.md |
 | D22 | P3 | `_fallback_blocks` в analyzer делит только по пустым строкам — абзацы через одиночный `\n` склеиваются (зафиксировано тестом как текущее поведение) | B14 |
-| D23 | P3 | `PROJECT_NAME` в `.env.example`/`config.py` нигде не используется | B10 |
