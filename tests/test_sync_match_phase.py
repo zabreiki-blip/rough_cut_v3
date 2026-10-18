@@ -14,6 +14,7 @@ from sync_match_phase import (
     SyncMatchContext,
     SyncMatchResult,
     _make_checkpoint_writer,
+    _match_signature,
     run_match_phase,
 )
 
@@ -346,6 +347,36 @@ def test_rematch_confirmed_forces_rematch_of_older_confirmed_prior() -> None:
     assert [m.status for m in h.store.items] == ["auto_matched"]
 
 
+def test_rematch_confirmed_replaces_legacy_confirmed_without_manual_timestamp() -> None:
+    h = _Harness(["a"])
+    h.store.items = [_prior("a", status="confirmed")]
+
+    result = h.run(rematch_confirmed=True)
+
+    assert h.matched == ["a"]
+    assert [m.status for m in result.matches] == ["auto_matched"]
+    assert [m.status for m in h.store.items] == ["auto_matched"]
+
+
+def test_rematch_confirmed_keeps_manual_edit_made_during_job() -> None:
+    h = _Harness(["a"])
+    h.store.items = [_prior("a", status="confirmed")]
+    original = h._match_segment
+    manual = _prior("a", status="confirmed", manual_updated_at="2026-01-01T00:00:05+00:00")
+
+    def match_and_edit(request: Any) -> Any:
+        fresh = original(request)
+        h.store.items = [manual]  # user confirms via PATCH while the job runs
+        return fresh
+
+    h._match_segment = match_and_edit  # type: ignore[method-assign]
+
+    result = h.run(rematch_confirmed=True)
+
+    assert h.store.items == [manual]
+    assert result.matches == [manual]
+
+
 def test_cost_budget_exceeded_outside_review_propagates_from_phase() -> None:
     h = _Harness(["a", "b"])
 
@@ -375,12 +406,17 @@ def _writer(
     dirty: bool = True,
     scenario_revision_id: str = "",
     started: datetime | None = _STARTED,
+    initial: list[Any] | None = None,
 ) -> tuple[Any, dict[str, bool]]:
     state = {"dirty": dirty}
     ctx: Any = SimpleNamespace(match_store=store, data_lock=threading.Lock())
     write = _make_checkpoint_writer(
         ctx,
         existing=existing,
+        initial_signatures={
+            item.segment_id: _match_signature(item)
+            for item in (store.items if initial is None else initial)
+        },
         checkpoint_state=state,
         rematched_this_run=rematched if rematched is not None else set(),
         matching_started_at_dt=started,
@@ -479,14 +515,37 @@ def test_checkpoint_writer_unknown_job_start_makes_manual_edit_authoritative() -
     assert store.items == [manual]
 
 
-def test_checkpoint_writer_confirmed_without_manual_timestamp_is_authoritative() -> None:
+def test_checkpoint_writer_legacy_confirmed_without_timestamp_yields_to_forced_rematch() -> None:
     legacy = _stored("a", status="confirmed")
     store = _Store([legacy])
-    write, _ = _writer(store, {"a": _fresh("a")}, rematched={"a"})
+    fresh = _fresh("a")
+    existing = {"a": fresh}
+    write, _ = _writer(store, existing, rematched={"a"})
 
     write()
 
-    assert store.items == [legacy]
+    assert store.items == [fresh]
+    assert existing["a"] is fresh
+
+
+def test_checkpoint_writer_unstamped_confirmation_added_during_job_is_authoritative() -> None:
+    raced = _stored("a", status="confirmed", confirmed_by="editor-during-job")
+    store = _Store([raced])
+    write, _ = _writer(store, {"a": _fresh("a")}, rematched={"a"}, initial=[])
+
+    write()
+
+    assert store.items == [raced]
+
+
+def test_checkpoint_writer_legacy_confirmed_without_timestamp_kept_when_not_rematched() -> None:
+    legacy = _stored("a", status="confirmed")
+    store = _Store([legacy])
+    write, _ = _writer(store, {"b": _fresh("b")}, rematched={"b"})
+
+    write()
+
+    assert next(item for item in store.items if item.segment_id == "a") is legacy
 
 
 def test_checkpoint_writer_unconfirmed_rematched_persisted_loses_to_fresh_match() -> None:

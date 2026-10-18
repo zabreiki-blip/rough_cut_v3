@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -126,10 +127,26 @@ class _ReviewState:
     failures: list[dict[str, str]] = field(default_factory=list)
 
 
+def _match_signature(match: Any) -> str:
+    """Stable fingerprint of a stored match, used to detect changes during a job."""
+    to_dict = getattr(match, "to_dict", None)
+    payload = (
+        to_dict()
+        if callable(to_dict)
+        else {
+            "status": getattr(match, "status", None),
+            "source_id": getattr(match, "source_id", None),
+            "metadata": getattr(match, "metadata", None),
+        }
+    )
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
 def _make_checkpoint_writer(
     ctx: SyncMatchContext,
     *,
     existing: dict[str, Any],
+    initial_signatures: Mapping[str, str],
     checkpoint_state: dict[str, bool],
     rematched_this_run: set[str],
     matching_started_at_dt: datetime | None,
@@ -149,7 +166,13 @@ def _make_checkpoint_writer(
             # the segment at all. An older confirmation/edit that predates
             # the job must yield to an explicit forced rematch, otherwise
             # ``rematch_confirmed=True`` can never actually replace a
-            # previously confirmed range.
+            # previously confirmed range. A confirmation without a
+            # ``manual_updated_at`` is legacy data: every current write path
+            # (the PATCH matches route) stamps it, so such a record
+            # predates the job and yields to a forced rematch, unless the
+            # stored record differs from the snapshot taken at phase start
+            # (a confirmation written during the job by a path that does not
+            # stamp the timestamp).
             for persisted_id, persisted_match in persisted.items():
                 persisted_revision = persisted_match.metadata.get("normalization_revision")
                 persisted_scenario_revision_id = str(
@@ -175,12 +198,9 @@ def _make_checkpoint_writer(
                     else:
                         edited_during_run = manual_updated_at_dt >= matching_started_at_dt
                 elif persisted_match.status == "confirmed":
-                    # A confirmed record with no manual-edit timestamp at
-                    # all cannot be time-compared against the job start
-                    # (legacy data, or a confirmation raced in without
-                    # going through the PATCH endpoint). Stay
-                    # conservative rather than silently discard it.
-                    edited_during_run = True
+                    edited_during_run = initial_signatures.get(persisted_id) != _match_signature(
+                        persisted_match
+                    )
                 else:
                     edited_during_run = False
                 not_rematched_this_run = persisted_id not in rematched_this_run
@@ -300,6 +320,7 @@ def run_match_phase(
         if ctx.normalize_text(name)
     }
     existing = {item.segment_id: item for item in match_store.list()}
+    initial_signatures = {key: _match_signature(item) for key, item in existing.items()}
     confirmed_parent_ids = {
         segment_id
         for segment_id, item in existing.items()
@@ -352,6 +373,7 @@ def run_match_phase(
     checkpoint_matches = _make_checkpoint_writer(
         ctx,
         existing=existing,
+        initial_signatures=initial_signatures,
         checkpoint_state=checkpoint_state,
         rematched_this_run=rematched_this_run,
         matching_started_at_dt=matching_started_at_dt,
