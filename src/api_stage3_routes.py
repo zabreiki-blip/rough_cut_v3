@@ -15,12 +15,17 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from atomic_io import atomic_write_json, atomic_write_text
 from export_naming import xml_export_filename
+from job_runtime import trim_terminal_jobs
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
+_STAGE3_JOB_KINDS = ("scan", "prepare")
+_STAGE3_JOBS_MAX = 200
+_STAGE3_JOBS_TTL_SECONDS = 24 * 60 * 60
+_STAGE3_TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
 
 
 class Stage3OperationError(RuntimeError):
@@ -529,12 +534,60 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     }
 
 
-def _job_status_path(project: str, services: ModuleType) -> Path:
+def _job_status_path(project: str, kind: str, services: ModuleType) -> Path:
+    return services._ensure_project(project)["work"] / f"stage3_{kind}_job_status.json"
+
+
+def _legacy_job_status_path(project: str, services: ModuleType) -> Path:
     return services._ensure_project(project)["work"] / "stage3_job_status.json"
 
 
 def _persist_job(job: dict, services: ModuleType) -> None:
-    atomic_write_json(_job_status_path(str(job["project"]), services), job)
+    atomic_write_json(_job_status_path(str(job["project"]), str(job["kind"]), services), job)
+
+
+def _read_json_dict(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_persisted_jobs(project: str, kind: str, services: ModuleType) -> list[dict]:
+    """Read the persisted job for ``kind``; fall back to the pre-split shared file."""
+    path = _job_status_path(project, kind, services)
+    persisted = _read_json_dict(path)
+    if persisted is not None:
+        return [persisted]
+    if path.exists():
+        return []
+    legacy = _read_json_dict(_legacy_job_status_path(project, services))
+    if legacy is not None and legacy.get("kind") == kind:
+        return [legacy]
+    return []
+
+
+def _mark_interrupted(job: dict, services: ModuleType) -> None:
+    if job.get("status") in {"queued", "running"}:
+        job.update(
+            {
+                "status": "interrupted",
+                "message": "Stage 3 был прерван перезапуском сервера",
+                "finished_at": _now_iso(),
+            }
+        )
+        _persist_job(job, services)
+
+
+def _trim_jobs_locked(jobs: dict) -> None:
+    trim_terminal_jobs(
+        jobs,
+        terminal_statuses=_STAGE3_TERMINAL_STATUSES,
+        now=datetime.now(timezone.utc),
+        ttl_seconds=_STAGE3_JOBS_TTL_SECONDS,
+        max_jobs=_STAGE3_JOBS_MAX,
+    )
 
 
 def _update_job(job_id: str, jobs: dict, jobs_lock, services: ModuleType, **updates) -> dict | None:
@@ -564,6 +617,7 @@ def _create_job(project: str, kind: str, jobs: dict, jobs_lock, services: Module
         "finished_at": None,
     }
     with jobs_lock:
+        _trim_jobs_locked(jobs)
         jobs[job_id] = job
     _persist_job(job, services)
     return dict(job)
@@ -732,22 +786,14 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 project = services._resolve_project_name(request.args.get("project"))
             except ValueError as exc:
                 return services._json_error(str(exc), 400)
-            path = _job_status_path(project, services)
-            try:
-                persisted = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                persisted = None
-            if isinstance(persisted, dict) and str(persisted.get("id") or "") == job_id:
-                job = persisted
-                if job.get("status") in {"queued", "running"}:
-                    job.update(
-                        {
-                            "status": "interrupted",
-                            "message": "Stage 3 был прерван перезапуском сервера",
-                            "finished_at": _now_iso(),
-                        }
-                    )
-                    _persist_job(job, services)
+            for kind in _STAGE3_JOB_KINDS:
+                for persisted in _read_persisted_jobs(project, kind, services):
+                    if str(persisted.get("id") or "") == job_id:
+                        job = persisted
+                        _mark_interrupted(job, services)
+                        break
+                if job is not None:
+                    break
         if job is None:
             return services._json_error("job not found", 404)
         return jsonify({"ok": True, "result": job})
@@ -770,22 +816,15 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         if candidates:
             latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
             return jsonify({"ok": True, "result": latest})
-        path = _job_status_path(project, services)
-        try:
-            restored = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        restored_jobs = [
+            restored
+            for current_kind in ([kind] if kind else _STAGE3_JOB_KINDS)
+            for restored in _read_persisted_jobs(project, current_kind, services)
+        ]
+        if not restored_jobs:
             return services._json_error("job not found", 404)
-        if kind and restored.get("kind") != kind:
-            return services._json_error("job not found", 404)
-        if restored.get("status") in {"queued", "running"}:
-            restored.update(
-                {
-                    "status": "interrupted",
-                    "message": "Stage 3 был прерван перезапуском сервера",
-                    "finished_at": _now_iso(),
-                }
-            )
-            _persist_job(restored, services)
+        restored = max(restored_jobs, key=lambda item: str(item.get("created_at") or ""))
+        _mark_interrupted(restored, services)
         return jsonify({"ok": True, "result": restored})
 
     @app.post("/stage3/media/scan")

@@ -826,3 +826,144 @@ def test_latest_stage3_job_status_survives_route_registry_restart(client) -> Non
     job = restored.get_json()["result"]
     assert job["id"] == completed_id
     assert job["status"] == "completed"
+
+
+def _stub_empty_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "/app/projects/BRIK/media/reviews",
+            "relative_directory": "media/reviews",
+            "recursive": False,
+            "sources": [],
+        },
+    )
+
+
+def _restarted_client(services) -> object:
+    restarted_app = Flask(__name__)
+    restarted_app.config.update(TESTING=True)
+    api_stage3_routes.register_stage3_routes(restarted_app, services)
+    return restarted_app.test_client()
+
+
+def test_stage3_job_registry_is_trimmed_but_keeps_active_jobs(client) -> None:
+    http, _app, monkeypatch = client
+    monkeypatch.setattr(api_stage3_routes, "_STAGE3_JOBS_MAX", 2)
+    _stub_empty_scan(monkeypatch)
+    _HoldingThread.instances.clear()
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _HoldingThread)
+    active_id = http.post("/stage3/jobs/prepare/start", json={"project": "ACTIVE"}).get_json()[
+        "result"
+    ]["job_id"]
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+
+    job_ids = [
+        http.post("/stage3/jobs/scan/start", json={"project": "BRIK"}).get_json()["result"][
+            "job_id"
+        ]
+        for _ in range(5)
+    ]
+
+    assert http.get(f"/stage3/jobs/{job_ids[0]}?project=BRIK").status_code == 404
+    assert http.get(f"/stage3/jobs/{job_ids[1]}?project=BRIK").status_code == 404
+    assert http.get(f"/stage3/jobs/{job_ids[-1]}?project=BRIK").status_code == 200
+    active = http.get(f"/stage3/jobs/{active_id}?project=BRIK").get_json()["result"]
+    assert active["status"] == "queued"
+
+
+def test_stage3_job_registry_drops_expired_terminal_jobs(client) -> None:
+    http, _app, monkeypatch = client
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    _stub_empty_scan(monkeypatch)
+    first_id = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"}).get_json()["result"][
+        "job_id"
+    ]
+    second_id = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"}).get_json()["result"][
+        "job_id"
+    ]
+    assert http.get(f"/stage3/jobs/{first_id}?project=BRIK").status_code == 200
+
+    monkeypatch.setattr(api_stage3_routes, "_STAGE3_JOBS_TTL_SECONDS", -1.0)
+    third_id = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"}).get_json()["result"][
+        "job_id"
+    ]
+
+    assert http.get(f"/stage3/jobs/{first_id}?project=BRIK").status_code == 404
+    assert http.get(f"/stage3/jobs/{second_id}?project=BRIK").status_code == 404
+    assert http.get(f"/stage3/jobs/{third_id}?project=BRIK").status_code == 200
+
+
+def test_stage3_scan_and_prepare_statuses_do_not_overwrite_each_other(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    _stub_empty_scan(monkeypatch)
+    scan_id = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"}).get_json()["result"][
+        "job_id"
+    ]
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "fps": 25,
+                "width": 1920,
+                "height": 1080,
+                "normalization_revision": "norm-1",
+                "segments": [{"id": "snh1", "type": "snh"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepare_id = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"}).get_json()[
+        "result"
+    ]["job_id"]
+
+    restarted = _restarted_client(services)
+
+    scan = restarted.get("/stage3/jobs/status?project=BRIK&kind=scan").get_json()["result"]
+    prepare = restarted.get("/stage3/jobs/status?project=BRIK&kind=prepare").get_json()["result"]
+    assert (scan["id"], scan["kind"], scan["status"]) == (scan_id, "scan", "completed")
+    assert (prepare["id"], prepare["kind"], prepare["status"]) == (
+        prepare_id,
+        "prepare",
+        "completed",
+    )
+    assert restarted.get(f"/stage3/jobs/{scan_id}?project=BRIK").get_json()["result"]["kind"] == (
+        "scan"
+    )
+    assert (
+        restarted.get(f"/stage3/jobs/{prepare_id}?project=BRIK").get_json()["result"]["kind"]
+        == "prepare"
+    )
+    latest = restarted.get("/stage3/jobs/status?project=BRIK").get_json()["result"]
+    assert latest["id"] == prepare_id
+    assert (paths["work"] / "stage3_scan_job_status.json").exists()
+    assert (paths["work"] / "stage3_prepare_job_status.json").exists()
+    assert not (paths["work"] / "stage3_job_status.json").exists()
+
+
+def test_stage3_legacy_shared_job_status_file_is_still_read(client) -> None:
+    _http, app, _monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    legacy = {
+        "id": "legacyjob",
+        "project": "BRIK",
+        "kind": "scan",
+        "status": "completed",
+        "progress": 100,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    (paths["work"] / "stage3_job_status.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    restarted = _restarted_client(services)
+
+    by_kind = restarted.get("/stage3/jobs/status?project=BRIK&kind=scan")
+    assert by_kind.get_json()["result"]["id"] == "legacyjob"
+    assert restarted.get("/stage3/jobs/legacyjob?project=BRIK").status_code == 200
+    assert restarted.get("/stage3/jobs/status?project=BRIK&kind=prepare").status_code == 404

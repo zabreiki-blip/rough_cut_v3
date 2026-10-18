@@ -55,7 +55,7 @@
 | ID | Pri | Долг | Источник |
 |----|-----|------|----------|
 | D17 | P3 | `run_sync_job` разбит на оркестратор (`api_sync_worker.py`, 273 строки, из них `run_sync_job` 257) и фазы `sync_asr_phase.py` / `sync_match_phase.py` / `sync_cost_tracker.py` с юнит-тестами. Остаток: ~50 строк распаковки `services` и сборка двух контекстов (`SyncAsrContext`, `SyncMatchContext`) в самом оркестраторе; `run_asr_phase` ~390 строк одним циклом | B11 |
-| D18 | P2 | Пять копий job-фреймворка (создание/персист/reserve/trim/interrupted). Общий `trim_terminal_jobs` есть в `job_runtime.py`, подключён только к final review | B12 |
+| D18 | P2 | Пять копий job-фреймворка (создание/персист/reserve/interrupted). Trim уже общий (`trim_terminal_jobs` во всех пяти реестрах, у Stage 3 лимит/TTL, раздельные файлы scan/prepare). Остаются расхождения: политика ошибки записи (best-effort vs raise), trim при терминальном update только у final review, нет cancel у нормализации и Stage 3 | B12, после пилота F1–F4 |
 | D19 | P3 | Квадратичные сканы в финальной проверке (`_best_span`) и пересчёт `_sync_summary` на каждом сегменте; не измерено | B13 |
 | D20 | P3 | `cep/js/main.js` (2364 строки) и `cep/host.jsx` (3632) — монолиты | Заморожено (CEP вне scope); B17 |
 | D21 | P3 | Крупные модули: `normalizer.py`, `api.py`, `cloud_asr.py` | AUDIT.md |
