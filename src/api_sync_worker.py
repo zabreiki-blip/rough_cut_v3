@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, TypedDict
+from typing import Any
 
 from api_final_review_jobs import canonical_decimal_string
 from api_service_contracts import SyncWorkerServices
@@ -11,6 +11,7 @@ from job_runtime import asr_slot
 from cost_budget import CostBudget, CostBudgetExceeded
 from stage2.cloud_asr import plan_cloud_chunks
 from stage2.whisper_runner import resolve_backend
+from sync_cost_tracker import SyncCostTracker, _AsrMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -33,23 +34,6 @@ def _parse_iso_datetime(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
-
-
-class _AsrMetrics(TypedDict):
-    """Per-key typed job-status fields for ASR usage metrics.
-
-    A plain ``dict[str, object]`` forces every value to the ``object``
-    type, which breaks ``+=`` on the numeric fields under mypy (see
-    api_sync_worker.py history). A ``TypedDict`` keeps each key's own
-    declared type (``str``/``float``) without changing the dict's shape,
-    so it still unpacks into ``_update_sync_job(**asr_metrics)`` exactly
-    as before.
-    """
-
-    asr_backend_used: str
-    asr_cost_usd_total: float
-    asr_timestamp_precision: str
-    transcription_wall_sec_total: float
 
 
 def run_sync_job(
@@ -116,72 +100,6 @@ def run_sync_job(
         "asr_timestamp_precision": "",
         "transcription_wall_sec_total": 0.0,
     }
-    cloud_costs: dict[str, dict[str, Any]] = {}
-
-    def cloud_totals() -> tuple[Decimal, Decimal, bool]:
-        return (
-            sum((item["known"] for item in cloud_costs.values()), Decimal("0")),
-            sum((item["reserved"] for item in cloud_costs.values()), Decimal("0")),
-            any(item["pending"] for item in cloud_costs.values()),
-        )
-
-    def account_cloud_source(
-        source_id: str,
-        initial_exposure: Decimal,
-        payload: Any,
-        *,
-        snapshot: bool = False,
-    ) -> None:
-        def value(name: str) -> Any:
-            return payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
-
-        current = cloud_costs.setdefault(
-            source_id,
-            {"known": Decimal("0"), "reserved": Decimal("0"), "pending": False},
-        )
-        known = value("spent_usd" if snapshot else "cost_usd")
-        reserved = value("reserved_usd" if snapshot else "reserved_cost_usd")
-        pending = value("cost_pending")
-        if known is not None:
-            # The adapter treats all prior exposure as initial spent. Only
-            # the current source's delta is newly confirmed provider cost.
-            current["known"] = max(Decimal("0"), Decimal(str(known)) - initial_exposure)
-        if reserved is not None:
-            current["reserved"] = Decimal(str(reserved))
-        if pending is not None:
-            current["pending"] = bool(pending)
-        elif reserved is not None:
-            current["pending"] = current["reserved"] > 0
-        known_total, reserved_total, pending_total = cloud_totals()
-        asr_metrics["asr_cost_usd_total"] = float(known_total)
-        _update_sync_job(
-            job_id,
-            persist=should_persist_progress(),
-            cost_usd=float(known_total),
-            reserved_cost_usd=float(reserved_total),
-            cost_pending=pending_total,
-            **asr_metrics,
-        )
-
-    # The semantic-review budget starts from the cloud ASR exposure of this job,
-    # so a single job limit covers ASR and LLM spend together.
-    llm_budget_state: dict[str, Any] = {"budget": None, "initial": Decimal("0")}
-
-    def llm_cost_fields() -> dict[str, Any]:
-        llm_budget = llm_budget_state["budget"]
-        if llm_budget is None:
-            return {}
-        snapshot = llm_budget.snapshot()
-        known_total, reserved_total, pending_total = cloud_totals()
-        llm_spent = max(0.0, snapshot["spent_usd"] - float(llm_budget_state["initial"]))
-        return {
-            "cost_usd": float(known_total) + llm_spent,
-            "reserved_cost_usd": float(reserved_total) + snapshot["reserved_usd"],
-            "cost_pending": pending_total or llm_budget.has_pending_reservations,
-            "llm_cost_usd": llm_spent,
-            # Part of llm_cost_usd booked by estimate, not by provider-reported cost.
-            "llm_estimated_cost_usd": snapshot["estimated_spent_usd"],
-        }
 
     def should_persist_progress(*, force: bool = False) -> bool:
         nonlocal last_progress_persist_at
@@ -191,6 +109,14 @@ def run_sync_job(
                 return False
             last_progress_persist_at = now
             return True
+
+    cost_tracker = SyncCostTracker(
+        job_id=job_id,
+        update_job=_update_sync_job,
+        should_persist=should_persist_progress,
+        asr_metrics=asr_metrics,
+        logger=logger,
+    )
 
     # Not dead code: the cancel/failure handlers below call ``checkpoint_matches``
     # even when the job stops before matching starts. This no-op is the binding
@@ -255,7 +181,7 @@ def run_sync_job(
 
             def record_cloud_usage(selected_model: str) -> None:
                 nonlocal usage_recorded, pending_usage_recorded
-                current = cloud_costs.get(source.id)
+                current = cost_tracker.source_cost(source.id)
                 if current is None:
                     return
                 if current["pending"] and not pending_usage_recorded:
@@ -446,8 +372,7 @@ def run_sync_job(
                             raise CostBudgetExceeded(
                                 "Cloud source changed since cost preflight; start the sync job again"
                             )
-                        known_total, reserved_total, _pending = cloud_totals()
-                        initial_exposure = known_total + reserved_total
+                        initial_exposure = cost_tracker.cloud_exposure()
                         budget = CostBudget(
                             Decimal(options["max_cost_usd"]),
                             Decimal(options["usd_per_minute_estimate"]),
@@ -465,7 +390,7 @@ def run_sync_job(
                         options["initial_cost_usd"] = canonical_decimal_string(initial_exposure)
 
                         def report_budget(snapshot: dict[str, Any]) -> None:
-                            account_cloud_source(
+                            cost_tracker.account_cloud_source(
                                 source.id, initial_exposure, snapshot, snapshot=True
                             )
 
@@ -502,7 +427,9 @@ def run_sync_job(
                         )
                     result_backend_metadata = result.get("backend_metadata") or {}
                     if cloud_dispatch:
-                        account_cloud_source(source.id, initial_exposure, result_backend_metadata)
+                        cost_tracker.account_cloud_source(
+                            source.id, initial_exposure, result_backend_metadata
+                        )
                         record_cloud_usage(str(result.get("model") or model or ""))
                     elif str(result.get("backend") or backend or "") == "cloud-audio":
                         asr_usage_callback(
@@ -544,7 +471,7 @@ def run_sync_job(
             except Exception as exc:
                 failed_cost = getattr(exc, "cost_usd", None)
                 if cloud_dispatch:
-                    account_cloud_source(source.id, initial_exposure, exc)
+                    cost_tracker.account_cloud_source(source.id, initial_exposure, exc)
                     record_cloud_usage(str(model or ""))
                 elif failed_cost is not None:
                     asr_usage_callback(
@@ -629,24 +556,14 @@ def run_sync_job(
         except ValueError:
             llm_review_limit = 30
         if llm_review_enabled:
-            known_total, reserved_total, _pending = cloud_totals()
             # Prefer the settings frozen at job start; fall back to the environment
             # for callers that bypass the start route.
             llm_cost_env = job.get("llm_cost_env")
             if not isinstance(llm_cost_env, dict):
                 llm_cost_env = os.environ
-            try:
-                llm_budget_state["budget"] = CostBudget.for_llm_tts(
-                    llm_cost_env, known_total + reserved_total
-                )
-                llm_budget_state["initial"] = known_total + reserved_total
-            except ValueError as exc:
+            if not cost_tracker.init_llm_budget(llm_cost_env):
                 # Fail closed: without a valid budget no paid review call is made.
                 llm_review_enabled = False
-                logger.warning(
-                    "Sync job=%s: LLM review disabled, invalid cost settings: %s", job_id, exc
-                )
-                _update_sync_job(job_id, llm_budget_error=str(exc))
         llm_reviewed = 0
         llm_review_failures: list[dict[str, str]] = []
         checkpoint_state = {"dirty": False}
@@ -825,7 +742,7 @@ def run_sync_job(
                             candidates=semantic_candidates,
                             settings=settings,
                             usage_callback=semantic_usage_callback,
-                            budget=llm_budget_state["budget"],
+                            budget=cost_tracker.llm_budget,
                         )
                         llm_reviewed += 1
                         if decision is not None:
@@ -883,7 +800,7 @@ def run_sync_job(
                 segment_failures=list(segment_failures),
                 llm_reviewed=llm_reviewed,
                 llm_review_failures=list(llm_review_failures),
-                **llm_cost_fields(),
+                **cost_tracker.llm_cost_fields(),
             )
 
         checkpoint_matches()
@@ -900,7 +817,7 @@ def run_sync_job(
             segment_failures=segment_failures,
             llm_reviewed=llm_reviewed,
             llm_review_failures=llm_review_failures,
-            **llm_cost_fields(),
+            **cost_tracker.llm_cost_fields(),
             **asr_metrics,
             **summary,
         )
@@ -933,7 +850,7 @@ def run_sync_job(
             message="Failed",
             error=str(exc),
             finished_at=_utc_now_iso(),
-            **llm_cost_fields(),
+            **cost_tracker.llm_cost_fields(),
         )
     finally:
         _release_sync_project(project)
