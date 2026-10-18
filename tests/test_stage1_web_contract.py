@@ -28,6 +28,13 @@ def test_restored_tts_job_rehydrates_every_resume_control() -> None:
     assert "restoreTtsControls(response.result);" in STAGE1_JS
 
 
+def test_tts_style_degradation_is_surfaced_in_live_panel() -> None:
+    assert 'id="live_style_warning"' in PROJECT_HTML
+    assert "state.style_degraded_ids" in STAGE1_JS
+    assert "result.style_degraded" in STAGE1_JS
+    assert ".live-warning" in STAGE1_CSS
+
+
 def test_tts_menu_uses_openrouter_models_and_style_direction() -> None:
     assert '<option value="gemini"' not in PROJECT_HTML
     assert "OpenRouter · MAI-Voice-2" in PROJECT_HTML

@@ -34,6 +34,26 @@ function eventTitle(event) {
   return map[event] || event || "—";
 }
 
+const STYLE_DEGRADED_IDS_SHOWN = 20;
+
+function normalizeIds(value) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+export function styleDegradedMessage(idsList, total) {
+  const list = normalizeIds(idsList);
+  if (!list.length) return "";
+  const shown = list.slice(0, STYLE_DEGRADED_IDS_SHOWN).join(", ");
+  const rest = list.length - STYLE_DEGRADED_IDS_SHOWN;
+  const of = Number(total) > 0 ? ` из ${Number(total)}` : "";
+  return (
+    `Стиль озвучки не применён у ${list.length}${of} блоков: провайдер вернул пустое аудио, `
+    + `блоки озвучены без стиля (обычным голосом). Блоки: ${shown}${rest > 0 ? ` и ещё ${rest}` : ""}.`
+  );
+}
+
 export function renderLive() {
   if (!ids.live_job_status) return;
   ids.live_job_status.dataset.state = live.status || "idle";
@@ -44,6 +64,11 @@ export function renderLive() {
   ids.live_done.textContent = `${live.done || 0}/${live.total || 0}`;
   ids.live_error.textContent = live.error ? `${live.error}` : "—";
   ids.live_error.classList.toggle("has-error", Boolean(live.error));
+  if (ids.live_style_warning) {
+    const warning = styleDegradedMessage(live.styleDegradedIds, live.total);
+    ids.live_style_warning.textContent = warning;
+    ids.live_style_warning.hidden = !warning;
+  }
   if (currentTtsJobId !== lastTtsEtaJobId) {
     lastTtsEtaJobId = currentTtsJobId;
     ttsJobClientStartedAt = null;
@@ -91,7 +116,7 @@ async function doTTS() {
   }
   setLive({
     status: "queued", event: "queued",
-    current: "—", retries: 0, done: 0, total: 0, error: "",
+    current: "—", retries: 0, done: 0, total: 0, error: "", styleDegradedIds: [],
   });
   appendLog(`TTS job: provider=${f.provider}, model=${f.tts_model || "local"}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
   const start = await postJSON("/stage1/tts-jobs/start", {
@@ -169,7 +194,15 @@ async function doTTS() {
     if (state.status === "completed") {
       const result = state.result || {};
       setStepState(ids.step_tts, "completed");
-      setLive({ status: "completed", event: "completed", current: "—", done: total, total, error: "" });
+      const degradedIds = normalizeIds(state.style_degraded_ids || result.style_degraded_ids);
+      setLive({
+        status: "completed", event: "completed", current: "—", done: total, total, error: "",
+        styleDegradedIds: degradedIds,
+      });
+      if (degradedIds.length) {
+        toast(`Стиль озвучки не применён у ${degradedIds.length} блоков`, "warn");
+        appendLog(`TTS style degraded: ${degradedIds.join(", ")}`, "warn");
+      }
       const gen = result.files_count || state.generated || 0;
       const skip = result.skipped_count || state.skipped || 0;
       toast(`TTS завершён: ${gen} создано, ${skip} пропущено`, "success");
@@ -243,7 +276,7 @@ async function clearTTS() {
   setStepState(ids.step_validate, "idle");
   setLive({
     status: "idle", event: "—", current: "—",
-    retries: 0, done: 0, total: 0, error: "",
+    retries: 0, done: 0, total: 0, error: "", styleDegradedIds: [],
   });
   toast(`Озвучка очищена: удалено ${result.files_removed || 0} файлов`, "success");
   appendLog(`TTS cleared: files=${result.files_removed || 0}, manifests=${result.manifests_reset || 0}`);
@@ -308,6 +341,7 @@ function renderRestoredTtsJob(state) {
     done,
     total,
     error: String(state.last_error || state.error || ""),
+    styleDegradedIds: normalizeIds(state.style_degraded_ids),
   });
   if (total > 0) {
     const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
@@ -385,6 +419,9 @@ async function doPhraseTTS() {
     speed: f.speed,
   }, PHRASE_TTS_TIMEOUT_MS);
   toast("Фраза озвучена", "success");
+  if (result.style_degraded) {
+    toast("Стиль озвучки не применён: провайдер вернул пустое аудио, фраза озвучена без стиля", "warn");
+  }
   appendLog(`Phrase done: file=${result.file}, voice=${result.voice}`);
   if (result.playback_url && ids.phrase_player) {
     ids.phrase_player.src = `${result.playback_url}?t=${Date.now()}`;

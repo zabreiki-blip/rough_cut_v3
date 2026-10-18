@@ -54,6 +54,7 @@ export const ids = {
   live_job_elapsed: el("live_job_elapsed"),
   live_job_eta: el("live_job_eta"),
   live_error: el("live_error"),
+  live_style_warning: el("live_style_warning"),
   speaker_items: el("speaker_items"),
   speaker_hint: el("speaker_hint"),
   log_box: el("log_box"),
@@ -205,4 +206,6 @@ export const live = {
   done: 0,
   total: 0,
   error: "",
+  // Block ids whose audio fell back to plain transcript (style not applied).
+  styleDegradedIds: [],
 };

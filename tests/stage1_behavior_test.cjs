@@ -153,6 +153,36 @@ async function testPhraseTtsTimeout({ core, tts }) {
   }
 }
 
+function testStyleDegradedWarning({ state, tts }) {
+  const { ids, live } = state;
+  const warning = ids.live_style_warning;
+  const original = { ...live };
+  try {
+    // Degradation present: visible warning with count, total and block ids.
+    Object.assign(live, { status: "completed", total: 5, styleDegradedIds: ["zk1", "<b>x</b>"] });
+    tts.renderLive();
+    assert.strictEqual(warning.hidden, false);
+    assert.ok(warning.textContent.includes("2 из 5"), warning.textContent);
+    assert.ok(warning.textContent.includes("zk1, <b>x</b>"), warning.textContent);
+    assert.strictEqual(warning.innerHTML, undefined, "ids must go through textContent only");
+
+    // Long list is truncated with a "и ещё N" tail.
+    const many = Array.from({ length: 25 }, (_v, i) => `b${i}`);
+    const text = tts.styleDegradedMessage(many, 25);
+    assert.ok(text.includes("b19") && !text.includes("b20,") && text.includes("и ещё 5"), text);
+
+    // No degradation: nothing shown.
+    Object.assign(live, { styleDegradedIds: [] });
+    tts.renderLive();
+    assert.strictEqual(warning.hidden, true);
+    assert.strictEqual(warning.textContent, "");
+    assert.strictEqual(tts.styleDegradedMessage(undefined, 3), "");
+  } finally {
+    Object.assign(live, original);
+    tts.renderLive();
+  }
+}
+
 function testComputeEtaSeconds({ core }) {
   const { computeEtaSeconds } = core;
   const now = Date.now();
@@ -595,6 +625,7 @@ async function main() {
     ["testRenderEtaCells", () => testRenderEtaCells(modules)],
     ["testCloudDisablesLocalWhisperModel", () => testCloudDisablesLocalWhisperModel(modules)],
     ["testHasUnsavedChangesAndBeforeunload", () => testHasUnsavedChangesAndBeforeunload(modules)],
+    ["testStyleDegradedWarning", () => testStyleDegradedWarning(modules)],
     ["testRestoredSpeakerDirectory", () => testRestoredSpeakerDirectory(modules)],
     ["testPhraseTtsTimeout", () => testPhraseTtsTimeout(modules)],
     ["testConfirmDialog", () => testConfirmDialog(modules)],
