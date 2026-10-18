@@ -48,6 +48,7 @@ from job_runtime import (
     get_job,
     release_project,
     reserve_project,
+    trim_terminal_jobs,
     update_job,
 )
 from openrouter_usage import make_usage_callback, reconcile_pending, usage_summary
@@ -245,6 +246,7 @@ _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
 _NORMALIZATION_ACTIVE_PROJECTS = _NORMALIZATION_RUNTIME.active_projects
 _NORMALIZATION_JOBS_MAX = 50
+_NORMALIZATION_JOBS_TTL_SECONDS = 24 * 60 * 60
 _PROJECT_TRANSITION_LOCKS: dict[str, threading.RLock] = {}
 _PROJECT_TRANSITION_LOCKS_GUARD = threading.Lock()
 
@@ -826,6 +828,10 @@ def _normalization_payload_for_save(payload: dict, normalized_path: Path) -> dic
 
 def _persist_normalization_job(job: dict) -> None:
     stage1_jobs.persist_normalization_job(_normalization_job_services(), job)
+
+
+def _trim_normalization_jobs_locked() -> None:
+    stage1_jobs.trim_normalization_jobs_locked(_normalization_job_services())
 
 
 def _create_normalization_job(
@@ -1549,35 +1555,18 @@ def _load_persisted_sync_job(project: str) -> dict | None:
 
 def _trim_sync_jobs_locked() -> None:
     """Bound completed sync-job history while never evicting active jobs."""
-    now = datetime.now(UTC)
-    terminal_statuses = {"completed", "failed", "cancelled", "interrupted"}
-    terminal_ids = [
-        job_id for job_id, job in _SYNC_JOBS.items() if job.get("status") in terminal_statuses
-    ]
-    for job_id in terminal_ids:
-        stamp = _SYNC_JOBS[job_id].get("finished_at") or _SYNC_JOBS[job_id].get("created_at") or ""
-        try:
-            expired = (now - datetime.fromisoformat(stamp)).total_seconds() > _SYNC_JOBS_TTL_SECONDS
-        except (TypeError, ValueError):
-            expired = False
-        if expired:
-            _SYNC_JOBS.pop(job_id, None)
-            _SYNC_CANCEL_EVENTS.pop(job_id, None)
 
-    terminal_ids = [
-        job_id for job_id, job in _SYNC_JOBS.items() if job.get("status") in terminal_statuses
-    ]
-    ordered_ids = sorted(
-        terminal_ids,
-        key=lambda job_id: (
-            _SYNC_JOBS[job_id].get("finished_at") or _SYNC_JOBS[job_id].get("created_at") or "",
-            job_id,
-        ),
-    )
-    drop_count = max(0, len(_SYNC_JOBS) - _SYNC_JOBS_MAX)
-    for job_id in ordered_ids[:drop_count]:
-        _SYNC_JOBS.pop(job_id, None)
+    def drop_cancel_event(job_id: str) -> None:
         _SYNC_CANCEL_EVENTS.pop(job_id, None)
+
+    trim_terminal_jobs(
+        _SYNC_JOBS,
+        terminal_statuses={"completed", "failed", "cancelled", "interrupted"},
+        now=datetime.now(UTC),
+        ttl_seconds=_SYNC_JOBS_TTL_SECONDS,
+        max_jobs=_SYNC_JOBS_MAX,
+        on_evict=drop_cancel_event,
+    )
 
 
 def _create_sync_job(project: str) -> dict:

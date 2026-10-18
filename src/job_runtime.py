@@ -18,24 +18,6 @@ class JobRegistry:
     active_projects: set[str] = field(default_factory=set)
     cancel_events: dict[str, threading.Event] = field(default_factory=dict)
 
-    def reserve(self, project: str) -> bool:
-        return reserve_project(self.lock, self.active_projects, project)
-
-    def release(self, project: str) -> None:
-        release_project(self.lock, self.active_projects, project)
-
-    def update(
-        self,
-        job_id: str,
-        updates: dict[str, Any],
-        *,
-        increments: dict[str, int | float] | None = None,
-    ) -> dict[str, Any] | None:
-        return update_job(self.lock, self.jobs, job_id, updates, increments=increments)
-
-    def get(self, job_id: str) -> dict[str, Any] | None:
-        return get_job(self.lock, self.jobs, job_id)
-
 
 def reserve_project(lock: threading.Lock, active: set[str], project: str) -> bool:
     with lock:

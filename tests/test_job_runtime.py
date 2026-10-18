@@ -1,31 +1,40 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import threading
 import time
 
 import pytest
 
 import api
-from job_runtime import JobRegistry, asr_concurrency_limit, asr_slot
+from job_runtime import (
+    JobRegistry,
+    asr_concurrency_limit,
+    asr_slot,
+    release_project,
+    reserve_project,
+    trim_terminal_jobs,
+    update_job,
+)
 
 
-def test_registry_owns_job_state_and_returns_snapshots() -> None:
+def test_update_job_returns_snapshot_copy() -> None:
     registry = JobRegistry()
     registry.jobs["job-1"] = {"status": "queued"}
 
-    snapshot = registry.update("job-1", {"status": "running"})
+    snapshot = update_job(registry.lock, registry.jobs, "job-1", {"status": "running"})
 
     assert snapshot == {"status": "running"}
     assert snapshot is not registry.jobs["job-1"]
-    assert registry.get("missing") is None
+    assert update_job(registry.lock, registry.jobs, "missing", {}) is None
 
 
-def test_registry_reserves_projects_atomically() -> None:
+def test_reserve_project_is_atomic() -> None:
     registry = JobRegistry()
     outcomes: list[bool] = []
 
     def reserve() -> None:
-        outcomes.append(registry.reserve("demo"))
+        outcomes.append(reserve_project(registry.lock, registry.active_projects, "demo"))
 
     threads = [threading.Thread(target=reserve) for _ in range(8)]
     for thread in threads:
@@ -35,18 +44,18 @@ def test_registry_reserves_projects_atomically() -> None:
 
     assert outcomes.count(True) == 1
     assert outcomes.count(False) == 7
-    registry.release("demo")
-    assert registry.reserve("demo")
+    release_project(registry.lock, registry.active_projects, "demo")
+    assert reserve_project(registry.lock, registry.active_projects, "demo")
 
 
-def test_registry_increments_field_atomically_under_concurrency() -> None:
+def test_update_job_increments_field_atomically_under_concurrency() -> None:
     registry = JobRegistry()
     registry.jobs["job-1"] = {"retry_count": 0}
     iterations = 200
 
     def bump() -> None:
         for _ in range(iterations):
-            registry.update("job-1", {}, increments={"retry_count": 1})
+            update_job(registry.lock, registry.jobs, "job-1", {}, increments={"retry_count": 1})
 
     threads = [threading.Thread(target=bump) for _ in range(8)]
     for thread in threads:
@@ -55,6 +64,93 @@ def test_registry_increments_field_atomically_under_concurrency() -> None:
         thread.join()
 
     assert registry.jobs["job-1"]["retry_count"] == 8 * iterations
+
+
+# --- trim_terminal_jobs ----------------------------------------------------
+
+_NOW = datetime(2026, 1, 10, tzinfo=UTC)
+_TERMINAL = {"completed", "failed"}
+
+
+def _stamp(days_ago: float) -> str:
+    return (_NOW - timedelta(days=days_ago)).isoformat()
+
+
+def _trim(jobs: dict, *, max_jobs: int = 100, ttl: float = 86400.0, on_evict=None) -> list[str]:
+    return trim_terminal_jobs(
+        jobs,
+        terminal_statuses=_TERMINAL,
+        now=_NOW,
+        ttl_seconds=ttl,
+        max_jobs=max_jobs,
+        on_evict=on_evict,
+    )
+
+
+def test_trim_drops_oldest_terminal_over_limit_and_keeps_active() -> None:
+    jobs = {
+        "run": {"status": "running", "created_at": _stamp(0.5)},
+        "old": {"status": "completed", "finished_at": _stamp(0.3)},
+        "mid": {"status": "failed", "finished_at": _stamp(0.2)},
+        "new": {"status": "completed", "finished_at": _stamp(0.1)},
+    }
+
+    evicted = _trim(jobs, max_jobs=2)
+
+    assert evicted == ["old", "mid"]
+    assert set(jobs) == {"run", "new"}
+
+
+def test_trim_never_evicts_active_even_over_limit() -> None:
+    jobs = {f"j{i}": {"status": "running", "created_at": _stamp(5)} for i in range(4)}
+
+    assert _trim(jobs, max_jobs=1) == []
+    assert len(jobs) == 4
+
+
+def test_trim_expires_terminal_by_ttl_and_calls_on_evict() -> None:
+    jobs = {
+        "stale": {"status": "completed", "finished_at": _stamp(2)},
+        "fresh": {"status": "completed", "finished_at": _stamp(0.5)},
+        "run": {"status": "running", "created_at": _stamp(9)},
+    }
+    seen: list[str] = []
+
+    evicted = _trim(jobs, on_evict=seen.append)
+
+    assert evicted == ["stale"] == seen
+    assert set(jobs) == {"fresh", "run"}
+
+
+def test_trim_ttl_falls_back_to_created_at() -> None:
+    jobs = {
+        "stale": {"status": "failed", "created_at": _stamp(2)},
+        "fresh": {"status": "failed", "created_at": _stamp(0.5)},
+    }
+
+    assert _trim(jobs) == ["stale"]
+
+
+def test_trim_unparsable_stamp_is_not_expired() -> None:
+    jobs = {
+        "bad": {"status": "completed", "finished_at": "garbage"},
+        "none": {"status": "completed"},
+    }
+
+    assert _trim(jobs) == []
+    assert set(jobs) == {"bad", "none"}
+
+
+def test_trim_limit_ties_broken_by_job_id() -> None:
+    same = _stamp(0.1)
+    jobs = {
+        "b": {"status": "completed", "finished_at": same},
+        "c": {"status": "completed", "finished_at": same},
+        "a": {"status": "completed", "finished_at": same},
+    }
+
+    assert _trim(jobs, max_jobs=1) == ["a", "b"]
+    assert set(jobs) == {"c"}
 
 
 def test_api_job_facade_honors_reassigned_legacy_state(monkeypatch) -> None:

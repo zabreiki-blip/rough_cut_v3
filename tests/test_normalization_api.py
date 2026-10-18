@@ -227,6 +227,81 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(restored.status_code, 200)
         self.assertEqual(restored.get_json()["result"]["status"], "completed")
 
+    def _create_job(self, project: str = "demo") -> dict:
+        return api._create_normalization_job(
+            project,
+            input_path=self._source(project),
+            use_llm=False,
+            hint="",
+            llm_preset="fast",
+        )
+
+    def test_create_trims_oldest_terminal_jobs_and_keeps_active(self) -> None:
+        with api._NORMALIZATION_JOBS_LOCK:
+            api._NORMALIZATION_JOBS.clear()
+            api._NORMALIZATION_JOBS["active"] = {
+                "id": "active",
+                "status": "running",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            }
+            for index in range(api._NORMALIZATION_JOBS_MAX):
+                stamp = f"2099-01-01T00:00:{index:02d}+00:00"
+                api._NORMALIZATION_JOBS[f"done-{index:02d}"] = {
+                    "id": f"done-{index:02d}",
+                    "status": "completed",
+                    "created_at": stamp,
+                    "finished_at": stamp,
+                }
+        try:
+            created = self._create_job()
+            with api._NORMALIZATION_JOBS_LOCK:
+                ids = set(api._NORMALIZATION_JOBS)
+            self.assertEqual(len(ids), api._NORMALIZATION_JOBS_MAX)
+            self.assertIn("active", ids)
+            self.assertIn(created["id"], ids)
+            self.assertNotIn("done-00", ids)
+            self.assertNotIn("done-01", ids)
+            self.assertIn("done-02", ids)
+        finally:
+            with api._NORMALIZATION_JOBS_LOCK:
+                api._NORMALIZATION_JOBS.clear()
+
+    def test_create_expires_terminal_jobs_by_ttl_but_not_active(self) -> None:
+        old = "2020-01-01T00:00:00+00:00"
+        with api._NORMALIZATION_JOBS_LOCK:
+            api._NORMALIZATION_JOBS.clear()
+            api._NORMALIZATION_JOBS.update(
+                {
+                    "queued": {"id": "queued", "status": "queued", "created_at": old},
+                    "stale": {
+                        "id": "stale",
+                        "status": "failed",
+                        "created_at": old,
+                        "finished_at": old,
+                    },
+                }
+            )
+        try:
+            created = self._create_job()
+            with api._NORMALIZATION_JOBS_LOCK:
+                ids = set(api._NORMALIZATION_JOBS)
+            self.assertEqual(ids, {"queued", created["id"]})
+        finally:
+            with api._NORMALIZATION_JOBS_LOCK:
+                api._NORMALIZATION_JOBS.clear()
+
+    def test_status_restores_interrupted_job_after_memory_reset(self) -> None:
+        created = self._create_job()
+        api._update_normalization_job(created["id"], status="running")
+        with api._NORMALIZATION_JOBS_LOCK:
+            api._NORMALIZATION_JOBS.clear()
+        restored = self.client.get("/stage1/normalization-jobs/status?project=demo")
+        self.assertEqual(restored.status_code, 200)
+        result = restored.get_json()["result"]
+        self.assertEqual(result["id"], created["id"])
+        self.assertEqual(result["status"], "interrupted")
+        self.assertTrue(result["finished_at"])
+
     def test_revision_conflict_is_409(self) -> None:
         source = self._source()
         response = self.client.post(

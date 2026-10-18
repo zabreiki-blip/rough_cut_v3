@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime
 import os
 from pathlib import Path
 from typing import Any
 
 from api_service_contracts import NormalizationJobServices, TtsJobServices
 from cost_budget import CostBudget
+from job_runtime import trim_terminal_jobs
 from stage4.revision_assets import merge_voiceover_manifest_item
 
 
@@ -38,40 +40,32 @@ def load_persisted_tts_job(services: TtsJobServices, project: str) -> dict | Non
     return restored
 
 
+TTS_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+NORMALIZATION_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+
+
 def trim_tts_jobs_locked(services: TtsJobServices) -> None:
-    now = services.datetime.now(services.UTC)
-    terminal_ids = [
-        job_id
-        for job_id, job in services._TTS_JOBS.items()
-        if job.get("status") in {"completed", "failed", "cancelled"}
-    ]
-    for job_id in terminal_ids:
-        stamp = services._TTS_JOBS[job_id].get("finished_at") or ""
-        try:
-            expired = (
-                now - services.datetime.fromisoformat(stamp)
-            ).total_seconds() > services._TTS_JOBS_TTL_SECONDS
-        except (TypeError, ValueError):
-            expired = False
-        if expired:
-            services._TTS_JOBS.pop(job_id, None)
-    terminal_ids = [
-        job_id
-        for job_id, job in services._TTS_JOBS.items()
-        if job.get("status") in {"completed", "failed", "cancelled"}
-    ]
-    ordered_ids = sorted(
-        terminal_ids,
-        key=lambda job_id: (
-            services._TTS_JOBS[job_id].get("finished_at")
-            or services._TTS_JOBS[job_id].get("created_at")
-            or "",
-            job_id,
-        ),
+    trim_terminal_jobs(
+        services._TTS_JOBS,
+        terminal_statuses=TTS_TERMINAL_STATUSES,
+        now=services.datetime.now(services.UTC),
+        ttl_seconds=services._TTS_JOBS_TTL_SECONDS,
+        max_jobs=services._TTS_JOBS_MAX,
     )
-    drop_count = max(0, len(services._TTS_JOBS) - services._TTS_JOBS_MAX)
-    for job_id in ordered_ids[:drop_count]:
-        services._TTS_JOBS.pop(job_id, None)
+
+
+def trim_normalization_jobs_locked(services: NormalizationJobServices) -> None:
+    try:
+        now = datetime.fromisoformat(services._utc_now_iso())
+    except (TypeError, ValueError):
+        return
+    trim_terminal_jobs(
+        services._NORMALIZATION_JOBS,
+        terminal_statuses=NORMALIZATION_TERMINAL_STATUSES,
+        now=now,
+        ttl_seconds=services._NORMALIZATION_JOBS_TTL_SECONDS,
+        max_jobs=services._NORMALIZATION_JOBS_MAX,
+    )
 
 
 def reserve_tts_project(services: TtsJobServices, project: str) -> bool:
@@ -421,20 +415,7 @@ def create_normalization_job(
     }
     with services._NORMALIZATION_JOBS_LOCK:
         services._NORMALIZATION_JOBS[job["id"]] = job
-        terminal = sorted(
-            (
-                (job_id, item)
-                for job_id, item in services._NORMALIZATION_JOBS.items()
-                if item.get("status") in {"completed", "failed", "cancelled"}
-            ),
-            key=lambda pair: pair[1].get("finished_at") or pair[1].get("created_at") or "",
-        )
-        drop_count = max(
-            0,
-            len(services._NORMALIZATION_JOBS) - services._NORMALIZATION_JOBS_MAX,
-        )
-        for old_id, _old_job in terminal[:drop_count]:
-            services._NORMALIZATION_JOBS.pop(old_id, None)
+        services._trim_normalization_jobs_locked()
         snapshot = dict(job)
     services._persist_normalization_job(snapshot)
     return snapshot

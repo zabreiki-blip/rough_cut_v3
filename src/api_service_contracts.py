@@ -149,6 +149,7 @@ class NormalizationJobServices(Protocol):
     _NORMALIZATION_JOBS_LOCK: Any
     _NORMALIZATION_ACTIVE_PROJECTS: set[str]
     _NORMALIZATION_JOBS_MAX: int
+    _NORMALIZATION_JOBS_TTL_SECONDS: float
 
     def _normalize_project_name(self, name: str) -> str: ...
 
@@ -175,6 +176,8 @@ class NormalizationJobServices(Protocol):
     def get_job(self, lock: Any, jobs: dict[str, JsonDict], job_id: str) -> JsonDict | None: ...
 
     def _persist_normalization_job(self, job: JsonDict) -> None: ...
+
+    def _trim_normalization_jobs_locked(self) -> None: ...
 
     def _update_normalization_job(self, job_id: str, **updates: Any) -> JsonDict | None: ...
 
