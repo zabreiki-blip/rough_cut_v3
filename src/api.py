@@ -1333,9 +1333,16 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
     }
 
 
+# Worker-only fields of a sync job record that must not reach status responses.
+_SYNC_JOB_PRIVATE_FIELDS = ("llm_cost_env",)
+
+
 def _sync_job_with_live_summary(job: dict) -> dict:
-    """Refresh terminal job counters after matches are reviewed in the browser."""
-    snapshot = dict(job)
+    """Refresh terminal job counters after matches are reviewed in the browser.
+
+    Also strips worker-only fields: the result is the public status payload.
+    """
+    snapshot = {k: v for k, v in job.items() if k not in _SYNC_JOB_PRIVATE_FIELDS}
     if str(snapshot.get("status") or "") in {"queued", "running", "cancelling"}:
         return snapshot
     project = str(snapshot.get("project") or "").strip()

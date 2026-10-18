@@ -3211,6 +3211,32 @@ def test_sync_job_hands_one_budget_to_llm_review_and_publishes_cost(
     assert job["cost_usd"] == 0.5
 
 
+def test_sync_job_status_separates_estimated_llm_cost_and_hides_frozen_env(
+    sync_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.1")
+    monkeypatch.setenv("ROUGH_CUT_LLM_USD_PER_1K_TOKENS_ESTIMATE", "1")
+    client, projects = sync_api
+
+    def review(*_args, **kwargs):
+        budget = kwargs["budget"]
+        budget.settle(budget.reserve_llm_attempt([{"role": "user", "content": ""}], 1000), "0.5")
+        budget.settle_response(
+            budget.reserve_llm_attempt([{"role": "user", "content": ""}], 1000), {}
+        )
+        return SemanticDecision(1, 0.92, "тот же смысл", "test/model")
+
+    job = _start_low_confidence_llm_job(client, projects, review)
+
+    assert job["llm_estimated_cost_usd"] == 1.0
+    assert job["llm_cost_usd"] == 1.5
+    assert job["cost_usd"] == 1.5
+    assert "llm_cost_env" not in job
+    alias = client.get("/stage2/sync-jobs/status?project=demo").get_json()["result"]
+    assert "llm_cost_env" not in alias
+
+
 def test_sync_job_completes_without_review_when_asr_spend_already_exceeds_limit(
     sync_api, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

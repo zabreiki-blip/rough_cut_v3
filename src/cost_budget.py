@@ -9,11 +9,44 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import uuid4
 
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectTimeout as RequestsConnectTimeout
+from urllib3.exceptions import NewConnectionError
+
 from openrouter_usage import extract_cost
 
 
 class CostBudgetExceeded(RuntimeError):
     """The next estimated provider attempt would exceed the job limit."""
+
+
+# Depth limit for walking exception chains (requests -> urllib3 -> OS error).
+_MAX_CAUSE_DEPTH = 6
+
+
+def _has_new_connection_error(error: BaseException) -> bool:
+    """Whether urllib3's NewConnectionError (incl. DNS failure) is in the error chain.
+
+    Follows ``args[0]``, ``.reason`` (MaxRetryError) and ``__cause__`` (not ``__context__``,
+    which may hold an earlier retry's error),
+    breadth-first, at most ``_MAX_CAUSE_DEPTH`` levels deep.
+    """
+    level: list[BaseException] = [error]
+    for _ in range(_MAX_CAUSE_DEPTH):
+        next_level: list[BaseException] = []
+        for node in level:
+            if isinstance(node, NewConnectionError):
+                return True
+            candidates = (
+                node.args[0] if node.args else None,
+                getattr(node, "reason", None),
+                node.__cause__,
+            )
+            next_level.extend(c for c in candidates if isinstance(c, BaseException))
+        if not next_level:
+            break
+        level = next_level
+    return False
 
 
 # Environment variables that configure a job budget for LLM/TTS spend.
@@ -129,6 +162,7 @@ class CostBudget:
         self._spent_usd = _nonnegative_decimal(initial_spent_usd, "initial_spent_usd")
         if require_asr_rate and self.limit_usd > 0 and self.usd_per_minute == 0:
             raise ValueError("usd_per_minute must be positive when limit_usd is positive")
+        self._estimated_spent_usd = Decimal("0")
         self._reservations: dict[str, Decimal] = {}
         self._lock = threading.RLock()
 
@@ -225,6 +259,39 @@ class CostBudget:
                 actual = _nonnegative_decimal(actual_usd, "actual_usd")
             del self._reservations[reservation_id]
             self._spent_usd += actual
+            if actual_usd is None:
+                self._estimated_spent_usd += actual
+
+    def release(self, reservation_id: str) -> None:
+        """Drop a reservation of an attempt the provider will not bill.
+
+        Idempotent; spent is never changed. Unknown or settled IDs are ignored.
+        """
+        with self._lock:
+            self._reservations.pop(reservation_id, None)
+
+    def release_if_rejected(self, reservation_id: str | None, response: object) -> None:
+        """Release after an HTTP answer with status >= 400 (rejected, not billed)."""
+        status = getattr(response, "status_code", None)
+        if reservation_id is not None and isinstance(status, int) and status >= 400:
+            self.release(reservation_id)
+
+    def release_if_unsent(self, reservation_id: str | None, error: BaseException) -> None:
+        """Release only when the connection was provably never established.
+
+        Released: ``ConnectTimeout`` and a ``ConnectionError`` whose chain holds
+        urllib3 ``NewConnectionError`` (incl. DNS ``NameResolutionError``).
+        Everything else stays reserved, because the provider may already have
+        received and billed the request: ``ConnectionError`` wrapping
+        ``ProtocolError``/``RemoteDisconnected`` (aborted after send), ``ReadTimeout``,
+        ``SSLError`` and any other error.
+        """
+        if reservation_id is None:
+            return
+        if isinstance(error, RequestsConnectTimeout) or (
+            isinstance(error, RequestsConnectionError) and _has_new_connection_error(error)
+        ):
+            self.release(reservation_id)
 
     def settle_response(self, reservation_id: str, body: Mapping[str, Any]) -> None:
         """Settle an LLM reservation by ``usage.cost`` or, if absent, by its estimate."""
@@ -238,4 +305,6 @@ class CostBudget:
                 "spent_usd": float(self._spent_usd),
                 "reserved_usd": float(reserved),
                 "total_usd": float(self._spent_usd + reserved),
+                # Part of spent_usd booked by estimate (no provider-reported cost).
+                "estimated_spent_usd": float(self._estimated_spent_usd),
             }

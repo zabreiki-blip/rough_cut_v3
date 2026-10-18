@@ -107,23 +107,30 @@ def review_candidates_with_llm(
     reservation_id = (
         budget.reserve_llm_attempt(messages, max_tokens) if budget is not None else None
     )
-    response = call(
-        f"{config.openrouter_base_url}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {config.openrouter_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": config.openrouter_model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "max_tokens": max_tokens,
-            # Without this flag OpenRouter omits ``usage.cost`` from the answer.
-            "usage": {"include": True},
-            "messages": messages,
-        },
-        timeout=timeout_seconds,
-    )
+    try:
+        response = call(
+            f"{config.openrouter_base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.openrouter_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config.openrouter_model,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+                "max_tokens": max_tokens,
+                # Without this flag OpenRouter omits ``usage.cost`` from the answer.
+                "usage": {"include": True},
+                "messages": messages,
+            },
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        if budget is not None:
+            budget.release_if_unsent(reservation_id, exc)
+        raise
+    if budget is not None:
+        budget.release_if_rejected(reservation_id, response)
     response.raise_for_status()
     body = response.json()
     if budget is not None and reservation_id is not None:

@@ -190,6 +190,8 @@ def run_sync_job(
             "reserved_cost_usd": float(reserved_total) + snapshot["reserved_usd"],
             "cost_pending": pending_total or llm_budget.has_pending_reservations,
             "llm_cost_usd": llm_spent,
+            # Part of llm_cost_usd booked by estimate, not by provider-reported cost.
+            "llm_estimated_cost_usd": snapshot["estimated_spent_usd"],
         }
 
     def should_persist_progress(*, force: bool = False) -> bool:

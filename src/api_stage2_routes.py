@@ -529,7 +529,7 @@ def _stage2_sync_job_cancel(services: ModuleType, job_id: str):
         )
         snapshot = dict(job)
     services._persist_sync_job(snapshot)
-    return jsonify({"ok": True, "result": snapshot}), 202
+    return jsonify({"ok": True, "result": services._sync_job_with_live_summary(snapshot)}), 202
 
 
 def _stage2_sync_job_status_alias(services: ModuleType):

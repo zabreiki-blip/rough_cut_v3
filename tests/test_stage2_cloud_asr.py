@@ -740,6 +740,7 @@ def test_budget_reserves_before_every_http_attempt(monkeypatch) -> None:
             "spent_usd": 0.02,
             "reserved_usd": 0.06,
             "total_usd": 0.08,
+            "estimated_spent_usd": 0.0,
             "cost_pending": True,
         }
     )

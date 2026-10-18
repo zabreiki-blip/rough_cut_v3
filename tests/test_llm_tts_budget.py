@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 import tenacity
+from urllib3.connection import HTTPConnection
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 import stage1.analyzer as analyzer_module
 import stage1.normalizer as normalizer_module
@@ -31,6 +33,12 @@ from stage2.sync_llm_review import SemanticCandidate, review_candidates_with_llm
 
 LLM_RATE = Decimal("1")
 TTS_RATE = Decimal("1")
+
+
+def _unsent_error() -> requests.ConnectionError:
+    """A ConnectionError as requests raises it when the TCP connect was refused."""
+    refused = NewConnectionError(HTTPConnection("api.example"), "refused")
+    return requests.ConnectionError(MaxRetryError(pool=None, url="/x", reason=refused))
 
 
 def _budget(
@@ -124,15 +132,16 @@ def test_analyze_retry_reserves_again_for_every_attempt() -> None:
     with patch.object(
         openrouter_client.requests,
         "post",
-        side_effect=[requests.ConnectionError("boom"), _analyze_response(0.002)],
+        side_effect=[_unsent_error(), _analyze_response(0.002)],
     ) as post:
         analyze_with_openrouter(_analyze_settings(), "Текст", budget=budget)
     assert post.call_count == 2
     snapshot = _snapshot(budget)
-    # The failed attempt stays reserved (provider may have billed it); the
+    # The unsent attempt (ConnectionError) released its reservation; the
     # second attempt was reserved separately and settled by its actual cost.
     assert snapshot["spent_usd"] == 0.002
-    assert snapshot["reserved_usd"] >= 2.0
+    assert snapshot["reserved_usd"] == 0.0
+    assert not budget.has_pending_reservations
 
 
 def test_analyze_retry_is_blocked_when_second_reservation_exceeds_limit() -> None:
@@ -145,7 +154,7 @@ def test_analyze_retry_is_blocked_when_second_reservation_exceeds_limit() -> Non
     with patch.object(
         openrouter_client.requests,
         "post",
-        side_effect=[requests.ConnectionError("boom"), _analyze_response(0.002)],
+        side_effect=[requests.ReadTimeout("timed out"), _analyze_response(0.002)],
     ) as post:
         with pytest.raises(CostBudgetExceeded):
             analyze_with_openrouter(_analyze_settings(), "Текст", budget=budget)
@@ -242,7 +251,7 @@ def test_classifier_retry_loop_reserves_before_every_attempt() -> None:
     assert post.call_count == 3
     snapshot = _snapshot(budget)
     assert snapshot["spent_usd"] == 0.004
-    assert snapshot["reserved_usd"] >= 2.0  # two failed attempts remain reserved
+    assert snapshot["reserved_usd"] == 0.0  # rejected (503) attempts are released
 
 
 def test_classifier_retry_is_blocked_by_budget_and_not_swallowed() -> None:
@@ -257,7 +266,10 @@ def test_classifier_retry_is_blocked_by_budget_and_not_swallowed() -> None:
     budget = _budget(str(one_attempt * Decimal("1.5")), llm=LLM_RATE)
     with (
         patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
-        patch("requests.post", side_effect=[_ChatResponse(503), _ChatResponse()]) as post,
+        patch(
+            "requests.post",
+            side_effect=[requests.ReadTimeout("timed out"), _ChatResponse()],
+        ) as post,
         patch.object(normalizer_module.time, "sleep"),
     ):
         with pytest.raises(CostBudgetExceeded):
@@ -271,13 +283,14 @@ def test_classifier_network_error_retry_reserves_again() -> None:
         patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
         patch(
             "requests.post",
-            side_effect=[requests.ConnectionError("boom"), _ChatResponse(cost=0.004)],
+            side_effect=[_unsent_error(), _ChatResponse(cost=0.004)],
         ) as post,
         patch.object(normalizer_module.time, "sleep"),
     ):
         _classify(budget)
     assert post.call_count == 2
-    assert _snapshot(budget)["reserved_usd"] >= 1.0
+    assert _snapshot(budget)["reserved_usd"] == 0.0
+    assert _snapshot(budget)["spent_usd"] == 0.004
 
 
 def test_classifier_without_budget_or_with_zero_rates_is_unchanged() -> None:
@@ -594,13 +607,37 @@ def test_tts_settles_estimate_after_success() -> None:
     assert _snapshot(budget)["reserved_usd"] == 0.0
 
 
-def test_tts_failed_attempt_keeps_its_reservation() -> None:
+def test_tts_rejected_attempt_releases_its_reservation() -> None:
     post = MagicMock(return_value=_TtsResponse(500))
     budget = _budget("10", tts=TTS_RATE)
     with pytest.raises(RuntimeError, match="OpenRouter TTS failed"):
         _synth(post, budget)
+    assert _snapshot(budget)["reserved_usd"] == 0.0
+    assert _snapshot(budget)["spent_usd"] == 0.0
+    assert not budget.has_pending_reservations
+
+
+def test_tts_connection_error_releases_but_read_timeout_stays_pending() -> None:
+    budget = _budget("10", tts=TTS_RATE)
+    with pytest.raises(requests.ConnectionError):
+        _synth(MagicMock(side_effect=_unsent_error()), budget)
+    assert not budget.has_pending_reservations
+    with pytest.raises(requests.ConnectTimeout):
+        _synth(MagicMock(side_effect=requests.ConnectTimeout("slow connect")), budget)
+    assert not budget.has_pending_reservations
+    with pytest.raises(requests.ReadTimeout):
+        _synth(MagicMock(side_effect=requests.ReadTimeout("slow read")), budget)
+    assert budget.has_pending_reservations
     assert _snapshot(budget)["reserved_usd"] == 0.5
     assert _snapshot(budget)["spent_usd"] == 0.0
+
+
+def test_tts_settle_by_estimate_is_reported_as_estimated() -> None:
+    budget = _budget("10", tts=TTS_RATE)
+    _synth(MagicMock(return_value=_TtsResponse()), budget)
+    snapshot = _snapshot(budget)
+    assert snapshot["spent_usd"] == 0.5
+    assert snapshot["estimated_spent_usd"] == 0.5
 
 
 def test_tts_estimate_uses_the_text_actually_sent_with_style_notes() -> None:
@@ -656,11 +693,12 @@ def test_tts_retry_reserves_before_each_attempt() -> None:
     assert post.call_count == 3
     snapshot = _snapshot(budget)
     assert snapshot["spent_usd"] == 0.5
-    assert snapshot["reserved_usd"] == 1.0  # two failed attempts stay reserved
+    assert snapshot["reserved_usd"] == 0.0  # two rejected (502) attempts are released
+    assert snapshot["estimated_spent_usd"] == 0.5
 
 
 def test_tts_retry_stops_on_budget_exceeded_and_reports_it() -> None:
-    post = MagicMock(side_effect=[_TtsResponse(502), _TtsResponse()])
+    post = MagicMock(side_effect=[requests.ReadTimeout("timed out"), _TtsResponse()])
     budget = _budget("0.75", tts=TTS_RATE)  # one 0.5 attempt fits, a second does not
     audio, attempts, errors, final_error, _degraded = _retry(post, budget)
     assert audio is None
@@ -688,3 +726,103 @@ def test_macos_connector_is_not_budgeted() -> None:
     assert result == b"wav"
     connector.assert_called_once()
     assert _snapshot(budget)["total_usd"] == 0.0
+
+
+# --- release of failed attempts ----------------------------------------------
+
+
+@pytest.mark.parametrize("status", [429, 500])
+def test_analyze_rejected_response_releases_reservation(status: int) -> None:
+    budget = _budget(llm=LLM_RATE)
+    rejected = MagicMock()
+    rejected.status_code = status
+    rejected.raise_for_status.side_effect = requests.HTTPError(str(status))
+    with patch.object(openrouter_client.requests, "post", return_value=rejected):
+        with pytest.raises(requests.HTTPError):
+            analyze_with_openrouter(_analyze_settings(), "Текст", budget=budget)
+    assert not budget.has_pending_reservations
+    assert _snapshot(budget)["spent_usd"] == 0.0
+
+
+def test_analyze_read_timeout_stays_pending() -> None:
+    budget = _budget(llm=LLM_RATE)
+    with patch.object(openrouter_client.requests, "post", side_effect=requests.ReadTimeout("slow")):
+        with pytest.raises(requests.ReadTimeout):
+            analyze_with_openrouter(_analyze_settings(), "Текст", budget=budget)
+    assert budget.has_pending_reservations
+    assert _snapshot(budget)["spent_usd"] == 0.0
+
+
+def test_classifier_rejected_response_releases_reservation() -> None:
+    budget = _budget(llm=LLM_RATE)
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", return_value=_ChatResponse(429)),
+        patch.object(normalizer_module.time, "sleep"),
+    ):
+        with pytest.raises(requests.HTTPError):
+            _classify(budget)
+    assert not budget.has_pending_reservations
+    assert _snapshot(budget)["spent_usd"] == 0.0
+
+
+def test_classifier_read_timeout_stays_pending_connect_error_is_released() -> None:
+    budget = _budget(llm=LLM_RATE)
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", side_effect=requests.ReadTimeout("slow")),
+        patch.object(normalizer_module.time, "sleep"),
+    ):
+        with pytest.raises(requests.ReadTimeout):
+            _classify(budget)
+    assert _snapshot(budget)["reserved_usd"] >= 3.0  # three attempts, all ambiguous
+
+    unsent = _budget(llm=LLM_RATE)
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", side_effect=requests.ConnectTimeout("no route")),
+        patch.object(normalizer_module.time, "sleep"),
+    ):
+        with pytest.raises(requests.ConnectTimeout):
+            _classify(unsent)
+    assert not unsent.has_pending_reservations
+
+
+def test_classifier_settle_by_estimate_is_reported_as_estimated() -> None:
+    actual = _budget(llm=LLM_RATE)
+    estimated = _budget(llm=LLM_RATE)
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", return_value=_ChatResponse(cost=0.004)),
+    ):
+        _classify(actual)
+    with (
+        patch.object(normalizer_module, "get_settings", return_value=_classifier_settings()),
+        patch("requests.post", return_value=_ChatResponse()),
+    ):
+        _classify(estimated)
+    assert _snapshot(actual)["estimated_spent_usd"] == 0.0
+    assert _snapshot(estimated)["estimated_spent_usd"] == _snapshot(estimated)["spent_usd"] > 0
+
+
+def test_sync_review_rejected_response_releases_reservation() -> None:
+    class Rejected(_ReviewResponse):
+        status_code = 503
+
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError("503")
+
+    budget = _budget(llm=LLM_RATE)
+    with pytest.raises(requests.HTTPError):
+        _review(MagicMock(return_value=Rejected()), budget)
+    assert not budget.has_pending_reservations
+
+
+def test_sync_review_connection_error_released_read_timeout_pending() -> None:
+    budget = _budget(llm=LLM_RATE)
+    with pytest.raises(requests.ConnectionError):
+        _review(MagicMock(side_effect=_unsent_error()), budget)
+    assert not budget.has_pending_reservations
+    with pytest.raises(requests.ReadTimeout):
+        _review(MagicMock(side_effect=requests.ReadTimeout("slow")), budget)
+    assert budget.has_pending_reservations

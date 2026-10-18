@@ -3,6 +3,15 @@
 from decimal import Decimal
 
 import pytest
+import requests
+from urllib3.connection import HTTPConnection
+from urllib3.exceptions import (
+    MaxRetryError,
+    NameResolutionError,
+    NewConnectionError,
+    ProtocolError,
+    SSLError,
+)
 
 from cost_budget import CostBudget, CostBudgetExceeded, CostGuardConfig
 
@@ -65,6 +74,7 @@ def test_budget_disabled_still_tracks_estimates_and_actuals() -> None:
         "spent_usd": 12.5,
         "reserved_usd": 0.0,
         "total_usd": 12.5,
+        "estimated_spent_usd": 0.0,
     }
 
 
@@ -99,6 +109,7 @@ def test_budget_settlement_replaces_estimate_and_releases_headroom() -> None:
         "spent_usd": 0.15,
         "reserved_usd": 0.15,
         "total_usd": 0.3,
+        "estimated_spent_usd": 0.0,
     }
 
 
@@ -111,6 +122,7 @@ def test_budget_unknown_cost_keeps_estimate_reserved() -> None:
         "spent_usd": 0.0,
         "reserved_usd": 0.1,
         "total_usd": 0.1,
+        "estimated_spent_usd": 0.0,
     }
     with pytest.raises(CostBudgetExceeded):
         budget.reserve_attempt(1)
@@ -369,3 +381,146 @@ def test_concurrent_reservations_never_exceed_the_limit() -> None:
     assert len(granted) == 10
     assert len(denied) == 30
     assert budget.snapshot()["reserved_usd"] == 10.0
+
+
+def _llm_budget() -> CostBudget:
+    return CostBudget(Decimal("0"), Decimal("0"), llm_usd_per_1k_tokens=Decimal("1"))
+
+
+def test_release_drops_reservation_without_changing_spent() -> None:
+    budget = _llm_budget()
+    budget.settle(budget.reserve_llm_attempt([{"content": "x"}], 1000), "0.25")
+    reservation = budget.reserve_llm_attempt([{"content": "x"}], 1000)
+    assert budget.has_pending_reservations
+    budget.release(reservation)
+    assert not budget.has_pending_reservations
+    snapshot = budget.snapshot()
+    assert snapshot["spent_usd"] == 0.25
+    assert snapshot["reserved_usd"] == 0.0
+
+
+def test_release_is_idempotent_and_ignores_unknown_ids() -> None:
+    budget = _llm_budget()
+    reservation = budget.reserve_llm_attempt([{"content": "x"}], 1000)
+    budget.release(reservation)
+    budget.release(reservation)
+    budget.release("never-issued")
+    assert budget.snapshot()["total_usd"] == 0.0
+
+
+def test_release_after_settle_does_not_touch_spent() -> None:
+    budget = _llm_budget()
+    reservation = budget.reserve_llm_attempt([{"content": "x"}], 1000)
+    budget.settle(reservation, "0.5")
+    budget.release(reservation)
+    assert budget.snapshot()["spent_usd"] == 0.5
+
+
+def test_release_frees_headroom_under_limit() -> None:
+    budget = CostBudget(Decimal("1.5"), Decimal("0.1"), llm_usd_per_1k_tokens=Decimal("1"))
+    reservation = budget.reserve_llm_attempt([{"content": ""}], 1000)
+    with pytest.raises(CostBudgetExceeded):
+        budget.reserve_llm_attempt([{"content": ""}], 1000)
+    budget.release(reservation)
+    budget.reserve_llm_attempt([{"content": ""}], 1000)
+
+
+def test_release_is_thread_safe() -> None:
+    import threading
+
+    budget = _llm_budget()
+    ids = [budget.reserve_llm_attempt([{"content": ""}], 100) for _ in range(200)]
+    barrier = threading.Barrier(8)
+
+    def work(chunk: list[str]) -> None:
+        barrier.wait()
+        for reservation in chunk + ids[:20]:  # overlapping ids race on purpose
+            budget.release(reservation)
+
+    threads = [threading.Thread(target=work, args=(ids[20 + i :: 8],)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not budget.has_pending_reservations
+    assert budget.snapshot()["total_usd"] == 0.0
+
+
+def test_settle_by_actual_cost_is_not_estimated() -> None:
+    budget = _llm_budget()
+    budget.settle_response(
+        budget.reserve_llm_attempt([{"content": "x"}], 1000), {"usage": {"cost": 0.01}}
+    )
+    snapshot = budget.snapshot()
+    assert snapshot["spent_usd"] == 0.01
+    assert snapshot["estimated_spent_usd"] == 0.0
+
+
+def test_settle_by_estimate_is_tracked_separately_but_counts_in_total() -> None:
+    budget = _llm_budget()
+    budget.settle(budget.reserve_llm_attempt([{"content": ""}], 1000), "0.01")
+    budget.settle_response(budget.reserve_llm_attempt([{"content": ""}], 1000), {})
+    snapshot = budget.snapshot()
+    assert snapshot["estimated_spent_usd"] == 1.0
+    assert snapshot["spent_usd"] == 1.01
+    assert snapshot["total_usd"] == 1.01
+
+
+def _wrapped(reason: BaseException) -> requests.ConnectionError:
+    """Build a requests.ConnectionError the way requests does after urllib3 gives up."""
+    return requests.ConnectionError(MaxRetryError(pool=None, url="/x", reason=reason))
+
+
+def _reserved_llm_budget() -> tuple[CostBudget, str]:
+    budget = _llm_budget()
+    return budget, budget.reserve_llm_attempt([{"content": "x"}], 1000)
+
+
+def test_release_if_unsent_releases_connect_timeout() -> None:
+    budget, reservation = _reserved_llm_budget()
+    budget.release_if_unsent(reservation, requests.ConnectTimeout("no route"))
+    assert not budget.has_pending_reservations
+
+
+def test_release_if_unsent_releases_refused_connection() -> None:
+    budget, reservation = _reserved_llm_budget()
+    refused = NewConnectionError(HTTPConnection("api.example"), "refused")
+    budget.release_if_unsent(reservation, _wrapped(refused))
+    assert not budget.has_pending_reservations
+
+
+def test_release_if_unsent_releases_dns_failure() -> None:
+    budget, reservation = _reserved_llm_budget()
+    dns = NameResolutionError("api.example", HTTPConnection("api.example"), OSError("dns"))
+    budget.release_if_unsent(reservation, _wrapped(dns))
+    assert not budget.has_pending_reservations
+
+
+def test_release_if_unsent_keeps_reservation_after_connection_aborted() -> None:
+    budget, reservation = _reserved_llm_budget()
+    aborted = ProtocolError("Connection aborted.", ConnectionResetError("x"))
+    budget.release_if_unsent(reservation, _wrapped(aborted))
+    assert budget.has_pending_reservations
+    assert budget.snapshot()["reserved_usd"] == 1.001
+
+
+def test_release_if_unsent_keeps_reservation_after_remote_disconnect() -> None:
+    budget, reservation = _reserved_llm_budget()
+    disconnected = requests.ConnectionError(
+        ProtocolError("Connection aborted.", ConnectionResetError("x"))
+    )
+    budget.release_if_unsent(reservation, disconnected)
+    assert budget.has_pending_reservations
+    assert budget.snapshot()["reserved_usd"] == 1.001
+
+
+def test_release_if_unsent_keeps_reservation_for_read_timeout() -> None:
+    budget, reservation = _reserved_llm_budget()
+    budget.release_if_unsent(reservation, requests.ReadTimeout("slow"))
+    assert budget.has_pending_reservations
+
+
+def test_release_if_unsent_keeps_reservation_for_ssl_error() -> None:
+    budget, reservation = _reserved_llm_budget()
+    budget.release_if_unsent(reservation, _wrapped(SSLError("handshake failed")))
+    assert budget.has_pending_reservations

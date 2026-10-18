@@ -2345,11 +2345,15 @@ def _openrouter_classifier(
             response = requests.post(
                 f"{settings.openrouter_base_url}/chat/completions", **request_kwargs
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            if budget is not None:
+                budget.release_if_unsent(reservation_id, exc)
             if attempt == 2:
                 raise
             time.sleep(2**attempt)
             continue
+        if budget is not None:
+            budget.release_if_rejected(reservation_id, response)
         if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
             break
         time.sleep(2**attempt)

@@ -157,14 +157,23 @@ def analyze_with_openrouter(
     def _do_request():
         # Every HTTP attempt, retries included, is reserved before dispatch.
         # CostBudgetExceeded is not retryable and propagates to the caller.
+        reservation_id: str | None = None
         if budget is not None:
-            reservation_ids.append(budget.reserve_llm_attempt(payload["messages"], max_tokens))
-        resp = requests.post(
-            f"{settings.openrouter_base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
+            reservation_id = budget.reserve_llm_attempt(payload["messages"], max_tokens)
+            reservation_ids.append(reservation_id)
+        try:
+            resp = requests.post(
+                f"{settings.openrouter_base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+        except Exception as exc:
+            if budget is not None:
+                budget.release_if_unsent(reservation_id, exc)
+            raise
+        if budget is not None:
+            budget.release_if_rejected(reservation_id, resp)
         resp.raise_for_status()
         return resp
 
@@ -194,7 +203,8 @@ def analyze_with_openrouter(
 
     data = response.json()
     if budget is not None and reservation_ids:
-        # Only the answered attempt is settled; failed attempts stay reserved.
+        # Only the answered attempt is settled; rejected/unsent attempts were
+        # released, ambiguous ones (e.g. read timeout) stay reserved.
         budget.settle_response(reservation_ids[-1], data)
     report_json_usage(usage_callback, data, model=settings.openrouter_model)
     # After the retry wrapper on purpose: a cut-off answer must not be re-bought.

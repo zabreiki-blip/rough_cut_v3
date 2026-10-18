@@ -368,13 +368,20 @@ def _synthesize_openrouter_wav(
     # callers' retry loops call it again). The estimate covers the text that
     # is actually sent, including director's notes.
     reservation_id = budget.reserve_tts_attempt(input_text) if budget is not None else None
-    response = requests.post(
-        f"{settings.openrouter_base_url}/audio/speech",
-        headers=headers,
-        json=payload,
-        timeout=240,
-    )
     try:
+        response = requests.post(
+            f"{settings.openrouter_base_url}/audio/speech",
+            headers=headers,
+            json=payload,
+            timeout=240,
+        )
+    except Exception as exc:
+        if budget is not None:
+            budget.release_if_unsent(reservation_id, exc)
+        raise
+    try:
+        if budget is not None:
+            budget.release_if_rejected(reservation_id, response)
         if response.status_code != 200:
             try:
                 err = response.json()
