@@ -108,15 +108,6 @@ def run_sync_job(
     _release_sync_project = services._release_sync_project
     _SYNC_JOBS_LOCK = services._SYNC_JOBS_LOCK
     _SYNC_CANCEL_EVENTS = services._SYNC_CANCEL_EVENTS
-    paths = _project_paths(project)
-    asr_usage_callback = services._make_openrouter_usage_callback(
-        project, stage="assembly", operation="sync_asr", job_id=job_id
-    )
-    semantic_usage_callback = services._make_openrouter_usage_callback(
-        project, stage="assembly", operation="sync_llm_review", job_id=job_id
-    )
-    source_store, match_store = _sync_stores(paths)
-    cancel_event = _sync_cancel_event(job_id)
     progress_persist_lock = threading.Lock()
     last_progress_persist_at = 0.0
     asr_metrics: _AsrMetrics = {
@@ -125,8 +116,6 @@ def run_sync_job(
         "asr_timestamp_precision": "",
         "transcription_wall_sec_total": 0.0,
     }
-    job = services._get_sync_job(job_id) or {}
-    cloud_source_options = job.get("cloud_source_options")
     cloud_costs: dict[str, dict[str, Any]] = {}
 
     def cloud_totals() -> tuple[Decimal, Decimal, bool]:
@@ -214,6 +203,19 @@ def run_sync_job(
             raise _JobCancelled("Sync job cancelled")
 
     try:
+        # Setup lives inside the try so a failure here still marks the job
+        # failed and runs ``finally`` (project release, cancel event cleanup).
+        paths = _project_paths(project)
+        asr_usage_callback = services._make_openrouter_usage_callback(
+            project, stage="assembly", operation="sync_asr", job_id=job_id
+        )
+        semantic_usage_callback = services._make_openrouter_usage_callback(
+            project, stage="assembly", operation="sync_llm_review", job_id=job_id
+        )
+        source_store, match_store = _sync_stores(paths)
+        cancel_event = _sync_cancel_event(job_id)
+        job = services._get_sync_job(job_id) or {}
+        cloud_source_options = job.get("cloud_source_options")
         ensure_not_cancelled()
         _update_sync_job(
             job_id,
