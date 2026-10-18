@@ -3,11 +3,17 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from decimal import Decimal
-from typing import Any, TypedDict
+from typing import Any, Protocol, TypedDict
 
 from cost_budget import CostBudget
 
 _module_logger = logging.getLogger(__name__)
+
+
+class ProgressPersistGate(Protocol):
+    """``should_persist_progress`` of a sync job: throttles progress persistence."""
+
+    def __call__(self, *, force: bool = False) -> bool: ...
 
 
 class _AsrMetrics(TypedDict):

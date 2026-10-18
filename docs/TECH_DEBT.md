@@ -54,7 +54,7 @@
 
 | ID | Pri | Долг | Источник |
 |----|-----|------|----------|
-| D17 | P2 | `run_sync_job` — ~860 строк, ~40 замыканий, без прямого юнит-теста | B11 |
+| D17 | P3 | `run_sync_job` разбит на оркестратор (`api_sync_worker.py`, 273 строки, из них `run_sync_job` 257) и фазы `sync_asr_phase.py` / `sync_match_phase.py` / `sync_cost_tracker.py` с юнит-тестами. Остаток: ~50 строк распаковки `services` и сборка двух контекстов (`SyncAsrContext`, `SyncMatchContext`) в самом оркестраторе; `run_asr_phase` ~390 строк одним циклом | B11 |
 | D18 | P2 | Пять копий job-фреймворка (создание/персист/reserve/trim/interrupted). Общий `trim_terminal_jobs` есть в `job_runtime.py`, подключён только к final review | B12 |
 | D19 | P3 | Квадратичные сканы в финальной проверке (`_best_span`) и пересчёт `_sync_summary` на каждом сегменте; не измерено | B13 |
 | D20 | P3 | `cep/js/main.js` (2364 строки) и `cep/host.jsx` (3632) — монолиты | Заморожено (CEP вне scope); B17 |
