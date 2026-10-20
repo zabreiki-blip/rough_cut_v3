@@ -11,6 +11,12 @@ from typing import Any
 
 from cost_budget import CostBudgetExceeded
 from stage2.sync_models import AlignmentRequest, TimecodeMode
+from stage2.sync_offset_clusters import (
+    DEFAULT_AUTO_THRESHOLD,
+    OffsetClusterConfig,
+    apply_offset_cluster_promotions,
+    is_promotion_candidate,
+)
 from stage2.sync_storage import SyncMatchStore
 from sync_cost_tracker import ProgressPersistGate, SyncCostTracker
 
@@ -214,6 +220,12 @@ def _make_checkpoint_writer(
     return checkpoint_matches
 
 
+def _is_manual_match(match: Any) -> bool:
+    """Confirmed or hand-edited: the user's decision, never reviewed or overwritten."""
+    metadata = getattr(match, "metadata", None) or {}
+    return match.status == "confirmed" or bool(metadata.get("manual_updated_at"))
+
+
 def _review_match(
     ctx: SyncMatchContext,
     state: _ReviewState,
@@ -333,11 +345,10 @@ def run_match_phase(
         source_speakers=source_speakers,
         preserve_whole_uids=confirmed_parent_ids,
     )
-    matcher = ctx.matcher_cls(
-        matching_sources,
-        indexes,
-        ctx.matcher_config_cls(search_window_sec=ctx.search_window_sec),
-    )
+    matcher_config = ctx.matcher_config_cls(search_window_sec=ctx.search_window_sec)
+    matcher = ctx.matcher_cls(matching_sources, indexes, matcher_config)
+    auto_threshold = float(getattr(matcher_config, "auto_threshold", DEFAULT_AUTO_THRESHOLD))
+    offset_cluster_config = OffsetClusterConfig.from_env(getenv)
     settings = ctx.get_settings()
     llm_review_enabled = bool(settings.openrouter_api_key) and str(
         getenv("SYNC_LLM_REVIEW_ENABLED", "1")
@@ -415,6 +426,9 @@ def run_match_phase(
 
     segment_failures: list[dict[str, str]] = []
     processed = 0
+    # Strong fallback matches may be promoted by the offset-cluster pass once every
+    # segment is matched; their paid LLM review waits until that is decided.
+    deferred_review: list[str] = []
     for unit in units:
         ensure_not_cancelled()
         segment_id = str(unit.get("segment_id") or "").strip()
@@ -485,10 +499,22 @@ def run_match_phase(
                     timecode_mode=ctx.timecode_mode,
                 )
             )
-            match = _review_match(ctx, review, cost_tracker, settings, match, segment_id)
+            # A match whose review is deferred must not look finished: the fingerprint
+            # (the only thing the reuse branch above trusts) is stamped once the
+            # offset-cluster pass promoted it or its review ran. If the job is
+            # cancelled or fails before that, the next run rematches it and the review
+            # is not lost.
+            review_deferred = offset_cluster_config.enabled and is_promotion_candidate(
+                match, auto_threshold, offset_cluster_config.min_words
+            )
+            if review_deferred:
+                deferred_review.append(segment_id)
+            else:
+                match = _review_match(ctx, review, cost_tracker, settings, match, segment_id)
             match.metadata["normalization_revision"] = normalization_revision
             match.metadata["scenario_revision_id"] = scenario_revision_id
-            match.metadata["matching_fingerprint"] = matching_fingerprint
+            if not review_deferred:
+                match.metadata["matching_fingerprint"] = matching_fingerprint
             match.metadata["parent_block_uid"] = str(unit.get("parent_block_uid") or segment_id)
             match.metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
             match.metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
@@ -519,6 +545,70 @@ def run_match_phase(
             **cost_tracker.llm_cost_fields(),
         )
 
+    # Offset-cluster pass: a systematic timecode shift shared by several strong
+    # fallback matches of one source confirms each of them. It runs before the LLM
+    # review of those matches, so promoted ones never reach the paid review.
+    current_matches = [item for key, item in existing.items() if key in current_ids]
+    offset_report = apply_offset_cluster_promotions(
+        current_matches,
+        matching_sources,
+        offset_cluster_config,
+        auto_threshold=auto_threshold,
+        default_timecode_mode=ctx.timecode_mode,
+    )
+    if offset_report.promoted or offset_report.demoted:
+        checkpoint_state["dirty"] = True
+        # Reused matches were not rematched: without this the checkpoint merge would
+        # restore their stale persisted copies over the promoted/reverted ones.
+        rematched_this_run.update(offset_report.promoted)
+        rematched_this_run.update(offset_report.demoted)
+        ctx.logger.info(
+            "Sync job=%s: offset-cluster pass promoted %d, reverted %d fallback matches",
+            job_id,
+            len(offset_report.promoted),
+            len(offset_report.demoted),
+        )
+    # The pass decided the promoted ones: they need no review and may be reused.
+    # Whatever is still ``needs_review`` gets its review below, one at a time.
+    pending_review: list[str] = []
+    for segment_id in deferred_review:
+        deferred = existing.get(segment_id)
+        if deferred is None or _is_manual_match(deferred):
+            continue  # edited by the user during the run: their copy is authoritative
+        if deferred.status == "auto_matched":
+            deferred.metadata["matching_fingerprint"] = matching_fingerprint
+        elif deferred.status == "needs_review":
+            pending_review.append(segment_id)
+    if deferred_review:
+        checkpoint_state["dirty"] = True  # fingerprints were stamped on promoted matches
+    if pending_review:
+        _update_sync_job(job_id, persist=False, message="Reviewing deferred matches")
+    for segment_id in pending_review:
+        ensure_not_cancelled()
+        deferred = existing.get(segment_id)
+        if deferred is None or _is_manual_match(deferred) or deferred.status != "needs_review":
+            continue
+        try:
+            reviewed = _review_match(ctx, review, cost_tracker, settings, deferred, segment_id)
+            reviewed.metadata["matching_fingerprint"] = matching_fingerprint
+            existing[segment_id] = reviewed
+            checkpoint_state["dirty"] = True
+        except CostBudgetExceeded:
+            raise
+        except Exception as exc:
+            # Keep the unreviewed match (no fingerprint: the next run retries it).
+            segment_failures.append({"segment_id": segment_id, "error": str(exc)})
+        current = [item for key, item in existing.items() if key in current_ids]
+        _update_sync_job(
+            job_id,
+            persist=should_persist_progress(),
+            done=processed,
+            **_sync_summary(current),
+            segment_failures=list(segment_failures),
+            llm_reviewed=review.reviewed,
+            llm_review_failures=list(review.failures),
+            **cost_tracker.llm_cost_fields(),
+        )
     checkpoint_matches()
     return SyncMatchResult(
         matches=[item for key, item in existing.items() if key in current_ids],

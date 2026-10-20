@@ -599,3 +599,293 @@ def test_checkpoint_writer_legacy_persisted_without_scenario_id_is_current() -> 
     write()
 
     assert store.items == [manual]
+
+
+# ---- offset-cluster promotion of fallback matches ---------------------------------
+
+
+def _fallback_match(
+    segment_id: str, offset: float, *, confidence: float = 0.9, approx_sec: float = 60.0
+) -> Any:
+    from stage2.sync_models import SyncMatch
+
+    speech_in = approx_sec + offset
+    return SyncMatch(
+        segment_id=segment_id,
+        query_text="some long enough quote here",
+        approximate_timecode="00:01:00",
+        source_id="src",
+        source_in_sec=speech_in - 2,
+        source_out_sec=speech_in + 5,
+        confidence=confidence,
+        status="needs_review",
+        strategy="fallback_full",
+        metadata={
+            "ambiguous": False,
+            "semantic_flags": [],
+            "gap_flags": [],
+            "timecode_mode": "relative",
+            "speech_in_sec": speech_in,
+        },
+    )
+
+
+def _run_offset_phase(
+    h: _Harness, offsets: dict[str, float], **overrides: Any
+) -> SyncMatchResult:
+    from stage2.sync_models import SyncSource
+
+    h.segment_ids = list(offsets)
+    confidences = overrides.pop("confidences", {})
+
+    def match_segment(request: Any) -> Any:
+        h.matched.append(request.segment_id)
+        return _fallback_match(
+            request.segment_id,
+            offsets[request.segment_id],
+            confidence=confidences.get(request.segment_id, 0.9),
+        )
+
+    h._match_segment = match_segment  # type: ignore[method-assign]
+    source = SyncSource(id="src", speaker="A", premiere_sequence="Seq")
+    return run_match_phase(
+        h.context(**overrides),
+        [source],
+        [SimpleNamespace(source_id="src")],
+        cost_tracker=h.tracker,  # type: ignore[arg-type]
+        checkpoint=h.checkpoint,
+    )
+
+
+_CLUSTER = {"a": 640.0, "b": 650.0, "c": 660.0, "d": 670.0}
+
+
+def test_offset_cluster_promotes_fallback_matches_and_persists_them() -> None:
+    h = _Harness([])
+
+    result = _run_offset_phase(h, {**_CLUSTER, "outlier": 1500.0})
+
+    status = {m.segment_id: m.status for m in result.matches}
+    assert status == {
+        "a": "auto_matched",
+        "b": "auto_matched",
+        "c": "auto_matched",
+        "d": "auto_matched",
+        "outlier": "needs_review",
+    }
+    assert result.matches[0].metadata["promoted_by"] == "offset_cluster"
+    assert result.matches[0].strategy == "fallback_full"
+    stored = {m.segment_id: m.status for m in h.store.items}
+    assert stored == status
+
+
+def test_offset_cluster_pass_can_be_disabled_by_env() -> None:
+    h = _Harness([])
+    h.env["SYNC_OFFSET_CLUSTER_ENABLED"] = "0"
+
+    result = _run_offset_phase(h, _CLUSTER)
+
+    assert {m.status for m in result.matches} == {"needs_review"}
+    assert all("offset_cluster" not in m.metadata for m in result.matches)
+
+
+def test_offset_cluster_min_support_is_configurable() -> None:
+    h = _Harness([])
+    h.env["SYNC_OFFSET_CLUSTER_MIN_SUPPORT"] = "4"
+
+    result = _run_offset_phase(h, _CLUSTER)
+
+    assert {m.status for m in result.matches} == {"needs_review"}
+
+
+def test_offset_cluster_promotes_reused_matches_of_unchanged_fingerprint() -> None:
+    h = _Harness([])
+    prior = [_fallback_match(k, v) for k, v in _CLUSTER.items()]
+    for item in prior:
+        item.metadata.update({"normalization_revision": 3, "matching_fingerprint": "fp"})
+    h.store.items = prior
+
+    result = _run_offset_phase(h, _CLUSTER)
+
+    assert h.matched == []  # nothing rematched
+    assert {m.status for m in result.matches} == {"auto_matched"}
+    assert {m.status for m in h.store.items} == {"auto_matched"}
+
+
+def test_promoted_candidate_skips_paid_llm_review_but_unpromoted_one_is_reviewed() -> None:
+    h = _Harness([], review=True)
+    offsets = {**_CLUSTER, "lonely": 1500.0}
+
+    # 0.79 < SYNC_LLM_REVIEW_THRESHOLD (0.80): reviewable by the LLM unless promoted
+    result = _run_offset_phase(h, offsets, confidences={k: 0.79 for k in offsets})
+
+    assert {m.segment_id: m.status for m in result.matches}["a"] == "auto_matched"
+    assert h.review_calls == 1  # only the lonely, unconfirmed outlier
+    assert result.llm_reviewed == 1
+
+
+def test_offset_cluster_promotion_of_reused_match_survives_checkpoint_merge() -> None:
+    import copy
+
+    class _CopyingStore(_Store):
+        def list(self) -> list[Any]:  # like the real store: fresh objects on every read
+            return [copy.deepcopy(item) for item in self.items]
+
+    h = _Harness([])
+    h.store = _CopyingStore()
+    prior = [_fallback_match(k, v) for k, v in _CLUSTER.items()]
+    for item in prior:
+        item.metadata.update({"normalization_revision": 3, "matching_fingerprint": "fp"})
+    h.store.items = prior
+
+    _run_offset_phase(h, _CLUSTER)
+
+    assert h.matched == []
+    assert {m.status for m in h.store.items} == {"auto_matched"}
+
+
+def _call_counting_cancel(raise_on_call: int) -> Any:
+    calls = {"n": 0}
+
+    def ensure() -> None:
+        calls["n"] += 1
+        if calls["n"] == raise_on_call:
+            raise _Cancelled("Sync job cancelled")
+
+    return ensure
+
+
+def test_deferred_review_candidate_is_not_reusable_until_reviewed() -> None:
+    h = _Harness([], review=True)
+    offsets = {"lonely": 1500.0}
+    confidences = {"lonely": 0.79}
+
+    # one unit -> call 1; the deferred loop's first check is call 2
+    with pytest.raises(_Cancelled):
+        _run_offset_phase(
+            h, offsets, confidences=confidences, ensure_not_cancelled=_call_counting_cancel(2)
+        )
+    h.checkpoint.checkpoint()  # what the cancel handler of run_sync_job does
+    assert [m.segment_id for m in h.store.items] == ["lonely"]
+    assert h.review_calls == 0
+
+    result = _run_offset_phase(h, offsets, confidences=confidences)
+
+    assert h.matched == ["lonely", "lonely"]  # not reused: rematched
+    assert h.review_calls == 1
+    assert result.llm_reviewed == 1
+    assert result.matches[0].metadata["matching_fingerprint"] == "fp"
+
+
+def test_reviewed_and_promoted_deferred_matches_are_reusable_afterwards() -> None:
+    h = _Harness([], review=True)
+    offsets = {**_CLUSTER, "lonely": 1500.0}
+    confidences = {k: 0.79 for k in offsets}
+    _run_offset_phase(h, offsets, confidences=confidences)
+    assert h.review_calls == 1
+
+    result = _run_offset_phase(h, offsets, confidences=confidences)
+
+    assert h.review_calls == 1
+    assert len(h.matched) == len(offsets)  # second run reused everything
+    assert {m.metadata["matching_fingerprint"] for m in result.matches} == {"fp"}
+
+
+@pytest.mark.parametrize("status", ["confirmed", "needs_review"])
+def test_deferred_review_skips_match_edited_manually_during_run(status: str) -> None:
+    import copy
+
+    class _SwapStore(_Store):
+        def list(self) -> list[Any]:
+            return [copy.deepcopy(item) for item in self.items]
+
+    h = _Harness([], review=True)
+    h.store = _SwapStore()
+    manual = _fallback_match("lonely", 1500.0, confidence=0.79)
+    manual.status = status  # type: ignore[assignment]
+    manual.metadata.update(
+        {"normalization_revision": 3, "manual_updated_at": "2026-06-01T00:00:00+00:00"}
+    )
+    offsets = {"lonely": 1500.0, **{f"o{i}": 3000.0 + 1000 * i for i in range(9)}}
+    calls = {"n": 0}
+
+    def ensure() -> None:
+        calls["n"] += 1
+        if calls["n"] == 10:  # the user edits the match before the 10th unit
+            h.store.items = [manual]
+
+    result = _run_offset_phase(
+        h, offsets, confidences={"lonely": 0.79}, ensure_not_cancelled=ensure
+    )
+
+    assert h.review_calls == 0
+    kept = {m.segment_id: m for m in result.matches}["lonely"]
+    assert kept.status == status
+    assert kept.metadata["manual_updated_at"] == "2026-06-01T00:00:00+00:00"
+
+
+def test_deferred_review_updates_job_progress() -> None:
+    h = _Harness([], review=True)
+
+    _run_offset_phase(h, {"lonely": 1500.0}, confidences={"lonely": 0.79})
+
+    last = h.updates[-1][1]
+    assert last["llm_reviewed"] == 1
+    assert "persist" in last and "llm_cost_usd" in last and "matched" in last
+
+
+def test_deferred_review_failure_is_recorded_and_match_stays_rematchable() -> None:
+    h = _Harness([], review=True)
+
+    def boom(_match: Any) -> Any:
+        raise RuntimeError("boom")
+
+    result = _run_offset_phase(
+        h, {"lonely": 1500.0}, confidences={"lonely": 0.79}, semantic_review_candidates=boom
+    )
+
+    assert result.segment_failures == [{"segment_id": "lonely", "error": "boom"}]
+    assert [m.segment_id for m in result.matches] == ["lonely"]
+    assert "matching_fingerprint" not in result.matches[0].metadata
+    assert [m.segment_id for m in h.store.items] == ["lonely"]
+
+
+def test_offset_cluster_budget_exceeded_in_deferred_review_keeps_matches() -> None:
+    h = _Harness([], review=True)
+    h.review_error = CostBudgetExceeded("limit hit")
+    offsets = {"l1": 1500.0, "l2": 2500.0}
+
+    result = _run_offset_phase(h, offsets, confidences={k: 0.79 for k in offsets})
+
+    assert h.review_calls == 1  # review switched off after the budget error
+    assert [m.segment_id for m in result.matches] == ["l1", "l2"]
+
+
+def test_offset_cluster_demotion_survives_checkpoint_merge() -> None:
+    import copy
+
+    class _CopyingStore(_Store):
+        def list(self) -> list[Any]:
+            return [copy.deepcopy(item) for item in self.items]
+
+    h = _Harness([])
+    h.store = _CopyingStore()
+    prior = [_fallback_match(k, v) for k, v in list(_CLUSTER.items())[:3]]
+    for item in prior:
+        item.status = "auto_matched"
+        item.metadata.update(
+            {
+                "normalization_revision": 3,
+                "matching_fingerprint": "fp",
+                "promoted_by": "offset_cluster",
+                "offset_cluster": {"support": 3},
+            }
+        )
+    h.store.items = prior
+
+    result = _run_offset_phase(h, {k: _CLUSTER[k] for k in ("a", "b", "c")})
+
+    assert h.matched == []
+    assert {m.status for m in result.matches} == {"needs_review"}
+    assert {m.status for m in h.store.items} == {"needs_review"}
+    assert all("promoted_by" not in m.metadata for m in h.store.items)
