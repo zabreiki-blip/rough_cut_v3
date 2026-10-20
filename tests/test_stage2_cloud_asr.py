@@ -1109,8 +1109,45 @@ def test_find_coverage_holes_tail_is_hole() -> None:
     assert find_coverage_holes(segments, [False, True], 0.0, 300.0) == [(80.0, 300.0)]
 
 
+def test_find_coverage_holes_leading_gap_before_first_segment_is_hole() -> None:
+    # Единственная реплика 80-90 с явным концом: начало части 0-80 не покрыто,
+    # хвост 90-100 короче min_sec и дырой не считается.
+    segments = [_hole_seg(80, 90, 25)]
+    assert find_coverage_holes(segments, [True], 0.0, 100.0) == [(0.0, 80.0)]
+    # Без собственного конца результат по началу тот же.
+    assert find_coverage_holes(segments, [False], 0.0, 100.0) == [(0.0, 80.0)]
+    # Длинный хвост (>= min_sec) тоже дыра, начальная идёт первой.
+    assert find_coverage_holes(segments, [True], 0.0, 150.0) == [(0.0, 80.0), (90.0, 150.0)]
+
+
+def test_find_coverage_holes_short_leading_gap_is_not_hole() -> None:
+    segments = [_hole_seg(20, 90, 100)]
+    assert find_coverage_holes(segments, [True], 0.0, 100.0) == []
+    # Ровно min_sec - дыра (как и для промежутков между репликами).
+    segments = [_hole_seg(30, 90, 100)]
+    assert find_coverage_holes(segments, [True], 0.0, 100.0) == [(0.0, 30.0)]
+
+
+def test_find_coverage_holes_leading_gap_skips_overlap_covered_by_previous_part() -> None:
+    # Часть 280-600 перекрывает предыдущую на 280-300: этот кусок уже покрыт
+    # предыдущей частью, поэтому начальный пропуск считается от covered_until.
+    segments = [_hole_seg(320, 400, 200)]
+    assert find_coverage_holes(segments, [True], 280.0, 400.0) == [(280.0, 320.0)]
+    assert find_coverage_holes(segments, [True], 280.0, 400.0, covered_until=300.0) == []
+    segments = [_hole_seg(340, 400, 150)]
+    # Пропуск 300-340 = 40 с >= min_sec: дыра, но без уже покрытых 280-300.
+    assert find_coverage_holes(segments, [True], 280.0, 400.0, covered_until=300.0) == [
+        (300.0, 340.0)
+    ]
+    # Весь пропуск внутри перекрытия: дыры нет.
+    segments = [_hole_seg(310, 400, 150)]
+    assert find_coverage_holes(segments, [True], 270.0, 400.0, covered_until=300.0) == []
+
+
 def test_find_coverage_holes_empty_part_is_hole() -> None:
     assert find_coverage_holes([], [], 100.0, 400.0) == [(100.0, 400.0)]
+    assert find_coverage_holes([], [], 100.0, 400.0, covered_until=120.0) == [(120.0, 400.0)]
+    assert find_coverage_holes([], [], 100.0, 140.0, covered_until=120.0) == []
     assert find_coverage_holes([], [], 100.0, 110.0) == []
 
 
@@ -1311,3 +1348,41 @@ def test_failed_piece_of_long_hole_is_reported_alone(monkeypatch: pytest.MonkeyP
     coverage = result["coverage"]
     assert coverage["holes_repaired"] == 1
     assert coverage["unrecovered_ranges"] == [[150.0, 240.0]]
+
+
+def test_leading_hole_starts_at_part_start_for_first_part_and_at_covered_until_for_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Две части по 5 минут с перекрытием 60 с (части 0..300 и 240..540). Повторы
+    # выключены, поэтому найденные дыры попадают в unrecovered_ranges как есть.
+    # Часть 0: речь начинается с 01:00 -> начальная дыра от part_start (0..60).
+    # Часть 1: речь начинается с абсолютных 340 с; зона 240..300 уже покрыта
+    # предыдущей частью -> начальная дыра считается от covered_until (300..340).
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "0")
+    extracted: list[tuple[float, float]] = []
+
+    async def extract(_self, _path, start, duration):
+        extracted.append((start, duration))
+        return b"mp3"
+
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    replies = iter(
+        [
+            f"[01:00 — 05:00] ГОЛОС 1: {_words(1000)}",
+            f"[01:40 — 05:00] ГОЛОС 1: {_words(1000)}",
+        ]
+    )
+    _patch_async_client(monkeypatch, lambda _request: _model_response(next(replies)))
+
+    result = transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        chunk_minutes=5,
+        overlap_sec=60,
+        duration_sec=540.0,
+    )
+
+    assert extracted == [(0.0, 300.0), (240.0, 300.0)]
+    coverage = result["coverage"]
+    assert coverage["holes_detected"] == 2
+    assert coverage["unrecovered_ranges"] == [[0.0, 60.0], [300.0, 340.0]]

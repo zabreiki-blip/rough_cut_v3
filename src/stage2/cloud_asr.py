@@ -1047,10 +1047,17 @@ def find_coverage_holes(
     *,
     min_sec: float | None = None,
     max_wpm: float | None = None,
+    covered_until: float | None = None,
 ) -> list[tuple[float, float]]:
     """Интервалы части, где модель, судя по всему, пропустила речь.
 
-    Дырой считается: (1) интервал реплики без собственного конца от модели
+    Дырой считается: (0) начальный интервал от начала части до первой реплики
+    длиной не меньше `min_sec`; если часть перекрывает предыдущую, `covered_until`
+    (номинальная граница, до которой её уже покрыла предыдущая часть) сдвигает
+    начало ТОЛЬКО этого начального интервала (и дыры «вся часть без реплик»),
+    чтобы не повторять платное распознавание зоны перекрытия. На дыры (1)-(3)
+    ниже `covered_until` не влияет: они считаются по фактическим репликам части;
+    (1) интервал реплики без собственного конца от модели
     (она тянется до начала следующей реплики или до конца части) длиной не
     меньше `min_sec` при плотности ниже `max_wpm` слов в минуту — это
     включает «хвост» части; (2) промежуток не меньше `min_sec` между явным
@@ -1062,10 +1069,13 @@ def find_coverage_holes(
         min_sec = _env_float("SYNC_CLOUD_ASR_HOLE_MIN_SEC", DEFAULT_HOLE_MIN_SEC)
     if max_wpm is None:
         max_wpm = _env_float("SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True)
+    lead_start = part_start if covered_until is None else max(part_start, covered_until)
     if not segments:
-        return [(part_start, part_end)] if part_end - part_start >= min_sec else []
+        return [(lead_start, part_end)] if part_end - lead_start >= min_sec else []
 
     holes: list[tuple[float, float]] = []
+    if segments[0].start - lead_start >= min_sec:
+        holes.append((lead_start, segments[0].start))
     for i, seg in enumerate(segments):
         has_own_end = i < len(own_end_flags) and own_end_flags[i] and seg.end > seg.start
         next_start = segments[i + 1].start if i + 1 < len(segments) else part_end
@@ -1760,7 +1770,13 @@ class CloudAudioAsrAdapter:
                 # Дыры только запоминаем: повторы делаются вторым проходом,
                 # после всех основных частей, — иначе повтор дыры съел бы
                 # бюджет, зарезервированный под ещё не распознанные части.
-                part_holes = find_coverage_holes(part_segments, part_own_end, part_start, part_end)
+                part_holes = find_coverage_holes(
+                    part_segments,
+                    part_own_end,
+                    part_start,
+                    part_end,
+                    covered_until=None if idx == 0 else idx * chunk_len,
+                )
                 holes_detected += sum(len(split_hole(h, hole_split_sec)) for h in part_holes)
                 if part_segments:
                     part_segments[-1] = replace(part_segments[-1], end=part_end)
