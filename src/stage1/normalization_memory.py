@@ -39,6 +39,38 @@ _GLUED_NUMBER_STRIPPABLE_PREFIXES = frozenset(
     }
 )
 
+# Markers whose whitespace-separated trailing index ("диктор 1", "зк 5") is a
+# speaker/cue index and is stripped. Superset of the glued-form prefixes: it
+# also covers the multi-word and word-form built-in markers. Kept in sync (by
+# hand) with `_BUILTIN_MARKERS`/`_TECH_MARKERS` in normalizer.py. A person's
+# name ("Сергей 1" / "Сергей 2") is deliberately absent: the index is what
+# tells two different speakers apart.
+_SPACED_NUMBER_STRIPPABLE_PREFIXES = _GLUED_NUMBER_STRIPPABLE_PREFIXES | frozenset(
+    {
+        "narrator",
+        "з к",
+        "закадр",
+        "закадровый текст",
+        "диктор",
+        "голос диктора",
+        "интервью",
+        "ведущий",
+        "ведущая",
+        "life",
+        "титры",
+        "плашка",
+        "графика",
+        "карта",
+        "фото",
+        "архив",
+        "отбивка",
+        "шапка",
+        "склейка",
+        "ремарка",
+        "техническое",
+    }
+)
+
 
 def _validate_scope(scope: str) -> str:
     if scope not in VALID_ALIAS_SCOPES:
@@ -51,13 +83,15 @@ def _validate_scope(scope: str) -> str:
 def normalize_marker(marker: str) -> str:
     value = marker.casefold().replace("ё", "е").strip()
     value = re.sub(r"[\s.:;,_/\\|\-–—]+", " ", value)
-    # A speaker index separated by whitespace ("диктор 1") is stripped for
-    # any marker -- this was the original behaviour and is safe because the
-    # letter part alone (before the space) is what gets matched on.
+    # A speaker index separated by whitespace ("диктор 1") is stripped only
+    # for the closed set of known service-cue markers. For arbitrary markers
+    # (a person's name: "Сергей 1" vs "Сергей 2") the index distinguishes
+    # different speakers and must be kept, otherwise learned rules and
+    # suppressions collide on the same key.
     spaced_match = re.search(r"\s+\d+[a-zа-я]?\s*$", value)
     if spaced_match:
         candidate = value[: spaced_match.start()].strip()
-        if candidate:
+        if candidate in _SPACED_NUMBER_STRIPPABLE_PREFIXES:
             value = candidate
     else:
         # A glued digit ("тех32", "зк5") is only stripped for the closed set
@@ -80,6 +114,7 @@ class NormalizationMemory:
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._create_schema()
+        self._rekey_stale_normalized_markers()
 
     def close(self) -> None:
         self._conn.close()
@@ -189,6 +224,73 @@ class NormalizationMemory:
             raise
         finally:
             self._conn.execute(f"PRAGMA foreign_keys = {'ON' if previous_foreign_keys else 'OFF'}")
+
+    def _rekey_stale_normalized_markers(self) -> None:
+        """Recompute ``normalized_marker`` from the stored raw ``marker``.
+
+        Older versions stripped a spaced numeric index from every marker, so
+        "Сергей 2" was stored under the key "сергей". The raw marker is always
+        stored next to the key, so the key is rebuilt from it. If the rebuilt
+        key already exists for the same (target_type, source, scope) the stale
+        duplicate row is dropped. There is deliberately no fallback to the old
+        ambiguous key. Idempotent: no-ops once every key matches its marker.
+        """
+        try:
+            stale = []
+            for row in self._conn.execute(
+                "SELECT id, marker, normalized_marker, scope FROM aliases"
+            ):
+                new_key = normalize_marker(str(row["marker"]))
+                if new_key and new_key != row["normalized_marker"]:
+                    stale.append((row["id"], new_key, row["normalized_marker"], row["scope"]))
+            stale_suppressions = []
+            for row in self._conn.execute(
+                "SELECT rowid AS rid, marker, normalized_marker FROM alias_suppressions"
+            ):
+                new_key = normalize_marker(str(row["marker"]))
+                if new_key and new_key != row["normalized_marker"]:
+                    stale_suppressions.append((row["rid"], new_key))
+            if not stale and not stale_suppressions:
+                return
+            touched: set[tuple[str, str]] = set()
+            with self.transaction():
+                # Phase 1: park every stale row under a unique temporary key so
+                # that a stale row's target key can never collide with another
+                # stale row's *old* key (chains like "Сергей 2" / "Сергей 2 2").
+                # Phase 2 then moves each row, addressed by its own id/rowid;
+                # only a genuine clash with an already-correct row drops the
+                # stale row itself. Rows that are not stale are never touched.
+                for rule_id, _new_key, _old_key, _scope in stale:
+                    self._conn.execute(
+                        "UPDATE aliases SET normalized_marker=? WHERE id=?",
+                        (f"\x00rekey:{rule_id}", rule_id),
+                    )
+                for rid, _new_key in stale_suppressions:
+                    self._conn.execute(
+                        "UPDATE alias_suppressions SET normalized_marker=? WHERE rowid=?",
+                        (f"\x00rekey:{rid}", rid),
+                    )
+                for rule_id, new_key, old_key, scope in stale:
+                    cur = self._conn.execute(
+                        "UPDATE OR IGNORE aliases SET normalized_marker=? WHERE id=?",
+                        (new_key, rule_id),
+                    )
+                    if cur.rowcount == 0:
+                        self._conn.execute("DELETE FROM aliases WHERE id=?", (rule_id,))
+                    touched.add((new_key, scope))
+                    touched.add((old_key, scope))
+                for rid, new_key in stale_suppressions:
+                    cur = self._conn.execute(
+                        "UPDATE OR IGNORE alias_suppressions SET normalized_marker=? WHERE rowid=?",
+                        (new_key, rid),
+                    )
+                    if cur.rowcount == 0:
+                        self._conn.execute("DELETE FROM alias_suppressions WHERE rowid=?", (rid,))
+                for key, scope in touched:
+                    self._reconcile_conflicts(key, scope)
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
