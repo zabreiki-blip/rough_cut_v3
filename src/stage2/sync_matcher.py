@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import heapq
+import os
 import re
 import unicodedata
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from math import isfinite
 from typing import Any, Iterable
@@ -445,6 +446,21 @@ def parse_timecode(value: str | float | int | None, fps: float = 25.0) -> float 
     raise ValueError(f"invalid timecode: {value!r}")
 
 
+DEFAULT_MAX_INTERNAL_GAP_SEC = 5.0
+
+
+def _default_max_internal_gap_sec() -> float:
+    """Gap gate default; ``SYNC_MATCH_MAX_INTERNAL_GAP_SEC`` overrides it."""
+    raw = os.environ.get("SYNC_MATCH_MAX_INTERNAL_GAP_SEC", "").strip()
+    if not raw:
+        return DEFAULT_MAX_INTERNAL_GAP_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_INTERNAL_GAP_SEC
+    return value if isfinite(value) and value > 0 else DEFAULT_MAX_INTERNAL_GAP_SEC
+
+
 @dataclass(frozen=True)
 class MatcherConfig:
     search_window_sec: float = 180.0
@@ -457,6 +473,9 @@ class MatcherConfig:
     # These are editorial handles, not confidence margins.
     head_padding_sec: float = 2.0
     tail_padding_sec: float = 1.5
+    # A candidate stitched across a longer silence between neighbouring words
+    # is not one continuous phrase and must be reviewed by an editor.
+    max_internal_gap_sec: float = field(default_factory=_default_max_internal_gap_sec)
 
     def __post_init__(self) -> None:
         if self.search_window_sec <= 0:
@@ -473,6 +492,8 @@ class MatcherConfig:
             raise ValueError("review_threshold must not exceed auto_threshold")
         if self.max_alternatives < 0:
             raise ValueError("max_alternatives must not be negative")
+        if not (isfinite(self.max_internal_gap_sec) and self.max_internal_gap_sec > 0):
+            raise ValueError("max_internal_gap_sec must be positive")
 
 
 @dataclass(frozen=True)
@@ -489,6 +510,8 @@ class _Candidate:
     confidence: float
     text: str
     strategy: str
+    max_gap_sec: float = 0.0
+    max_word_duration_sec: float = 0.0
 
 
 def _source_start_tc(source: SyncSource) -> float:
@@ -1052,6 +1075,14 @@ class _StartSearch:
             confidence=best.bound,
             text=" ".join(item.word.word for item in span),
             strategy=search.strategy,
+            max_gap_sec=max(
+                (
+                    max(0.0, right.word.start - left.word.end)
+                    for left, right in zip(span, span[1:])
+                ),
+                default=0.0,
+            ),
+            max_word_duration_sec=max(item.word.end - item.word.start for item in span),
         )
 
 
@@ -1577,6 +1608,18 @@ class SyncMatcher:
         # Negations and changed numbers can flip the meaning of an otherwise
         # highly similar sentence; such matches must never be auto-assembled.
         semantic_flags = _semantic_gate_flags(request.text, best.text)
+        # Words glued across a long silence (e.g. two halves of the phrase
+        # minutes apart) score highly but are not a continuous quote.
+        # A single word that lasts longer than the same threshold is just as
+        # impossible and hides a pause: interpolated cloud timestamps spread a
+        # segment evenly over words (gap is always ~0), and Whisper may stretch
+        # a word's end over the silence after it.  Applied to every precision.
+        gap_flags = (
+            ["large_time_gap"]
+            if best.max_gap_sec > self.config.max_internal_gap_sec
+            or best.max_word_duration_sec > self.config.max_internal_gap_sec
+            else []
+        )
         # A strong global fallback is useful, but its disagreement with the
         # supplied timecode must remain visible to an editor.
         auto = (
@@ -1584,6 +1627,7 @@ class SyncMatcher:
             and not ambiguous
             and best.strategy != "fallback_full"
             and not semantic_flags
+            and not gap_flags
         )
         status: MatchStatus = "auto_matched" if auto else "needs_review"
         alternatives = []
@@ -1617,6 +1661,13 @@ class SyncMatcher:
                     "ambiguous": ambiguous,
                     "timecode_mode": request.timecode_mode,
                     "semantic_flags": semantic_flags,
+                    "gap_flags": gap_flags,
+                    "max_internal_gap_sec": round(best.max_gap_sec, 4),
+                    "max_word_duration_sec": round(best.max_word_duration_sec, 4),
+                    "max_internal_gap_threshold_sec": self.config.max_internal_gap_sec,
+                    "timestamp_precision": str(
+                        self.indexes[best.source_id].metadata.get("timestamp_precision") or ""
+                    ),
                     "speech_in_sec": round(best.start, 4),
                     "speech_out_sec": round(best.end, 4),
                     "head_padding_sec": self.config.head_padding_sec,

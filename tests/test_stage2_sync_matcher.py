@@ -17,6 +17,7 @@ from stage2.sync_matcher import (
     parse_timecode,
 )
 from stage2.sync_models import AlignmentRequest, SyncSource, WordIndex, WordTimestamp
+from stage2.sync_transcript import ingest_word_index
 
 
 def _index(source_id: str, text: str, start: float, step: float = 0.5) -> WordIndex:
@@ -782,6 +783,206 @@ def test_clean_match_without_numbers_or_negation_stays_auto_matched() -> None:
 
     assert result.status == "auto_matched"
     assert result.metadata["semantic_flags"] == []
+
+
+def _gapped_index(source_id: str, parts: list[tuple[str, float]]) -> WordIndex:
+    words: list[WordTimestamp] = []
+    for text, start in parts:
+        for offset, word in enumerate(text.split()):
+            words.append(WordTimestamp(word, start + offset * 0.3, start + offset * 0.3 + 0.3))
+    return WordIndex(source_id=source_id, words=words)
+
+
+def test_candidate_spanning_huge_time_gap_needs_review_with_gap_flag() -> None:
+    index = _gapped_index("s1", [("мы обязательно", 10.0), ("вернемся завтра", 900.0)])
+    result = SyncMatcher([_source("s1")], [index]).match(
+        AlignmentRequest(
+            segment_id="stitched",
+            text="мы обязательно вернемся завтра",
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "needs_review"
+    assert result.metadata["max_internal_gap_sec"] > 800
+    assert "large_time_gap" in result.metadata["gap_flags"]
+
+
+def test_natural_pause_below_threshold_stays_auto_matched() -> None:
+    index = _gapped_index("s1", [("мы обязательно", 10.0), ("вернемся завтра", 12.1)])
+    result = SyncMatcher([_source("s1")], [index]).match(
+        AlignmentRequest(
+            segment_id="pause",
+            text="мы обязательно вернемся завтра",
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "auto_matched"
+    assert result.metadata["gap_flags"] == []
+    assert 1.0 < result.metadata["max_internal_gap_sec"] < 2.0
+
+
+def test_internal_gap_threshold_is_configurable() -> None:
+    index = _gapped_index("s1", [("мы обязательно", 10.0), ("вернемся завтра", 12.1)])
+    result = SyncMatcher(
+        [_source("s1")], [index], MatcherConfig(max_internal_gap_sec=1.0)
+    ).match(
+        AlignmentRequest(
+            segment_id="pause-strict",
+            text="мы обязательно вернемся завтра",
+            source_ids=("s1",),
+        )
+    )
+
+    assert result.status == "needs_review"
+    assert result.metadata["gap_flags"] == ["large_time_gap"]
+
+
+def _match_phrase(index: WordIndex, config: MatcherConfig | None = None, segment_id: str = "q"):
+    return SyncMatcher([_source("s1")], [index], config).match(
+        AlignmentRequest(
+            segment_id=segment_id,
+            text="мы обязательно вернемся завтра",
+            source_ids=("s1",),
+        )
+    )
+
+
+def _interpolated_index(start: float, end: float) -> WordIndex:
+    return ingest_word_index(
+        {"segments": [{"text": "мы обязательно вернемся завтра", "start": start, "end": end}]},
+        "s1",
+    )
+
+
+def test_interpolated_segment_with_hidden_pause_needs_review_by_word_duration() -> None:
+    index = _interpolated_index(10.0, 900.0)
+    assert index.metadata["timestamp_precision"] == "interpolated"
+    result = _match_phrase(index)
+
+    assert result.status == "needs_review"
+    assert result.metadata["gap_flags"] == ["large_time_gap"]
+    # Interpolated words are contiguous: the hidden pause is not an inter-word gap.
+    assert result.metadata["max_internal_gap_sec"] == 0.0
+    assert result.metadata["max_word_duration_sec"] == pytest.approx(222.5)
+    assert result.metadata["timestamp_precision"] == "interpolated"
+
+
+def test_normal_interpolated_segment_stays_auto_matched() -> None:
+    result = _match_phrase(_interpolated_index(10.0, 12.0))
+
+    assert result.status == "auto_matched"
+    assert result.metadata["gap_flags"] == []
+    assert result.metadata["max_word_duration_sec"] == pytest.approx(0.5)
+    assert result.metadata["timestamp_precision"] == "interpolated"
+
+
+def test_real_word_timestamps_with_stretched_word_need_review() -> None:
+    words = [
+        WordTimestamp("мы", 10.0, 10.3),
+        WordTimestamp("обязательно", 10.3, 40.0),
+        WordTimestamp("вернемся", 40.0, 40.3),
+        WordTimestamp("завтра", 40.3, 40.6),
+    ]
+    result = _match_phrase(WordIndex(source_id="s1", words=words))
+
+    assert result.status == "needs_review"
+    assert result.metadata["gap_flags"] == ["large_time_gap"]
+    assert result.metadata["max_word_duration_sec"] == pytest.approx(29.7)
+
+
+def test_word_duration_exactly_at_threshold_stays_auto_matched() -> None:
+    words = [
+        WordTimestamp("мы", 10.0, 10.3),
+        WordTimestamp("обязательно", 10.3, 15.3),
+        WordTimestamp("вернемся", 15.3, 15.6),
+        WordTimestamp("завтра", 15.6, 15.9),
+    ]
+    result = _match_phrase(WordIndex(source_id="s1", words=words))
+
+    assert result.status == "auto_matched"
+    assert result.metadata["gap_flags"] == []
+
+
+def test_word_duration_gate_uses_configured_threshold() -> None:
+    result = _match_phrase(_interpolated_index(10.0, 12.0), MatcherConfig(max_internal_gap_sec=0.4))
+
+    assert result.status == "needs_review"
+    assert result.metadata["gap_flags"] == ["large_time_gap"]
+
+
+def test_gap_exactly_at_threshold_stays_auto_matched() -> None:
+    # Words are 0.3 s long; second part starts exactly 5.0 s after the first ends.
+    index = _gapped_index("s1", [("мы обязательно", 10.0), ("вернемся завтра", 10.6 + 5.0)])
+    result = _match_phrase(index, MatcherConfig(max_internal_gap_sec=5.0))
+
+    assert result.status == "auto_matched"
+    assert result.metadata["max_internal_gap_sec"] == pytest.approx(5.0)
+
+
+def test_gap_just_above_threshold_needs_review() -> None:
+    index = _gapped_index("s1", [("мы обязательно", 10.0), ("вернемся завтра", 10.6 + 5.01)])
+    result = _match_phrase(index, MatcherConfig(max_internal_gap_sec=5.0))
+
+    assert result.status == "needs_review"
+    assert result.metadata["gap_flags"] == ["large_time_gap"]
+
+
+def test_single_word_span_has_zero_gap_and_is_auto_matched() -> None:
+    # The query is split ("пол года") while the transcript has one word, so the
+    # best span is a single word; the low thresholds only let such a span through.
+    index = WordIndex(source_id="s1", words=[WordTimestamp("полгода", 10.0, 10.5)])
+    result = SyncMatcher(
+        [_source("s1")],
+        [index],
+        MatcherConfig(auto_threshold=0.05, review_threshold=0.05),
+    ).match(AlignmentRequest(segment_id="one", text="пол года", source_ids=("s1",)))
+
+    assert result.status == "auto_matched"
+    assert result.matched_text == "полгода"
+    assert result.metadata["max_internal_gap_sec"] == 0.0
+    assert result.metadata["max_word_duration_sec"] == pytest.approx(0.5)
+    assert result.metadata["gap_flags"] == []
+
+
+def test_overlapping_words_do_not_produce_negative_gap() -> None:
+    words = [
+        WordTimestamp("мы", 10.0, 10.6),
+        WordTimestamp("обязательно", 10.3, 11.0),
+        WordTimestamp("вернемся", 10.8, 11.4),
+        WordTimestamp("завтра", 11.2, 11.8),
+    ]
+    result = _match_phrase(WordIndex(source_id="s1", words=words))
+
+    assert result.status == "auto_matched"
+    assert result.metadata["max_internal_gap_sec"] == 0.0
+    assert result.metadata["gap_flags"] == []
+
+
+@pytest.mark.parametrize("raw", ["12.5", " 12.5 "])
+def test_gap_threshold_env_override_valid(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("SYNC_MATCH_MAX_INTERNAL_GAP_SEC", raw)
+    assert MatcherConfig().max_internal_gap_sec == 12.5
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-3", "inf", "-inf", "nan", ""])
+def test_gap_threshold_env_override_invalid_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("SYNC_MATCH_MAX_INTERNAL_GAP_SEC", raw)
+    assert MatcherConfig().max_internal_gap_sec == sync_matcher_module.DEFAULT_MAX_INTERNAL_GAP_SEC
+
+
+def test_gap_threshold_defaults_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYNC_MATCH_MAX_INTERNAL_GAP_SEC", raising=False)
+    assert MatcherConfig().max_internal_gap_sec == 5.0
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+def test_config_rejects_non_positive_or_non_finite_gap_threshold(value: float) -> None:
+    with pytest.raises(ValueError, match="max_internal_gap_sec"):
+        MatcherConfig(max_internal_gap_sec=value)
 
 
 @pytest.mark.parametrize(
