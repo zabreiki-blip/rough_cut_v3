@@ -17,6 +17,7 @@ from api_final_review_jobs import canonical_decimal_string
 from cost_budget import LLM_TTS_ENV_NAMES, CostGuardConfig
 from export_naming import xml_export_filename
 from stage2.cloud_asr import DEFAULT_OVERLAP_SEC, plan_cloud_chunks, resolve_chunk_minutes
+from sync_asr_phase import _cloud_index_is_outdated
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
@@ -291,6 +292,9 @@ def _sync_cloud_preflight(
     except ValueError:
         overlap_sec = DEFAULT_OVERLAP_SEC
     chunk_minutes = resolve_chunk_minutes()
+    current_cloud_mapping = services._transcription_config(
+        backend="cloud-audio", model=None, language="ru"
+    ).get("cloud_timestamp_mapping")
     estimate = Decimal("0")
     source_options: dict[str, Any] = {}
     for source in sources:
@@ -319,7 +323,13 @@ def _sync_cloud_preflight(
                     index,
                     audio_path,
                     audio_signature=audio_signature,
+                ) and not _cloud_index_is_outdated(
+                    index.metadata.get(services._TRANSCRIPTION_CACHE_KEY),
+                    current_cloud_mapping,
                 ):
+                    # Same rule as execution (sync_asr_phase): outdated
+                    # generated cloud indexes are retranscribed, so they
+                    # must be budgeted here as well.
                     continue
         try:
             with wave.open(str(audio_path), "rb") as stream:

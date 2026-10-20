@@ -2796,6 +2796,40 @@ def test_sync_budget_preflight_skips_unselected_and_reusable_sources(sync_api, m
     assert job["reused_indexes"] == 1
 
 
+def test_sync_preflight_includes_outdated_cloud_index_for_retranscription(sync_api, monkeypatch):
+    # Execution retranscribes generated cloud indexes from an outdated
+    # mapping; the cost preflight must select them too, otherwise the worker
+    # aborts with "Cloud source changed since cost preflight".
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+
+    def run_job():
+        with (
+            patch.object(api, "transcribe_audio", return_value=_budget_transcript(0.01)),
+            patch.object(api.threading, "Thread", _ImmediateThread),
+        ):
+            response = client.post(
+                "/stage2/sync-jobs/start", json={"project": "demo", "asr_engine": "cloud"}
+            )
+        assert response.status_code == 200, response.get_json()
+        return client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+
+    first = run_job()
+    assert first["status"] == "completed", first
+    assert first["transcribed"] == 1
+
+    index_path = next(sync_api[1].rglob("budget_1.words.json"))
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    payload["metadata"]["transcription_cache"]["config"]["cloud_timestamp_mapping"] = "2"
+    index_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    second = run_job()
+    assert second["status"] == "completed", second
+    assert (second["transcribed"], second["reused_indexes"]) == (1, 0)
+    assert second["estimated_cost_usd"] == "0.06"
+
+
 @pytest.mark.parametrize("limit, expected_limit", [("invalid", 0), ("1", 1)])
 def test_sync_budget_cloud_configuration_does_not_block_local_asr(
     sync_api,
