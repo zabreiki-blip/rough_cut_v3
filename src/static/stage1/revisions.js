@@ -126,7 +126,7 @@ function revisionDateShort(revision) {
   return revisionDate(revision).split(",")[0];
 }
 
-async function loadProjectInbox(quiet) {
+export async function loadProjectInbox(quiet) {
   if (!ids.inbox_scenario_select) return;
   try {
     const result = await getJSON(`/stage4/inbox?project=${encodeURIComponent(project)}`);
@@ -410,14 +410,22 @@ if (ids.revision_search) {
 if (ids.btn_revision_prev) ids.btn_revision_prev.addEventListener("click", () => navigateRevisionCards(-1));
 if (ids.btn_revision_next) ids.btn_revision_next.addEventListener("click", () => navigateRevisionCards(1));
 
-async function importRevision() {
-  const inputPath = ids.inbox_scenario_select?.value || "";
-  if (!inputPath) throw new Error("Положите новый сценарий в папку ЗАГРУЗИТЬ/Сценарии");
+export async function importRevision() {
   if (!appState.normalization || !Array.isArray(appState.normalization.blocks)) {
-    throw new Error("Сначала создайте и проверьте исходную нормализацию сценария");
+    throw new Error(
+      "Сначала нормализуйте и подтвердите исходный сценарий на вкладке «Нормализация». "
+      + "«Загрузить новую редакцию» — для следующих версий."
+    );
   }
   if (revisionsState.integrity?.blocking) {
     throw new Error(revisionsState.integrity.message || "Сначала восстановите состояние редакций");
+  }
+  if (!ids.inbox_scenario_select?.value) await loadProjectInbox(false);
+  const inputPath = ids.inbox_scenario_select?.value || "";
+  if (!inputPath) {
+    throw new Error(
+      "В папке ЗАГРУЗИТЬ/Сценарии нет новых файлов сценария (уже загруженные редакции скрыты)"
+    );
   }
   ids.btn_import_revision.textContent = "Сравнение…";
   try {
@@ -1039,6 +1047,23 @@ if (ids.dashboard_canvas) {
     }
   });
 }
+
+// Re-read the inbox when the user returns to the window (e.g. after dropping a
+// file into ЗАГРУЗИТЬ/Сценарии), only while the "Редакции" tab is active.
+// `focus` and `visibilitychange` often fire together, hence the debounce.
+const INBOX_REFRESH_DEBOUNCE_MS = 2000;
+let lastInboxRefreshAt = 0;
+export function refreshInboxOnReturn() {
+  if (document.visibilityState === "hidden") return;
+  const activeTab = document.querySelector(".workspace-tab.active");
+  if (activeTab?.dataset?.tab !== "versions") return;
+  const now = Date.now();
+  if (now - lastInboxRefreshAt < INBOX_REFRESH_DEBOUNCE_MS) return;
+  lastInboxRefreshAt = now;
+  return loadProjectInbox(true);
+}
+window.addEventListener("focus", () => { refreshInboxOnReturn(); });
+document.addEventListener("visibilitychange", () => { refreshInboxOnReturn(); });
 
 if (ids.btn_import_revision) ids.btn_import_revision.addEventListener("click", () => safely(importRevision));
 if (ids.revision_list) ids.revision_list.addEventListener("click", (event) => {

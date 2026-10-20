@@ -99,6 +99,10 @@ function installBrowserGlobals() {
   };
   globalThis.document = doc;
   globalThis.window = globalThis;
+  // Node's globalThis has no EventTarget API; revisions.js registers a window
+  // "focus" listener at import time.
+  globalThis.addEventListener = () => {};
+  globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {} });
   globalThis.localStorage = {
     values: {},
     getItem(key) { return this.values[key] || null; },
@@ -116,7 +120,8 @@ async function loadModules() {
   const normalization = await import(moduleUrl("normalization.js"));
   const sync = await import(moduleUrl("sync.js"));
   const tts = await import(moduleUrl("tts.js"));
-  return { state, core, normalization, sync, tts };
+  const revisions = await import(moduleUrl("revisions.js"));
+  return { state, core, normalization, sync, tts, revisions };
 }
 
 function testRestoredSpeakerDirectory({ state, tts }) {
@@ -618,6 +623,94 @@ async function testSyncSourcesEditor({ state, sync }) {
   }
 }
 
+// Stage 4 inbox: importRevision() check order + inbox re-read, and the
+// debounced refresh on window return while the "Редакции" tab is active.
+async function testRevisionsInbox({ state, revisions }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalNormalization = appState.normalization;
+  const originalQuerySelector = document.querySelector;
+  const originalNow = Date.now;
+  const select = ids.inbox_scenario_select;
+  // The mock <select> does not parse options: emulate "first option selected".
+  Object.defineProperty(select, "innerHTML", {
+    configurable: true,
+    set(html) { select.value = (/<option value="([^"]*)"/.exec(html) || [])[1] || ""; },
+  });
+  const inboxCalls = [];
+  let inboxFiles = [];
+  const importPosts = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("/stage4/inbox")) {
+      inboxCalls.push(target);
+      return { ok: true, json: async () => ({ ok: true, result: { scenario_files: inboxFiles, review_files: [] } }) };
+    }
+    if (target.includes("/stage4/revisions/import")) {
+      importPosts.push(JSON.parse(options.body));
+      throw new Error("stop-after-import-post");
+    }
+    throw new Error(`testRevisionsInbox: unexpected fetch ${target}`);
+  };
+  const rejectsWith = async (fragment) => {
+    await assert.rejects(revisions.importRevision(), (err) => {
+      assert.ok(err.message.includes(fragment), err.message);
+      return true;
+    });
+  };
+  try {
+    // 1. No normalization: error comes first, no inbox request, even with an empty select.
+    select.value = "";
+    appState.normalization = null;
+    await rejectsWith("Сначала нормализуйте и подтвердите исходный сценарий");
+    appState.normalization = { blocks: "nope" };
+    await rejectsWith("Сначала нормализуйте и подтвердите исходный сценарий");
+    assert.strictEqual(inboxCalls.length, 0);
+
+    // 2. Normalized, select empty, inbox still empty after re-read.
+    appState.normalization = { blocks: [] };
+    await rejectsWith("нет новых файлов сценария");
+    assert.strictEqual(inboxCalls.length, 1, "empty select must trigger one inbox re-read");
+
+    // 3. File appeared after page load: re-read fills select, import proceeds.
+    inboxFiles = [{ relative_path: "Сценарии/new.docx", name: "new.docx", fingerprint: "sha256:abc" }];
+    await rejectsWith("stop-after-import-post");
+    assert.strictEqual(inboxCalls.length, 2);
+    assert.strictEqual(importPosts.length, 1);
+    assert.strictEqual(importPosts[0].input_path, "Сценарии/new.docx");
+
+    // 4. Select already filled: no extra inbox request.
+    select.value = "Сценарии/new.docx";
+    await rejectsWith("stop-after-import-post");
+    assert.strictEqual(inboxCalls.length, 2);
+
+    // 5. Return-to-window refresh: only on "versions" tab, debounced.
+    let activeTab = "assembly";
+    document.querySelector = () => ({ dataset: { tab: activeTab } });
+    let now = 1_000_000;
+    Date.now = () => now;
+    inboxCalls.length = 0;
+    await revisions.refreshInboxOnReturn();
+    assert.strictEqual(inboxCalls.length, 0, "inactive versions tab must not refresh");
+    activeTab = "versions";
+    await revisions.refreshInboxOnReturn();
+    assert.strictEqual(inboxCalls.length, 1);
+    now += 500;
+    await revisions.refreshInboxOnReturn();
+    assert.strictEqual(inboxCalls.length, 1, "repeat within debounce window is skipped");
+    now += 5000;
+    await revisions.refreshInboxOnReturn();
+    assert.strictEqual(inboxCalls.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.normalization = originalNormalization;
+    document.querySelector = originalQuerySelector;
+    Date.now = originalNow;
+    delete select.innerHTML;
+    select.value = "";
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
@@ -631,6 +724,7 @@ async function main() {
     ["testConfirmDialog", () => testConfirmDialog(modules)],
     ["testSyncMatchSpeakerFilterHint", () => testSyncMatchSpeakerFilterHint(modules)],
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],
+    ["testRevisionsInbox", () => testRevisionsInbox(modules)],
   ];
 
   let passed = 0;
