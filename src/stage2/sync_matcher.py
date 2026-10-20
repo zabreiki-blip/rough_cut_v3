@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import heapq
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from math import isfinite
@@ -705,17 +707,367 @@ def _length_samples(min_length: int, max_length: int, target: int) -> tuple[list
     return sorted(values), step
 
 
-def _search_one(
+_CHAR_LEVEL_MAX_LENGTH = 480
+
+
+class _QueryProfile:
+    """Per-request constants of `_score`, computed once instead of per span."""
+
+    __slots__ = (
+        "tokens",
+        "length",
+        "chars",
+        "counts",
+        "content_counts",
+        "content_total",
+        "char_masks",
+    )
+
+    def __init__(self, query: list[str]):
+        self.tokens = query
+        self.length = len(query)
+        self.chars = " ".join(query)
+        self.counts = Counter(query)
+        content = [token for token in query if token not in _STOPWORDS and len(token) >= 3]
+        self.content_total = len(content)
+        self.content_counts = Counter(content)
+        masks: dict[str, int] = {}
+        for position, char in enumerate(self.chars):
+            masks[char] = masks.get(char, 0) | (1 << position)
+        self.char_masks = masks
+
+
+def _matching_total(first: list[str] | str, second: list[str] | str) -> int:
+    matcher = SequenceMatcher(None, first, second, autojunk=False)
+    return sum(block.size for block in matcher.get_matching_blocks())
+
+
+def _lcs_length(profile: _QueryProfile, text: str) -> int:
+    """Longest common subsequence length with the query characters.
+
+    Bit-parallel (Hyyro) LCS. The matching blocks `difflib` finds form a
+    common subsequence, so this is an upper bound of its matched characters.
+    """
+    size = len(profile.chars)
+    full = (1 << size) - 1
+    masks = profile.char_masks
+    vector = full
+    for char in text:
+        mask = masks.get(char)
+        if mask is not None:
+            vector = ((vector + (vector & mask)) | (vector & ~mask)) & full
+    return size - vector.bit_count()
+
+
+def _combine_score(
+    profile: _QueryProfile,
+    span_length: int,
+    matched: int,
+    content_hits: int,
+    char_ratio: float | None,
+) -> float:
+    """`_score` rebuilt from its parts with the identical float operations.
+
+    ``char_ratio=None`` means "unknown, assume the maximum": the result is then
+    an upper bound of the exact score, because every term is monotonic.
+    """
+    ratio = 2.0 * matched / (profile.length + span_length)
+    ordered_coverage = matched / profile.length
+    if profile.content_total:
+        content_coverage = content_hits / profile.content_total
+    else:
+        content_coverage = ordered_coverage
+    if char_ratio is None:
+        char_ratio = 1.0
+    return min(
+        1.0,
+        0.38 * ratio + 0.34 * ordered_coverage + 0.20 * content_coverage + 0.08 * char_ratio,
+    )
+
+
+class _LengthItem:
+    """One candidate span length of a start, refined from cheap bound to exact."""
+
+    __slots__ = ("order", "length", "span", "bound", "tier", "matched", "hits", "chars")
+
+    def __init__(
+        self,
+        order: int,
+        length: int,
+        span: int,
+        bound: float,
+        matched: int,
+        hits: int,
+        chars: int,
+    ):
+        self.order = order
+        self.length = length
+        self.span = span
+        self.bound = bound
+        # 0: multiset bound, 1: exact token-level match, 2: character LCS
+        # bound, 3: exact score.
+        self.tier = 0
+        self.matched = matched
+        self.hits = hits
+        self.chars = chars
+
+
+class _SourceSearch:
+    """Shared, read-only inputs of every start of one `_search_one` call."""
+
+    __slots__ = (
+        "source",
+        "tokens",
+        "norm",
+        "profile",
+        "strategy",
+        "min_length",
+        "max_length",
+        "coarse_lengths",
+        "length_step",
+    )
+
+    def __init__(
+        self,
+        source: SyncSource,
+        tokens: list[_Token],
+        profile: _QueryProfile,
+        strategy: str,
+        min_length: int,
+        max_length: int,
+    ):
+        self.source = source
+        self.tokens = tokens
+        self.norm = [item.normalized for item in tokens]
+        self.profile = profile
+        self.strategy = strategy
+        self.min_length = min_length
+        self.max_length = max_length
+        self.coarse_lengths, self.length_step = _length_samples(
+            min_length, max_length, profile.length
+        )
+
+
+class _StartSearch:
+    """Best span length of one candidate start, resolved lazily.
+
+    The original search scored every sampled length exactly. Here each length
+    first gets a cheap upper bound of its score; exact (expensive) scoring
+    runs only for lengths whose bound can still beat the best exact score of
+    this start, so the chosen length, its score and the tie-breaking (earliest
+    length wins, as with the strict ``>`` of the original loop) are identical.
+    """
+
+    __slots__ = ("search", "start", "items", "best", "stage", "extra_bound", "seen_spans")
+
+    def __init__(self, search: _SourceSearch, start: int):
+        self.search = search
+        self.start = start
+        self.best: _LengthItem | None = None
+        self.stage = 1
+        self.seen_spans: set[int] = set()
+        self.items: list[_LengthItem] = []
+        self.extra_bound = -1.0
+        self._init_stage_one()
+
+    def _prefix_stats(self, longest: int) -> list[tuple[int, int, int]]:
+        """Per prefix length: (multiset overlap, content hits, char length)."""
+        search = self.search
+        profile = search.profile
+        counts = profile.counts
+        content_counts = profile.content_counts
+        norm = search.norm
+        used: dict[str, int] = {}
+        seen: set[str] = set()
+        overlap = 0
+        hits = 0
+        chars = -1
+        stats: list[tuple[int, int, int]] = [(0, 0, 0)]
+        for position in range(self.start, self.start + longest):
+            token = norm[position]
+            chars += len(token) + 1
+            taken = used.get(token, 0)
+            if taken < counts.get(token, 0):
+                used[token] = taken + 1
+                overlap += 1
+            if token not in seen:
+                seen.add(token)
+                hits += content_counts.get(token, 0)
+            stats.append((overlap, hits, chars))
+        return stats
+
+    def _bound(self, span: int, overlap: int, hits: int, chars: int) -> float:
+        profile = self.search.profile
+        if max(len(profile.chars), chars) <= _CHAR_LEVEL_MAX_LENGTH:
+            return _combine_score(profile, span, overlap, hits, None)
+        # Long text: `_score` reuses the token ratio in place of the char ratio.
+        ratio = 2.0 * overlap / (profile.length + span)
+        return _combine_score(profile, span, overlap, hits, ratio)
+
+    def _make_item(self, order: int, length: int, stats: list[tuple[int, int, int]]) -> _LengthItem:
+        span = min(length, len(self.search.norm) - self.start)
+        overlap, hits, chars = stats[span]
+        return _LengthItem(
+            order, length, span, self._bound(span, overlap, hits, chars), overlap, hits, chars
+        )
+
+    def _init_stage_one(self) -> None:
+        search = self.search
+        longest = min(search.max_length, len(search.norm) - self.start)
+        stats = self._prefix_stats(longest)
+        seen_spans: set[int] = set()
+        for order, length in enumerate(search.coarse_lengths):
+            span = min(length, len(search.norm) - self.start)
+            if span in seen_spans:
+                # Truncated at the transcript end: same span, same score,
+                # and an equal score never replaces the earlier length.
+                continue
+            seen_spans.add(span)
+            self.items.append(self._make_item(order, length, stats))
+        self.seen_spans = seen_spans
+        if search.length_step > 1:
+            # Any non-sampled length may become a refinement candidate.
+            coarse = set(search.coarse_lengths)
+            for length in range(search.min_length, search.max_length + 1):
+                if length in coarse:
+                    continue
+                span = min(length, len(search.norm) - self.start)
+                if span in seen_spans:
+                    continue
+                overlap, hits, chars = stats[span]
+                self.extra_bound = max(self.extra_bound, self._bound(span, overlap, hits, chars))
+
+    @property
+    def done(self) -> bool:
+        return self.stage == 0
+
+    @property
+    def bound(self) -> float:
+        """Upper bound of the final confidence of this start."""
+        value = self.best.bound if self.best is not None else -1.0
+        for item in self.items:
+            if item.bound > value:
+                value = item.bound
+        if self.stage == 1 and self.extra_bound > value:
+            value = self.extra_bound
+        return value
+
+    def _beaten(self, item: _LengthItem) -> bool:
+        best = self.best
+        if best is None:
+            return False
+        return item.bound < best.bound or (item.bound == best.bound and item.order > best.order)
+
+    def _prune(self) -> None:
+        if self.best is not None:
+            self.items = [item for item in self.items if not self._beaten(item)]
+
+    def _exact_item(self, item: _LengthItem) -> None:
+        search = self.search
+        profile = search.profile
+        span_tokens = search.norm[self.start : self.start + item.span]
+        if item.tier == 0:
+            item.matched = _matching_total(profile.tokens, span_tokens)
+            item.tier = 1
+            item.bound = self._bound(item.span, item.matched, item.hits, item.chars)
+            return
+        ratio = 2.0 * item.matched / (profile.length + item.span)
+        if max(len(profile.chars), item.chars) <= _CHAR_LEVEL_MAX_LENGTH:
+            joined = " ".join(span_tokens)
+            if item.tier == 1:
+                lcs = _lcs_length(profile, joined)
+                char_bound = 2.0 * lcs / (len(profile.chars) + item.chars)
+                item.bound = _combine_score(profile, item.span, item.matched, item.hits, char_bound)
+                item.tier = 2
+                return
+            char_ratio = SequenceMatcher(None, profile.chars, joined, autojunk=False).ratio()
+        else:
+            char_ratio = ratio
+        item.bound = _combine_score(profile, item.span, item.matched, item.hits, char_ratio)
+        item.tier = 3
+
+    def refine(self) -> None:
+        """Advance the most promising length of this start by one tier."""
+        item = max(self.items, key=lambda value: (value.bound, -value.order), default=None)
+        if item is not None:
+            self._exact_item(item)
+            if item.tier == 3:
+                self.items.remove(item)
+                best = self.best
+                if best is None or item.bound > best.bound:
+                    self.best = item
+                elif item.bound == best.bound and item.order < best.order:
+                    self.best = item
+                self._prune()
+        if self.items:
+            return
+        if self.stage == 1 and self.search.length_step > 1 and self.best is not None:
+            self._start_refinement()
+        else:
+            self.stage = 0
+
+    def _start_refinement(self) -> None:
+        search = self.search
+        assert self.best is not None
+        coarse = set(search.coarse_lengths)
+        refine_start = max(search.min_length, self.best.length - search.length_step)
+        refine_end = min(search.max_length, self.best.length + search.length_step)
+        self.stage = 2
+        self.extra_bound = -1.0
+        lengths = [
+            length
+            for length in range(refine_start, refine_end + 1)
+            if length not in coarse
+            and min(length, len(search.norm) - self.start) not in self.seen_spans
+        ]
+        if not lengths:
+            self.stage = 0
+            return
+        longest = min(max(lengths), len(search.norm) - self.start)
+        stats = self._prefix_stats(longest)
+        # Refinement lengths follow every sampled one, and only a strictly
+        # better score replaces the best, so they never win ties.
+        base = len(search.coarse_lengths)
+        seen: set[int] = set()
+        for offset, length in enumerate(lengths):
+            span = min(length, len(search.norm) - self.start)
+            if span in seen:
+                continue
+            seen.add(span)
+            self.items.append(self._make_item(base + offset, length, stats))
+        self._prune()
+        if not self.items:
+            self.stage = 0
+
+    def candidate(self) -> _Candidate:
+        search = self.search
+        best = self.best
+        assert best is not None
+        span = search.tokens[self.start : self.start + best.span]
+        source = search.source
+        return _Candidate(
+            source_id=source.id,
+            start=max(0.0, span[0].word.start + source.guide_offset_sec),
+            end=span[-1].word.end + source.guide_offset_sec,
+            confidence=best.bound,
+            text=" ".join(item.word.word for item in span),
+            strategy=search.strategy,
+        )
+
+
+def _prepare_search(
     source: SyncSource,
     index: WordIndex,
-    query: list[str],
+    profile: _QueryProfile,
     approx: float | None,
     window: float | None,
     strategy: str,
     timed_tokens: list[_Token] | None = None,
     max_starts: int = _MAX_CANDIDATE_STARTS,
     exclude_word_time_range: tuple[float, float] | None = None,
-) -> list[_Candidate]:
+) -> tuple[_SourceSearch, list[int]] | None:
+    """Select the transcript window and candidate starts of one source."""
+    query = profile.tokens
     all_tokens = timed_tokens if timed_tokens is not None else _timed_tokens(index)
     if approx is not None and window is not None:
         guide_approx = approx - source.guide_offset_sec
@@ -726,14 +1078,12 @@ def _search_one(
     else:
         tokens = all_tokens
     if not tokens:
-        return []
+        return None
 
     min_length = max(1, len(query) - max(3, len(query) // 3))
     if len(tokens) < min_length or max_starts <= 0:
-        return []
+        return None
     max_length = min(len(tokens), len(query) + max(5, len(query) // 2))
-    coarse_lengths, length_step = _length_samples(min_length, max_length, len(query))
-    candidates: list[_Candidate] = []
     latest_start = len(tokens) - min_length
     eligible_starts: Iterable[int] = range(latest_start + 1)
     if exclude_word_time_range is not None:
@@ -746,47 +1096,48 @@ def _search_one(
                 and tokens[start].word.start <= excluded_upper
             )
         ]
-    for start in _candidate_starts(
+    starts = _candidate_starts(
         query,
         tokens,
         max_starts=max_starts,
         eligible_starts=eligible_starts,
-    ):
-        best: _Candidate | None = None
+    )
+    search = _SourceSearch(source, tokens, profile, strategy, min_length, max_length)
+    return search, starts
 
-        def score_length(length: int) -> _Candidate | None:
-            span = tokens[start : start + length]
-            if len(span) < min_length:
-                return None
-            confidence = _score(query, [item.normalized for item in span])
-            return _Candidate(
-                source_id=source.id,
-                start=max(0.0, span[0].word.start + source.guide_offset_sec),
-                end=span[-1].word.end + source.guide_offset_sec,
-                confidence=confidence,
-                text=" ".join(item.word.word for item in span),
-                strategy=strategy,
-            )
 
-        best_length = min_length
-        for length in coarse_lengths:
-            current = score_length(length)
-            if current is None:
-                continue
-            if best is None or current.confidence > best.confidence:
-                best = current
-                best_length = length
-        if best is not None and length_step > 1:
-            refine_start = max(min_length, best_length - length_step)
-            refine_end = min(max_length, best_length + length_step)
-            for length in range(refine_start, refine_end + 1):
-                if length in coarse_lengths:
-                    continue
-                current = score_length(length)
-                if current is not None and current.confidence > best.confidence:
-                    best = current
-        if best is not None:
-            candidates.append(best)
+def _search_one(
+    source: SyncSource,
+    index: WordIndex,
+    query: list[str],
+    approx: float | None,
+    window: float | None,
+    strategy: str,
+    timed_tokens: list[_Token] | None = None,
+    max_starts: int = _MAX_CANDIDATE_STARTS,
+    exclude_word_time_range: tuple[float, float] | None = None,
+) -> list[_Candidate]:
+    """Best span of every candidate start of one source (exhaustive)."""
+    prepared = _prepare_search(
+        source,
+        index,
+        _QueryProfile(query),
+        approx,
+        window,
+        strategy,
+        timed_tokens,
+        max_starts,
+        exclude_word_time_range,
+    )
+    if prepared is None:
+        return []
+    search, starts = prepared
+    candidates: list[_Candidate] = []
+    for start in starts:
+        state = _StartSearch(search, start)
+        while not state.done:
+            state.refine()
+        candidates.append(state.candidate())
     return candidates
 
 
@@ -842,6 +1193,99 @@ def _has_usable_range(
         return False
     start, end = _padded_range(candidate, source, config)
     return end - start > 0.001
+
+
+class _BestFirstSearch:
+    """Scores candidate starts of all sources best-bound-first, stopping early.
+
+    The matcher only reads the first ``needed`` entries of the ranked,
+    de-duplicated candidate list (best, runner-up and alternatives). Ranking
+    and de-duplication walk the list in descending confidence and each entry's
+    fate depends only on entries above it, so the leading entries whose
+    confidence is strictly above the upper bound of every start not yet scored
+    are exactly the leading entries of the exhaustive result. Searching stops
+    as soon as the ``needed``-th entry clears that bound. Entries below the
+    cut are simply never scored; they cannot reach the output.
+    """
+
+    def __init__(
+        self,
+        sources: dict[str, SyncSource],
+        config: MatcherConfig,
+        needed: int,
+    ):
+        self._sources = sources
+        self._config = config
+        self._needed = needed
+        self._heap: list[tuple[float, int, int, int, _StartSearch]] = []
+        self._sequence = 0
+        # (source order, start, candidate) per phase, in scoring-independent order.
+        self._completed: dict[int, list[tuple[int, int, _Candidate]]] = {1: [], 2: []}
+        self._ranked: list[_Candidate] | None = None
+        self._ranked_phase = 1
+        self._cut: float | None = None
+
+    def add(self, phase: int, source_order: int, search: _SourceSearch, starts: list[int]) -> None:
+        for start in starts:
+            state = _StartSearch(search, start)
+            self._push(phase, source_order, state)
+
+    def _push(self, phase: int, source_order: int, state: _StartSearch) -> None:
+        self._sequence += 1
+        heapq.heappush(self._heap, (-state.bound, self._sequence, phase, source_order, state))
+
+    @property
+    def unscored_bound(self) -> float:
+        return -self._heap[0][0] if self._heap else -1.0
+
+    def _usable_ranked(self, candidates: Iterable[_Candidate]) -> list[_Candidate]:
+        return [
+            item
+            for item in _deduplicate(candidates)
+            if _has_usable_range(item, self._sources[item.source_id], self._config)
+        ]
+
+    def _phase_candidates(self, phase: int) -> list[_Candidate]:
+        return [item for _order, _start, item in sorted(self._completed[phase], key=_by_position)]
+
+    def ranked(self, phase: int) -> list[_Candidate]:
+        """Ranked usable candidates scored so far (``phase`` 2 = merged with fallback)."""
+        if self._ranked is None or self._ranked_phase != phase:
+            local = self._usable_ranked(self._phase_candidates(1))
+            if phase == 1:
+                self._ranked = local
+            else:
+                self._ranked = self._usable_ranked([*local, *self._phase_candidates(2)])
+            self._ranked_phase = phase
+            self._cut = (
+                self._ranked[self._needed - 1].confidence
+                if len(self._ranked) >= self._needed
+                else None
+            )
+        return self._ranked
+
+    def run(self, phase: int, finished: Callable[[list[_Candidate], float], bool]) -> None:
+        """Score starts until ``finished(ranked, unscored_bound)`` or none are left."""
+        while self._heap:
+            if finished(self.ranked(phase), self.unscored_bound):
+                return
+            _bound, _sequence, state_phase, source_order, state = heapq.heappop(self._heap)
+            if state.done:
+                candidate = state.candidate()
+                self._completed[state_phase].append((source_order, state.start, candidate))
+                # A candidate under the current cut cannot change the leading entries.
+                if self._cut is None or candidate.confidence >= self._cut:
+                    self._ranked = None
+                continue
+            state.refine()
+            self._push(state_phase, source_order, state)
+
+    def enough(self, ranked: list[_Candidate], unscored_bound: float) -> bool:
+        return len(ranked) >= self._needed and ranked[self._needed - 1].confidence > unscored_bound
+
+
+def _by_position(entry: tuple[int, int, _Candidate]) -> tuple[int, int]:
+    return entry[0], entry[1]
 
 
 class SyncMatcher:
@@ -1024,17 +1468,19 @@ class SyncMatcher:
                 metadata=_metadata({"unmatched_reason": reason}),
             )
 
-        local: list[_Candidate] = []
+        profile = _QueryProfile(query)
+        needed = max(2, self.config.max_alternatives + 1)
+        searcher = _BestFirstSearch(self.sources, self.config, needed)
         local_counts: dict[str, int] = {}
         local_word_ranges: dict[str, tuple[float, float]] = {}
         has_approx = request.approximate_timecode not in (None, "")
-        for source in sources:
+        for order, source in enumerate(sources):
             approx = _approx_for_source(request, source)
             window = self.config.search_window_sec if approx is not None else None
-            source_candidates = _search_one(
+            prepared = _prepare_search(
                 source,
                 self.indexes[source.id],
-                query,
+                profile,
                 approx,
                 window,
                 "near_timecode" if approx is not None else "full_transcript",
@@ -1043,47 +1489,59 @@ class SyncMatcher:
                     _MAX_LOCAL_CANDIDATE_STARTS if approx is not None else _MAX_CANDIDATE_STARTS
                 ),
             )
-            local.extend(source_candidates)
-            local_counts[source.id] = len(source_candidates)
+            # Every start yields exactly one candidate.
+            local_counts[source.id] = len(prepared[1]) if prepared else 0
+            if prepared:
+                searcher.add(1, order, *prepared)
             if approx is not None and window is not None:
                 guide_approx = approx - source.guide_offset_sec
                 local_word_ranges[source.id] = (
                     guide_approx - window,
                     guide_approx + window,
                 )
-        candidates = [
-            item
-            for item in _deduplicate(local)
-            if _has_usable_range(item, self.sources[item.source_id], self.config)
-        ]
 
-        if has_approx and (
-            not candidates or candidates[0].confidence < self.config.fallback_trigger
-        ):
-            fallback: list[_Candidate] = []
-            for source in sources:
+        needs_fallback = False
+        if has_approx:
+            # Whether the global fallback runs depends only on the best local
+            # candidate, so score locally until that is known.
+            trigger = self.config.fallback_trigger
+
+            def fallback_decided(ranked: list[_Candidate], unscored: float) -> bool:
+                nonlocal needs_fallback
+                if ranked and ranked[0].confidence > unscored:
+                    needs_fallback = ranked[0].confidence < trigger
+                    return True
+                if unscored < trigger:
+                    needs_fallback = not ranked or ranked[0].confidence < trigger
+                    return True
+                return False
+
+            searcher.run(1, fallback_decided)
+            if not searcher.unscored_bound >= 0:
+                fallback_decided(searcher.ranked(1), -1.0)
+
+        if needs_fallback:
+            for order, source in enumerate(sources):
                 remaining_starts = max(
                     0,
                     _MAX_CANDIDATE_STARTS - local_counts.get(source.id, 0),
                 )
-                fallback.extend(
-                    _search_one(
-                        source,
-                        self.indexes[source.id],
-                        query,
-                        None,
-                        None,
-                        "fallback_full",
-                        self.timed_tokens[source.id],
-                        max_starts=remaining_starts,
-                        exclude_word_time_range=local_word_ranges.get(source.id),
-                    )
+                prepared = _prepare_search(
+                    source,
+                    self.indexes[source.id],
+                    profile,
+                    None,
+                    None,
+                    "fallback_full",
+                    self.timed_tokens[source.id],
+                    max_starts=remaining_starts,
+                    exclude_word_time_range=local_word_ranges.get(source.id),
                 )
-            candidates = [
-                item
-                for item in _deduplicate([*candidates, *fallback])
-                if _has_usable_range(item, self.sources[item.source_id], self.config)
-            ]
+                if prepared:
+                    searcher.add(2, order, *prepared)
+        phase = 2 if needs_fallback else 1
+        searcher.run(phase, searcher.enough)
+        candidates = searcher.ranked(phase)
 
         if not candidates or candidates[0].confidence < self.config.review_threshold:
             reason = "no_candidate" if not candidates else "below_review_threshold"
