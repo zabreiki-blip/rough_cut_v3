@@ -308,3 +308,27 @@ def test_cached_index_is_dropped_when_it_no_longer_matches_audio(tmp_path: Path)
     assert result.indexes == []
     assert (result.reused, result.transcribed) == (0, 0)
     assert result.source_failures == [{"source_id": "a", "error": "refresh failed"}]
+
+
+def test_unrecovered_cloud_coverage_becomes_source_warning(tmp_path: Path) -> None:
+    h = _Harness(tmp_path, ["a", "b"])
+
+    def transcribe(audio_path: Path, **_kwargs: Any) -> dict[str, Any]:
+        coverage = {"unrecovered_sec": 0.0, "unrecovered_ranges": []}
+        if audio_path.stem == "a":
+            coverage = {"unrecovered_sec": 180.0, "unrecovered_ranges": [[60.0, 240.0]]}
+        return {
+            "model": "m",
+            "language": "ru",
+            "backend": "faster-whisper",
+            "words": [],
+            "backend_metadata": {"coverage": coverage},
+        }
+
+    result = h.run([_source("a"), _source("b")], transcribe_audio=transcribe)
+
+    assert result.source_failures == []
+    assert len(result.source_warnings) == 1
+    assert result.source_warnings[0]["source_id"] == "a"
+    assert "не распознано 3.0 мин" in result.source_warnings[0]["warning"]
+    assert any("source_warnings" in kwargs for _args, kwargs in h.updates)

@@ -26,7 +26,9 @@ from stage2.cloud_asr import (
     _reconcile_speakers,
     _rescale_stretched_timestamps,
     _stitch_chunk,
+    find_coverage_holes,
     plan_cloud_chunks,
+    resolve_chunk_minutes,
     parse_speaker_legend,
     parse_transcript,
     transcribe_cloud,
@@ -365,6 +367,15 @@ def _no_real_ffmpeg_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda self, media_path: 60.0)
     monkeypatch.setattr(CloudAudioAsrAdapter, "_extract_chunk_mp3", fake_extract_chunk_mp3)
+    # Короткие тестовые ответы выглядят «разреженными»; повторные запросы по
+    # дырам включаются только в тестах покрытия (ниже).
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "0")
+    for name in (
+        "SYNC_CLOUD_ASR_CHUNK_MINUTES",
+        "SYNC_CLOUD_ASR_HOLE_MIN_SEC",
+        "SYNC_CLOUD_ASR_HOLE_MAX_WPM",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 _RealAsyncClient = httpx.AsyncClient
@@ -1029,3 +1040,229 @@ def test_confirmed_duration_rejects_invalid_values_before_http(monkeypatch, dura
     with pytest.raises(ValueError, match="duration_sec"):
         transcribe_cloud(Path("unused.wav"), api_key="test-key", duration_sec=duration)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Покрытие: дыры внутри части и их повторное распознавание
+# ---------------------------------------------------------------------------
+
+
+def _words(count: int) -> str:
+    return " ".join(["слово"] * count)
+
+
+def _hole_seg(start: float, end: float, words: int) -> AsrSegment:
+    return AsrSegment(text=_words(words), start=start, end=end, words=[], speaker="ГОЛОС 1")
+
+
+def test_default_chunking_is_five_minutes_with_short_overlap() -> None:
+    assert cloud_asr.DEFAULT_CHUNK_MINUTES == 5.0
+    assert cloud_asr.DEFAULT_OVERLAP_SEC == 20.0
+    parts = plan_cloud_chunks(
+        1200.0, cloud_asr.DEFAULT_CHUNK_MINUTES, cloud_asr.DEFAULT_OVERLAP_SEC
+    )
+    assert parts == [(0.0, 300.0), (280.0, 600.0), (580.0, 900.0), (880.0, 1200.0)]
+    adapter = CloudAudioAsrAdapter(api_key="test-key")
+    assert adapter._plan_chunks(1200.0) == parts
+
+
+def test_chunk_minutes_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert resolve_chunk_minutes() == 5.0
+    monkeypatch.setenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", "10")
+    assert resolve_chunk_minutes() == 10.0
+    assert CloudAudioAsrAdapter(api_key="test-key").chunk_minutes == 10.0
+    for bad in ("abc", "0", "-3", "nan"):
+        monkeypatch.setenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", bad)
+        assert resolve_chunk_minutes() == 5.0
+
+
+def test_find_coverage_holes_normal_density_has_no_holes() -> None:
+    segments = [_hole_seg(0, 60, 150), _hole_seg(60, 120, 140), _hole_seg(120, 180, 160)]
+    assert find_coverage_holes(segments, [False] * 3, 0.0, 180.0) == []
+
+
+def test_find_coverage_holes_sparse_long_segment_is_hole() -> None:
+    segments = [_hole_seg(0, 60, 150), _hole_seg(60, 300, 12), _hole_seg(300, 360, 150)]
+    assert find_coverage_holes(segments, [False] * 3, 0.0, 360.0) == [(60.0, 300.0)]
+
+
+def test_find_coverage_holes_short_sparse_segment_is_not_hole() -> None:
+    segments = [_hole_seg(0, 20, 2), _hole_seg(20, 60, 100)]
+    assert find_coverage_holes(segments, [False, False], 0.0, 60.0) == []
+
+
+def test_find_coverage_holes_long_segment_with_own_end_is_not_hole() -> None:
+    segments = [_hole_seg(0, 120, 20), _hole_seg(120, 180, 150)]
+    assert find_coverage_holes(segments, [True, False], 0.0, 180.0) == []
+
+
+def test_find_coverage_holes_gap_after_explicit_end_is_hole() -> None:
+    segments = [_hole_seg(0, 20, 60), _hole_seg(100, 160, 150)]
+    assert find_coverage_holes(segments, [True, False], 0.0, 160.0) == [(20.0, 100.0)]
+
+
+def test_find_coverage_holes_tail_is_hole() -> None:
+    segments = [_hole_seg(0, 60, 150), _hole_seg(60, 300, 10)]
+    assert find_coverage_holes(segments, [False, False], 0.0, 300.0) == [(60.0, 300.0)]
+    # Последний сегмент с явным концом, за которым тишина до конца части.
+    segments = [_hole_seg(0, 60, 150), _hole_seg(60, 80, 50)]
+    assert find_coverage_holes(segments, [False, True], 0.0, 300.0) == [(80.0, 300.0)]
+
+
+def test_find_coverage_holes_empty_part_is_hole() -> None:
+    assert find_coverage_holes([], [], 100.0, 400.0) == [(100.0, 400.0)]
+    assert find_coverage_holes([], [], 100.0, 110.0) == []
+
+
+def test_find_coverage_holes_thresholds_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    segments = [_hole_seg(0, 60, 150), _hole_seg(60, 120, 10)]
+    assert find_coverage_holes(segments, [False, False], 0.0, 120.0) == [(60.0, 120.0)]
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_MIN_SEC", "90")
+    assert find_coverage_holes(segments, [False, False], 0.0, 120.0) == []
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_MIN_SEC", "30")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_MAX_WPM", "5")
+    assert find_coverage_holes(segments, [False, False], 0.0, 120.0) == []
+
+
+_SPARSE_PART = (
+    f"[00:00] ГОЛОС 1: {_words(100)}\n[01:00] ГОЛОС 1: {_words(10)}\n[04:00] ГОЛОС 1: {_words(100)}"
+)
+
+
+def _coverage_call(
+    monkeypatch: pytest.MonkeyPatch, replies: list, **kwargs: Any
+) -> tuple[dict[str, Any], list[tuple[float, float]]]:
+    extracted: list[tuple[float, float]] = []
+
+    async def extract(_self, _path, start, duration):
+        extracted.append((start, duration))
+        return b"mp3"
+
+    async def no_sleep(_self, _attempt):
+        pass
+
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_extract_chunk_mp3", extract)
+    monkeypatch.setattr(CloudAudioAsrAdapter, "_sleep_backoff", no_sleep)
+    calls = iter(replies)
+    _patch_async_client(monkeypatch, lambda _request: next(calls)())
+    result = transcribe_cloud(
+        Path("unused.wav"),
+        api_key="test-key",
+        chunk_minutes=10,
+        overlap_sec=0,
+        duration_sec=300.0,
+        **kwargs,
+    )
+    return result, extracted
+
+
+def test_hole_is_re_recognized_only_on_its_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    retry = f"[00:03] ГОЛОС 1: {_words(150)}\n[01:30] ГОЛОС 1: {_words(150)}"
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(retry, cost=0.02),
+        ],
+    )
+
+    # Вторая нарезка — дыра (60..240) с полем 3 с с каждой стороны.
+    assert extracted == [(0.0, 300.0), (57.0, 186.0)]
+    assert result["cost_usd"] == pytest.approx(0.07)
+    segments = result["segments"]
+    assert [round(seg["start"]) for seg in segments] == [0, 60, 147, 240]
+    assert sum(len(seg["text"].split()) for seg in segments) == 100 + 300 + 100
+    coverage = result["coverage"]
+    assert coverage["holes_detected"] == 1
+    assert coverage["holes_repaired"] == 1
+    assert coverage["unrecovered_sec"] == 0.0
+    assert coverage["unrecovered_ranges"] == []
+    assert coverage["words_per_minute"] == pytest.approx(500 / 5)
+
+
+def test_hole_retry_not_better_keeps_original_and_reports_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    result, _ = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(f"[00:03] ГОЛОС 1: {_words(5)}", cost=0.01),
+        ],
+    )
+    assert sum(len(seg["text"].split()) for seg in result["segments"]) == 210
+    assert result["coverage"]["holes_repaired"] == 0
+    assert result["coverage"]["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert result["cost_usd"] == pytest.approx(0.06)
+
+
+def test_failed_hole_retry_does_not_fail_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    result, _ = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: httpx.Response(500, text="boom"),
+            lambda: httpx.Response(500, text="boom"),
+            lambda: httpx.Response(500, text="boom"),
+        ],
+    )
+    assert len(result["segments"]) == 3
+    assert result["cost_usd"] == pytest.approx(0.05)
+    coverage = result["coverage"]
+    assert coverage["holes_detected"] == 1
+    assert coverage["holes_repaired"] == 0
+    assert coverage["unrecovered_sec"] == pytest.approx(180.0)
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+
+
+def test_hole_retries_disabled_makes_no_extra_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, extracted = _coverage_call(
+        monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)]
+    )
+    assert extracted == [(0.0, 300.0)]
+    assert result["coverage"]["holes_detected"] == 1
+    assert result["coverage"]["unrecovered_sec"] == pytest.approx(180.0)
+
+
+def test_hole_retry_over_budget_keeps_paid_file_and_cancel_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    # 5 минут по 0.06 USD/мин = 0.30; повтор дыры (186 с, ~0.186) не влезает в 0.40.
+    # Уже оплаченный файл не должен пропасть: повтор пропускается, дыра
+    # остаётся в отчёте о покрытии, лишнего запроса к модели нет.
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [lambda: _model_response(_SPARSE_PART, cost=0.30)],
+        max_cost_usd="0.40",
+        usd_per_minute_estimate="0.06",
+    )
+    # Ответ модели в фикстуре один: второй запрос упал бы на StopIteration.
+    assert len(extracted) == 2
+    assert result["cost_usd"] == pytest.approx(0.30)
+    assert result["coverage"]["holes_repaired"] == 0
+    assert result["coverage"]["unrecovered_sec"] > 0
+
+    cancel = asyncio.Event()
+
+    def first_reply() -> httpx.Response:
+        cancel.set()
+        return _model_response(_SPARSE_PART, cost=0.05)
+
+    with pytest.raises(asyncio.CancelledError):
+        _coverage_call(monkeypatch, [first_reply], cancel=cancel)
+
+
+def test_cloud_transcription_fingerprint_changes_with_timestamp_mapping() -> None:
+    import api
+
+    cloud = api._transcription_config(backend="cloud-audio", model="m", language="ru")
+    assert cloud["cloud_timestamp_mapping"] == "3"
+    local = api._transcription_config(backend="faster-whisper", model="m", language="ru")
+    assert local["cloud_timestamp_mapping"] == ""
+    assert api._transcription_config_fingerprint(cloud) != api._transcription_config_fingerprint(
+        {**cloud, "cloud_timestamp_mapping": "2"}
+    )

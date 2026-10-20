@@ -495,6 +495,7 @@ function renderSyncJob(value) {
 
   ids.sync_job_status.dataset.state = status;
   const segmentFailures = Array.isArray(job.segment_failures) ? job.segment_failures : [];
+  const sourceWarnings = Array.isArray(job.source_warnings) ? job.source_warnings : [];
   ids.sync_job_status.textContent = status === "completed"
     ? (segmentFailures.length ? "готово с ошибками" : "готово")
     : status === "failed" ? "ошибка"
@@ -504,9 +505,12 @@ function renderSyncJob(value) {
     : status === "queued" ? "в очереди"
     : "в работе";
   ids.sync_job_progress.hidden = false;
-  ids.sync_job_message.textContent = segmentFailures.length
+  const warningSuffix = sourceWarnings.length
+    ? ` · ${sourceWarnings.map((item) => item.warning || item.source_id || "предупреждение").join("; ")}`
+    : "";
+  ids.sync_job_message.textContent = (segmentFailures.length
     ? `${message} · ошибок сегментов: ${segmentFailures.length} (${segmentFailures[0].segment_id || "без ID"}: ${segmentFailures[0].error || "ошибка"})`
-    : message;
+    : message) + warningSuffix;
   ids.sync_job_numbers.textContent = totalSources > 0
     ? `${completedSources}/${totalSources} файлов · ${pct}%`
     : (total > 0 ? `${done}/${total}` : `${pct}%`);

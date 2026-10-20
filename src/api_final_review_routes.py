@@ -25,7 +25,7 @@ from api_final_review_jobs import (
     final_review_deadline,
 )
 from cost_budget import CostGuardConfig
-from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
+from stage2.cloud_asr import DEFAULT_OVERLAP_SEC, plan_cloud_chunks, resolve_chunk_minutes
 from stage2.whisper_runner import resolve_backend
 
 
@@ -100,7 +100,7 @@ def _estimate_final_review(
             pass  # Cloud-only configuration must not prevent local work.
         return result, {}
     guard = CostGuardConfig.from_environ(environ)
-    chunk_minutes = float(str(requested_options.get("chunk_minutes", DEFAULT_CHUNK_MINUTES)))
+    chunk_minutes = float(str(requested_options.get("chunk_minutes", resolve_chunk_minutes())))
     raw_overlap = requested_options.get("overlap_sec")
     if raw_overlap is None:
         # Match the adapter's fallback for an invalid environment overlap.

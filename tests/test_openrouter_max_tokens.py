@@ -285,6 +285,8 @@ def _asr_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda self, media_path: 60.0)
     monkeypatch.setattr(CloudAudioAsrAdapter, "_extract_chunk_mp3", fake_extract)
+    # Short fake replies look like coverage holes; keep these tests to one request.
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "0")
 
 
 def _patch_asr_client(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:

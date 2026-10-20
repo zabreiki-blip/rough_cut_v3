@@ -69,7 +69,7 @@ from typing import Any, Callable
 
 import httpx
 
-from cost_budget import CostBudget, CostGuardConfig
+from cost_budget import CostBudget, CostBudgetExceeded, CostGuardConfig
 from openrouter_limits import finish_reason
 
 from .asr_contract import AsrProgress, AsrRunResult, AsrSegment
@@ -99,11 +99,24 @@ def _attach_budget(error: BaseException, budget: CostBudget) -> None:
 
 
 DEFAULT_MODEL = "google/gemini-3.7-flash"
-DEFAULT_CHUNK_MINUTES = 20.0
+# Части по 5 минут: на 20-минутных частях модель молча теряла 30–45% речи
+# (замолкала до конца части или пропускала минуты в середине), причём
+# finish_reason не был "length". Переопределяется SYNC_CLOUD_ASR_CHUNK_MINUTES.
+DEFAULT_CHUNK_MINUTES = 5.0
 # Перекрытие по умолчанию (см. также SYNC_CLOUD_ASR_OVERLAP_SEC ниже) —
 # значение, использующееся, если явный overlap_sec не передан и переменная
 # окружения не задана.
-DEFAULT_OVERLAP_SEC = 60.0
+DEFAULT_OVERLAP_SEC = 20.0
+# Обнаружение «дыр» в покрытии части (см. find_coverage_holes): интервал не
+# короче HOLE_MIN_SEC с плотностью речи ниже HOLE_MAX_WPM слов в минуту, если
+# у реплики нет собственного конца от модели. Переопределяется
+# SYNC_CLOUD_ASR_HOLE_MIN_SEC / SYNC_CLOUD_ASR_HOLE_MAX_WPM.
+DEFAULT_HOLE_MIN_SEC = 30.0
+DEFAULT_HOLE_MAX_WPM = 40.0
+# Сколько раз повторно распознавать одну дыру (SYNC_CLOUD_ASR_HOLE_RETRIES).
+DEFAULT_HOLE_RETRIES = 1
+# Поле вокруг дыры при повторной нарезке аудио, секунды.
+_HOLE_PAD_SEC = 3.0
 DEFAULT_TIMEOUT_SEC = 900.0
 DEFAULT_MAX_RETRIES = 3
 # Верхняя граница выходных токенов одного запроса к ASR-модели (стоимость
@@ -978,6 +991,120 @@ def plan_cloud_chunks(
     return parts
 
 
+def _env_float(name: str, default: float, *, allow_zero: bool = False) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        return default
+    return value
+
+
+def resolve_chunk_minutes() -> float:
+    """Длина части из SYNC_CLOUD_ASR_CHUNK_MINUTES или DEFAULT_CHUNK_MINUTES."""
+    return _env_float("SYNC_CLOUD_ASR_CHUNK_MINUTES", DEFAULT_CHUNK_MINUTES)
+
+
+def _resolve_hole_retries() -> int:
+    raw = os.getenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_HOLE_RETRIES
+    except ValueError:
+        return DEFAULT_HOLE_RETRIES
+    return value if value >= 0 else DEFAULT_HOLE_RETRIES
+
+
+def _count_words(text: str) -> int:
+    return len(text.split())
+
+
+def find_coverage_holes(
+    segments: list[AsrSegment],
+    own_end_flags: list[bool],
+    part_start: float,
+    part_end: float,
+    *,
+    min_sec: float | None = None,
+    max_wpm: float | None = None,
+) -> list[tuple[float, float]]:
+    """Интервалы части, где модель, судя по всему, пропустила речь.
+
+    Дырой считается: (1) интервал реплики без собственного конца от модели
+    (она тянется до начала следующей реплики или до конца части) длиной не
+    меньше `min_sec` при плотности ниже `max_wpm` слов в минуту — это
+    включает «хвост» части; (2) промежуток не меньше `min_sec` между явным
+    концом реплики и началом следующей (или концом части); (3) вся часть
+    без реплик, если она не короче `min_sec`. Длинная реплика с явным концом
+    дырой не считается — это настоящая длинная реплика.
+    """
+    if min_sec is None:
+        min_sec = _env_float("SYNC_CLOUD_ASR_HOLE_MIN_SEC", DEFAULT_HOLE_MIN_SEC)
+    if max_wpm is None:
+        max_wpm = _env_float("SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True)
+    if not segments:
+        return [(part_start, part_end)] if part_end - part_start >= min_sec else []
+
+    holes: list[tuple[float, float]] = []
+    for i, seg in enumerate(segments):
+        has_own_end = i < len(own_end_flags) and own_end_flags[i] and seg.end > seg.start
+        next_start = segments[i + 1].start if i + 1 < len(segments) else part_end
+        if has_own_end:
+            gap_start = min(seg.end, next_start)
+            if next_start - gap_start >= min_sec:
+                holes.append((gap_start, next_start))
+            continue
+        span = next_start - seg.start
+        if span >= min_sec and _count_words(seg.text) / (span / 60.0) < max_wpm:
+            holes.append((seg.start, next_start))
+    return holes
+
+
+def _merge_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _build_coverage_report(
+    segments: list[AsrSegment],
+    unrecovered: list[tuple[float, float]],
+    *,
+    holes_detected: int,
+    holes_repaired: int,
+    word_count: int,
+    duration_sec: float,
+) -> dict[str, Any]:
+    """Отчёт о покрытии: сколько дыр найдено/починено и что осталось.
+
+    Нерасшифрованный интервал, который реально закрыт плотной речью
+    соседней (перекрывающейся) части, из отчёта исключается.
+    """
+    max_wpm = _env_float("SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True)
+    ranges: list[list[float]] = []
+    for start, end in _merge_ranges(unrecovered):
+        words = sum(_count_words(seg.text) for seg in segments if start <= seg.start < end)
+        if end > start and words / ((end - start) / 60.0) >= max_wpm:
+            continue
+        ranges.append([round(start, 3), round(end, 3)])
+    return {
+        "holes_detected": holes_detected,
+        "holes_repaired": holes_repaired,
+        "unrecovered_sec": round(sum(end - start for start, end in ranges), 3),
+        "unrecovered_ranges": ranges,
+        "words_per_minute": round(word_count / (duration_sec / 60.0), 2)
+        if duration_sec > 0
+        else 0.0,
+    }
+
+
 def _resolve_max_output_tokens() -> int:
     raw = os.getenv("SYNC_CLOUD_ASR_MAX_TOKENS", "").strip()
     try:
@@ -1006,7 +1133,7 @@ class CloudAudioAsrAdapter:
         language: str = "ru",
         base_url: str | None = None,
         api_key: str | None = None,
-        chunk_minutes: float = DEFAULT_CHUNK_MINUTES,
+        chunk_minutes: float | None = None,
         overlap_sec: float | None = None,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
         reasoning_effort: str | None = "minimal",
@@ -1024,9 +1151,11 @@ class CloudAudioAsrAdapter:
         )
         self._base_url = resolved_base_url.rstrip("/")
         self._api_key = api_key if api_key is not None else _resolve_api_key()
-        self.chunk_minutes = chunk_minutes
+        # chunk_minutes не задан явно — SYNC_CLOUD_ASR_CHUNK_MINUTES, иначе
+        # DEFAULT_CHUNK_MINUTES (5 мин).
+        self.chunk_minutes = chunk_minutes if chunk_minutes is not None else resolve_chunk_minutes()
         # overlap_sec не задан явно — берём из переменной окружения
-        # SYNC_CLOUD_ASR_OVERLAP_SEC, иначе DEFAULT_OVERLAP_SEC (60 c).
+        # SYNC_CLOUD_ASR_OVERLAP_SEC, иначе DEFAULT_OVERLAP_SEC (20 c).
         if overlap_sec is not None:
             self.overlap_sec = overlap_sec
         else:
@@ -1360,6 +1489,108 @@ class CloudAudioAsrAdapter:
 
     # -- низкоуровневый прогон -------------------------------------------------
 
+    async def _repair_hole(
+        self,
+        client: httpx.AsyncClient,
+        audio_path: Path,
+        hole: tuple[float, float],
+        segments: list[AsrSegment],
+        own_end: list[bool],
+        *,
+        part_start: float,
+        part_end: float,
+        prompt: str,
+        cancel: asyncio.Event | None,
+        budget: CostBudget | None,
+        budget_callback: Callable[[dict[str, float]], None] | None,
+        deadline_monotonic: float | None,
+        retries: int,
+        label_map: dict[str, str] | None = None,
+    ) -> tuple[list[AsrSegment], list[bool], float | None, list[dict], bool, bool]:
+        """Повторно распознаёт один интервал-дыру (с полем) и вклеивает результат.
+
+        Возвращает (сегменты, флаги, стоимость повторов или None, сырые ответы,
+        восстановлена ли дыра, исчерпан ли бюджет). Ошибка запроса
+        (`CloudAudioAsrError`) или разбора не валит файл — дыра остаётся как
+        есть. Отмена пробрасывается. Нехватка бюджета (`CostBudgetExceeded`)
+        тоже не валит уже оплаченный файл: повтор пропускается, дыра остаётся
+        невосстановленной, а вызывающий код перестаёт чинить остальные дыры.
+        """
+        hole_start, hole_end = hole
+        pad_start = max(part_start, hole_start - _HOLE_PAD_SEC)
+        pad_end = min(part_end, hole_end + _HOLE_PAD_SEC)
+        old_words = sum(
+            _count_words(seg.text) for seg in segments if hole_start - 0.01 <= seg.start < hole_end
+        )
+        cost_total: float | None = None
+        raws: list[dict] = []
+        for _attempt in range(retries):
+            if cancel is not None and cancel.is_set():
+                raise asyncio.CancelledError("Распознавание отменено пользователем")
+            try:
+                mp3_bytes = await self._extract_chunk_mp3(
+                    audio_path, pad_start, pad_end - pad_start
+                )
+                content, cost, raw = await self._call_model(
+                    client,
+                    base64.b64encode(mp3_bytes).decode("ascii"),
+                    prompt=prompt,
+                    cancel=cancel,
+                    budget=budget,
+                    duration_sec=pad_end - pad_start,
+                    budget_callback=budget_callback,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            except CostBudgetExceeded as exc:
+                logger.warning(
+                    "Облачный ASR: повтор дыры %.1f–%.1f с пропущен — бюджет: %s",
+                    hole_start,
+                    hole_end,
+                    exc,
+                )
+                return segments, own_end, cost_total, raws, False, True
+            except CloudAudioAsrError as exc:
+                logger.warning(
+                    "Облачный ASR: повтор дыры %.1f–%.1f с не удался: %s",
+                    hole_start,
+                    hole_end,
+                    exc,
+                )
+                continue
+            raws.append(raw)
+            if cost is not None:
+                cost_total = (cost_total or 0.0) + cost
+            if finish_reason(raw) == "length":
+                continue
+            try:
+                transcript_text, _legend = split_transcript_and_legend(content)
+                new_segments, new_own_end = _parse_transcript_with_own_end(
+                    transcript_text, offset_sec=pad_start
+                )
+            except Exception:
+                logger.warning("Облачный ASR: не удалось разобрать повтор дыры", exc_info=True)
+                continue
+            kept = [
+                (
+                    replace(seg, speaker=label_map.get(seg.speaker, seg.speaker))
+                    if label_map and seg.speaker is not None
+                    else seg,
+                    flag,
+                )
+                for seg, flag in zip(new_segments, new_own_end)
+                if hole_start - 0.5 <= seg.start < hole_end
+            ]
+            if sum(_count_words(seg.text) for seg, _flag in kept) <= old_words:
+                continue
+            remaining = [
+                (seg, flag)
+                for seg, flag in zip(segments, own_end)
+                if not (hole_start - 0.01 <= seg.start < hole_end)
+            ]
+            merged = sorted(remaining + kept, key=lambda item: item[0].start)
+            return [m[0] for m in merged], [m[1] for m in merged], cost_total, raws, True, False
+        return segments, own_end, cost_total, raws, False, False
+
     async def transcribe_words(
         self,
         audio_path: Path,
@@ -1411,6 +1642,12 @@ class CloudAudioAsrAdapter:
         # описание) — передаётся в промпт следующей части (пункт 2 защиты) и
         # используется при склейке меток после сборки всех частей (пункт 3).
         speaker_descriptions: dict[str, str] = {}
+        holes_detected = 0
+        pending_holes: list[
+            tuple[tuple[float, float], float, float, str, dict[str, str]]
+        ] = []
+        holes_repaired = 0
+        unrecovered: list[tuple[float, float]] = []
 
         try:
             for idx, (part_start, part_end) in enumerate(parts):
@@ -1496,6 +1733,13 @@ class CloudAudioAsrAdapter:
                         ),
                         cost_usd=total_cost if cost_found else None,
                     ) from exc
+                # Дыры только запоминаем: повторы делаются вторым проходом,
+                # после всех основных частей, — иначе повтор дыры съел бы
+                # бюджет, зарезервированный под ещё не распознанные части.
+                part_holes = find_coverage_holes(
+                    part_segments, part_own_end, part_start, part_end
+                )
+                holes_detected += len(part_holes)
                 if part_segments:
                     part_segments[-1] = replace(part_segments[-1], end=part_end)
                     # Конец принудительно дотянут до технической границы
@@ -1513,6 +1757,8 @@ class CloudAudioAsrAdapter:
                 )
                 accumulated.extend(to_add)
                 accumulated_own_end.extend(own_end_to_add)
+                for hole in part_holes:
+                    pending_holes.append((hole, part_start, part_end, prompt, label_map))
 
                 # Переводим легенду этой части (локальные метки) в сквозные
                 # метки через label_map и запоминаем первое известное описание
@@ -1532,6 +1778,47 @@ class CloudAudioAsrAdapter:
                             duration_sec=duration_sec or None,
                         )
                     )
+
+            # Второй проход: повторно распознаём дыры на остаток бюджета.
+            retries = _resolve_hole_retries()
+            for hole, hole_part_start, hole_part_end, hole_prompt, hole_labels in pending_holes:
+                if retries <= 0:
+                    unrecovered.append(hole)
+                    continue
+                (
+                    accumulated,
+                    accumulated_own_end,
+                    repair_cost,
+                    repair_raws,
+                    repaired,
+                    budget_exhausted,
+                ) = await self._repair_hole(
+                    client,
+                    audio_path,
+                    hole,
+                    accumulated,
+                    accumulated_own_end,
+                    part_start=hole_part_start,
+                    part_end=hole_part_end,
+                    prompt=hole_prompt,
+                    cancel=cancel,
+                    budget=budget,
+                    budget_callback=budget_callback,
+                    deadline_monotonic=deadline_monotonic,
+                    retries=retries,
+                    label_map=hole_labels,
+                )
+                raw_responses.extend(repair_raws)
+                if repair_cost is not None:
+                    total_cost += repair_cost
+                    cost_found = True
+                if repaired:
+                    holes_repaired += 1
+                else:
+                    unrecovered.append(hole)
+                if budget_exhausted:
+                    # Остальные дыры не чиним: каждая попытка упрётся в тот же лимит.
+                    retries = 0
         finally:
             if own_client:
                 await client.aclose()
@@ -1581,6 +1868,14 @@ class CloudAudioAsrAdapter:
         )
 
         word_count = sum(len(seg.text.split()) for seg in final_segments)
+        coverage = _build_coverage_report(
+            final_segments,
+            unrecovered,
+            holes_detected=holes_detected,
+            holes_repaired=holes_repaired,
+            word_count=word_count,
+            duration_sec=duration_sec,
+        )
 
         return AsrRunResult(
             words=[],
@@ -1599,6 +1894,7 @@ class CloudAudioAsrAdapter:
                 "base_url": self._base_url,
                 "speaker_descriptions": speaker_descriptions,
                 "timestamp_scale": timestamp_scale,
+                "coverage": coverage,
             },
             word_count=word_count,
             speakers=speakers,
@@ -1656,7 +1952,7 @@ def transcribe_cloud(
         model=model or DEFAULT_MODEL,
         language=language,
         api_key=api_key,
-        chunk_minutes=chunk_minutes if chunk_minutes is not None else DEFAULT_CHUNK_MINUTES,
+        chunk_minutes=chunk_minutes,
         overlap_sec=overlap_sec,
         timeout_sec=DEFAULT_TIMEOUT_SEC,
     )
@@ -1709,4 +2005,5 @@ def transcribe_cloud(
         "cost_limit_usd": snapshot["limit_usd"],
         "cost_pending": budget.has_pending_reservations,
         "base_url": str(result.params.get("base_url") or ""),
+        "coverage": result.params.get("coverage") or {},
     }

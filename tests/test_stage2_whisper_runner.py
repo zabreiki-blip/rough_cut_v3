@@ -382,6 +382,7 @@ class WhisperRunnerTest(unittest.TestCase):
             "backend": "cloud-audio",
             "duration_sec": 4.0,
             "cost_usd": 0.0123,
+            "coverage": {"holes_detected": 2, "holes_repaired": 1, "unrecovered_sec": 30.0},
         }
         with TemporaryDirectory() as directory:
             audio_path = Path(directory) / "audio.wav"
@@ -415,6 +416,7 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertEqual(meta["cost_usd"], 0.0123)
         self.assertEqual(meta["timestamp_precision"], "interpolated")
         self.assertNotIn("segments", meta)
+        self.assertEqual(meta["coverage"]["holes_repaired"], 1)
 
     def test_transcribe_cloud_missing_api_key_raises_clear_error(self) -> None:
         with (

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -70,6 +70,33 @@ class SyncAsrResult:
     source_failures: list[dict[str, str]]
     transcribed: int
     reused: int
+    # Non-fatal per-source notes, e.g. cloud ASR coverage holes it could not
+    # recover: {"source_id": ..., "warning": ...}.
+    source_warnings: list[dict[str, str]] = field(default_factory=list)
+
+
+def _coverage_warning(source_id: str, metadata: Mapping[str, Any]) -> dict[str, str] | None:
+    coverage = metadata.get("coverage")
+    if not isinstance(coverage, Mapping):
+        return None
+    try:
+        unrecovered_sec = float(coverage.get("unrecovered_sec") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if unrecovered_sec <= 0:
+        return None
+    ranges = ", ".join(
+        f"{float(item[0]):.0f}–{float(item[1]):.0f} с"
+        for item in (coverage.get("unrecovered_ranges") or [])[:5]
+        if isinstance(item, (list, tuple)) and len(item) == 2
+    )
+    return {
+        "source_id": source_id,
+        "warning": (
+            f"В источнике {source_id} не распознано {unrecovered_sec / 60.0:.1f} мин речи"
+            + (f" ({ranges})" if ranges else "")
+        ),
+    }
 
 
 def run_asr_phase(
@@ -123,6 +150,7 @@ def run_asr_phase(
 
     indexes: list[Any] = []
     source_failures: list[dict[str, str]] = []
+    source_warnings: list[dict[str, str]] = []
     transcribed = 0
     reused = 0
 
@@ -422,6 +450,10 @@ def run_asr_phase(
                 )
                 save_word_index(index_path, index)
                 transcribed += 1
+                warning = _coverage_warning(source.id, result_backend_metadata)
+                if warning is not None:
+                    source_warnings.append(warning)
+                    _update_sync_job(job_id, source_warnings=list(source_warnings))
             indexes.append(index)
         except Exception as exc:
             failed_cost = getattr(exc, "cost_usd", None)
@@ -465,4 +497,5 @@ def run_asr_phase(
         source_failures=source_failures,
         transcribed=transcribed,
         reused=reused,
+        source_warnings=source_warnings,
     )

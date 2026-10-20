@@ -375,6 +375,9 @@ def _transcribe_cloud(
         "cost_pending": result.get("cost_pending"),
         "base_url": result.get("base_url"),
         "timestamp_precision": "interpolated",
+        # Coverage report of the cloud ASR (holes found/repaired, unrecovered
+        # ranges, words per minute); see cloud_asr.find_coverage_holes.
+        "coverage": result.get("coverage") or {},
         "segment_count": len(segments),
         "explicit_end_segment_count": explicit_end_count,
         # Lifted to the top-level result by transcribe_audio(); kept here

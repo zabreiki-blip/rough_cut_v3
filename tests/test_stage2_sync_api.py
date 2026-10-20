@@ -2498,6 +2498,7 @@ def test_sync_budget_preflight_sums_canonical_wav_durations_with_overlap(
     monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1.3220")
     monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
     monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "60")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", "20")
     options = []
 
     def transcribe(_path, **kwargs):
@@ -2526,6 +2527,34 @@ def test_sync_budget_preflight_sums_canonical_wav_durations_with_overlap(
     assert all(item["overlap_sec"] == 60 for item in options)
     assert all(item["max_cost_usd"] == "1.3220" for item in options)
     assert all(item["usd_per_minute_estimate"] == "0.06" for item in options)
+
+
+def test_sync_preflight_defaults_to_five_minute_cloud_chunks(sync_api, monkeypatch) -> None:
+    client = _prepare_budget_sources(sync_api, [1201])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.delenv("SYNC_CLOUD_ASR_OVERLAP_SEC", raising=False)
+    monkeypatch.delenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", raising=False)
+    options = []
+
+    def transcribe(_path, **kwargs):
+        options.append(kwargs["cloud_options"])
+        return _budget_transcript(0)
+
+    with (
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "cloud"},
+        )
+    assert response.status_code == 200, response.get_json()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    # Five 5-minute parts: 1201 s + 4 repeated 20 s overlaps = 1281 billed seconds.
+    assert job["estimated_cost_usd"] == "1.281"
+    assert [item["chunk_minutes"] for item in options] == [5.0]
+    assert [item["overlap_sec"] for item in options] == [20.0]
 
 
 def test_sync_cost_limit_rejects_aggregate_before_reserving_or_creating_worker(
@@ -2844,6 +2873,7 @@ def test_sync_budget_exact_fractional_overlap_limit_is_accepted_at_dispatch(sync
     monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1.210399999999999864")
     monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
     monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "0.1")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", "20")
     dispatched = []
 
     def transcribe(path, **_kwargs):
@@ -2871,6 +2901,7 @@ def test_sync_budget_freezes_cloud_backend_and_options_before_worker_start(sync_
     monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
     monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
     monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "20")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", "20")
     dispatched = []
 
     class ConfigurationChangesBeforeStart(_ImmediateThread):
@@ -3033,6 +3064,7 @@ def test_sync_budget_per_chunk_decimal_rounding_matches_dispatch_at_exact_cap(
     monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", limit)
     monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.01")
     monkeypatch.setenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "0.1")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", "20")
     dispatched = []
 
     def transcribe(path, **_options):

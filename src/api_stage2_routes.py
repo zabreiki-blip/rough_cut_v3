@@ -16,7 +16,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from api_final_review_jobs import canonical_decimal_string
 from cost_budget import LLM_TTS_ENV_NAMES, CostGuardConfig
 from export_naming import xml_export_filename
-from stage2.cloud_asr import DEFAULT_CHUNK_MINUTES, DEFAULT_OVERLAP_SEC, plan_cloud_chunks
+from stage2.cloud_asr import DEFAULT_OVERLAP_SEC, plan_cloud_chunks, resolve_chunk_minutes
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
@@ -290,6 +290,7 @@ def _sync_cloud_preflight(
         overlap_sec = float(os.getenv("SYNC_CLOUD_ASR_OVERLAP_SEC", "").strip())
     except ValueError:
         overlap_sec = DEFAULT_OVERLAP_SEC
+    chunk_minutes = resolve_chunk_minutes()
     estimate = Decimal("0")
     source_options: dict[str, Any] = {}
     for source in sources:
@@ -327,7 +328,7 @@ def _sync_cloud_preflight(
             raise ValueError(f"invalid sync WAV for {source.id}: {exc}") from exc
         if duration_sec <= 0:
             raise ValueError(f"sync WAV duration must be positive for {source.id}")
-        chunks = plan_cloud_chunks(duration_sec, DEFAULT_CHUNK_MINUTES, overlap_sec)
+        chunks = plan_cloud_chunks(duration_sec, chunk_minutes, overlap_sec)
         estimate += sum(
             (
                 Decimal(str(end - start)) * guard.cloud_asr_usd_per_minute / Decimal("60")
@@ -337,7 +338,7 @@ def _sync_cloud_preflight(
         )
         source_options[source.id] = {
             "duration_sec": duration_sec,
-            "chunk_minutes": DEFAULT_CHUNK_MINUTES,
+            "chunk_minutes": chunk_minutes,
             "overlap_sec": overlap_sec,
             "max_cost_usd": str(guard.max_usd_per_job),
             "usd_per_minute_estimate": str(guard.cloud_asr_usd_per_minute),

@@ -641,6 +641,8 @@ def test_cloud_options_refresh_environment_budget_in_reused_worker(
     calls = multiprocessing.get_context("fork").Value("i", 0)
     audio_path = tmp_path / "audio.wav"
     audio_path.touch()
+    # Фикстура — одно слово на минуту (это «дыра»); тест про бюджет, не про дыры.
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "0")
     monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "1")
     monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
 

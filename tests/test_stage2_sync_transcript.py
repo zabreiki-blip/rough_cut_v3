@@ -138,3 +138,14 @@ def test_generator_protocol_decouples_alignment_from_whisper_invocation() -> Non
             return WordIndex(source_id=source.id)
 
     assert isinstance(FakeGenerator(), WordIndexGenerator)
+
+
+def test_explicit_words_from_interpolating_backend_keep_interpolated_precision() -> None:
+    index = ingest_word_index(
+        {
+            "words": [{"word": "раз", "start": 0.0, "end": 1.0}],
+            "backend_metadata": {"timestamp_precision": "interpolated"},
+        },
+        "s1",
+    )
+    assert index.metadata["timestamp_precision"] == "interpolated"

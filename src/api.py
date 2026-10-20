@@ -1059,7 +1059,7 @@ def _transcription_config(
         or "<backend-default>"
     )
     cloud_timestamp_mapping = (
-        "2" if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"} else ""
+        "3" if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"} else ""
     )
     return {
         "backend": configured_backend.lower(),
@@ -1076,9 +1076,11 @@ def _transcription_config(
         "faster_whisper_version": _installed_version("faster-whisper"),
         "mlx_whisper_version": _installed_version("mlx-whisper"),
         "openai_whisper_version": _installed_version("openai-whisper"),
-        # Bump only cloud indexes: cloud ASR now repairs rare stretched
-        # timestamp scales before word interpolation, so older cached words
-        # must not be reused with the obsolete scale.
+        # Bump only cloud indexes. "2": cloud ASR repairs rare stretched
+        # timestamp scales before word interpolation. "3": 5-minute parts,
+        # re-recognition of coverage holes and a coverage report; indexes
+        # from 20-minute parts silently lost 30-45% of speech and must not
+        # be reused.
         "cloud_timestamp_mapping": cloud_timestamp_mapping,
     }
 
@@ -1581,6 +1583,7 @@ def _create_sync_job(project: str) -> dict:
         "transcribed": 0,
         "reused_indexes": 0,
         "source_failures": [],
+        "source_warnings": [],
         "total_segments": 0,
         "total": 0,
         "done": 0,

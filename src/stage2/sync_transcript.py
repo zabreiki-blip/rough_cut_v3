@@ -147,6 +147,10 @@ def ingest_word_index(
         backend_metadata = payload.get("backend_metadata")
         if isinstance(backend_metadata, dict):
             metadata["backend_metadata"] = backend_metadata
+            # Words were spread linearly over segment spans (cloud ASR): the
+            # index is interpolated even though it carries explicit words.
+            if str(backend_metadata.get("timestamp_precision") or "").lower() == "interpolated":
+                interpolated = True
         for key in ("backend", "audio_path", "schema_version"):
             if key in payload:
                 metadata[key] = payload[key]
