@@ -1059,7 +1059,7 @@ def _transcription_config(
         or "<backend-default>"
     )
     cloud_timestamp_mapping = (
-        "3" if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"} else ""
+        "4" if configured_backend.lower() in {"cloud", "cloud-audio", "openrouter"} else ""
     )
     return {
         "backend": configured_backend.lower(),
@@ -1080,7 +1080,8 @@ def _transcription_config(
         # timestamp scales before word interpolation. "3": 5-minute parts,
         # re-recognition of coverage holes and a coverage report; indexes
         # from 20-minute parts silently lost 30-45% of speech and must not
-        # be reused.
+        # be reused. "4": long holes are re-recognized in pieces of up to
+        # 2 minutes; "3" indexes are redone only if speech is still missing.
         "cloud_timestamp_mapping": cloud_timestamp_mapping,
     }
 

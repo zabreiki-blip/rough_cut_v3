@@ -397,3 +397,27 @@ def test_current_manual_and_local_indexes_are_reused(tmp_path: Path, index: Any)
 
     assert (result.reused, result.transcribed) == (1, 0)
     assert h.transcribe_calls == []
+
+
+def _hole_index(unrecovered_sec: float) -> Any:
+    index = _cloud_index("a", mapping="3")
+    index.metadata["coverage"] = {"unrecovered_sec": unrecovered_sec}
+    return index
+
+
+@pytest.mark.parametrize("unrecovered_sec, transcribed", [(612.9, 1), (0.0, 0)])
+def test_mapping_3_index_is_retranscribed_only_with_unrecovered_holes(
+    tmp_path: Path, unrecovered_sec: float, transcribed: int
+) -> None:
+    # Mapping "4" re-recognizes long holes in short pieces; mapping "3"
+    # indexes are worth redoing only where speech is still missing.
+    h = _Harness(tmp_path, ["a"])
+    h.cached["a"] = _hole_index(unrecovered_sec)
+    (tmp_path / "a.index.json").write_text("{}")
+
+    def config(**kw: Any) -> dict[str, Any]:
+        return {**_cloud_config(**kw), "cloud_timestamp_mapping": "4"}
+
+    result = h.run([_source("a")], transcription_config=config)
+
+    assert result.transcribed == transcribed

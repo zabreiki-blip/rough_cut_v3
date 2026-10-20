@@ -102,13 +102,15 @@ def _coverage_warning(source_id: str, metadata: Mapping[str, Any]) -> dict[str, 
 _CLOUD_BACKENDS = frozenset({"cloud", "cloud-audio", "openrouter"})
 
 
-def _cloud_index_is_outdated(cache: Any, current_mapping: Any) -> bool:
+def _cloud_index_is_outdated(cache: Any, current_mapping: Any, coverage: Any = None) -> bool:
     """Whether a generated cloud transcript predates the current cloud mapping.
 
     Completed transcripts are normally reused across config changes, but cloud
     indexes from older mappings are known to be defective (mapping "2" and
     earlier: 20-minute parts that silently lost 30-45% of speech). Manual
     corrections and non-cloud transcripts are never invalidated here.
+    Indexes from mapping "3" onwards carry a coverage report; they are redone
+    only while speech is still missing (``coverage.unrecovered_sec > 0``).
     """
     if not current_mapping or not isinstance(cache, dict):
         return False
@@ -119,7 +121,15 @@ def _cloud_index_is_outdated(cache: Any, current_mapping: Any) -> bool:
         return False
     if str(config.get("backend") or "").strip().lower() not in _CLOUD_BACKENDS:
         return False
-    return str(config.get("cloud_timestamp_mapping") or "") != str(current_mapping)
+    stored_mapping = str(config.get("cloud_timestamp_mapping") or "")
+    if stored_mapping == str(current_mapping):
+        return False
+    if stored_mapping.isdigit() and int(stored_mapping) >= 3 and isinstance(coverage, dict):
+        try:
+            return float(coverage.get("unrecovered_sec") or 0.0) > 0
+        except (TypeError, ValueError):
+            return True
+    return True
 
 
 def run_asr_phase(
@@ -319,6 +329,7 @@ def run_asr_phase(
                         _transcription_config(
                             backend="cloud-audio", model=model, language=language
                         ).get("cloud_timestamp_mapping"),
+                        cached_index.metadata.get("coverage"),
                     )
                 )
             ):

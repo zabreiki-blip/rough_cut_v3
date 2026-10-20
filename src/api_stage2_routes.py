@@ -326,6 +326,7 @@ def _sync_cloud_preflight(
                 ) and not _cloud_index_is_outdated(
                     index.metadata.get(services._TRANSCRIPTION_CACHE_KEY),
                     current_cloud_mapping,
+                    index.metadata.get("coverage"),
                 ):
                     # Same rule as execution (sync_asr_phase): outdated
                     # generated cloud indexes are retranscribed, so they

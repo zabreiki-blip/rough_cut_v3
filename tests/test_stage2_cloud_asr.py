@@ -1158,6 +1158,7 @@ def _coverage_call(
 
 def test_hole_is_re_recognized_only_on_its_interval(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", "600")
     retry = f"[00:03] ГОЛОС 1: {_words(150)}\n[01:30] ГОЛОС 1: {_words(150)}"
     result, extracted = _coverage_call(
         monkeypatch,
@@ -1184,6 +1185,7 @@ def test_hole_is_re_recognized_only_on_its_interval(monkeypatch: pytest.MonkeyPa
 def test_hole_retry_not_better_keeps_original_and_reports_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", "600")
     monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
     result, _ = _coverage_call(
         monkeypatch,
@@ -1199,6 +1201,7 @@ def test_hole_retry_not_better_keeps_original_and_reports_range(
 
 
 def test_failed_hole_retry_does_not_fail_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", "600")
     monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
     result, _ = _coverage_call(
         monkeypatch,
@@ -1219,6 +1222,7 @@ def test_failed_hole_retry_does_not_fail_the_file(monkeypatch: pytest.MonkeyPatc
 
 
 def test_hole_retries_disabled_makes_no_extra_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", "600")
     result, extracted = _coverage_call(
         monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)]
     )
@@ -1230,6 +1234,7 @@ def test_hole_retries_disabled_makes_no_extra_request(monkeypatch: pytest.Monkey
 def test_hole_retry_over_budget_keeps_paid_file_and_cancel_propagates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", "600")
     monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
     # 5 минут по 0.06 USD/мин = 0.30; повтор дыры (186 с, ~0.186) не влезает в 0.40.
     # Уже оплаченный файл не должен пропасть: повтор пропускается, дыра
@@ -1260,9 +1265,49 @@ def test_cloud_transcription_fingerprint_changes_with_timestamp_mapping() -> Non
     import api
 
     cloud = api._transcription_config(backend="cloud-audio", model="m", language="ru")
-    assert cloud["cloud_timestamp_mapping"] == "3"
+    assert cloud["cloud_timestamp_mapping"] == "4"
     local = api._transcription_config(backend="faster-whisper", model="m", language="ru")
     assert local["cloud_timestamp_mapping"] == ""
     assert api._transcription_config_fingerprint(cloud) != api._transcription_config_fingerprint(
-        {**cloud, "cloud_timestamp_mapping": "2"}
+        {**cloud, "cloud_timestamp_mapping": "3"}
     )
+
+
+def test_long_hole_is_re_recognized_in_short_pieces(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Модель «замолкает» и на повторе длинного куска, поэтому дыра 60..240 c
+    # повторяется кусками не длиннее 120 с: (60, 150) и (150, 240).
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    piece = f"[00:03] ГОЛОС 1: {_words(150)}"
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(piece, cost=0.01),
+            lambda: _model_response(piece, cost=0.01),
+        ],
+    )
+
+    assert extracted == [(0.0, 300.0), (57.0, 96.0), (147.0, 96.0)]
+    assert result["cost_usd"] == pytest.approx(0.07)
+    segments = result["segments"]
+    assert [round(seg["start"]) for seg in segments] == [0, 60, 150, 240]
+    assert sum(len(seg["text"].split()) for seg in segments) == 100 + 150 + 150 + 100
+    coverage = result["coverage"]
+    assert coverage["holes_repaired"] == coverage["holes_detected"] == 2
+    assert coverage["unrecovered_sec"] == 0.0
+
+
+def test_failed_piece_of_long_hole_is_reported_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    result, _extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(f"[00:03] ГОЛОС 1: {_words(150)}", cost=0.01),
+            lambda: _model_response("[00:03] ГОЛОС 1: тишина", cost=0.01),
+        ],
+    )
+
+    coverage = result["coverage"]
+    assert coverage["holes_repaired"] == 1
+    assert coverage["unrecovered_ranges"] == [[150.0, 240.0]]

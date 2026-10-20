@@ -117,6 +117,9 @@ DEFAULT_HOLE_MAX_WPM = 40.0
 DEFAULT_HOLE_RETRIES = 1
 # Поле вокруг дыры при повторной нарезке аудио, секунды.
 _HOLE_PAD_SEC = 3.0
+# Длинная дыра повторяется кусками не длиннее этого (SYNC_CLOUD_ASR_HOLE_SPLIT_SEC):
+# на повторе длинного куска модель снова «замолкает» так же, как на части.
+DEFAULT_HOLE_SPLIT_SEC = 120.0
 DEFAULT_TIMEOUT_SEC = 900.0
 DEFAULT_MAX_RETRIES = 3
 # Верхняя граница выходных токенов одного запроса к ASR-модели (стоимость
@@ -1018,6 +1021,20 @@ def _resolve_hole_retries() -> int:
     return value if value >= 0 else DEFAULT_HOLE_RETRIES
 
 
+def split_hole(hole: tuple[float, float], max_sec: float) -> list[tuple[float, float]]:
+    """Делит дыру на равные куски не длиннее `max_sec` (для повторов)."""
+    start, end = hole
+    length = end - start
+    if max_sec <= 0 or length <= max_sec:
+        return [hole]
+    count = math.ceil(length / max_sec)
+    step = length / count
+    return [
+        (round(start + i * step, 3), end if i == count - 1 else round(start + (i + 1) * step, 3))
+        for i in range(count)
+    ]
+
+
 def _count_words(text: str) -> int:
     return len(text.split())
 
@@ -1580,15 +1597,23 @@ class CloudAudioAsrAdapter:
                 for seg, flag in zip(new_segments, new_own_end)
                 if hole_start - 0.5 <= seg.start < hole_end
             ]
-            if sum(_count_words(seg.text) for seg, _flag in kept) <= old_words:
+            new_words = sum(_count_words(seg.text) for seg, _flag in kept)
+            if new_words <= old_words:
                 continue
+            # Вклеиваем любой прирост, но восстановленной считаем дыру только
+            # с нормальной плотностью речи: одно слово на минуты — всё ещё дыра.
+            hole_minutes = max(hole_end - hole_start, 1e-6) / 60.0
+            max_wpm = _env_float(
+                "SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True
+            )
+            repaired = new_words / hole_minutes >= max_wpm
             remaining = [
                 (seg, flag)
                 for seg, flag in zip(segments, own_end)
                 if not (hole_start - 0.01 <= seg.start < hole_end)
             ]
             merged = sorted(remaining + kept, key=lambda item: item[0].start)
-            return [m[0] for m in merged], [m[1] for m in merged], cost_total, raws, True, False
+            return [m[0] for m in merged], [m[1] for m in merged], cost_total, raws, repaired, False
         return segments, own_end, cost_total, raws, False, False
 
     async def transcribe_words(
@@ -1643,9 +1668,8 @@ class CloudAudioAsrAdapter:
         # используется при склейке меток после сборки всех частей (пункт 3).
         speaker_descriptions: dict[str, str] = {}
         holes_detected = 0
-        pending_holes: list[
-            tuple[tuple[float, float], float, float, str, dict[str, str]]
-        ] = []
+        hole_split_sec = _env_float("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", DEFAULT_HOLE_SPLIT_SEC)
+        pending_holes: list[tuple[tuple[float, float], float, float, str, dict[str, str]]] = []
         holes_repaired = 0
         unrecovered: list[tuple[float, float]] = []
 
@@ -1736,10 +1760,8 @@ class CloudAudioAsrAdapter:
                 # Дыры только запоминаем: повторы делаются вторым проходом,
                 # после всех основных частей, — иначе повтор дыры съел бы
                 # бюджет, зарезервированный под ещё не распознанные части.
-                part_holes = find_coverage_holes(
-                    part_segments, part_own_end, part_start, part_end
-                )
-                holes_detected += len(part_holes)
+                part_holes = find_coverage_holes(part_segments, part_own_end, part_start, part_end)
+                holes_detected += sum(len(split_hole(h, hole_split_sec)) for h in part_holes)
                 if part_segments:
                     part_segments[-1] = replace(part_segments[-1], end=part_end)
                     # Конец принудительно дотянут до технической границы
@@ -1758,7 +1780,8 @@ class CloudAudioAsrAdapter:
                 accumulated.extend(to_add)
                 accumulated_own_end.extend(own_end_to_add)
                 for hole in part_holes:
-                    pending_holes.append((hole, part_start, part_end, prompt, label_map))
+                    for piece in split_hole(hole, hole_split_sec):
+                        pending_holes.append((piece, part_start, part_end, prompt, label_map))
 
                 # Переводим легенду этой части (локальные метки) в сквозные
                 # метки через label_map и запоминаем первое известное описание
