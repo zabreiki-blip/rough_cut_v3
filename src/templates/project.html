@@ -700,11 +700,17 @@
 
   <div id="toast-container"></div>
 
+  <div id="scroll_jump" class="scroll-jump" hidden>
+    <button id="btn_scroll_top" class="scroll-jump-btn" type="button" aria-label="Прокрутить страницу в начало" title="В начало" hidden><span aria-hidden="true">↑</span></button>
+    <button id="btn_scroll_bottom" class="scroll-jump-btn" type="button" aria-label="Прокрутить страницу в конец" title="В конец" hidden><span aria-hidden="true">↓</span></button>
+  </div>
+
   <script>
     window.__PROJECT_NAME__ = {{ defaults.project | tojson }};
     window.__STAGE1_DEFAULTS__ = {{ defaults | tojson }};
     window.__STAGE1_STATUS__ = {{ status | tojson }};
   </script>
   <script type="module" src="{{ url_for('static', filename='stage1.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='scroll_jump.js') }}"></script>
 </body>
 </html>

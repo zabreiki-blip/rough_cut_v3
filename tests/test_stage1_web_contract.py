@@ -263,3 +263,33 @@ def test_stage1_entry_point_is_loaded_as_module_without_native_confirm() -> None
     assert '<script type="module" src="' in PROJECT_HTML
     assert "stage1.js" in PROJECT_HTML
     assert "window.confirm(" not in STAGE1_JS
+
+
+def test_project_page_has_scroll_jump_buttons_and_module() -> None:
+    scroll_js = (ROOT / "src" / "static" / "scroll_jump.js").read_text(encoding="utf-8")
+    assert 'id="btn_scroll_top"' in PROJECT_HTML
+    assert 'id="btn_scroll_bottom"' in PROJECT_HTML
+    assert 'aria-label="Прокрутить страницу в начало"' in PROJECT_HTML
+    assert 'aria-label="Прокрутить страницу в конец"' in PROJECT_HTML
+    assert "filename='scroll_jump.js'" in PROJECT_HTML
+    assert "export function computeVisibility" in scroll_js
+    assert "prefers-reduced-motion" in scroll_js
+    assert ".scroll-jump-btn:focus-visible" in STAGE1_CSS
+
+
+def test_scroll_jump_logic_in_node_runtime() -> None:
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    result = subprocess.run(
+        [node, str(ROOT / "tests" / "scroll_jump_test.cjs")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

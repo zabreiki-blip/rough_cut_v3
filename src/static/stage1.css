@@ -1068,6 +1068,30 @@ select { cursor: pointer; }
   z-index: 9999; display: grid; gap: 8px;
 }
 
+/* Scroll jump buttons: bottom-right, below toasts (top-right, z-index 9999) */
+.scroll-jump {
+  position: fixed; right: 20px; bottom: 24px;
+  z-index: 900; display: grid; gap: 8px;
+}
+.scroll-jump[hidden], .scroll-jump-btn[hidden] { display: none; }
+.scroll-jump-btn {
+  width: 40px; height: 40px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--bg-card);
+  color: var(--ink);
+  font: inherit; font-size: 18px; line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  transition: transform 120ms, border-color 150ms, background 150ms;
+}
+.scroll-jump-btn:hover { background: var(--bg-hover); border-color: var(--accent-light); transform: translateY(-1px); }
+.scroll-jump-btn:focus-visible { outline: 2px solid var(--accent-light); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .scroll-jump-btn { transition: none; }
+}
+
 .toast {
   padding: 12px 18px;
   border-radius: var(--radius-sm);

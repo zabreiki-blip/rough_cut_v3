@@ -120,6 +120,9 @@ jobs:
       - name: Stage 1 UI behavior test
         run: node tests/stage1_behavior_test.cjs
 
+      - name: Scroll jump behavior test
+        run: node tests/scroll_jump_test.cjs
+
       - name: Docker Compose config
         run: |
           cp .env.example .env

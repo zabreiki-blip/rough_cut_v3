@@ -8,6 +8,7 @@
   },
   "scripts": {
     "lint:cep": "eslint cep tests/cep_behavior_test.cjs",
-    "test:stage1": "node tests/stage1_behavior_test.cjs"
+    "test:stage1": "node tests/stage1_behavior_test.cjs",
+    "test:scroll-jump": "node tests/scroll_jump_test.cjs"
   }
 }
