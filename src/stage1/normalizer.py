@@ -111,6 +111,14 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
     r"(?P<speaker>[^:\n]{1,80}?)\s*:\s*[,;]?\s*(?P<content>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+# ``СНХ Имя, роль — файл.wav 00:05:42 — реплика``: the marker is followed by
+# whitespace (no comma), the credit by a dash and an optional media file name.
+_SNH_DASH_CREDIT = re.compile(
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<credit>[А-ЯЁA-Z][^—–\n]{1,160}?)\s+[—–-]\s+"
+    r"(?P<rest>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_MEDIA_FILE_NAME = re.compile(r"^(?:.{1,118}\.[A-Za-z0-9]{2,5}|\S{1,120})$")
 _EXPLICIT_SYNC_LABEL = re.compile(r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE)
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.][0-5]\d(?:\s+|[:.])[0-5]\d\]?|"
@@ -469,7 +477,7 @@ def _generate_normalization_unlocked(
             "Active scenario revision cannot be replaced by another source; "
             "import it as a new scenario revision"
         )
-    paragraphs = _extract_paragraphs(input_path)
+    paragraphs = _merge_snh_credit_headers(_extract_paragraphs(input_path))
     now = _utcnow()
     blocks: list[NormalizedBlock] = []
 
@@ -1099,6 +1107,8 @@ def _annotate_continuation_context(
     blocks: list[NormalizedBlock], video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
 ) -> None:
     previous: NormalizedBlock | None = None
+    # Last sync block, kept alive only across bare splice markers.
+    splice_donor: NormalizedBlock | None = None
     for block in blocks:
         if (
             previous is not None
@@ -1160,17 +1170,41 @@ def _annotate_continuation_context(
         # A bare timecoded quote can inherit the interviewee only from the
         # immediately preceding sync. A cue or narration in between makes
         # that attribution uncertain and requires an explicit speaker.
+        # The one exception is a bare "СКЛЕЙКА" splice marker: it only joins
+        # two cuts of the same interview, so a timecoded quote after one or
+        # more of them still belongs to the sync block preceding the markers.
         if block.type == BlockType.SYNC.value:
+            donor = previous
             if (
                 not block.speaker
                 and previous is not None
-                and previous.type == BlockType.SYNC.value
-                and previous.speaker
+                and previous.type != BlockType.SYNC.value
+                and splice_donor is not None
+                and _is_splice_marker(previous.original_text)
+                and _starts_with_unambiguous_timecode(block.original_text)
+            ):
+                donor = splice_donor
+            if (
+                not block.speaker
+                and donor is not None
+                and donor.type == BlockType.SYNC.value
+                and donor.speaker
             ):
                 block.continuation_of_type = BlockType.SYNC.value
-                block.speaker = previous.speaker
-                block.role = previous.role
+                block.speaker = donor.speaker
+                block.role = donor.role
+        if block.type == BlockType.SYNC.value:
+            splice_donor = block
+        elif not _is_splice_marker(block.original_text):
+            splice_donor = None
         previous = block
+
+
+_SPLICE_MARKER_RE = re.compile(r"^[\s:.]*склейка[\s:.]*$", re.IGNORECASE)
+
+
+def _is_splice_marker(text: str) -> bool:
+    return bool(_SPLICE_MARKER_RE.match(text))
 
 
 def _looks_like_sync_continuation(text: str) -> bool:
@@ -1460,6 +1494,69 @@ def _starts_with_unambiguous_timecode(text: str) -> bool:
     return _is_unambiguous_timecode_match(stripped, match.start(1), match.end(1))
 
 
+def _parse_snh_dash_credit(text: str) -> dict[str, str] | None:
+    """Parse ``СНХ Имя[, роль] — [файл] 00:05:42 — реплика``.
+
+    Returns marker/speaker/role/source/content (``content`` starts at the first
+    timecode and is empty for a header-only paragraph), or ``None`` when the
+    paragraph is not this form.
+    """
+    match = _SNH_DASH_CREDIT.match(text)
+    if not match:
+        return None
+    credit = match.group("credit").strip()
+    if _TIMECODE.search(credit):
+        return None
+    speaker, _, role = credit.partition(",")
+    speaker, role = speaker.strip(), role.strip(" \t,;:")
+    if not _SYNC_NAME_ONLY_LABEL.fullmatch(speaker) or not _looks_like_plausible_sync_credit(
+        speaker
+    ):
+        return None
+    rest = match.group("rest").strip()
+    timecode_at = -1
+    for found in _TIMECODE.finditer(rest):
+        if _is_unambiguous_timecode_match(rest, found.start(), found.end()):
+            timecode_at = found.start()
+            break
+    if timecode_at < 0:
+        source, content = rest, ""
+    else:
+        source, content = rest[:timecode_at], rest[timecode_at:].strip()
+    source = source.strip(" \t–—-")
+    if (not source and timecode_at < 0) or (source and not _MEDIA_FILE_NAME.match(source)):
+        return None
+    return {
+        "marker": match.group("marker"),
+        "speaker": speaker,
+        "role": role,
+        "source": source,
+        "content": content,
+        "header_only": "" if content else "1",
+    }
+
+
+def _merge_snh_credit_headers(paragraphs: list[str]) -> list[str]:
+    """Join a header-only ``СНХ Имя — файл`` paragraph with the next timecoded one."""
+    merged: list[str] = []
+    index = 0
+    while index < len(paragraphs):
+        current = paragraphs[index]
+        credit = _parse_snh_dash_credit(current)
+        if (
+            credit
+            and credit["header_only"]
+            and index + 1 < len(paragraphs)
+            and _starts_with_unambiguous_timecode(paragraphs[index + 1])
+        ):
+            merged.append(f"{current.rstrip()} {paragraphs[index + 1].lstrip()}")
+            index += 2
+            continue
+        merged.append(current)
+        index += 1
+    return merged
+
+
 def _split_label(text: str) -> tuple[str, str]:
     # Generic labels are deliberately limited: prose containing an ordinary colon
     # should not accidentally become a learned marker.
@@ -1470,6 +1567,9 @@ def _split_label(text: str) -> tuple[str, str]:
         marker = explicit_sync.group("marker").strip()
         speaker = explicit_sync.group("speaker").strip(" \t,;:")
         return f"{marker}, {speaker}", explicit_sync.group("content").strip()
+    dash_credit = _parse_snh_dash_credit(text)
+    if dash_credit:
+        return dash_credit["marker"], dash_credit["content"]
     life = _LIFE_PREFIX.match(text)
     if life:
         body = life.group("body").strip()
@@ -1724,7 +1824,17 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     has_sync_metadata = False
     explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
     match = _SYNC_METADATA.match(block.normalized_text)
-    if explicit_label:
+    dash_credit = _parse_snh_dash_credit(block.original_text)
+    if dash_credit and normalize_marker(block.original_label) == normalize_marker(
+        dash_credit["marker"]
+    ):
+        block.speaker = dash_credit["speaker"]
+        block.role = dash_credit["role"]
+        if dash_credit["source"]:
+            block.source_description = dash_credit["source"]
+        fragment_source = dash_credit["content"]
+        has_sync_metadata = True
+    elif explicit_label:
         block.speaker = explicit_label.group(1).strip(" \t,;:")
         block.role = ""
         has_sync_metadata = True
