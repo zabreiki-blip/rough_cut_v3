@@ -122,6 +122,7 @@ def _mapping_summary(mapping) -> list[dict]:
                 "media_name": detail.get("media_name", ""),
                 "media_source_id": detail.get("media_source_id", ""),
                 "max_source_out_sec": detail.get("max_source_out_sec", 0.0),
+                "source_label": detail.get("source_label", ""),
                 "sequence_aliases": detail.get("sequence_aliases", []),
                 "speaker_aliases": detail.get("speaker_aliases", []),
                 "media_kind": detail.get("media_kind", "video"),

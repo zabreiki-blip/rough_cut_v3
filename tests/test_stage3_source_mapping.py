@@ -187,3 +187,76 @@ def test_source_identity_keeps_unrelated_names_fail_closed() -> None:
     )
 
     assert result.unmapped_source_ids == ("ulynovsk_sinh",)
+
+
+def _speaker_segments(pairs: list[tuple[str, str]]) -> FullTimeline:
+    segments = [
+        TimelineSegment(
+            id=f"snh{index}",
+            type="snh",
+            text="СНХ",
+            duration_sec=2,
+            start_sec=index * 2.0,
+            source_id="litovkin",
+            source_in_sec=10,
+            source_out_sec=12,
+            match_status="confirmed",
+            sequence_name=sequence,
+            speaker=speaker,
+        )
+        for index, (sequence, speaker) in enumerate(pairs, start=1)
+    ]
+    return FullTimeline(project="UIP", fps=25, segments=segments)
+
+
+def test_foreign_timeline_speaker_does_not_tie_with_own_sequence() -> None:
+    timeline = _speaker_segments(
+        [
+            ("УИП_Литовкин", "Виктор ЛИТОВКИН"),
+            ("УИП_Литовкин", "Виктор ЛИТОВКИН"),
+            ("УИП_Литовкин", "ЖАРЕНКОВ"),
+        ]
+    )
+    sources = [_source("litovkin", "УИП_Литовкин", "Виктор Литовкин")]
+    own = _media("own", "УИП_Литовкин.wav", duration=500)
+    foreign = _media("foreign", "ЖАРЕНКОВ.wav", duration=500)
+
+    result = map_catalog_to_timeline(timeline, sources, [foreign, own])
+
+    assert result.catalog["litovkin"] is own
+    assert result.unmapped_source_ids == ()
+    detail = result.details["litovkin"]
+    assert detail["reason"] == "exact_sequence_name"
+    assert detail["source_label"] == "УИП_Литовкин"
+    assert "жаренков" not in detail["sequence_aliases"]
+    assert "жаренков" in detail["speaker_aliases"]
+
+
+def test_review_media_source_maps_to_own_file_despite_foreign_names() -> None:
+    timeline = _speaker_segments([("Чужая", "ЖАРЕНКОВ"), ("Чужая", "ЖАРЕНКОВ")])
+    source = {
+        "id": "litovkin",
+        "source_kind": "review_media",
+        "premiere_sequence": "Чужая",
+        "speaker": "ЖАРЕНКОВ",
+        "media_path": "ЗАГРУЗИТЬ/Просмотровки/УИП_Литовкин.wav",
+        "metadata": {"media_name": "УИП_Литовкин.wav"},
+    }
+    own = _media("own", "УИП_Литовкин.wav", duration=500)
+    foreign = _media("foreign", "ЖАРЕНКОВ.wav", duration=500)
+    other = _media("other", "Чужая.wav", duration=500)
+
+    result = map_catalog_to_timeline(timeline, [source], [foreign, other, own])
+
+    assert result.catalog["litovkin"] is own
+    assert result.details["litovkin"]["reason"] == "source_media_path"
+    assert result.details["litovkin"]["score"] == 500
+
+
+def test_source_label_falls_back_to_media_basename() -> None:
+    source = {"id": "s", "media_path": "dir/Файл.wav", "speaker": "X"}
+    result = map_catalog_to_timeline(
+        _speaker_segments([]), [source], [_media("m", "Файл.wav", duration=500)]
+    )
+
+    assert result.details["s"]["source_label"] == "Файл.wav"

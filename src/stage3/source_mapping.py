@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any, Mapping, Sequence, SupportsFloat
+from typing import Any, Collection, Mapping, Sequence, SupportsFloat
 import unicodedata
 
 from stage2.models import FullTimeline
@@ -180,12 +180,37 @@ def _media_duration(media: object) -> float:
     return 0.0
 
 
-def _source_aliases(source: object, timeline_aliases: set[str]) -> tuple[set[str], set[str]]:
+def _source_own_media_names(source: object) -> set[str]:
+    """Basenames of the media file the source itself describes (media_path/media_name)."""
+
+    metadata = _field(source, "metadata", default={})
+    values = [_field(source, "media_path")]
+    if isinstance(metadata, Mapping):
+        values.append(metadata.get("media_name") or "")
+    return {Path(str(value).strip()).name for value in values if str(value or "").strip()}
+
+
+def _source_label(source: object) -> str:
+    sequence = str(
+        _field(source, "premiere_sequence", "sequence_name", "proxy_sequence_name")
+    ).strip()
+    if sequence:
+        return sequence
+    return min(_source_own_media_names(source), default="")
+
+
+def _source_aliases(
+    source: object,
+    timeline_sequences: set[str],
+    timeline_speakers: set[str] = frozenset(),  # type: ignore[assignment]
+) -> tuple[set[str], set[str]]:
     sequence_values = {
         str(_field(source, "premiere_sequence", "sequence_name", "proxy_sequence_name")).strip(),
-        *timeline_aliases,
+        *timeline_sequences,
     }
-    speaker_values = {str(_field(source, "speaker")).strip()}
+    # Timeline speakers are only a weak hint: one misattributed Stage 2 line must
+    # never reach the high-priority sequence aliases.
+    speaker_values = {str(_field(source, "speaker")).strip(), *timeline_speakers}
     raw_speakers = _field(source, "speakers", default=())
     if isinstance(raw_speakers, str):
         speaker_values.update(re.split(r"[,;\n]+", raw_speakers))
@@ -209,9 +234,18 @@ def _score_media(
     media_name: str,
     sequence_aliases: set[str],
     speaker_aliases: set[str],
+    own_media_names: Collection[str] = (),
 ) -> tuple[int, str]:
     media_normalized = _normalize(media_name)
     media_canonical = _canonical(media_name)
+    # The source's own media file outranks every alias, including foreign
+    # timeline names, so a stray speaker can never create a tie with it.
+    for own_name in own_media_names:
+        if media_normalized and media_normalized == _normalize(own_name):
+            return 500, "source_media_path"
+    for own_name in own_media_names:
+        if media_canonical and media_canonical == _canonical(own_name):
+            return 450, "source_media_path"
     canonical_sequences = {_canonical(alias) for alias in sequence_aliases}
     canonical_speakers = {_canonical(alias) for alias in speaker_aliases}
     media_identity = normalize_source_identity(media_name)
@@ -272,13 +306,18 @@ def map_catalog_to_timeline(
     if len({item[0] for item in media_items}) != len(media_items):
         raise ValueError("duplicate catalog media source_id")
 
-    timeline_aliases: dict[str, set[str]] = {}
+    timeline_sequences: dict[str, set[str]] = {}
+    timeline_speakers: dict[str, set[str]] = {}
     max_source_out: dict[str, float] = {}
     for segment in full_timeline.segments:
         if not segment.source_id:
             continue
-        aliases = timeline_aliases.setdefault(segment.source_id, set())
-        aliases.update(value for value in (segment.sequence_name, segment.speaker) if value)
+        sequences = timeline_sequences.setdefault(segment.source_id, set())
+        speakers = timeline_speakers.setdefault(segment.source_id, set())
+        if segment.sequence_name:
+            sequences.add(segment.sequence_name)
+        if segment.speaker:
+            speakers.add(segment.speaker)
         if (
             segment.type in {"snh", "host"}
             and segment.match_status in _MATCHED_STATUSES
@@ -294,17 +333,23 @@ def map_catalog_to_timeline(
     tolerance = 1.0 / full_timeline.fps
     for source_id, source in source_items:
         sequence_aliases, speaker_aliases = _source_aliases(
-            source, timeline_aliases.get(source_id, set())
+            source,
+            timeline_sequences.get(source_id, set()),
+            timeline_speakers.get(source_id, set()),
         )
+        own_media_names = _source_own_media_names(source)
         candidates: list[tuple[int, str, str, object]] = []
         for media_id, media in media_items:
-            score, method = _score_media(_media_name(media), sequence_aliases, speaker_aliases)
+            score, method = _score_media(
+                _media_name(media), sequence_aliases, speaker_aliases, own_media_names
+            )
             if score:
                 candidates.append((score, media_id, method, media))
         candidates.sort(key=lambda item: (-item[0], item[1]))
         best_score = candidates[0][0] if candidates else 0
         best = [candidate for candidate in candidates if candidate[0] == best_score]
         base_detail: dict[str, Any] = {
+            "source_label": _source_label(source),
             "sequence_aliases": sorted(sequence_aliases),
             "speaker_aliases": sorted(speaker_aliases),
             "max_source_out_sec": max_source_out.get(source_id, 0.0),

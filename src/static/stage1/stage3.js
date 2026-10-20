@@ -74,7 +74,7 @@ function renderStage3Media(result) {
 
 function stage3MappingLabel(item) {
   const aliases = (item.sequence_aliases || []).concat(item.speaker_aliases || []);
-  return aliases[0] || item.source_id || "Источник";
+  return item.source_label || aliases[0] || item.source_id || "Источник";
 }
 
 function renderStage3SourceMapping(mapping) {
