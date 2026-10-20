@@ -99,6 +99,29 @@ def _coverage_warning(source_id: str, metadata: Mapping[str, Any]) -> dict[str, 
     }
 
 
+_CLOUD_BACKENDS = frozenset({"cloud", "cloud-audio", "openrouter"})
+
+
+def _cloud_index_is_outdated(cache: Any, current_mapping: Any) -> bool:
+    """Whether a generated cloud transcript predates the current cloud mapping.
+
+    Completed transcripts are normally reused across config changes, but cloud
+    indexes from older mappings are known to be defective (mapping "2" and
+    earlier: 20-minute parts that silently lost 30-45% of speech). Manual
+    corrections and non-cloud transcripts are never invalidated here.
+    """
+    if not current_mapping or not isinstance(cache, dict):
+        return False
+    if cache.get("origin") != "generated":
+        return False
+    config = cache.get("config")
+    if not isinstance(config, dict):
+        return False
+    if str(config.get("backend") or "").strip().lower() not in _CLOUD_BACKENDS:
+        return False
+    return str(config.get("cloud_timestamp_mapping") or "") != str(current_mapping)
+
+
 def run_asr_phase(
     ctx: SyncAsrContext,
     sources: Sequence[Any],
@@ -289,6 +312,15 @@ def run_asr_phase(
                 cached_index is not None
                 and not should_force
                 and (cache_matches_audio or not audio_is_available)
+                and not (
+                    audio_is_available
+                    and _cloud_index_is_outdated(
+                        cached_index.metadata.get(_TRANSCRIPTION_CACHE_KEY),
+                        _transcription_config(
+                            backend="cloud-audio", model=model, language=language
+                        ).get("cloud_timestamp_mapping"),
+                    )
+                )
             ):
                 # A completed transcript is an expensive durable artifact.
                 # Switching Small/Medium changes only future files; it must

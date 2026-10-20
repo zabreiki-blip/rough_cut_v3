@@ -332,3 +332,68 @@ def test_unrecovered_cloud_coverage_becomes_source_warning(tmp_path: Path) -> No
     assert result.source_warnings[0]["source_id"] == "a"
     assert "не распознано 3.0 мин" in result.source_warnings[0]["warning"]
     assert any("source_warnings" in kwargs for _args, kwargs in h.updates)
+
+
+def _cloud_config(**kw: Any) -> dict[str, Any]:
+    backend = kw["backend"]
+    is_cloud = backend in {"cloud", "cloud-audio", "openrouter"}
+    return {
+        "backend": backend,
+        "model": kw["model"],
+        "cloud_timestamp_mapping": "3" if is_cloud else "",
+    }
+
+
+def _cloud_index(source_id: str, *, mapping: str, origin: str = "generated") -> Any:
+    return SimpleNamespace(
+        source_id=source_id,
+        metadata={
+            _CACHE_KEY: {
+                "audio": {},
+                "origin": origin,
+                "config": {"backend": "cloud-audio", "cloud_timestamp_mapping": mapping},
+            }
+        },
+    )
+
+
+def test_outdated_cloud_index_is_retranscribed(tmp_path: Path) -> None:
+    # Cloud indexes from the old 20-minute parts silently lost speech; they
+    # must not be reused once the cloud timestamp mapping has moved on.
+    h = _Harness(tmp_path, ["a"])
+    h.cached["a"] = _cloud_index("a", mapping="2")
+    (tmp_path / "a.index.json").write_text("{}")
+
+    result = h.run([_source("a")], transcription_config=_cloud_config)
+
+    assert (result.reused, result.transcribed) == (0, 1)
+    assert h.transcribe_calls == ["a"]
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        _cloud_index("a", mapping="3"),
+        _cloud_index("a", mapping="2", origin="manual"),
+        SimpleNamespace(
+            source_id="a",
+            metadata={
+                _CACHE_KEY: {
+                    "audio": {},
+                    "origin": "generated",
+                    "config": {"backend": "faster-whisper", "cloud_timestamp_mapping": ""},
+                }
+            },
+        ),
+    ],
+    ids=["current-cloud", "manual-cloud", "local-whisper"],
+)
+def test_current_manual_and_local_indexes_are_reused(tmp_path: Path, index: Any) -> None:
+    h = _Harness(tmp_path, ["a"])
+    h.cached["a"] = index
+    (tmp_path / "a.index.json").write_text("{}")
+
+    result = h.run([_source("a")], transcription_config=_cloud_config)
+
+    assert (result.reused, result.transcribed) == (1, 0)
+    assert h.transcribe_calls == []
