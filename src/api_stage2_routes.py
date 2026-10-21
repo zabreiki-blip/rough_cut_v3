@@ -17,7 +17,7 @@ from api_final_review_jobs import canonical_decimal_string
 from cost_budget import LLM_TTS_ENV_NAMES, CostGuardConfig
 from export_naming import xml_export_filename
 from stage2.cloud_asr import DEFAULT_OVERLAP_SEC, plan_cloud_chunks, resolve_chunk_minutes
-from sync_asr_phase import _cloud_index_is_outdated
+from sync_asr_phase import _cloud_index_is_outdated, index_coverage_report
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage_common import _scenario_revision_matches, _timeline_is_current
 
@@ -326,7 +326,7 @@ def _sync_cloud_preflight(
                 ) and not _cloud_index_is_outdated(
                     index.metadata.get(services._TRANSCRIPTION_CACHE_KEY),
                     current_cloud_mapping,
-                    index.metadata.get("coverage"),
+                    index_coverage_report(index),
                 ):
                     # Same rule as execution (sync_asr_phase): outdated
                     # generated cloud indexes are retranscribed, so they

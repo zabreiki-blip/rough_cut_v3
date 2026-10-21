@@ -104,6 +104,23 @@ def _coverage_warning(source_id: str, metadata: Mapping[str, Any]) -> dict[str, 
 _CLOUD_BACKENDS = frozenset({"cloud", "cloud-audio", "openrouter"})
 
 
+def index_coverage_report(index: Any) -> Any:
+    """Cloud ASR coverage report of a word index (None when absent).
+
+    It lives in ``metadata.backend_metadata.coverage``; the top-level
+    ``metadata.coverage`` is accepted as a legacy fallback.
+    """
+    metadata = getattr(index, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    backend_metadata = metadata.get("backend_metadata")
+    if isinstance(backend_metadata, Mapping) and isinstance(
+        backend_metadata.get("coverage"), Mapping
+    ):
+        return backend_metadata["coverage"]
+    return metadata.get("coverage")
+
+
 def _cloud_index_is_outdated(cache: Any, current_mapping: Any, coverage: Any = None) -> bool:
     """Whether a generated cloud transcript predates the current cloud mapping.
 
@@ -483,7 +500,7 @@ def run_asr_phase(
                         _transcription_config(
                             backend="cloud-audio", model=model, language=language
                         ).get("cloud_timestamp_mapping"),
-                        cached_index.metadata.get("coverage"),
+                        index_coverage_report(cached_index),
                     )
                 )
             ):

@@ -400,28 +400,54 @@ def test_current_manual_and_local_indexes_are_reused(tmp_path: Path, index: Any)
     assert h.transcribe_calls == []
 
 
-def _hole_index(unrecovered_sec: float) -> Any:
-    index = _cloud_index("a", mapping="3")
-    index.metadata["coverage"] = {"unrecovered_sec": unrecovered_sec}
+def _hole_index(unrecovered_sec: float, *, mapping: str = "3", legacy: bool = False) -> Any:
+    index = _cloud_index("a", mapping=mapping)
+    coverage = {"unrecovered_sec": unrecovered_sec}
+    if legacy:
+        index.metadata["coverage"] = coverage
+    else:
+        # Real layout: cloud ASR writes coverage under backend_metadata.
+        index.metadata["backend_metadata"] = {"coverage": coverage}
     return index
 
 
+def _mapping_config(mapping: str) -> Any:
+    def config(**kw: Any) -> dict[str, Any]:
+        return {**_cloud_config(**kw), "cloud_timestamp_mapping": mapping}
+
+    return config
+
+
+@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("unrecovered_sec, transcribed", [(612.9, 1), (0.0, 0)])
 def test_mapping_3_index_is_retranscribed_only_with_unrecovered_holes(
-    tmp_path: Path, unrecovered_sec: float, transcribed: int
+    tmp_path: Path, unrecovered_sec: float, transcribed: int, legacy: bool
 ) -> None:
     # Mapping "4" re-recognizes long holes in short pieces; mapping "3"
     # indexes are worth redoing only where speech is still missing.
     h = _Harness(tmp_path, ["a"])
-    h.cached["a"] = _hole_index(unrecovered_sec)
+    h.cached["a"] = _hole_index(unrecovered_sec, legacy=legacy)
     (tmp_path / "a.index.json").write_text("{}")
 
-    def config(**kw: Any) -> dict[str, Any]:
-        return {**_cloud_config(**kw), "cloud_timestamp_mapping": "4"}
-
-    result = h.run([_source("a")], transcription_config=config)
+    result = h.run([_source("a")], transcription_config=_mapping_config("4"))
 
     assert result.transcribed == transcribed
+
+
+@pytest.mark.parametrize("unrecovered_sec, transcribed", [(180.0, 1), (0.0, 0)])
+def test_mapping_bump_keeps_fully_covered_mapping_4_index(
+    tmp_path: Path, unrecovered_sec: float, transcribed: int
+) -> None:
+    # A future mapping bump ("4" -> "5") must not trigger paid re-recognition
+    # of indexes whose coverage report shows no missing speech.
+    h = _Harness(tmp_path, ["a"])
+    h.cached["a"] = _hole_index(unrecovered_sec, mapping="4")
+    (tmp_path / "a.index.json").write_text("{}")
+
+    result = h.run([_source("a")], transcription_config=_mapping_config("5"))
+
+    assert result.transcribed == transcribed
+    assert result.reused == 1 - transcribed
 
 
 # ---------------------------------------------------------------------------
@@ -783,3 +809,24 @@ def test_unavailable_engine_gives_warning_with_reason(
     result = repair.run(_holey_index("a"))
     assert any("faster-whisper не установлен" in w["warning"] for w in result.source_warnings)
     assert repair.engine_calls == [] and repair.saves == 0
+
+
+def test_mapping_bump_after_local_repair_does_not_retranscribe(repair: _RepairHarness) -> None:
+    # Local repair zeroes coverage.unrecovered_sec; a later mapping bump must
+    # then reuse the repaired index instead of paying for a new cloud run.
+    index = _holey_index("a")
+    index.metadata[_CACHE_KEY]["config"] = {
+        "backend": "cloud-audio",
+        "cloud_timestamp_mapping": "4",
+    }
+    repair.words_by_clip_start[37.0] = _local(40.0, 20)
+    # The outdated check applies only when the guide audio is present.
+    (repair.h.tmp_path / "a.wav").write_bytes(b"audio")
+    first = repair.run(index, transcription_config=_mapping_config("4"))
+    cov = first.indexes[0].metadata["backend_metadata"]["coverage"]
+    assert cov["unrecovered_sec"] == 0 and first.transcribed == 0
+
+    second = repair.run(first.indexes[0], transcription_config=_mapping_config("5"))
+
+    assert second.source_failures == []
+    assert (second.transcribed, second.reused) == (0, 1)
