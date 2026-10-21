@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from cost_budget import CostBudgetExceeded
+from stage2.match_retiming import (
+    apply_retime_to_match,
+    load_retime_map,
+    retime_map_path,
+)
 from stage2.sync_models import AlignmentRequest, TimecodeMode
 from stage2.sync_offset_clusters import (
     DEFAULT_AUTO_THRESHOLD,
@@ -108,6 +113,9 @@ class SyncMatchContext:
     alignment_request_cls: type[AlignmentRequest]
     matching_fingerprint: Callable[..., str]
     sync_summary: Callable[[Sequence[Any]], dict[str, Any]]
+    # ``(paths, source_id) -> index file``: next to it lies the retime map used to carry
+    # confirmed matches over to retimed word times. ``None`` disables that pass.
+    word_index_path: Callable[[Any, str], Path] | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +226,68 @@ def _make_checkpoint_writer(
             checkpoint_state["dirty"] = False
 
     return checkpoint_matches
+
+
+def _retime_confirmed_matches(
+    ctx: SyncMatchContext,
+    existing: dict[str, Any],
+    sources: Sequence[Any],
+    indexes: Sequence[Any],
+) -> tuple[list[str], list[str]]:
+    """Carry confirmed matches over to the retimed word times of their source.
+
+    The cloud index words were retimed by a local Whisper pass, but the matching
+    below never touches confirmed matches, so their ``source_in/out`` would stay in the
+    old cloud time. For every confirmed match of a source whose retime map belongs to
+    the current index, unedited boundaries are recomputed (status stays confirmed);
+    hand-edited or ambiguous ones are only flagged ``retime_pending_review``.
+    Returns ``(retimed ids, ids flagged for review)``; matches are changed in place.
+    """
+    if ctx.word_index_path is None:
+        return [], []
+    sources_by_id = {str(getattr(item, "id", "")): item for item in sources}
+    indexes_by_id = {str(getattr(item, "source_id", "")): item for item in indexes}
+    retimed: list[str] = []
+    review: list[str] = []
+    for source_id in sorted(
+        {str(getattr(m, "source_id", "")) for m in existing.values() if m.status == "confirmed"}
+    ):
+        index, source = indexes_by_id.get(source_id), sources_by_id.get(source_id)
+        if index is None or source is None:
+            continue
+        try:
+            rmap = load_retime_map(
+                retime_map_path(ctx.word_index_path(ctx.paths, source_id), source_id)
+            )
+        except Exception:
+            ctx.logger.warning("Sync job=%s: retime map of %s unreadable", ctx.job_id, source_id)
+            continue
+        if rmap is None or not rmap.matches_index(index):
+            continue  # not retimed, or the map belongs to another state of the index
+        for segment_id, match in existing.items():
+            if match.source_id != source_id or match.status != "confirmed":
+                continue
+            try:
+                outcome = apply_retime_to_match(
+                    match,
+                    rmap,
+                    now_iso=ctx.utc_now_iso(),
+                    guide_offset_sec=float(getattr(source, "guide_offset_sec", 0.0) or 0.0),
+                    duration_sec=float(getattr(source, "duration_sec", 0.0) or 0.0),
+                )
+            except Exception:
+                ctx.logger.warning(
+                    "Sync job=%s: retime of confirmed match %s failed",
+                    ctx.job_id,
+                    segment_id,
+                    exc_info=True,
+                )
+                continue
+            if outcome == "retimed":
+                retimed.append(segment_id)
+            elif outcome == "review":
+                review.append(segment_id)
+    return retimed, review
 
 
 def _is_manual_match(match: Any) -> bool:
@@ -393,6 +463,28 @@ def run_match_phase(
     )
     # From here on the cancel/failure handlers save partial matches.
     checkpoint.activate(checkpoint_matches)
+
+    # Confirmed matches are never rematched below, so move them to the retimed word
+    # times here. Marking them as rematched makes the checkpoint merge keep this copy
+    # unless the user edited the match during the run (then theirs wins).
+    retimed_ids, review_ids = _retime_confirmed_matches(ctx, existing, sources, indexes)
+    if retimed_ids or review_ids:
+        rematched_this_run.update(retimed_ids)
+        rematched_this_run.update(review_ids)
+        checkpoint_state["dirty"] = True
+        ctx.logger.warning(
+            "Sync job=%s: source timecodes were refined: %d confirmed matches moved, "
+            "%d need a boundary check",
+            job_id,
+            len(retimed_ids),
+            len(review_ids),
+        )
+        ctx.update_job(
+            job_id,
+            persist=False,
+            retime_retimed_matches=len(retimed_ids),
+            retime_review_segment_ids=review_ids,
+        )
 
     current_ids = {
         str(unit.get("segment_id") or "").strip()

@@ -948,6 +948,48 @@ def test_retime_is_not_repeated_with_same_fingerprint(retime: _RetimeHarness) ->
     assert second.source_failures == [] and second.source_warnings == []
 
 
+def test_retime_writes_old_to_new_map_next_to_index_not_into_it(
+    retime: _RetimeHarness, tmp_path: Path
+) -> None:
+    from stage2.match_retiming import load_retime_map
+
+    original = _retime_index()
+    old_starts = [round(w.start, 4) for w in original.words]
+
+    result = retime.run(original)
+
+    index = result.indexes[0]
+    rmap = load_retime_map(tmp_path / "a.retime_map.json")
+    assert rmap is not None and rmap.matches_index(index)
+    assert rmap.old_starts == old_starts
+    assert rmap.new_starts[50] == pytest.approx(50 + SHIFT, abs=0.01)
+    assert rmap.new_starts == [round(w.start, 4) for w in index.words[: len(old_starts)]]
+    assert "retime_map" not in str(index.to_dict().keys()) and rmap.fingerprint in str(
+        _marker(index)
+    )
+
+
+def test_retime_map_is_not_rewritten_when_retime_is_not_repeated(
+    retime: _RetimeHarness, tmp_path: Path
+) -> None:
+    retime.run(_retime_index())
+    path = tmp_path / "a.retime_map.json"
+    before = path.read_bytes()
+    path.write_bytes(before + b" ")
+
+    retime.run(retime.disk())
+
+    assert path.read_bytes() == before + b" "
+
+
+def test_rejected_retime_writes_no_map(retime: _RetimeHarness, tmp_path: Path) -> None:
+    retime.local_words = [{"word": "чужой", "start": 1.0, "end": 1.5}] * 5
+
+    retime.run(_retime_index())
+
+    assert not (tmp_path / "a.retime_map.json").exists()
+
+
 def test_new_algorithm_version_retimes_from_cached_local_words(
     retime: _RetimeHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

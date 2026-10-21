@@ -214,6 +214,7 @@ def run_sync_job(
                 alignment_request_cls=AlignmentRequest,
                 matching_fingerprint=_sync_matching_fingerprint,
                 sync_summary=_sync_summary,
+                word_index_path=_word_index_path,
             ),
             sources,
             indexes,

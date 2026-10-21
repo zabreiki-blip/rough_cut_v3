@@ -1446,6 +1446,38 @@ def test_forced_rematch_replaces_a_stale_confirmed_match(sync_api) -> None:
     assert updated.metadata.get("manual_updated_at") != "2000-01-01T00:00:00+00:00"
 
 
+def test_patch_clears_retime_review_flag(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+    store = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json")
+    store.save(
+        api.SyncMatch(
+            segment_id="stable-sync-uid",
+            query_text="маленькая женщина покоряла великих людей",
+            source_id="vasilieva_01",
+            source_in_sec=9.0,
+            source_out_sec=13.0,
+            status="confirmed",
+            metadata={
+                "normalization_revision": 7,
+                "retime_pending_review": True,
+                "retime_review_for": "fp",
+            },
+        )
+    )
+
+    patched = client.patch(
+        "/stage2/sync-matches/stable-sync-uid",
+        json={"project": "demo", "status": "confirmed", "source_in_sec": 9.5},
+    )
+
+    assert patched.status_code == 200, patched.get_json()
+    metadata = store.get("stable-sync-uid").metadata
+    assert "retime_pending_review" not in metadata and "retime_review_for" not in metadata
+
+
 def test_forced_rematch_still_defers_to_a_concurrent_manual_edit(sync_api) -> None:
     client, projects = sync_api
     _write_confirmed_normalization(projects)

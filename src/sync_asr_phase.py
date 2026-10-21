@@ -13,6 +13,7 @@ from api_final_review_jobs import canonical_decimal_string
 from cost_budget import CostBudget, CostBudgetExceeded
 from job_runtime import asr_slot
 from stage2 import index_retiming, local_hole_repair
+from stage2.match_retiming import retime_map_path
 from stage2.cached_index_repair import has_unrecovered_holes, repair_cached_index_holes
 from stage2.cloud_asr import plan_cloud_chunks
 from stage2.whisper_runner import is_no_words_error, resolve_backend
@@ -253,6 +254,7 @@ def _retime_cloud_index(
             now_iso=ctx.utc_now_iso,
             transcribe=transcribe_whole,
             attempt_file=index_retiming.attempt_path(index_path, source.id),
+            retime_map_file=retime_map_path(index_path, source.id),
             index_identity=identity,
             slot=asr_wait,
             settings=settings,

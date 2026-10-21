@@ -23,6 +23,9 @@ faster-whisper (word_timestamps, VAD), и его время переноситс
   не меняются (чужой текст, другой язык, тишина дали бы горстку ложных якорей);
 - `timestamp_precision` становится `retimed` (исходное значение сохраняется в
   `backend_metadata.timestamp_precision_original`), только если слова менялись;
+- карта «старое -> новое время» слов пишется рядом (`<source_id>.retime_map.json`, см.
+  `match_retiming`) тоже вне индекса: по ней фаза сопоставления переносит границы
+  подтверждённых матчей;
 - отмена: индекс не меняется. Любая неудача (rejected / no_words / stopped /
   failed) пишет маркер попытки в ОТДЕЛЬНЫЙ файл `<source_id>.retime_attempt.json`,
   а не в индекс: индекс (а с ним `_sync_matching_fingerprint`, который хэширует
@@ -49,6 +52,7 @@ from typing import Any, Callable, ContextManager
 from atomic_io import atomic_write_json
 
 from . import local_hole_repair
+from .match_retiming import RetimeMap, save_retime_map
 from .cached_index_repair import (
     _merge,
     _ranges,
@@ -438,6 +442,7 @@ def retime_cached_index(
     now_iso: Callable[[], str],
     transcribe: Callable[..., list[dict[str, Any]]],
     attempt_file: Path | None = None,
+    retime_map_file: Path | None = None,
     index_identity: str = "",
     slot: Callable[[], ContextManager[Any]] | None = None,
     settings: RetimeSettings | None = None,
@@ -455,7 +460,9 @@ def retime_cached_index(
     распознавания (контекст-менеджер) берётся только вокруг `transcribe`.
     Исключения из `passthrough` (отмена) пробрасываются, остальные дают статус
     `failed`. При любом статусе кроме retimed (и дозаполнения дыр) индекс не меняется;
-    итог неудачной попытки пишется в `attempt_file` (не в индекс).
+    итог неудачной попытки пишется в `attempt_file` (не в индекс). При успехе соответствие
+    «старое -> новое время слов» пишется в `retime_map_file` (не в индекс, см. шапку
+    модуля): по нему пересчитываются границы подтверждённых матчей.
     """
     metadata = index.metadata
     backend_metadata = metadata.get("backend_metadata")
@@ -626,6 +633,13 @@ def retime_cached_index(
             }
         )
         new_backend_metadata["coverage"] = new_coverage
+    if retime_map_file is not None:
+        save_retime_map(
+            retime_map_file,
+            RetimeMap.from_words(
+                movable, new_movable, fingerprint=fingerprint, retimed_at=marker["retimed_at"]
+            ),
+        )
     index.words = new_movable
     index.metadata["backend_metadata"] = new_backend_metadata
     index.metadata["timestamp_precision"] = PRECISION

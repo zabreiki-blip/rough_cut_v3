@@ -709,6 +709,9 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
                 metadata["manual_updated_at"] = services._utc_now_iso()
+                # The user has looked at the match: the "check boundaries after retime" flag is done.
+                for key in ("retime_pending_review", "retime_review_for", "retime_review_at"):
+                    metadata.pop(key, None)
                 merged["metadata"] = metadata
                 source_id = str(merged.get("source_id") or "")
                 if source_id and source_id not in source_ids:

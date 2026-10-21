@@ -630,9 +630,7 @@ def _fallback_match(
     )
 
 
-def _run_offset_phase(
-    h: _Harness, offsets: dict[str, float], **overrides: Any
-) -> SyncMatchResult:
+def _run_offset_phase(h: _Harness, offsets: dict[str, float], **overrides: Any) -> SyncMatchResult:
     from stage2.sync_models import SyncSource
 
     h.segment_ids = list(offsets)
@@ -889,3 +887,168 @@ def test_offset_cluster_demotion_survives_checkpoint_merge() -> None:
     assert {m.status for m in result.matches} == {"needs_review"}
     assert {m.status for m in h.store.items} == {"needs_review"}
     assert all("promoted_by" not in m.metadata for m in h.store.items)
+
+
+# -- перенос границ подтверждённых матчей после перерасчёта времени слов индекса --
+
+from pathlib import Path  # noqa: E402
+
+from stage2.match_retiming import RetimeMap, retime_map_path, save_retime_map  # noqa: E402
+from stage2.sync_models import SyncMatch, WordTimestamp  # noqa: E402
+
+_RT_FP = "small|v2|x"
+_RT_AT = "2026-03-01T12:00:00+00:00"
+
+
+def _rt_confirmed(
+    segment_id: str = "a",
+    *,
+    manual: str | None = "2025-12-01T00:00:00+00:00",
+    source_in: float = 8.0,
+    source_out: float = 14.0,
+) -> SyncMatch:
+    metadata: dict[str, Any] = {
+        "normalization_revision": 3,
+        "matching_fingerprint": "old",
+        "speech_in_sec": 10.0,
+        "speech_out_sec": 12.5,
+        "head_padding_sec": 2.0,
+        "tail_padding_sec": 1.5,
+    }
+    if manual:
+        metadata["manual_updated_at"] = manual
+    return SyncMatch(
+        segment_id=segment_id,
+        query_text="q",
+        source_id="s",
+        source_in_sec=source_in,
+        source_out_sec=source_out,
+        status="confirmed",
+        metadata=metadata,
+    )
+
+
+class _RetimeSetup:
+    def __init__(self, tmp_path: Path, *, with_map: bool = True, marker_at: str = _RT_AT) -> None:
+        self.tmp_path = tmp_path
+        if with_map:
+            old = [WordTimestamp(f"w{i}", float(i), i + 0.5) for i in range(30)]
+            new = [WordTimestamp(w.word, w.start + 5.0, w.end + 5.0) for w in old]
+            save_retime_map(
+                retime_map_path(tmp_path / "s.words.json", "s"),
+                RetimeMap.from_words(old, new, fingerprint=_RT_FP, retimed_at=_RT_AT),
+            )
+        marker = {"fingerprint": _RT_FP, "retimed_at": marker_at}
+        self.index = SimpleNamespace(
+            source_id="s", metadata={"backend_metadata": {"retiming": marker}}
+        )
+        self.source = SimpleNamespace(
+            id="s", speaker_names=[], guide_offset_sec=0.0, duration_sec=0.0
+        )
+
+    def run(self, h: _Harness, **overrides: Any) -> SyncMatchResult:
+        return run_match_phase(
+            h.context(
+                word_index_path=lambda _paths, sid: self.tmp_path / f"{sid}.words.json",
+                **overrides,
+            ),
+            [self.source],
+            [self.index],
+            cost_tracker=h.tracker,  # type: ignore[arg-type]
+            checkpoint=h.checkpoint,
+        )
+
+
+def test_confirmed_match_of_retimed_source_is_shifted_and_persisted(tmp_path: Path) -> None:
+    h = _Harness(["a"])
+    h.store.items = [_rt_confirmed()]
+
+    result = _RetimeSetup(tmp_path).run(h)
+
+    saved = h.store.items[0]
+    assert h.matched == []  # подтверждённый матч не сопоставляется заново
+    assert saved.status == "confirmed"
+    assert (saved.source_in_sec, saved.source_out_sec) == (13.0, 19.0)
+    assert saved.metadata["retimed_from"]["source_in_sec"] == 8.0
+    assert saved.metadata["retimed_from"]["fingerprint"] == _RT_FP
+    assert result.matches == [saved]
+    fields = {k: v for _a, kw in h.updates for k, v in kw.items()}
+    assert fields["retime_retimed_matches"] == 1
+
+
+def test_manual_boundary_edit_is_kept_and_flagged_for_review(tmp_path: Path) -> None:
+    h = _Harness(["a"])
+    h.store.items = [_rt_confirmed(source_in=8.5)]
+
+    _RetimeSetup(tmp_path).run(h)
+
+    saved = h.store.items[0]
+    assert (saved.source_in_sec, saved.source_out_sec) == (8.5, 14.0)
+    assert saved.status == "confirmed" and saved.metadata["retime_pending_review"] is True
+    fields = {k: v for _a, kw in h.updates for k, v in kw.items()}
+    assert fields["retime_review_segment_ids"] == ["a"]
+
+
+def test_second_run_does_not_retime_again(tmp_path: Path) -> None:
+    h = _Harness(["a"])
+    h.store.items = [_rt_confirmed()]
+    setup = _RetimeSetup(tmp_path)
+    setup.run(h)
+    after_first = _match_signature(h.store.items[0])
+    writes = len(h.store.replaced)
+
+    setup.run(h)
+
+    assert _match_signature(h.store.items[0]) == after_first
+    assert h.store.items[0].source_in_sec == 13.0
+    assert len(h.store.replaced) == writes  # ничего не менялось -> checkpoint без записи
+
+
+def test_confirmed_match_of_not_retimed_source_is_untouched(tmp_path: Path) -> None:
+    h = _Harness(["a"])
+    h.store.items = [_rt_confirmed()]
+
+    _RetimeSetup(tmp_path, with_map=False).run(h)
+
+    assert h.store.items[0].source_in_sec == 8.0 and "retimed_from" not in h.store.items[0].metadata
+
+
+def test_stale_map_of_another_retime_is_ignored(tmp_path: Path) -> None:
+    h = _Harness(["a"])
+    h.store.items = [_rt_confirmed()]
+
+    _RetimeSetup(tmp_path, marker_at="2026-03-05T00:00:00+00:00").run(h)
+
+    assert h.store.items[0].source_in_sec == 8.0 and "retimed_from" not in h.store.items[0].metadata
+
+
+def test_match_confirmed_after_retime_is_untouched(tmp_path: Path) -> None:
+    h = _Harness(["a"])
+    h.store.items = [_rt_confirmed(manual="2026-03-02T00:00:00+00:00")]
+
+    _RetimeSetup(tmp_path).run(h)
+
+    saved = h.store.items[0]
+    assert saved.source_in_sec == 8.0
+    assert "retimed_from" not in saved.metadata and "retime_pending_review" not in saved.metadata
+
+
+def test_manual_edit_during_run_is_not_overwritten_by_retime(tmp_path: Path) -> None:
+    h = _Harness(["a", "b"])
+    h.store.items = [_rt_confirmed()]
+    original = h._match_segment
+    edited = _rt_confirmed(manual="2026-01-01T00:00:05+00:00", source_in=30.0, source_out=34.0)
+
+    def match_and_edit(request: Any) -> Any:
+        fresh = original(request)
+        h.store.items = [edited]  # пользователь правит границы через PATCH во время запуска
+        return fresh
+
+    h._match_segment = match_and_edit  # type: ignore[method-assign]
+
+    _RetimeSetup(tmp_path).run(h)
+
+    saved = {item.segment_id: item for item in h.store.items}["a"]
+    assert saved is edited
+    assert (saved.source_in_sec, saved.source_out_sec) == (30.0, 34.0)
+    assert "retimed_from" not in saved.metadata
