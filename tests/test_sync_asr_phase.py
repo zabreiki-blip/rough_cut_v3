@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -421,3 +422,364 @@ def test_mapping_3_index_is_retranscribed_only_with_unrecovered_holes(
     result = h.run([_source("a")], transcription_config=config)
 
     assert result.transcribed == transcribed
+
+
+# ---------------------------------------------------------------------------
+# Локальный ремонт дыр закэшированного облачного индекса
+# ---------------------------------------------------------------------------
+
+from stage2 import local_hole_repair  # noqa: E402
+from stage2.sync_models import WordIndex, WordTimestamp  # noqa: E402
+from stage2.sync_transcript import load_word_index as real_load  # noqa: E402
+from stage2.sync_transcript import save_word_index as real_save  # noqa: E402
+
+
+def _holey_index(source_id: str, holes: list[list[float]] | None = None) -> WordIndex:
+    holes = [[40.0, 60.0]] if holes is None else holes
+    words = [
+        WordTimestamp(f"c{i}", float(i), float(i) + 0.5)
+        for i in range(120)
+        if not any(a <= i < b for a, b in holes)
+    ]
+    return WordIndex(
+        source_id,
+        words,
+        metadata={
+            "backend": "cloud-audio",
+            "timestamp_precision": "interpolated",
+            _CACHE_KEY: {
+                "audio": {"sample_sha256": "x"},
+                "origin": "generated",
+                "config": {"backend": "cloud-audio"},
+            },
+            "backend_metadata": {
+                "coverage": {
+                    "holes_detected": len(holes),
+                    "holes_repaired": 0,
+                    "unrecovered_sec": sum(b - a for a, b in holes),
+                    "unrecovered_ranges": holes,
+                    "words_per_minute": 100.0,
+                },
+                "timestamp_precision": "interpolated",
+            },
+        },
+    )
+
+
+class _RepairHarness:
+    """Кэш-хит облачного индекса с дырами: реальные WordIndex/сохранение на
+    диск, моки только ffmpeg-нарезки, VAD и транскрайбера (процесс-воркера)."""
+
+    def __init__(self, h: _Harness, monkeypatch: pytest.MonkeyPatch, speech: float = 20.0):
+        self.h = h
+        self.engine_calls: list[dict[str, Any]] = []
+        self.clips: list[tuple[float, float]] = []
+        self.words_by_clip_start: dict[float, list[tuple[str, float, float]]] = {}
+        self.error: Exception | None = None
+        self.saves = 0
+        monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "1")
+
+        class Clip:
+            path = Path("clip.wav")
+            samples = None
+
+            def cleanup(self) -> None:
+                pass
+
+        def load_clip(_p, start, end, **_k):
+            self.clips.append((start, end))
+            return Clip()
+
+        monkeypatch.setattr(local_hole_repair, "_load_clip", load_clip)
+        monkeypatch.setattr(local_hole_repair, "_speech_seconds", lambda *_a: speech)
+
+    def transcribe(self, audio_path: Path, **kwargs: Any) -> dict[str, Any]:
+        self.engine_calls.append({"audio": audio_path, **kwargs})
+        if self.error is not None:
+            raise self.error
+        start = self.clips[-1][0]
+        words = self.words_by_clip_start.get(start, [])
+        return {"words": [{"word": w, "start": s - start, "end": e - start} for w, s, e in words]}
+
+    def save(self, path: Path, index: Any) -> None:
+        self.saves += 1
+        real_save(path, index)
+
+    def snapshot(self, index: WordIndex) -> dict[str, Any]:
+        """Индекс так, как его прочитает фаза (после записи на диск)."""
+        path = self.h.tmp_path / f"{index.source_id}.index.json"
+        real_save(path, index)
+        return copy.deepcopy(real_load(path, index.source_id).to_dict())
+
+    def run(self, index: WordIndex, **overrides: Any) -> SyncAsrResult:
+        path = self.h.tmp_path / f"{index.source_id}.index.json"
+        real_save(path, index)
+        self.saves = 0
+        values: dict[str, Any] = {
+            "transcribe_audio": self.transcribe,
+            "save_word_index": self.save,
+            "load_word_index": lambda p, sid: real_load(p, sid),
+        }
+        values.update(overrides)
+        self.h.cached[index.source_id] = index
+        source = _source(index.source_id)
+        source.duration_sec = 120.0
+        return self.h.run([source], **values)
+
+
+def _local(start: float, count: int, prefix: str = "l") -> list[tuple[str, float, float]]:
+    return [(f"{prefix}{i}", start + i, start + i + 0.5) for i in range(count)]
+
+
+@pytest.fixture
+def repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepairHarness:
+    return _RepairHarness(_Harness(tmp_path, ["a"]), monkeypatch)
+
+
+def test_cached_cloud_index_with_holes_is_repaired_and_saved(
+    repair: _RepairHarness, tmp_path: Path
+) -> None:
+    repair.words_by_clip_start[37.0] = _local(40.5, 15)
+    usage: list[dict[str, Any]] = []
+
+    result = repair.run(_holey_index("a"), asr_usage_callback=usage.append)
+
+    assert (result.reused, result.transcribed, result.source_failures) == (1, 0, [])
+    assert usage == []  # без облачных затрат
+    call = repair.engine_calls[0]
+    assert call["backend"] == "faster-whisper" and call["model"] == "medium"
+    assert call["audio"] == Path("clip.wav") and call["language"] == "ru"
+    assert call["cancel_event"] is repair.h.cancel_event
+    index = result.indexes[0]
+    assert [w.word for w in index.words if 40 <= w.start < 60] == [f"l{i}" for i in range(15)]
+    cov = index.metadata["backend_metadata"]["coverage"]
+    assert cov["unrecovered_ranges"] == [] and cov["local_repaired_ranges"] == [[40.0, 60.0]]
+    assert cov["local_repair"]["source"] == "cached-index"
+    assert cov["local_repair"]["repaired_at"] == "2026-01-01T00:00:00+00:00"
+    saved = real_load(tmp_path / "a.index.json", "a")
+    assert saved.to_dict() == index.to_dict()
+    assert repair.saves == 1
+    messages = [kw["message"] for _a, kw in repair.h.updates if "message" in kw]
+    assert any("Локальный ремонт пропусков" in m and "дыра 1 из 1" in m for m in messages)
+
+
+def test_second_run_with_same_settings_does_not_repair_again(repair: _RepairHarness) -> None:
+    repair.words_by_clip_start[37.0] = _local(40.5, 15)
+    first = repair.run(_holey_index("a"))
+    calls = len(repair.engine_calls)
+    assert calls == 1
+
+    second = repair.run(real_load(repair.h.tmp_path / "a.index.json", "a"))
+
+    assert len(repair.engine_calls) == calls and repair.saves == 0
+    assert second.indexes[0].to_dict() == first.indexes[0].to_dict()
+
+
+def test_model_change_repairs_only_remaining_holes(
+    repair: _RepairHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index = _holey_index("a", [[40.0, 60.0], [80.0, 100.0]])
+    repair.words_by_clip_start[37.0] = _local(40.5, 15)
+    repair.words_by_clip_start[77.0] = []
+    first = repair.run(index)
+    assert first.indexes[0].metadata["backend_metadata"]["coverage"]["unrecovered_ranges"] == [
+        [80.0, 100.0]
+    ]
+    repair.clips.clear()
+
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL", "small")
+    repair.words_by_clip_start[77.0] = _local(81.0, 14, "s")
+    second = repair.run(real_load(repair.h.tmp_path / "a.index.json", "a"))
+
+    assert repair.clips == [(77.0, 103.0)]
+    assert repair.engine_calls[-1]["model"] == "small"
+    cov = second.indexes[0].metadata["backend_metadata"]["coverage"]
+    assert cov["unrecovered_ranges"] == [] and cov["local_repair"]["model"] == "small"
+
+
+def test_silent_hole_goes_to_silent_ranges_and_is_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repair = _RepairHarness(_Harness(tmp_path, ["a"]), monkeypatch, speech=0.1)
+    result = repair.run(_holey_index("a"))
+    cov = result.indexes[0].metadata["backend_metadata"]["coverage"]
+    assert cov["silent_ranges"] == [[40.0, 60.0]] and cov["unrecovered_ranges"] == []
+    assert repair.engine_calls == [] and repair.saves == 1
+
+
+def test_engine_error_keeps_index_and_does_not_fail_the_phase(repair: _RepairHarness) -> None:
+    index = _holey_index("a")
+    before = repair.snapshot(index)
+    repair.error = RuntimeError("model load failed")
+
+    result = repair.run(index)
+
+    assert result.source_failures == [] and result.reused == 1
+    assert result.indexes[0].to_dict() == before and repair.saves == 0
+    assert any("model load failed" in w["warning"] for w in result.source_warnings)
+
+
+def test_disabled_repair_reuses_index_as_before(
+    repair: _RepairHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "0")
+    index = _holey_index("a")
+    before = repair.snapshot(index)
+    result = repair.run(index)
+    assert result.reused == 1 and result.source_warnings == []
+    assert result.indexes[0].to_dict() == before
+    assert repair.engine_calls == [] and repair.saves == 0
+
+
+def test_missing_audio_skips_repair_with_reason(repair: _RepairHarness) -> None:
+    index = _holey_index("a")
+    before = repair.snapshot(index)
+    (repair.h.tmp_path / "a.wav").unlink()
+
+    result = repair.run(index)
+
+    assert result.reused == 1 and result.source_failures == []
+    assert result.indexes[0].to_dict() == before and repair.engine_calls == []
+    assert any("аудио" in w["warning"] for w in result.source_warnings)
+
+
+def test_cancel_during_local_repair_raises_job_cancelled(repair: _RepairHarness) -> None:
+    def transcribe(audio_path: Path, **kwargs: Any) -> dict[str, Any]:
+        repair.h.cancel_event.set()
+        raise _WhisperCancelled("cancelled")
+
+    index = _holey_index("a")
+    with pytest.raises(_Cancelled):
+        repair.run(index, transcribe_audio=transcribe)
+    assert repair.saves == 0
+
+
+def test_manual_or_non_cloud_index_is_not_repaired(repair: _RepairHarness) -> None:
+    manual = _holey_index("a")
+    manual.metadata[_CACHE_KEY]["origin"] = "manual"
+    result = repair.run(manual)
+    assert result.reused == 1 and repair.engine_calls == [] and repair.saves == 0
+
+
+def real_load_roundtrip(repair: _RepairHarness, index: WordIndex) -> WordIndex:
+    repair.snapshot(index)
+    return real_load(repair.h.tmp_path / f"{index.source_id}.index.json", index.source_id)
+
+
+def test_repair_changes_matching_fingerprint(repair: _RepairHarness) -> None:
+    from api import _sync_matching_fingerprint
+
+    def fingerprint(index: WordIndex) -> str:
+        return _sync_matching_fingerprint(
+            units=[{"segment_id": "s1", "text": "q"}],
+            sources=[],
+            indexes=[index],
+            normalization_revision=1,
+            timecode_mode="relative",
+            search_window_sec=180.0,
+            llm_enabled=False,
+            llm_model="",
+            llm_threshold=0.0,
+            llm_limit=0,
+        )
+
+    repair.words_by_clip_start[37.0] = _local(40.5, 15)
+    index = _holey_index("a")
+    before = fingerprint(real_load_roundtrip(repair, index))
+
+    result = repair.run(index)
+
+    # индекс в памяти фазы — обновлённый, именно он уходит в сопоставление
+    assert fingerprint(result.indexes[0]) != before
+    saved = real_load(repair.h.tmp_path / "a.index.json", "a")
+    assert fingerprint(saved) == fingerprint(result.indexes[0])
+
+
+def test_unchanged_repair_saves_complete_marker_and_is_not_repeated(
+    repair: _RepairHarness,
+) -> None:
+    index = _holey_index("a")  # движок вернёт [] -> новых слов нет
+    first = repair.run(index)
+    cov = first.indexes[0].metadata["backend_metadata"]["coverage"]
+    assert cov["local_repair"]["complete"] is True and repair.saves == 1
+    assert len(repair.engine_calls) == 1
+    second = repair.run(first.indexes[0])
+    assert len(repair.engine_calls) == 1 and repair.saves == 0
+    assert second.reused == 1
+
+
+def test_whisper_no_words_error_is_empty_result_not_engine_failure(
+    repair: _RepairHarness,
+) -> None:
+    from stage2.whisper_runner import WhisperTranscriptionError
+
+    repair.error = WhisperTranscriptionError(
+        "faster-whisper returned no usable word timestamps for clip.wav"
+    )
+    result = repair.run(_holey_index("a"))
+    cov = result.indexes[0].metadata["backend_metadata"]["coverage"]
+    assert cov["local_repair"]["complete"] is True and repair.saves == 1
+    assert not any("не выполнен" in w["warning"] for w in result.source_warnings)
+
+
+def test_worker_relayed_no_words_error_is_empty_result(repair: _RepairHarness) -> None:
+    from stage2.whisper_process import WhisperProcessError
+
+    repair.error = WhisperProcessError(
+        "WhisperTranscriptionError: faster-whisper returned no usable word timestamps for c.wav"
+    )
+    result = repair.run(_holey_index("a"))
+    cov = result.indexes[0].metadata["backend_metadata"]["coverage"]
+    assert cov["local_repair"]["complete"] is True and repair.saves == 1
+
+
+def test_other_whisper_transcription_error_is_still_engine_failure(
+    repair: _RepairHarness,
+) -> None:
+    from stage2.whisper_runner import WhisperTranscriptionError
+
+    repair.error = WhisperTranscriptionError("Облачное распознавание речи не удалось: x")
+    result = repair.run(_holey_index("a"))
+    assert repair.saves == 0
+    assert "local_repair" not in result.indexes[0].metadata["backend_metadata"]["coverage"]
+
+
+def test_legacy_index_with_holes_gets_one_warning(repair: _RepairHarness) -> None:
+    index = _holey_index("a")
+    index.metadata[_CACHE_KEY]["origin"] = "legacy"
+    result = repair.run(index)
+    legacy = [w for w in result.source_warnings if "legacy" in w["warning"]]
+    assert len(legacy) == 1 and "перезапустите распознавание" in legacy[0]["warning"]
+    assert repair.engine_calls == [] and repair.saves == 0
+
+
+def test_manual_index_with_holes_gets_no_legacy_warning(repair: _RepairHarness) -> None:
+    index = _holey_index("a")
+    index.metadata[_CACHE_KEY]["origin"] = "manual"
+    result = repair.run(index)
+    assert not any("legacy" in w["warning"] for w in result.source_warnings)
+
+
+def test_remaining_holes_after_repair_give_coverage_warning(repair: _RepairHarness) -> None:
+    repair.words_by_clip_start[37.0] = _local(40.5, 15)
+    index = _holey_index("a", [[40.0, 60.0], [80.0, 100.0]])  # вторая дыра не поддастся
+    result = repair.run(index)
+    warnings = [w["warning"] for w in result.source_warnings]
+    assert any("не распознано" in w and "80–100" in w for w in warnings)
+
+
+def test_fully_repaired_index_gives_no_coverage_warning(repair: _RepairHarness) -> None:
+    repair.words_by_clip_start[37.0] = _local(40.5, 15)
+    result = repair.run(_holey_index("a"))
+    assert result.source_warnings == []
+
+
+def test_unavailable_engine_gives_warning_with_reason(
+    repair: _RepairHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        local_hole_repair, "unavailable_reason", lambda _s: "faster-whisper не установлен"
+    )
+    result = repair.run(_holey_index("a"))
+    assert any("faster-whisper не установлен" in w["warning"] for w in result.source_warnings)
+    assert repair.engine_calls == [] and repair.saves == 0

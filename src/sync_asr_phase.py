@@ -10,8 +10,10 @@ from typing import Any
 from api_final_review_jobs import canonical_decimal_string
 from cost_budget import CostBudget, CostBudgetExceeded
 from job_runtime import asr_slot
+from stage2 import local_hole_repair
+from stage2.cached_index_repair import has_unrecovered_holes, repair_cached_index_holes
 from stage2.cloud_asr import plan_cloud_chunks
-from stage2.whisper_runner import resolve_backend
+from stage2.whisper_runner import is_no_words_error, resolve_backend
 from sync_cost_tracker import ProgressPersistGate, SyncCostTracker, _AsrMetrics
 
 
@@ -130,6 +132,158 @@ def _cloud_index_is_outdated(cache: Any, current_mapping: Any, coverage: Any = N
         except (TypeError, ValueError):
             return True
     return True
+
+
+# Statuses that explain a skipped repair to the user; "disabled" stays silent.
+_REPAIR_WARNING_STATUSES = frozenset({"failed", "unavailable", "no_audio", "scale_repaired"})
+
+
+def _source_label(source: Any) -> str:
+    for name in ("premiere_sequence", "speaker"):
+        value = str(getattr(source, name, "") or "").strip()
+        if value:
+            return value
+    return str(source.id)
+
+
+def _repair_cached_index_holes(
+    ctx: SyncAsrContext,
+    source: Any,
+    index: Any,
+    index_path: Path,
+    audio_path: Path | None,
+) -> list[dict[str, str]]:
+    """Locally repair coverage holes of a reused cloud index and save it.
+
+    Costs nothing in the cloud and never fails the phase: any problem leaves
+    the index as it was and is returned as per-source warnings. The index is
+    updated in place, so matching in this very run sees the repaired words.
+    Only ``origin == "generated"`` indexes are repaired: manual corrections
+    must never be rewritten, and a legacy index (migrated without knowing
+    whether it was edited by hand) is skipped with an explanatory warning.
+    Holes that remain afterwards get the same coverage warning as a fresh
+    transcription. Cancellation raises ``ctx.job_cancelled_error``.
+    """
+    if not has_unrecovered_holes(index):
+        return []
+    cache = index.metadata.get(ctx.transcription_cache_key)
+    origin = cache.get("origin") if isinstance(cache, dict) else "legacy"
+    if origin != "generated":
+        if origin == "legacy" and local_hole_repair.LocalRepairSettings.from_env().enabled:
+            return [
+                {
+                    "source_id": source.id,
+                    "warning": (
+                        f"Локальный ремонт пропусков в источнике {source.id} пропущен: "
+                        "индекс legacy, перезапустите распознавание источника"
+                    ),
+                }
+            ]
+        return []
+    label = _source_label(source)
+    cancel_event = ctx.cancel_event
+
+    def on_progress(progress: Any) -> None:
+        ctx.update_job(
+            ctx.job_id,
+            persist=ctx.should_persist_progress(),
+            message=(
+                f"Локальный ремонт пропусков: {label}, дыра {progress.done + 1} из {progress.total}"
+            ),
+        )
+
+    def transcribe_clip(
+        clip_path: Path, model: str, language: str, progress_callback: Any = None
+    ) -> list[dict[str, Any]]:
+        # The same killable Whisper worker process the rest of the app uses:
+        # cancellation terminates it instead of waiting for a thread.
+        result = ctx.transcribe_audio(
+            clip_path,
+            backend="faster-whisper",
+            model=model,
+            language=language,
+            cancel_event=cancel_event,
+            timeout_seconds=(ctx.app_config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
+        )
+        return list(result.get("words") or [])
+
+    def transcribe_clip_safe(
+        clip_path: Path, model: str, language: str, progress_callback: Any = None
+    ) -> list[dict[str, Any]]:
+        try:
+            return transcribe_clip(clip_path, model, language, progress_callback)
+        except Exception as exc:
+            # Whisper found no speech in the clip after VAD: an empty result
+            # (the hole stays), not an engine failure to be retried every run.
+            if is_no_words_error(exc):
+                return []
+            raise
+
+    previous_words = list(index.words)
+    previous_backend_metadata = index.metadata.get("backend_metadata")
+    try:
+        with asr_slot(
+            ctx.asr_semaphore,
+            check_stop=ctx.ensure_not_cancelled,
+            on_wait=lambda: ctx.update_job(
+                ctx.job_id, message="Waiting for an ASR slot", asr_waiting=True
+            ),
+            on_acquired=lambda: ctx.update_job(
+                ctx.job_id, message=f"Локальный ремонт пропусков: {label}", asr_waiting=False
+            ),
+        ):
+            result = repair_cached_index_holes(
+                index,
+                audio_path,
+                language=ctx.language,
+                now_iso=ctx.utc_now_iso,
+                transcribe=transcribe_clip_safe,
+                cancel=cancel_event,
+                on_progress=on_progress,
+                duration_sec=float(getattr(source, "duration_sec", 0.0) or 0.0),
+            )
+        if result.status == "cancelled":
+            raise ctx.job_cancelled_error("Sync job cancelled")
+        if result.changed:
+            try:
+                ctx.save_word_index(index_path, index)
+            except Exception:
+                index.words = previous_words
+                index.metadata["backend_metadata"] = previous_backend_metadata
+                raise
+    except ctx.job_cancelled_error:
+        raise
+    except ctx.whisper_cancelled_error as exc:
+        raise ctx.job_cancelled_error("Sync job cancelled") from exc
+    except Exception as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ctx.job_cancelled_error("Sync job cancelled") from exc
+        return [
+            {
+                "source_id": source.id,
+                "warning": (
+                    f"Локальный ремонт пропусков в источнике {source.id} не выполнен: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+        ]
+    warnings: list[dict[str, str]] = []
+    if result.status in _REPAIR_WARNING_STATUSES:
+        warnings.append(
+            {
+                "source_id": source.id,
+                "warning": (
+                    f"Локальный ремонт пропусков в источнике {source.id} пропущен: {result.reason}"
+                ),
+            }
+        )
+    if result.status != "disabled":
+        coverage_warning = _coverage_warning(
+            source.id, index.metadata.get("backend_metadata") or {}
+        )
+        if coverage_warning is not None:
+            warnings.append(coverage_warning)
+    return warnings
 
 
 def run_asr_phase(
@@ -338,6 +492,16 @@ def run_asr_phase(
                 # not invalidate a transcript for unchanged media.
                 index = cached_index
                 reused += 1
+                repair_warnings = _repair_cached_index_holes(
+                    ctx,
+                    source,
+                    index,
+                    index_path,
+                    audio_path if audio_is_available else None,
+                )
+                if repair_warnings:
+                    source_warnings.extend(repair_warnings)
+                    _update_sync_job(job_id, source_warnings=list(source_warnings))
             else:
                 if audio_path is None:
                     raise FileNotFoundError(f"audio guide not found for sync source {source.id}")

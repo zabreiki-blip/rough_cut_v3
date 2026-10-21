@@ -24,6 +24,25 @@ class WhisperTranscriptionError(RuntimeError):
     """Raised when a backend did not return usable word timestamps."""
 
 
+# Fragment of the message of the "backend returned no words" error below; lets
+# callers (local hole repair of a silent-after-VAD clip) tell it apart from real
+# engine failures without catching every WhisperTranscriptionError.
+NO_WORDS_ERROR_MARKER = "returned no usable word timestamps"
+
+
+def is_no_words_error(exc: BaseException) -> bool:
+    """True for the "no words" error, raised directly or relayed by the Whisper
+    worker process (`WhisperProcessError("WhisperTranscriptionError: ...")`)."""
+    text = str(exc)
+    if NO_WORDS_ERROR_MARKER not in text:
+        return False
+    if isinstance(exc, WhisperTranscriptionError):
+        return True
+    return type(exc).__name__ == "WhisperProcessError" and text.startswith(
+        "WhisperTranscriptionError:"
+    )
+
+
 # "cloud-audio" is a paid, network-backed backend (see ``cloud_asr.py``) and is
 # intentionally NOT part of the local-only auto-selection order below — it is
 # only ever chosen by an explicit ``backend="cloud-audio"``/env request (see
@@ -430,9 +449,7 @@ def transcribe_audio(
         words, backend_meta = _transcribe_openai(path, selected_model, language)
 
     if not words:
-        error = WhisperTranscriptionError(
-            f"{selected} returned no usable word timestamps for {path.name}"
-        )
+        error = WhisperTranscriptionError(f"{selected} {NO_WORDS_ERROR_MARKER} for {path.name}")
         error.cost_usd = backend_meta.get("cost_usd")  # type: ignore[attr-defined]
         error.reserved_cost_usd = backend_meta.get("reserved_cost_usd")  # type: ignore[attr-defined]
         error.cost_limit_usd = backend_meta.get("cost_limit_usd")  # type: ignore[attr-defined]

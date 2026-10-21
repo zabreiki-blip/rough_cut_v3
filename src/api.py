@@ -1086,8 +1086,10 @@ def _transcription_config(
         # stage2.local_hole_repair) is deliberately NOT part of this config or
         # of the mapping: toggling it must not trigger a paid cloud re-run of
         # every cached index. The repair result is stored in the index itself
-        # (coverage.local_repaired_ranges / silent_ranges); to apply changed
-        # repair settings to an existing index, re-transcribe it with force.
+        # (coverage.local_repaired_ranges / silent_ranges / local_repair).
+        # Cached indexes with leftover holes are repaired locally by the ASR
+        # phase (stage2.cached_index_repair) once per repair settings; no
+        # forced paid re-run is needed.
         "cloud_timestamp_mapping": cloud_timestamp_mapping,
     }
 

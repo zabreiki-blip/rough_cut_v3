@@ -124,6 +124,11 @@ def unavailable_reason(settings: LocalRepairSettings) -> str | None:
     return None
 
 
+# Текст ошибки «слов не больше, чем было» (не сбой движка); по нему отличают
+# такие записи в `report["errors"]` от настоящих ошибок распознавания.
+NO_NEW_WORDS_ERROR = "локальное распознавание не дало новых слов"
+
+
 class _Stop(BaseException):
     """Остановка по отмене/дедлайну изнутри колбэка прогресса движка.
 
@@ -138,8 +143,15 @@ class _Stop(BaseException):
 
 @dataclass
 class LocalRepairOutcome:
-    segments: list[AsrSegment]
-    own_end: list[bool]
+    segments: list[AsrSegment] = field(default_factory=list)
+    own_end: list[bool] = field(default_factory=list)
+    # Слова (абсолютное время) для word-level ремонта готового индекса
+    # (`repair_words_locally`); None — ремонт шёл по репликам.
+    words: list[dict[str, Any]] | None = None
+    # Дыры, где упал сам движок (загрузка модели, ffmpeg, транскрипция), в
+    # отличие от «слов не больше, чем было»: такие неудачи могут быть
+    # временными, и вызывающий не должен считать попытку завершённой.
+    engine_failures: int = 0
     repaired: list[tuple[float, float]] = field(default_factory=list)
     silent: list[tuple[float, float]] = field(default_factory=list)
     unrecovered: list[tuple[float, float]] = field(default_factory=list)
@@ -275,22 +287,22 @@ def _flat_tokens(words: list[dict[str, Any]]) -> list[str]:
     return [token for word in words for token in _tokens(word["word"])]
 
 
-def _trim_boundary_duplicates(
+def _trim_edge_duplicates(
     words: list[dict[str, Any]],
-    previous: AsrSegment | None,
-    following: AsrSegment | None,
+    previous_tokens: list[str],
+    following_tokens: list[str],
 ) -> list[dict[str, Any]]:
-    """Отбрасывает слова на краях, повторяющие соседние облачные реплики
-    (совпадение не короче `_DEDUP_MIN_WORDS` слов, берётся самое длинное)."""
-    if previous is not None:
-        tail = _tokens(previous.text)[-_DEDUP_WINDOW:]
+    """Отбрасывает слова на краях, повторяющие токены соседей (совпадение не
+    короче `_DEDUP_MIN_WORDS` слов, берётся самое длинное)."""
+    if previous_tokens:
+        tail = previous_tokens[-_DEDUP_WINDOW:]
         for k in range(min(len(words), _DEDUP_WINDOW), 0, -1):
             head = _flat_tokens(words[:k])
             if _DEDUP_MIN_WORDS <= len(head) <= len(tail) and tail[-len(head) :] == head:
                 words = words[k:]
                 break
-    if following is not None and words:
-        head_tokens = _tokens(following.text)[:_DEDUP_WINDOW]
+    if following_tokens and words:
+        head_tokens = following_tokens[:_DEDUP_WINDOW]
         for k in range(min(len(words), _DEDUP_WINDOW), 0, -1):
             tail = _flat_tokens(words[-k:])
             if (
@@ -300,6 +312,34 @@ def _trim_boundary_duplicates(
                 words = words[:-k]
                 break
     return words
+
+
+def _trim_boundary_duplicates(
+    words: list[dict[str, Any]],
+    previous: AsrSegment | None,
+    following: AsrSegment | None,
+) -> list[dict[str, Any]]:
+    """То же для соседних облачных реплик."""
+    return _trim_edge_duplicates(
+        words,
+        _tokens(previous.text) if previous is not None else [],
+        _tokens(following.text) if following is not None else [],
+    )
+
+
+def _localize_words(
+    raw_words: list[dict[str, Any]], hole: tuple[float, float], clip_start: float
+) -> list[dict[str, Any]]:
+    """Слова фрагмента в абсолютное время; остаются только попавшие в дыру
+    (по середине слова), по порядку времени."""
+    hole_start, hole_end = hole
+    shifted = [
+        {**w, "start": round(clip_start + w["start"], 3), "end": round(clip_start + w["end"], 3)}
+        for w in raw_words
+    ]
+    inside = [w for w in shifted if hole_start <= (w["start"] + w["end"]) / 2.0 < hole_end]
+    inside.sort(key=lambda w: (w["start"], w["end"]))
+    return inside
 
 
 def _build_segments(words: list[dict[str, Any]], speaker: str | None = None) -> list[AsrSegment]:
@@ -347,12 +387,7 @@ def _splice(
 ) -> tuple[list[AsrSegment], list[bool], int] | None:
     """Вклеивает слова в дыру; None — если слов не больше, чем было."""
     hole_start, hole_end = hole
-    shifted = [
-        {**w, "start": round(clip_start + w["start"], 3), "end": round(clip_start + w["end"], 3)}
-        for w in raw_words
-    ]
-    inside = [w for w in shifted if hole_start <= (w["start"] + w["end"]) / 2.0 < hole_end]
-    inside.sort(key=lambda w: (w["start"], w["end"]))
+    inside = _localize_words(raw_words, hole, clip_start)
     in_hole = [s for s in segments if hole_start - 0.01 <= s.start < hole_end]
     outside = [s for s in segments if s not in in_hole]
     previous = max(
@@ -376,11 +411,36 @@ def _splice(
     return [m[0] for m in merged], [m[1] for m in merged], len(inside)
 
 
-def repair_holes_locally(
+def _splice_words(
+    words: list[dict[str, Any]],
+    hole: tuple[float, float],
+    raw_words: list[dict[str, Any]],
+    clip_start: float,
+) -> tuple[list[dict[str, Any]], int] | None:
+    """Word-level аналог `_splice`: слова индекса, начинающиеся в дыре
+    (разреженные облачные), заменяются локальными, только если тех больше;
+    края дедуплицируются относительно соседних слов вне дыры."""
+    hole_start, hole_end = hole
+    inside = _localize_words(raw_words, hole, clip_start)
+    in_hole = [w for w in words if hole_start - 0.01 <= w["start"] < hole_end]
+    before = [w for w in words if w["start"] < hole_start - 0.01]
+    after = [w for w in words if w["start"] >= hole_end]
+    inside = _trim_edge_duplicates(
+        inside,
+        _flat_tokens(before[-_DEDUP_WINDOW:]),
+        _flat_tokens(after[:_DEDUP_WINDOW]),
+    )
+    if len(inside) <= len(in_hole):
+        return None
+    merged = sorted(before + inside + after, key=lambda w: (w["start"], w["end"]))
+    return merged, len(inside)
+
+
+def _repair_loop(
     audio_path: Path,
     holes: list[tuple[float, float]],
-    segments: list[AsrSegment],
-    own_end: list[bool],
+    outcome: LocalRepairOutcome,
+    apply: Callable[[tuple[float, float], list[dict[str, Any]], float], int | None],
     *,
     duration_sec: float,
     language: str,
@@ -390,18 +450,22 @@ def repair_holes_locally(
     on_progress: Callable[[AsrProgress], None] | None = None,
     ffmpeg: str = "ffmpeg",
     abort: threading.Event | None = None,
+    transcribe: Callable[..., list[dict[str, Any]]] | None = None,
 ) -> LocalRepairOutcome:
-    """Проверяет и чинит дыры локально (синхронно: вызывать из потока).
+    """Общий цикл по дырам: фрагмент -> VAD -> распознавание -> `apply`.
+
+    `apply(hole, слова фрагмента, начало фрагмента)` вклеивает результат в
+    состояние вызывающего (реплики или слова) и возвращает число добавленных
+    слов либо None, если локальных слов не больше, чем было. `transcribe` —
+    замена `_transcribe_clip` (например, процесс-воркер): вызывается как
+    `transcribe(clip_path, model, language, progress_callback=...)`.
 
     `abort` — сигнал «результат больше не нужен» (дедлайн вызывающего истёк,
     а поток прервать нельзя, например во время загрузки модели): как только
     он взведён, функция останавливается на ближайшей проверке (колбэк
-    прогресса движка, границы дыр) и больше не вызывает `on_progress`. Все
-    результаты накапливаются только в локальном `LocalRepairOutcome`, общих
-    структур поток не меняет.
+    прогресса движка, границы дыр) и больше не вызывает `on_progress`.
     """
     cleanup_stale_tempdirs()
-    outcome = LocalRepairOutcome(segments=list(segments), own_end=list(own_end))
     errors: list[dict[str, Any]] = []
     words_added = 0
     consecutive_failures = 0
@@ -464,7 +528,7 @@ def repair_holes_locally(
                     outcome.silent.append(hole)
                     consecutive_failures = 0
                     continue
-                raw_words = _transcribe_clip(
+                raw_words = (transcribe or _transcribe_clip)(
                     clip.path, settings.model, language, progress_callback=engine_progress
                 )
             except _Stop:
@@ -478,6 +542,7 @@ def repair_holes_locally(
                     exc_info=True,
                 )
                 consecutive_failures += 1
+                outcome.engine_failures += 1
                 fail(hole, f"{type(exc).__name__}: {exc}")
                 continue
             finally:
@@ -485,11 +550,10 @@ def repair_holes_locally(
                     clip.cleanup()
             consecutive_failures = 0
             check_stop()  # результат брошенного потока не нужен
-            spliced = _splice(outcome.segments, outcome.own_end, hole, list(raw_words), clip_start)
-            if spliced is None:
-                fail(hole, "локальное распознавание не дало новых слов")
+            added = apply(hole, list(raw_words), clip_start)
+            if added is None:
+                fail(hole, NO_NEW_WORDS_ERROR)
                 continue
-            outcome.segments, outcome.own_end, added = spliced
             words_added += added
             outcome.repaired.append(hole)
         except _Stop as stop:
@@ -508,3 +572,90 @@ def repair_holes_locally(
     if outcome.stopped:
         outcome.report["stopped"] = outcome.stopped
     return outcome
+
+
+def repair_holes_locally(
+    audio_path: Path,
+    holes: list[tuple[float, float]],
+    segments: list[AsrSegment],
+    own_end: list[bool],
+    *,
+    duration_sec: float,
+    language: str,
+    settings: LocalRepairSettings,
+    cancel: Any | None = None,
+    deadline_monotonic: float | None = None,
+    on_progress: Callable[[AsrProgress], None] | None = None,
+    ffmpeg: str = "ffmpeg",
+    abort: threading.Event | None = None,
+) -> LocalRepairOutcome:
+    """Проверяет и чинит дыры локально по репликам (синхронно: вызывать из
+    потока). Все результаты накапливаются только в локальном
+    `LocalRepairOutcome`, общих структур поток не меняет."""
+    outcome = LocalRepairOutcome(segments=list(segments), own_end=list(own_end))
+
+    def apply(hole: tuple[float, float], raw_words: list[dict[str, Any]], clip_start: float):
+        spliced = _splice(outcome.segments, outcome.own_end, hole, raw_words, clip_start)
+        if spliced is None:
+            return None
+        outcome.segments, outcome.own_end, added = spliced
+        return added
+
+    return _repair_loop(
+        audio_path,
+        holes,
+        outcome,
+        apply,
+        duration_sec=duration_sec,
+        language=language,
+        settings=settings,
+        cancel=cancel,
+        deadline_monotonic=deadline_monotonic,
+        on_progress=on_progress,
+        ffmpeg=ffmpeg,
+        abort=abort,
+    )
+
+
+def repair_words_locally(
+    audio_path: Path,
+    holes: list[tuple[float, float]],
+    words: list[dict[str, Any]],
+    *,
+    duration_sec: float,
+    language: str,
+    settings: LocalRepairSettings,
+    cancel: Any | None = None,
+    deadline_monotonic: float | None = None,
+    on_progress: Callable[[AsrProgress], None] | None = None,
+    ffmpeg: str = "ffmpeg",
+    transcribe: Callable[..., list[dict[str, Any]]] | None = None,
+) -> LocalRepairOutcome:
+    """Word-level ремонт дыр готового индекса (слова `{word, start, end[, ...]}`
+    в абсолютном времени вместо реплик). Исходный список не меняется; итог в
+    `outcome.words`. Логика цикла, VAD, дедупа и вклейки общая с
+    `repair_holes_locally`; `transcribe` позволяет направить распознавание в
+    процесс-воркер (отменяемый), а не в поток."""
+    outcome = LocalRepairOutcome(words=[dict(w) for w in words])
+
+    def apply(hole: tuple[float, float], raw_words: list[dict[str, Any]], clip_start: float):
+        spliced = _splice_words(outcome.words or [], hole, raw_words, clip_start)
+        if spliced is None:
+            return None
+        outcome.words, added = spliced
+        return added
+
+    return _repair_loop(
+        audio_path,
+        holes,
+        outcome,
+        apply,
+        duration_sec=duration_sec,
+        language=language,
+        settings=settings,
+        cancel=cancel,
+        deadline_monotonic=deadline_monotonic,
+        on_progress=on_progress,
+        ffmpeg=ffmpeg,
+        transcribe=transcribe,
+    )
