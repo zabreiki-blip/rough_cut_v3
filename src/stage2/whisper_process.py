@@ -374,6 +374,8 @@ def _worker_key(
         os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC", "").strip(),
         os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC", "").strip(),
         os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC", "").strip(),
+        # VAD-проверка дыр перед облачным повтором тоже выполняется в worker.
+        os.getenv("SYNC_CLOUD_ASR_HOLE_VAD", "").strip().lower(),
         start_method,
     )
 

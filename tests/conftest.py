@@ -34,3 +34,11 @@ def _no_local_hole_repair_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     настоящие ffmpeg/VAD/Whisper на аудио тестов. Тесты, которые его проверяют,
     включают его явно (SYNC_CLOUD_ASR_LOCAL_REPAIR=1) и мокают движок."""
     monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_hole_vad_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VAD-проверка дыр перед облачным повтором (SYNC_CLOUD_ASR_HOLE_VAD) по
+    умолчанию включена и запускала бы настоящие ffmpeg/VAD на аудио тестов.
+    Тесты, которые её проверяют, включают её явно и мокают VAD."""
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_VAD", "0")

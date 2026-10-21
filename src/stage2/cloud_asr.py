@@ -1217,6 +1217,8 @@ def _build_coverage_report(
     local_repaired: list[tuple[float, float]] | None = None,
     silent: list[tuple[float, float]] | None = None,
     local_repair: dict[str, Any] | None = None,
+    holes_skipped_silent: int = 0,
+    hole_vad: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Отчёт о покрытии: сколько дыр найдено/починено и что осталось.
 
@@ -1224,7 +1226,9 @@ def _build_coverage_report(
     соседней (перекрывающейся) части, из отчёта исключается. Интервалы,
     восстановленные локальным Whisper (`local_repaired_ranges`, а
     `holes_repaired_local` — их число) и признанные тишиной по VAD
-    (`silent_ranges`), в `unrecovered_*` не входят.
+    (`silent_ranges`), в `unrecovered_*` не входят. Дыры, признанные тишиной
+    VAD ещё до платного облачного повтора, входят в `silent_ranges`, их число
+    — `holes_skipped_silent` (в `holes_detected` они тоже учтены).
     """
     max_wpm = _env_float("SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True)
     ranges: list[list[float]] = []
@@ -1236,6 +1240,8 @@ def _build_coverage_report(
     return {
         "holes_detected": holes_detected,
         "holes_repaired": holes_repaired,
+        "holes_skipped_silent": holes_skipped_silent,
+        "hole_vad": hole_vad or {},
         "holes_repaired_local": len(local_repaired or []),
         "local_repaired_ranges": [[round(a, 3), round(b, 3)] for a, b in (local_repaired or [])],
         "silent_ranges": silent_ranges,
@@ -1743,6 +1749,97 @@ class CloudAudioAsrAdapter:
             return [m[0] for m in merged], [m[1] for m in merged], cost_total, raws, repaired, False
         return segments, own_end, cost_total, raws, False, False
 
+    async def _prefilter_holes_by_vad(
+        self,
+        audio_path: Path,
+        pending: list[tuple[tuple[float, float], float, float, str, dict[str, str]]],
+        *,
+        duration_sec: float,
+        cancel: asyncio.Event | None,
+        deadline_monotonic: float | None,
+        on_progress: Callable[[AsrProgress], None] | None,
+    ) -> tuple[
+        list[tuple[tuple[float, float], float, float, str, dict[str, str]]],
+        list[tuple[float, float]],
+        int,
+        dict[str, Any],
+    ]:
+        """VAD-проверка дыр до платного облачного повтора.
+
+        Возвращает (дыры для облака, тишина, число пропущенных как тишина,
+        отчёт). Тишина не уходит в облако и записывается в `silent_ranges`;
+        дыра с речью только на части сужается до неё (с полем). Любой сбой
+        проверки оставляет дыры как есть — повтор идёт как раньше.
+        """
+        reason: str | None
+        try:
+            reason = local_hole_repair.hole_vad_unavailable_reason()
+        except Exception as exc:  # проверка наличия движка не должна валить прогон
+            reason = f"{type(exc).__name__}: {exc}"
+        if reason is not None:
+            return pending, [], 0, {"enabled": False, "skipped_reason": reason}
+        if not pending:
+            return pending, [], 0, {"enabled": True, "checked": 0}
+        settings = local_hole_repair.LocalRepairSettings.from_env()
+        soft_deadline = deadline_monotonic
+        if deadline_monotonic is not None:
+            soft_deadline = deadline_monotonic - settings.deadline_reserve_sec
+        abort = threading.Event()
+        progress_sink = on_progress
+
+        def guarded_progress(progress: AsrProgress) -> None:
+            if progress_sink is not None and not abort.is_set():
+                progress_sink(progress)
+
+        future = _run_in_daemon_thread(
+            lambda: local_hole_repair.prefilter_holes(
+                audio_path,
+                [item[0] for item in pending],
+                duration_sec=duration_sec,
+                settings=settings,
+                cancel=cancel,
+                deadline_monotonic=soft_deadline,
+                on_progress=guarded_progress if on_progress is not None else None,
+                ffmpeg=self._ffmpeg,
+                abort=abort,
+            )
+        )
+        report: dict[str, Any] = {
+            "enabled": True,
+            "checked": len(pending),
+            "min_speech_sec": settings.min_speech_sec,
+        }
+        try:
+            timeout = None if soft_deadline is None else max(0.0, soft_deadline - time.monotonic())
+            done, _ = await asyncio.wait({future}, timeout=timeout)
+            if not done:
+                abort.set()
+                done, _ = await asyncio.wait({future}, timeout=2.0)
+        except BaseException:
+            abort.set()
+            raise
+        if not done:
+            abort.set()
+            report["stopped"] = "deadline"
+            return pending, [], 0, report
+        try:
+            outcome = future.result()
+        except Exception as exc:
+            logger.warning("VAD-проверка дыр не выполнена: %s", exc, exc_info=True)
+            report["errors"] = [{"error": f"{type(exc).__name__}: {exc}"}]
+            return pending, [], 0, report
+        if outcome.stopped == "cancelled" or (cancel is not None and cancel.is_set()):
+            raise asyncio.CancelledError("Распознавание отменено пользователем")
+        if outcome.stopped:
+            report["stopped"] = outcome.stopped
+        report["narrowed"] = outcome.narrowed
+        report["errors"] = outcome.errors
+        kept: list[tuple[tuple[float, float], float, float, str, dict[str, str]]] = []
+        for item, pieces in zip(pending, outcome.keep):
+            for piece in pieces:
+                kept.append((piece, *item[1:]))
+        return kept, outcome.silent, outcome.skipped_silent, report
+
     async def _repair_unrecovered_locally(
         self,
         audio_path: Path,
@@ -1943,6 +2040,9 @@ class CloudAudioAsrAdapter:
         local_repaired: list[tuple[float, float]] = []
         silent: list[tuple[float, float]] = []
         local_report: dict[str, Any] = {}
+        vad_silent: list[tuple[float, float]] = []
+        holes_skipped_silent = 0
+        hole_vad_report: dict[str, Any] = {}
 
         try:
             for idx, (part_start, part_end) in enumerate(parts):
@@ -2081,6 +2181,22 @@ class CloudAudioAsrAdapter:
 
             # Второй проход: повторно распознаём дыры на остаток бюджета.
             retries = _resolve_hole_retries()
+            if retries > 0:
+                # Тишина и музыка не должны стоить денег: до платного повтора
+                # дыры проверяются VAD (без облака), см. local_hole_repair.
+                (
+                    pending_holes,
+                    vad_silent,
+                    holes_skipped_silent,
+                    hole_vad_report,
+                ) = await self._prefilter_holes_by_vad(
+                    audio_path,
+                    pending_holes,
+                    duration_sec=duration_sec,
+                    cancel=cancel,
+                    deadline_monotonic=deadline_monotonic,
+                    on_progress=on_progress,
+                )
             for hole, hole_part_start, hole_part_end, hole_prompt, hole_labels in pending_holes:
                 if retries <= 0:
                     unrecovered.append(hole)
@@ -2127,7 +2243,7 @@ class CloudAudioAsrAdapter:
                 accumulated_own_end,
                 unrecovered,
                 local_repaired,
-                silent,
+                local_silent,
                 local_report,
             ) = await self._repair_unrecovered_locally(
                 audio_path,
@@ -2140,6 +2256,7 @@ class CloudAudioAsrAdapter:
                 deadline_monotonic=deadline_monotonic,
                 on_progress=on_progress,
             )
+            silent = vad_silent + local_silent
         finally:
             if own_client:
                 await client.aclose()
@@ -2172,6 +2289,8 @@ class CloudAudioAsrAdapter:
             local_repaired=local_repaired,
             silent=silent,
             local_repair=local_report,
+            holes_skipped_silent=holes_skipped_silent,
+            hole_vad=hole_vad_report,
         )
 
         return AsrRunResult(

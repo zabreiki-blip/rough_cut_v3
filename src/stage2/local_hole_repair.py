@@ -44,6 +44,7 @@ MARGIN_ENV = "SYNC_CLOUD_ASR_LOCAL_REPAIR_MARGIN_SEC"
 MIN_SPEECH_ENV = "SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC"
 MAX_SEC_ENV = "SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC"
 DEADLINE_RESERVE_ENV = "SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC"
+HOLE_VAD_ENV = "SYNC_CLOUD_ASR_HOLE_VAD"
 DEFAULT_MODEL = "medium"
 DEFAULT_MARGIN_SEC = 3.0
 DEFAULT_MIN_SPEECH_SEC = 1.0
@@ -249,16 +250,23 @@ def _load_clip(audio_path: Path, start: float, end: float, *, ffmpeg: str = "ffm
         raise
 
 
-def _speech_seconds(samples: Any, lo_sec: float, hi_sec: float) -> float:
-    """Суммарная длительность речи (Silero VAD из faster-whisper) на [lo, hi]."""
+def _speech_intervals(samples: Any, lo_sec: float, hi_sec: float) -> list[tuple[float, float]]:
+    """Интервалы речи (Silero VAD из faster-whisper) на [lo, hi], в секундах
+    от начала `samples`."""
     from faster_whisper.vad import VadOptions, get_speech_timestamps  # type: ignore
 
-    window = samples[int(max(0.0, lo_sec) * _SAMPLE_RATE) : int(max(0.0, hi_sec) * _SAMPLE_RATE)]
+    lo = max(0.0, lo_sec)
+    window = samples[int(lo * _SAMPLE_RATE) : int(max(0.0, hi_sec) * _SAMPLE_RATE)]
     if len(window) == 0:
-        return 0.0
+        return []
     options = VadOptions(min_speech_duration_ms=250, speech_pad_ms=0)
     chunks = get_speech_timestamps(window, options, sampling_rate=_SAMPLE_RATE)
-    return sum(c["end"] - c["start"] for c in chunks) / _SAMPLE_RATE
+    return [(lo + c["start"] / _SAMPLE_RATE, lo + c["end"] / _SAMPLE_RATE) for c in chunks]
+
+
+def _speech_seconds(samples: Any, lo_sec: float, hi_sec: float) -> float:
+    """Суммарная длительность речи (Silero VAD из faster-whisper) на [lo, hi]."""
+    return sum(b - a for a, b in _speech_intervals(samples, lo_sec, hi_sec))
 
 
 def _transcribe_clip(
@@ -659,3 +667,163 @@ def repair_words_locally(
         ffmpeg=ffmpeg,
         transcribe=transcribe,
     )
+
+
+# -- предварительная VAD-проверка дыр перед ПЛАТНЫМ облачным повтором ----------
+
+# Поле вокруг речевых интервалов при сужении дыры и минимальный зазор: речь,
+# разделённую тишиной короче зазора, облаку отдаём одним куском (мелкие
+# запросы дороже по накладным расходам, а края реплик VAD режет без поля).
+_NARROW_PAD_SEC = 1.5
+_NARROW_MIN_GAP_SEC = 3.0
+
+
+def hole_vad_unavailable_reason() -> str | None:
+    """Почему VAD-проверка дыр перед облачным повтором не выполняется (None — можно)."""
+    if os.getenv(HOLE_VAD_ENV, "").strip().lower() in _FALSE_VALUES:
+        return "disabled"
+    from .whisper_runner import _module_available
+
+    if not _module_available("faster_whisper"):
+        return "faster-whisper не установлен"
+    return None
+
+
+def _narrow_to_speech(
+    hole: tuple[float, float], speech: list[tuple[float, float]]
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Сужает дыру до речевых интервалов (абсолютное время) с полем.
+
+    Возвращает (оставить для облака, тишина). Зазоры короче
+    `_NARROW_MIN_GAP_SEC`, включая края дыры, не вырезаются: дыра остаётся
+    целой, если вырезать нечего.
+    """
+    start, end = hole
+    spans: list[list[float]] = []
+    for a, b in sorted(speech):
+        a, b = max(start, a - _NARROW_PAD_SEC), min(end, b + _NARROW_PAD_SEC)
+        if b <= a:
+            continue
+        if spans and a - spans[-1][1] < _NARROW_MIN_GAP_SEC:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    if not spans:
+        return [hole], []
+    if spans[0][0] - start < _NARROW_MIN_GAP_SEC:
+        spans[0][0] = start
+    if end - spans[-1][1] < _NARROW_MIN_GAP_SEC:
+        spans[-1][1] = end
+    keep = [(a, b) for a, b in spans]
+    if keep == [hole]:
+        return [hole], []
+    silent: list[tuple[float, float]] = []
+    cursor = start
+    for a, b in keep:
+        if a > cursor:
+            silent.append((cursor, a))
+        cursor = b
+    if end > cursor:
+        silent.append((cursor, end))
+    return keep, silent
+
+
+@dataclass
+class HolePrefilter:
+    """Итог VAD-проверки дыр. `keep[i]` — что отправить в облако из i-й дыры
+    (пусто — вся дыра тишина; один элемент, равный дыре — без изменений)."""
+
+    keep: list[list[tuple[float, float]]] = field(default_factory=list)
+    silent: list[tuple[float, float]] = field(default_factory=list)
+    skipped_silent: int = 0
+    narrowed: int = 0
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    stopped: str | None = None
+
+
+def prefilter_holes(
+    audio_path: Path,
+    holes: list[tuple[float, float]],
+    *,
+    duration_sec: float,
+    settings: LocalRepairSettings,
+    cancel: Any | None = None,
+    deadline_monotonic: float | None = None,
+    on_progress: Callable[[AsrProgress], None] | None = None,
+    ffmpeg: str = "ffmpeg",
+    abort: threading.Event | None = None,
+) -> HolePrefilter:
+    """Прогоняет дыры через VAD до платного облачного повтора.
+
+    Порог речи и поле — те же, что у локального ремонта (`min_speech_sec`,
+    `margin_sec`): дыра, которую локальный проход всё равно признал бы
+    тишиной, не должна стоить денег. Любая ошибка (ffmpeg, VAD) на дыре —
+    она остаётся как есть (безопасный fallback: уйдёт в облако). Отмена
+    пробрасывается как `stopped="cancelled"`, дедлайн/abort — `"deadline"`:
+    оставшиеся дыры не проверяются и остаются как есть.
+    """
+    cleanup_stale_tempdirs()
+    result = HolePrefilter(keep=[[h] for h in holes])
+    for index, hole in enumerate(holes):
+        if cancel is not None and cancel.is_set():
+            result.stopped = "cancelled"
+            break
+        if (abort is not None and abort.is_set()) or (
+            deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
+        ):
+            result.stopped = "deadline"
+            break
+        hole_start, hole_end = hole
+        if on_progress is not None:
+            try:
+                on_progress(
+                    AsrProgress(
+                        done=index,
+                        total=len(holes),
+                        message=(
+                            f"Проверка речи в дыре {index + 1} из {len(holes)} "
+                            f"({hole_start:.0f}–{hole_end:.0f} с)"
+                        ),
+                        processed_sec=hole_start,
+                        duration_sec=duration_sec or None,
+                    )
+                )
+            except Exception:
+                logger.warning("Колбэк прогресса VAD-проверки дыр упал", exc_info=True)
+        clip_start = max(0.0, hole_start - settings.margin_sec)
+        clip_end = (
+            min(duration_sec, hole_end + settings.margin_sec)
+            if duration_sec
+            else hole_end + settings.margin_sec
+        )
+        clip = None
+        try:
+            clip = _load_clip(audio_path, clip_start, clip_end, ffmpeg=ffmpeg)
+            intervals = _speech_intervals(
+                clip.samples, hole_start - clip_start, hole_end - clip_start
+            )
+        except Exception as exc:  # дыра уходит в облако как раньше
+            logger.warning("VAD-проверка дыры %.1f-%.1f не удалась: %s", *hole, exc)
+            if len(result.errors) < _MAX_REPORTED_ERRORS:
+                result.errors.append(
+                    {
+                        "range": [round(hole_start, 3), round(hole_end, 3)],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+        finally:
+            if clip is not None:
+                clip.cleanup()
+        speech = [(clip_start + a, clip_start + b) for a, b in intervals]
+        if sum(b - a for a, b in speech) < settings.min_speech_sec:
+            result.keep[index] = []
+            result.silent.append(hole)
+            result.skipped_silent += 1
+            continue
+        keep, silent = _narrow_to_speech(hole, speech)
+        if silent:
+            result.keep[index] = keep
+            result.silent.extend(silent)
+            result.narrowed += 1
+    return result

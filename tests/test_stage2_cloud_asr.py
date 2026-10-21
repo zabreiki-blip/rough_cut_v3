@@ -1778,11 +1778,12 @@ def test_worker_key_includes_local_repair_settings(monkeypatch: pytest.MonkeyPat
         "SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC",
         "SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC",
         "SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC",
+        "SYNC_CLOUD_ASR_HOLE_VAD",
     ]
     for name in names:
         monkeypatch.delenv(name, raising=False)
     base = _worker_key("cloud-audio", "m", "ru", "fork")
-    for name, value in zip(names, ["0", "large-v3", "5", "2", "60", "9"]):
+    for name, value in zip(names, ["0", "large-v3", "5", "2", "60", "9", "0"]):
         monkeypatch.setenv(name, value)
         changed = _worker_key("cloud-audio", "m", "ru", "fork")
         assert changed != base, name
@@ -1908,3 +1909,199 @@ def test_stale_local_repair_tempdirs_are_removed(
     _direct_repair(monkeypatch, lambda *_a, **_k: [])
     assert not stale.exists()
     assert fresh.exists() and foreign.exists() and stale_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# VAD-проверка дыр до платного облачного повтора (SYNC_CLOUD_ASR_HOLE_VAD)
+# ---------------------------------------------------------------------------
+
+
+def _install_hole_vad(
+    monkeypatch: pytest.MonkeyPatch,
+    intervals: list[tuple[float, float]] | Exception,
+) -> dict[str, Any]:
+    """Включает VAD-проверку дыр; мокает нарезку и VAD (интервалы в секундах
+    от начала вырезки)."""
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_VAD", "1")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_RETRIES", "1")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_SPLIT_SEC", "600")
+    state: dict[str, Any] = {"clips": [], "vad": []}
+
+    def load_clip(_audio_path, start, end, **_kwargs):
+        state["clips"].append((start, end))
+        return _FakeClip(start, end)
+
+    def speech_intervals(_samples, lo, hi):
+        state["vad"].append((lo, hi))
+        if isinstance(intervals, Exception):
+            raise intervals
+        return list(intervals)
+
+    monkeypatch.setattr(local_hole_repair, "_load_clip", load_clip)
+    monkeypatch.setattr(local_hole_repair, "_speech_intervals", speech_intervals)
+    return state
+
+
+def test_hole_vad_silence_is_not_sent_to_paid_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_hole_vad(monkeypatch, [(5.0, 5.4)])
+    # Второго ответа нет: платный повтор по тишине вызвал бы StopIteration.
+    result, extracted = _coverage_call(
+        monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)]
+    )
+
+    assert extracted == [(0.0, 300.0)]
+    assert result["cost_usd"] == pytest.approx(0.05)
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == [[60.0, 240.0]]
+    assert coverage["silent_sec"] == 180.0
+    assert coverage["holes_detected"] == 1
+    assert coverage["holes_skipped_silent"] == 1
+    assert coverage["holes_repaired"] == 0
+    assert coverage["unrecovered_ranges"] == []
+    assert coverage["hole_vad"]["enabled"] is True
+    # Речь проверяется на самой дыре (вырезка с полем 3 с).
+    assert state["clips"] == [(57.0, 243.0)]
+    assert state["vad"] == [(3.0, 183.0)]
+
+
+def test_hole_vad_speech_is_sent_to_paid_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_hole_vad(monkeypatch, [(3.0, 183.0)])
+    retry = f"[00:03] ГОЛОС 1: {_words(150)}\n[01:30] ГОЛОС 1: {_words(150)}"
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(retry, cost=0.02),
+        ],
+    )
+    assert extracted == [(0.0, 300.0), (57.0, 186.0)]
+    assert result["cost_usd"] == pytest.approx(0.07)
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == []
+    assert coverage["holes_skipped_silent"] == 0
+    assert coverage["holes_repaired"] == 1
+
+
+def test_hole_vad_error_falls_back_to_paid_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_hole_vad(monkeypatch, RuntimeError("vad broke"))
+    retry = f"[00:03] ГОЛОС 1: {_words(150)}\n[01:30] ГОЛОС 1: {_words(150)}"
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(retry, cost=0.02),
+        ],
+    )
+    assert extracted == [(0.0, 300.0), (57.0, 186.0)]
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == []
+    assert coverage["holes_repaired"] == 1
+    assert coverage["hole_vad"]["errors"][0]["range"] == [60.0, 240.0]
+    assert "vad broke" in coverage["hole_vad"]["errors"][0]["error"]
+
+
+def test_hole_vad_disabled_keeps_old_behaviour(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_hole_vad(monkeypatch, [])  # тишина, но проверка выключена
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_VAD", "0")
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(f"[00:03] ГОЛОС 1: {_words(5)}", cost=0.01),
+        ],
+    )
+    assert extracted == [(0.0, 300.0), (57.0, 186.0)]
+    assert state["clips"] == [] and state["vad"] == []
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == []
+    assert coverage["holes_skipped_silent"] == 0
+    assert coverage["hole_vad"] == {"enabled": False, "skipped_reason": "disabled"}
+
+
+def test_hole_vad_without_faster_whisper_keeps_old_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from stage2 import whisper_runner
+
+    state = _install_hole_vad(monkeypatch, [])
+    monkeypatch.setattr(whisper_runner, "_module_available", lambda _module: False)
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(f"[00:03] ГОЛОС 1: {_words(5)}", cost=0.01),
+        ],
+    )
+    assert extracted == [(0.0, 300.0), (57.0, 186.0)]
+    assert state["clips"] == []
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == []
+    assert coverage["hole_vad"]["enabled"] is False
+    assert "faster-whisper" in coverage["hole_vad"]["skipped_reason"]
+
+
+def test_hole_vad_narrows_hole_to_speech_with_margin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Дыра 60..240, вырезка 57..243: речь на 100..110 и 111..115 (абс.) —
+    # в координатах вырезки 43..53 и 54..58. Поле 1.5 с, зазор 1 с < 3 с.
+    _install_hole_vad(monkeypatch, [(43.0, 53.0), (54.0, 58.0)])
+    retry = f"[00:03] ГОЛОС 1: {_words(60)}"
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(retry, cost=0.02),
+        ],
+    )
+    # Облаку уходит только 98.5..116.5 (+3 с поля вырезки с каждой стороны).
+    assert extracted == [(0.0, 300.0), (95.5, 24.0)]
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == [[60.0, 98.5], [116.5, 240.0]]
+    assert coverage["holes_detected"] == 1
+    assert coverage["holes_skipped_silent"] == 0
+    assert coverage["hole_vad"]["narrowed"] == 1
+
+
+def test_hole_vad_edge_gap_shorter_than_min_gap_keeps_hole_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Речь почти по всей дыре: вырезать нечего, дыра уходит целиком.
+    _install_hole_vad(monkeypatch, [(4.0, 182.0)])
+    result, extracted = _coverage_call(
+        monkeypatch,
+        [
+            lambda: _model_response(_SPARSE_PART, cost=0.05),
+            lambda: _model_response(f"[00:03] ГОЛОС 1: {_words(5)}", cost=0.01),
+        ],
+    )
+    assert extracted == [(0.0, 300.0), (57.0, 186.0)]
+    assert result["coverage"]["silent_ranges"] == []
+    assert result["coverage"]["hole_vad"]["narrowed"] == 0
+
+
+def test_hole_vad_cancel_before_paid_retry_stops_without_extra_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_hole_vad(monkeypatch, [(3.0, 183.0)])
+    cancel = asyncio.Event()
+
+    def vad_and_cancel(_samples, lo, hi):
+        cancel.set()
+        return [(3.0, 183.0)]
+
+    monkeypatch.setattr(local_hole_repair, "_speech_intervals", vad_and_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        _coverage_call(
+            monkeypatch,
+            [lambda: _model_response(_SPARSE_PART, cost=0.05)],
+            cancel=cancel,
+        )
+
+
+def test_hole_vad_unit_narrow_to_speech() -> None:
+    narrow = local_hole_repair._narrow_to_speech
+    # Две речевые группы далеко друг от друга и от краёв.
+    keep, silent = narrow((0.0, 100.0), [(20.0, 22.0), (70.0, 72.0)])
+    assert keep == [(18.5, 23.5), (68.5, 73.5)]
+    assert silent == [(0.0, 18.5), (23.5, 68.5), (73.5, 100.0)]
+    # Нет речи в интервалах — дыра как есть.
+    assert narrow((0.0, 10.0), []) == ([(0.0, 10.0)], [])
