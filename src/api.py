@@ -1331,6 +1331,12 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
     confirmed = sum(item.status == "confirmed" for item in matches)
     needs_review = sum(item.status == "needs_review" for item in matches)
     not_found = sum(item.status == "not_found" for item in matches)
+    # Speaker has no recording yet: the quote is expected to match once it is loaded.
+    no_source = sum(
+        item.status == "not_found"
+        and item.metadata.get("unmatched_reason") == "no_eligible_source"
+        for item in matches
+    )
     return {
         "auto_matched": auto_matched,
         "confirmed": confirmed,
@@ -1338,7 +1344,8 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
         "not_found": not_found,
         "matched": auto_matched + confirmed,
         "review": needs_review,
-        "unmatched": not_found,
+        "unmatched": not_found - no_source,
+        "no_source": no_source,
     }
 
 
@@ -1591,6 +1598,7 @@ def _create_sync_job(project: str) -> dict:
         "matched": 0,
         "review": 0,
         "unmatched": 0,
+        "no_source": 0,
         "segment_failures": [],
         "llm_reviewed": 0,
         "llm_review_failures": [],

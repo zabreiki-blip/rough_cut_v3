@@ -222,6 +222,7 @@ function syncCounts(document) {
     confirmed: summary.confirmed ?? document?.confirmed,
     review: summary.needs_review ?? summary.review ?? document?.needs_review,
     unmatched: summary.unmatched ?? document?.unmatched,
+    noSource: summary.no_source ?? document?.no_source,
   };
   if (Object.values(explicit).some((value) => value !== undefined)) {
     return {
@@ -229,6 +230,7 @@ function syncCounts(document) {
       confirmed: Number(explicit.confirmed || 0),
       review: Number(explicit.review || 0),
       unmatched: Number(explicit.unmatched || 0),
+      noSource: Number(explicit.noSource || 0),
     };
   }
   return syncMatches.reduce((counts, match) => {
@@ -236,9 +238,10 @@ function syncCounts(document) {
     if (status === "auto_matched") counts.auto += 1;
     else if (status === "confirmed") counts.confirmed += 1;
     else if (status === "needs_review") counts.review += 1;
+    else if (match.metadata?.unmatched_reason === "no_eligible_source") counts.noSource += 1;
     else counts.unmatched += 1;
     return counts;
-  }, { auto: 0, confirmed: 0, review: 0, unmatched: 0 });
+  }, { auto: 0, confirmed: 0, review: 0, unmatched: 0, noSource: 0 });
 }
 
 function updateSyncAsrControls() {
@@ -257,6 +260,7 @@ function renderSyncMatches(document) {
   ids.sync_count_confirmed.textContent = String(counts.confirmed);
   ids.sync_count_review.textContent = String(counts.review);
   ids.sync_count_unmatched.textContent = String(counts.unmatched);
+  ids.sync_count_no_source.textContent = String(counts.noSource);
 
   const reviewItems = syncMatches.filter((match) => {
     const status = normalizedMatchStatus(match.status);
@@ -329,7 +333,7 @@ function renderSyncMatches(document) {
       : "";
     const unmatchedReasons = {
       query_too_short: "Фраза слишком короткая для поиска по записи.",
-      no_eligible_source: "Для указанного говорящего нет подходящего источника.",
+      no_eligible_source: "Нет записи: для этого спикера ещё нет источника — реплика будет найдена после загрузки.",
       no_candidate: "В доступной расшифровке подходящая фраза не найдена.",
       below_review_threshold: "Есть только слабые совпадения; проверьте запись вручную.",
     };
@@ -340,7 +344,9 @@ function renderSyncMatches(document) {
       && Number.isFinite(sourceIn) && Number.isFinite(sourceOut) && sourceOut > sourceIn;
     const label = llmReview
       ? "LLM · проверить"
-      : (status === "unmatched" ? "не найдено" : "нужно проверить");
+      : (status === "unmatched"
+        ? (match.metadata?.unmatched_reason === "no_eligible_source" ? "нет записи" : "не найдено")
+        : "нужно проверить");
     const action = hasCandidate && matchId
       ? `<button class="btn btn-sm btn-accent" type="button"
            data-action="confirm-sync-match" data-match-id="${escaped(matchId)}">

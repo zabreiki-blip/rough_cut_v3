@@ -637,7 +637,7 @@
     byId("exportAndTranscribe").disabled = exportInProgress || whisperJobIsActive();
     currentWhisperReviewCount = reviewCount;
     byId("whisperReview").textContent = String(reviewCount);
-    byId("whisperUnmatched").textContent = Number(job.unmatched || 0);
+    byId("whisperUnmatched").textContent = Number(job.unmatched || 0) + Number(job.no_source || 0);
     byId("whisperReviewNoticeCount").textContent = String(reviewCount);
     reviewNotice.hidden = reviewCount <= 0;
     fill.className = "whisper-progress-fill";

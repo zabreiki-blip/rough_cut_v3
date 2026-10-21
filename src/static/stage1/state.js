@@ -87,6 +87,7 @@ export const ids = {
   sync_count_confirmed: el("sync_count_confirmed"),
   sync_count_review: el("sync_count_review"),
   sync_count_unmatched: el("sync_count_unmatched"),
+  sync_count_no_source: el("sync_count_no_source"),
   sync_review_count: el("sync_review_count"),
   sync_review_list: el("sync_review_list"),
   sync_timecode_mode: el("sync_timecode_mode"),

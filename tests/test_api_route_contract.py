@@ -189,6 +189,7 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
             "matched": 0,
             "review": 0,
             "unmatched": 0,
+            "no_source": 0,
         },
     }
 

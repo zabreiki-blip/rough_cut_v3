@@ -77,6 +77,75 @@ def test_matching_fingerprint_is_stable_and_tracks_word_content() -> None:
     assert api._sync_matching_fingerprint(**changed) != first
 
 
+def test_matching_fingerprint_changes_when_a_source_is_added() -> None:
+    """A new recording must invalidate prior no_eligible_source decisions."""
+    units = [
+        {
+            "segment_id": "block-1",
+            "parent_block_uid": "block-1",
+            "text": "точная цитата",
+            "speaker": "B",
+            "timecode_start": "00:10",
+        }
+    ]
+    first_source = SyncSource(id="a", speaker="A", premiere_sequence="A")
+    first_index = WordIndex(
+        source_id="a", words=[WordTimestamp("цитата", 1.0, 1.5)], generated_at="stable"
+    )
+    arguments = {
+        "units": units,
+        "sources": [first_source],
+        "indexes": [first_index],
+        "normalization_revision": 3,
+        "timecode_mode": "relative",
+        "search_window_sec": 180.0,
+        "llm_enabled": False,
+        "llm_model": "",
+        "llm_threshold": 0.8,
+        "llm_limit": 30,
+    }
+    before = api._sync_matching_fingerprint(**arguments)
+    added = dict(
+        arguments,
+        sources=[first_source, SyncSource(id="b", speaker="B", premiere_sequence="B")],
+        indexes=[
+            first_index,
+            WordIndex(
+                source_id="b",
+                words=[WordTimestamp("цитата", 2.0, 2.5)],
+                generated_at="stable",
+            ),
+        ],
+    )
+    assert api._sync_matching_fingerprint(**added) != before
+
+
+def test_sync_summary_splits_no_source_from_other_not_found() -> None:
+    def match(segment_id: str, status: str, reason: str = "") -> SyncMatch:
+        return SyncMatch(
+            segment_id=segment_id,
+            query_text="текст",
+            status=status,
+            metadata={"unmatched_reason": reason} if reason else {},
+        )
+
+    summary = api._sync_summary(
+        [
+            match("1", "auto_matched"),
+            match("2", "confirmed"),
+            match("3", "needs_review"),
+            match("4", "not_found", "no_eligible_source"),
+            match("5", "not_found", "no_eligible_source"),
+            match("6", "not_found", "below_review_threshold"),
+            match("7", "not_found"),
+        ]
+    )
+    assert summary["not_found"] == 4
+    assert summary["no_source"] == 2
+    assert summary["unmatched"] == 2
+    assert summary["unmatched"] + summary["no_source"] == summary["not_found"]
+
+
 @pytest.mark.parametrize(
     ("cue", "role"),
     [

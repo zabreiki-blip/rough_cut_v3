@@ -1294,7 +1294,7 @@ select { cursor: pointer; }
 
 .sync-stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 8px;
 }
 
@@ -1324,6 +1324,7 @@ select { cursor: pointer; }
 .sync-stat[data-state="confirmed"] strong { color: var(--green); }
 .sync-stat[data-state="review"] strong { color: var(--orange); }
 .sync-stat[data-state="unmatched"] strong { color: var(--red); }
+.sync-stat[data-state="no-source"] strong { color: var(--muted); }
 
 .sync-sources-list {
   display: grid;
