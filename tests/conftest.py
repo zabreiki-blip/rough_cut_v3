@@ -26,3 +26,11 @@ def hermetic_whisper_backend(monkeypatch: pytest.MonkeyPatch) -> None:
         "_module_available",
         lambda module: module in _FAKE_INSTALLED_MODULES,
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_local_hole_repair_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Локальный ремонт дыр облачного ASR по умолчанию включён и запускал бы
+    настоящие ffmpeg/VAD/Whisper на аудио тестов. Тесты, которые его проверяют,
+    включают его явно (SYNC_CLOUD_ASR_LOCAL_REPAIR=1) и мокают движок."""
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "0")

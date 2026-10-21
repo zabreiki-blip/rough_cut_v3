@@ -61,6 +61,7 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 from dataclasses import replace
 from decimal import Decimal
@@ -72,6 +73,7 @@ import httpx
 from cost_budget import CostBudget, CostBudgetExceeded, CostGuardConfig
 from openrouter_limits import finish_reason
 
+from . import local_hole_repair
 from .asr_contract import AsrProgress, AsrRunResult, AsrSegment
 from .text_normalization import fold_russian_text
 
@@ -826,17 +828,113 @@ def _rescale_stretched_timestamps(
     if observed_end <= duration_sec * _TIMESTAMP_RESCALE_OVERSHOOT_RATIO:
         return segments, None
     scale = duration_sec / observed_end
-    return (
-        [
-            replace(
-                segment,
-                start=max(0.0, segment.start * scale),
-                end=max(0.0, segment.end * scale),
-            )
-            for segment in segments
-        ],
-        scale,
-    )
+
+    def rescaled(segment: AsrSegment) -> AsrSegment:
+        if segment.timestamp_source:
+            # Реальные пословные таймкоды (вставка локального ремонта дыры)
+            # лежат в настоящем времени файла и растяжению модели не подвержены.
+            return segment
+        return replace(
+            segment,
+            start=max(0.0, segment.start * scale),
+            end=max(0.0, segment.end * scale),
+            words=[
+                replace(
+                    word,
+                    start=max(0.0, word.start * scale),
+                    end=max(0.0, word.end * scale),
+                )
+                for word in segment.words
+            ],
+        )
+
+    return [rescaled(segment) for segment in segments], scale
+
+
+def _monotonic_progress(
+    callback: Callable[[AsrProgress], None] | None,
+) -> Callable[[AsrProgress], None] | None:
+    """Колбэк прогресса, у которого `processed_sec` не откатывается назад
+    (локальный ремонт дыр приходит после последней облачной части)."""
+    if callback is None:
+        return None
+    top = 0.0
+
+    def emit(progress: AsrProgress) -> None:
+        nonlocal top
+        if progress.processed_sec is not None:
+            top = max(top, progress.processed_sec)
+            progress = replace(progress, processed_sec=top)
+        callback(progress)
+
+    return emit
+
+
+def _run_in_daemon_thread(fn: Callable[[], Any]) -> "asyncio.Future[Any]":
+    """Запускает `fn` в daemon-потоке и возвращает future с результатом.
+
+    В отличие от `asyncio.to_thread`, брошенный поток не держит ни
+    `asyncio.run` (он ждёт default-executor при выходе), ни интерпретатор:
+    результат необязательной локальной работы можно не дожидаться.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def deliver(result: Any, error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+
+    def target() -> None:
+        try:
+            result, error = fn(), None
+        except BaseException as exc:  # noqa: BLE001 - передаём в future
+            result, error = None, exc
+        with contextlib.suppress(RuntimeError):  # цикл уже закрыт — результат не нужен
+            loop.call_soon_threadsafe(deliver, result, error)
+
+    # Брошенный future не должен ругаться «exception was never retrieved».
+    future.add_done_callback(lambda f: f.cancelled() or f.exception())
+    threading.Thread(target=target, name="local-hole-repair", daemon=True).start()
+    return future
+
+
+def _finalize_segment_ends(
+    accumulated: list[AsrSegment], accumulated_own_end: list[bool], duration_sec: float
+) -> list[AsrSegment]:
+    """Сортирует реплики и назначает итоговые концы (см. комментарии ниже)."""
+    # Сортируем сегменты и их флаги «свой конец» синхронно (zip
+    # сохраняет пары, сортировка — только по времени начала сегмента).
+    paired = sorted(zip(accumulated, accumulated_own_end), key=lambda item: item[0].start)
+    final_segments: list[AsrSegment] = []
+    for i, (seg, own_end_flag) in enumerate(paired):
+        next_start = paired[i + 1][0].start if i + 1 < len(paired) else None
+        # Итоговый сосед по времени (после сшивки частей и отбрасывания
+        # дублей на стыке) может отличаться от того, что было видно на
+        # момент разбора одной части — поэтому санитарная проверка
+        # своего конца повторяется здесь же, ещё раз (см. _resolve_end):
+        # если модель дала конец, но он всё же вылез за пределы
+        # итогового соседа больше чем на допуск — тихо откатываемся к
+        # прежней логике вместо того, чтобы выдать заведомо неверную
+        # границу.
+        is_own_end = (
+            own_end_flag
+            and seg.end > seg.start
+            and (next_start is None or seg.end <= next_start + _END_OVERSHOOT_TOLERANCE_SEC)
+        )
+        if is_own_end:
+            end = min(seg.end, next_start) if next_start is not None else seg.end
+        elif next_start is not None:
+            end = next_start
+        else:
+            end = max(seg.start, duration_sec or seg.end)
+        # `has_explicit_end` доносит признак «это настоящая граница от
+        # модели» до вызывающего кода — см. AsrSegment.has_explicit_end.
+        final_segments.append(replace(seg, end=end, has_explicit_end=is_own_end))
+    return final_segments
 
 
 def _stitch_chunk(
@@ -1100,6 +1198,14 @@ def _merge_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]
     return merged
 
 
+def _range_is_dense(segments: list[AsrSegment], start: float, end: float, max_wpm: float) -> bool:
+    """Интервал реально закрыт плотной речью реплик, начавшихся внутри него."""
+    if end <= start:
+        return False
+    words = sum(_count_words(seg.text) for seg in segments if start <= seg.start < end)
+    return words / ((end - start) / 60.0) >= max_wpm
+
+
 def _build_coverage_report(
     segments: list[AsrSegment],
     unrecovered: list[tuple[float, float]],
@@ -1108,22 +1214,33 @@ def _build_coverage_report(
     holes_repaired: int,
     word_count: int,
     duration_sec: float,
+    local_repaired: list[tuple[float, float]] | None = None,
+    silent: list[tuple[float, float]] | None = None,
+    local_repair: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Отчёт о покрытии: сколько дыр найдено/починено и что осталось.
 
     Нерасшифрованный интервал, который реально закрыт плотной речью
-    соседней (перекрывающейся) части, из отчёта исключается.
+    соседней (перекрывающейся) части, из отчёта исключается. Интервалы,
+    восстановленные локальным Whisper (`local_repaired_ranges`, а
+    `holes_repaired_local` — их число) и признанные тишиной по VAD
+    (`silent_ranges`), в `unrecovered_*` не входят.
     """
     max_wpm = _env_float("SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True)
     ranges: list[list[float]] = []
     for start, end in _merge_ranges(unrecovered):
-        words = sum(_count_words(seg.text) for seg in segments if start <= seg.start < end)
-        if end > start and words / ((end - start) / 60.0) >= max_wpm:
+        if _range_is_dense(segments, start, end, max_wpm):
             continue
         ranges.append([round(start, 3), round(end, 3)])
+    silent_ranges = [[round(a, 3), round(b, 3)] for a, b in _merge_ranges(silent or [])]
     return {
         "holes_detected": holes_detected,
         "holes_repaired": holes_repaired,
+        "holes_repaired_local": len(local_repaired or []),
+        "local_repaired_ranges": [[round(a, 3), round(b, 3)] for a, b in (local_repaired or [])],
+        "silent_ranges": silent_ranges,
+        "silent_sec": round(sum(b - a for a, b in silent_ranges), 3),
+        "local_repair": local_repair or {},
         "unrecovered_sec": round(sum(end - start for start, end in ranges), 3),
         "unrecovered_ranges": ranges,
         "words_per_minute": round(word_count / (duration_sec / 60.0), 2)
@@ -1626,6 +1743,146 @@ class CloudAudioAsrAdapter:
             return [m[0] for m in merged], [m[1] for m in merged], cost_total, raws, repaired, False
         return segments, own_end, cost_total, raws, False, False
 
+    async def _repair_unrecovered_locally(
+        self,
+        audio_path: Path,
+        segments: list[AsrSegment],
+        own_end: list[bool],
+        unrecovered: list[tuple[float, float]],
+        *,
+        language: str,
+        duration_sec: float,
+        cancel: asyncio.Event | None,
+        deadline_monotonic: float | None,
+        on_progress: Callable[[AsrProgress], None] | None,
+    ) -> tuple[
+        list[AsrSegment],
+        list[bool],
+        list[tuple[float, float]],
+        list[tuple[float, float]],
+        list[tuple[float, float]],
+        dict[str, Any],
+    ]:
+        """Локальный проход по неисправленным дырам; не валит распознавание.
+
+        Возвращает (сегменты, флаги, оставшиеся дыры, починенные локально,
+        тишина, отчёт). Если ремонт выключен или faster-whisper недоступен,
+        дыры возвращаются как есть, причина — в отчёте.
+
+        Локальная фаза необязательна и обязана деградировать, а не ронять
+        облачный результат: у неё свой мягкий дедлайн (общий минус запас
+        `deadline_reserve_sec`, и/или `max_sec`) строго раньше общего. По его
+        истечении поток получает сигнал остановки; если он не успел
+        остановиться (загрузка модели не вызывает колбэков), его результат
+        не ждём: поток работает на копиях и после сигнала не пишет наружу и
+        не вызывает `on_progress`. Дыры остаются unrecovered, `stopped` —
+        "deadline".
+        """
+        settings = local_hole_repair.LocalRepairSettings.from_env()
+        try:
+            skipped = local_hole_repair.unavailable_reason(settings)
+        except Exception as exc:  # проверка наличия движка не должна валить прогон
+            skipped = f"{type(exc).__name__}: {exc}"
+        if skipped is not None:
+            report: dict[str, Any] = {"enabled": settings.enabled, "skipped_reason": skipped}
+            return segments, own_end, unrecovered, [], [], report
+        max_wpm = _env_float("SYNC_CLOUD_ASR_HOLE_MAX_WPM", DEFAULT_HOLE_MAX_WPM, allow_zero=True)
+        merged = _merge_ranges(unrecovered)
+        sparse = [r for r in merged if not _range_is_dense(segments, r[0], r[1], max_wpm)]
+        dense = [r for r in merged if r not in sparse]
+        report = {
+            "enabled": True,
+            "model": settings.model,
+            "margin_sec": settings.margin_sec,
+            "min_speech_sec": settings.min_speech_sec,
+            "words_added": 0,
+            "errors": [],
+        }
+        if not sparse:
+            return segments, own_end, unrecovered, [], [], report
+        # Дыры посчитаны в шкале модели. Если шкала растянута, позже она будет
+        # сжата, и локальные (реальные) таймкоды легли бы не туда.
+        _, stretched_scale = _rescale_stretched_timestamps(
+            _finalize_segment_ends(segments, own_end, duration_sec), duration_sec
+        )
+        if stretched_scale is not None:
+            report["skipped_reason"] = (
+                f"timestamp scale is stretched (x{stretched_scale:.3f}): "
+                "holes are measured in the wrong time"
+            )
+            return segments, own_end, unrecovered, [], [], report
+
+        now = time.monotonic()
+        soft_deadline = deadline_monotonic
+        if deadline_monotonic is not None:
+            soft_deadline = deadline_monotonic - settings.deadline_reserve_sec
+        if settings.max_sec > 0:
+            own_limit = now + settings.max_sec
+            soft_deadline = own_limit if soft_deadline is None else min(soft_deadline, own_limit)
+        if soft_deadline is not None and now >= soft_deadline:
+            report["stopped"] = "deadline"
+            return segments, own_end, unrecovered, [], [], report
+
+        abort = threading.Event()
+        # Колбэк прогресса живёт только пока результат нужен.
+        guarded_progress: Callable[[AsrProgress], None] | None = None
+        if on_progress is not None:
+            progress_sink = on_progress
+
+            def guarded_progress(progress: AsrProgress) -> None:
+                if not abort.is_set():
+                    progress_sink(progress)
+
+        future = _run_in_daemon_thread(
+            lambda: local_hole_repair.repair_holes_locally(
+                audio_path,
+                sparse,
+                segments,
+                own_end,
+                duration_sec=duration_sec,
+                language=language,
+                settings=settings,
+                cancel=cancel,
+                deadline_monotonic=soft_deadline,
+                on_progress=guarded_progress,
+                ffmpeg=self._ffmpeg,
+                abort=abort,
+            )
+        )
+        try:
+            timeout = None if soft_deadline is None else max(0.0, soft_deadline - time.monotonic())
+            done, _ = await asyncio.wait({future}, timeout=timeout)
+            if not done:
+                # Дедлайн в непрерываемом месте: просим остановиться и даём
+                # короткую отсрочку (колбэк движка успеет сработать), но не ждём.
+                abort.set()
+                grace = min(2.0, settings.deadline_reserve_sec / 2.0)
+                done, _ = await asyncio.wait({future}, timeout=grace)
+        except BaseException:
+            abort.set()  # отмена/дедлайн снаружи: брошенный поток молчит
+            raise
+        if not done:
+            logger.warning("Локальный ремонт дыр не уложился в дедлайн; результат без него")
+            report["stopped"] = "deadline"
+            report["abandoned"] = True
+            return segments, own_end, unrecovered, [], [], report
+        try:
+            outcome = future.result()
+        except Exception as exc:
+            logger.warning("Локальный ремонт дыр не выполнен: %s", exc, exc_info=True)
+            report["errors"] = [{"error": f"{type(exc).__name__}: {exc}"}]
+            return segments, own_end, unrecovered, [], [], report
+        if outcome.stopped == "cancelled" or (cancel is not None and cancel.is_set()):
+            raise asyncio.CancelledError("Распознавание отменено пользователем")
+        return (
+            outcome.segments,
+            outcome.own_end,
+            outcome.unrecovered + dense,
+            outcome.repaired,
+            outcome.silent,
+            outcome.report,
+        )
+
     async def transcribe_words(
         self,
         audio_path: Path,
@@ -1639,6 +1896,7 @@ class CloudAudioAsrAdapter:
         duration_sec: float | None = None,
     ) -> AsrRunResult:
         self._require_available()
+        on_progress = _monotonic_progress(on_progress)
         audio_path = Path(audio_path)
         # _probe_duration — синхронный subprocess.run (см. модульную функцию
         # _probe_duration выше) с таймаутом до _PROBE_TIMEOUT_SEC (60 с):
@@ -1682,6 +1940,9 @@ class CloudAudioAsrAdapter:
         pending_holes: list[tuple[tuple[float, float], float, float, str, dict[str, str]]] = []
         holes_repaired = 0
         unrecovered: list[tuple[float, float]] = []
+        local_repaired: list[tuple[float, float]] = []
+        silent: list[tuple[float, float]] = []
+        local_report: dict[str, Any] = {}
 
         try:
             for idx, (part_start, part_end) in enumerate(parts):
@@ -1858,6 +2119,27 @@ class CloudAudioAsrAdapter:
                 if budget_exhausted:
                     # Остальные дыры не чиним: каждая попытка упрётся в тот же лимит.
                     retries = 0
+
+            # Третий проход: оставшиеся дыры проверяем VAD и чиним локальным
+            # Whisper (см. local_hole_repair). Облачные деньги не тратятся.
+            (
+                accumulated,
+                accumulated_own_end,
+                unrecovered,
+                local_repaired,
+                silent,
+                local_report,
+            ) = await self._repair_unrecovered_locally(
+                audio_path,
+                accumulated,
+                accumulated_own_end,
+                unrecovered,
+                language=language or self.language,
+                duration_sec=duration_sec,
+                cancel=cancel,
+                deadline_monotonic=deadline_monotonic,
+                on_progress=on_progress,
+            )
         finally:
             if own_client:
                 await client.aclose()
@@ -1865,34 +2147,7 @@ class CloudAudioAsrAdapter:
         if cancel is not None and cancel.is_set():
             raise asyncio.CancelledError("Распознавание отменено пользователем")
 
-        # Сортируем сегменты и их флаги «свой конец» синхронно (zip
-        # сохраняет пары, сортировка — только по времени начала сегмента).
-        paired = sorted(zip(accumulated, accumulated_own_end), key=lambda item: item[0].start)
-        final_segments: list[AsrSegment] = []
-        for i, (seg, own_end_flag) in enumerate(paired):
-            next_start = paired[i + 1][0].start if i + 1 < len(paired) else None
-            # Итоговый сосед по времени (после сшивки частей и отбрасывания
-            # дублей на стыке) может отличаться от того, что было видно на
-            # момент разбора одной части — поэтому санитарная проверка
-            # своего конца повторяется здесь же, ещё раз (см. _resolve_end):
-            # если модель дала конец, но он всё же вылез за пределы
-            # итогового соседа больше чем на допуск — тихо откатываемся к
-            # прежней логике вместо того, чтобы выдать заведомо неверную
-            # границу.
-            is_own_end = (
-                own_end_flag
-                and seg.end > seg.start
-                and (next_start is None or seg.end <= next_start + _END_OVERSHOOT_TOLERANCE_SEC)
-            )
-            if is_own_end:
-                end = min(seg.end, next_start) if next_start is not None else seg.end
-            elif next_start is not None:
-                end = next_start
-            else:
-                end = max(seg.start, duration_sec or seg.end)
-            # `has_explicit_end` доносит признак «это настоящая граница от
-            # модели» до вызывающего кода — см. AsrSegment.has_explicit_end.
-            final_segments.append(replace(seg, end=end, has_explicit_end=is_own_end))
+        final_segments = _finalize_segment_ends(accumulated, accumulated_own_end, duration_sec)
 
         final_segments, timestamp_scale = _rescale_stretched_timestamps(
             final_segments, duration_sec
@@ -1914,6 +2169,9 @@ class CloudAudioAsrAdapter:
             holes_repaired=holes_repaired,
             word_count=word_count,
             duration_sec=duration_sec,
+            local_repaired=local_repaired,
+            silent=silent,
+            local_repair=local_report,
         )
 
         return AsrRunResult(
@@ -1944,6 +2202,22 @@ class CloudAudioAsrAdapter:
 # ---------------------------------------------------------------------------
 # Публичный интерфейс модуля
 # ---------------------------------------------------------------------------
+
+
+def _segment_to_dict(seg: AsrSegment) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "text": seg.text,
+        "start": seg.start,
+        "end": seg.end,
+        "speaker": seg.speaker,
+        "has_explicit_end": seg.has_explicit_end,
+    }
+    if seg.timestamp_source:
+        # Вставка локального ремонта дыры: реальные пословные таймкоды
+        # (см. sync_transcript._segment_words — явные words не интерполируются).
+        item["timestamp_source"] = seg.timestamp_source
+        item["words"] = [{"word": w.word, "start": w.start, "end": w.end} for w in seg.words]
+    return item
 
 
 def transcribe_cloud(
@@ -2020,16 +2294,7 @@ def transcribe_cloud(
         _attach_budget(exc, budget)
         raise
 
-    segments = [
-        {
-            "text": seg.text,
-            "start": seg.start,
-            "end": seg.end,
-            "speaker": seg.speaker,
-            "has_explicit_end": seg.has_explicit_end,
-        }
-        for seg in result.segments
-    ]
+    segments = [_segment_to_dict(seg) for seg in result.segments]
 
     snapshot = budget.snapshot()
     return {

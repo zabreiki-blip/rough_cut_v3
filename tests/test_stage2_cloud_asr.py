@@ -1386,3 +1386,525 @@ def test_leading_hole_starts_at_part_start_for_first_part_and_at_covered_until_f
     coverage = result["coverage"]
     assert coverage["holes_detected"] == 2
     assert coverage["unrecovered_ranges"] == [[0.0, 60.0], [300.0, 340.0]]
+
+
+# ---------------------------------------------------------------------------
+# Локальный ремонт неисправленных дыр (stage2/local_hole_repair.py)
+# ---------------------------------------------------------------------------
+
+from stage2 import local_hole_repair  # noqa: E402
+
+_HOLE_CLOUD_PART = (
+    f"[00:00] ГОЛОС 1: {_words(99)} раз два\n"
+    f"[01:00] ГОЛОС 1: {_words(10)}\n"
+    f"[04:00] ГОЛОС 1: {_words(100)}"
+)
+
+
+class _FakeClip:
+    def __init__(self, start: float, end: float) -> None:
+        self.start = start
+        self.end = end
+        self.path = Path("clip.wav")
+        self.samples = None
+
+    def cleanup(self) -> None:
+        pass
+
+
+def _install_local_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    speech_sec: float = 30.0,
+    words: list[tuple[str, float, float]] | None = None,
+    error: Exception | None = None,
+    on_transcribe=None,
+) -> dict[str, Any]:
+    """Мокает ffmpeg-нарезку, VAD и транскрайбер локального ремонта."""
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "1")
+    state: dict[str, Any] = {"clips": [], "transcribed": 0, "models": []}
+
+    def load_clip(_audio_path, start, end, **_kwargs):
+        state["clips"].append((start, end))
+        return _FakeClip(start, end)
+
+    def speech_seconds(_samples, lo, hi):
+        state["vad_range"] = (lo, hi)
+        return speech_sec
+
+    def transcribe_clip(_path, model, language, progress_callback=None):
+        state["transcribed"] += 1
+        state["models"].append((model, language))
+        if on_transcribe is not None:
+            on_transcribe()
+        if error is not None:
+            raise error
+        return [{"word": w, "start": s, "end": e} for w, s, e in words or []]
+
+    monkeypatch.setattr(local_hole_repair, "_load_clip", load_clip)
+    monkeypatch.setattr(local_hole_repair, "_speech_seconds", speech_seconds)
+    monkeypatch.setattr(local_hole_repair, "_transcribe_clip", transcribe_clip)
+    return state
+
+
+def _hole_words(count: int, first_clip_sec: float = 10.0, step: float = 4.0):
+    return [
+        (f"w{i}", first_clip_sec + i * step, first_clip_sec + i * step + 0.5) for i in range(count)
+    ]
+
+
+def test_local_repair_silence_goes_to_silent_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_local_engine(monkeypatch, speech_sec=0.2)
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "1")
+    coverage = result["coverage"]
+    assert coverage["silent_ranges"] == [[60.0, 240.0]]
+    assert coverage["unrecovered_ranges"] == []
+    assert coverage["unrecovered_sec"] == 0.0
+    assert coverage["holes_repaired_local"] == 0
+    assert coverage["local_repaired_ranges"] == []
+    assert state["transcribed"] == 0
+    assert sum(len(seg["text"].split()) for seg in result["segments"]) == 210
+    # Речь проверяется на самой дыре (в координатах вырезки с полем 3 с).
+    assert state["clips"] == [(57.0, 243.0)]
+    assert state["vad_range"] == (3.0, 183.0)
+
+
+def test_local_repair_inserts_words_at_absolute_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Вырезка начинается с 57 с: слова 1.0 (58 с) и 185.0 (242 с) лежат в поле
+    # вокруг дыры и не должны попасть в результат — там уже есть облачные слова.
+    words = [("лишнееслово", 1.0, 1.4), *_hole_words(12, 10.0, 4.0), ("хвост", 185.0, 185.4)]
+    state = _install_local_engine(monkeypatch, words=words)
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    coverage = result["coverage"]
+    assert state["transcribed"] == 1
+    assert coverage["unrecovered_ranges"] == []
+    assert coverage["unrecovered_sec"] == 0.0
+    assert coverage["holes_repaired_local"] == 1
+    assert coverage["local_repaired_ranges"] == [[60.0, 240.0]]
+    assert coverage["silent_ranges"] == []
+    segments = result["segments"]
+    starts = [seg["start"] for seg in segments]
+    assert starts == sorted(starts)
+    local = [seg for seg in segments if seg.get("timestamp_source") == "local-whisper"]
+    assert local
+    local_words = [w for seg in local for w in seg["words"]]
+    assert [w["word"] for w in local_words] == [f"w{i}" for i in range(12)]
+    assert local_words[0]["start"] == pytest.approx(67.0)
+    assert local_words[-1]["start"] == pytest.approx(57.0 + 10.0 + 11 * 4.0)
+    all_text = " ".join(seg["text"] for seg in segments)
+    assert "лишнееслово" not in all_text and "хвост" not in all_text
+    # Старый разреженный кусок (10 «слово») заменён, облачные края на месте.
+    assert sum(len(seg["text"].split()) for seg in segments) == 100 + 12 + 100
+    assert all("timestamp_source" not in seg for seg in segments if seg not in local)
+    assert state["models"] == [("medium", "ru")]
+
+
+def test_local_repair_trims_duplicate_boundary_words(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Облачная реплика перед дырой заканчивается на «раз два»; локальный проход
+    # начинает с тех же слов — они не должны дублироваться.
+    words = [("раз", 5.0, 5.3), ("два", 5.4, 5.7), *_hole_words(12, 10.0, 4.0)]
+    _install_local_engine(monkeypatch, words=words)
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_HOLE_CLOUD_PART, cost=0.05)])
+    texts = " ".join(seg["text"] for seg in result["segments"]).split()
+    pairs = [(a, b) for a, b in zip(texts, texts[1:]) if (a, b) == ("раз", "два")]
+    assert len(pairs) == 1
+    assert result["coverage"]["unrecovered_ranges"] == []
+
+
+def test_local_repair_engine_error_keeps_hole(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_local_engine(monkeypatch, error=RuntimeError("model load failed"))
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    coverage = result["coverage"]
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert coverage["holes_repaired_local"] == 0
+    assert "model load failed" in json.dumps(coverage["local_repair"], ensure_ascii=False)
+    assert sum(len(seg["text"].split()) for seg in result["segments"]) == 210
+
+
+def test_local_repair_not_better_keeps_hole(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_local_engine(monkeypatch, words=_hole_words(3, 10.0, 4.0))
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    assert result["coverage"]["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert result["coverage"]["local_repaired_ranges"] == []
+    assert sum(len(seg["text"].split()) for seg in result["segments"]) == 210
+
+
+def test_local_repair_disabled_by_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_local_engine(monkeypatch, words=_hole_words(10))
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "0")
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    coverage = result["coverage"]
+    assert state["transcribed"] == 0 and state["clips"] == []
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert coverage["holes_repaired_local"] == 0
+    assert coverage["silent_ranges"] == []
+    assert coverage["local_repair"]["skipped_reason"] == "disabled"
+
+
+def test_local_repair_skipped_when_faster_whisper_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_local_engine(monkeypatch, words=_hole_words(10))
+    from stage2 import whisper_runner
+
+    monkeypatch.setattr(whisper_runner, "_module_available", lambda _module: False)
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    coverage = result["coverage"]
+    assert state["transcribed"] == 0
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert "faster-whisper" in coverage["local_repair"]["skipped_reason"]
+
+
+def test_local_repair_not_attempted_without_holes(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_local_engine(monkeypatch, words=_hole_words(10))
+    dense = f"[00:00] ГОЛОС 1: {_words(100)}\n[01:00] ГОЛОС 1: {_words(300)}\n[04:00] ГОЛОС 1: {_words(100)}"
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(dense, cost=0.05)])
+    assert state["clips"] == []
+    assert result["coverage"]["local_repair"].get("skipped_reason") is None
+    assert result["coverage"]["holes_repaired_local"] == 0
+
+
+def test_local_repair_reports_progress_and_honours_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel = asyncio.Event()
+    _install_local_engine(monkeypatch, words=_hole_words(10), on_transcribe=lambda: cancel.set())
+    messages: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        _coverage_call(
+            monkeypatch,
+            [lambda: _model_response(_SPARSE_PART, cost=0.05)],
+            cancel=cancel,
+            progress_callback=lambda progress: messages.append(progress.message),
+        )
+    assert any("Локальн" in message for message in messages)
+
+
+def test_local_repair_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MARGIN_SEC",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC",
+        "SYNC_WHISPER_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = local_hole_repair.LocalRepairSettings.from_env()
+    assert (settings.enabled, settings.model) == (True, "medium")
+    assert (settings.margin_sec, settings.min_speech_sec) == (3.0, 1.0)
+    monkeypatch.setenv("SYNC_WHISPER_MODEL", "small")
+    assert local_hole_repair.LocalRepairSettings.from_env().model == "small"
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL", "large-v3")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MARGIN_SEC", "5")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC", "2.5")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "off")
+    settings = local_hole_repair.LocalRepairSettings.from_env()
+    assert (settings.enabled, settings.model) == (False, "large-v3")
+    assert (settings.margin_sec, settings.min_speech_sec) == (5.0, 2.5)
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MARGIN_SEC", "bad")
+    assert local_hole_repair.LocalRepairSettings.from_env().margin_sec == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Ревью локального ремонта: дедлайн, реальный механизм остановки, мелочи
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+import tempfile  # noqa: E402
+
+from stage2.asr_contract import AsrWord  # noqa: E402
+
+
+def test_local_repair_deadline_returns_cloud_result_when_engine_cannot_be_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Загрузка модели не вызывает колбэк прогресса: поток нельзя прервать.
+    release = threading.Event()
+    _install_local_engine(
+        monkeypatch, words=_hole_words(12), on_transcribe=lambda: release.wait(10.0)
+    )
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC", "1")
+    messages: list[str] = []
+    started = time.monotonic()
+    try:
+        result, _ = _coverage_call(
+            monkeypatch,
+            [lambda: _model_response(_SPARSE_PART, cost=0.05)],
+            timeout_sec=2.0,
+            progress_callback=lambda progress: messages.append(progress.message),
+        )
+        elapsed = time.monotonic() - started
+        calls_at_return = len(messages)
+    finally:
+        release.set()
+    # Платный облачный результат не потерян, общий дедлайн не наступил.
+    assert elapsed < 2.0
+    coverage = result["coverage"]
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert coverage["holes_repaired_local"] == 0
+    assert coverage["local_repair"]["stopped"] == "deadline"
+    assert sum(len(seg["text"].split()) for seg in result["segments"]) == 210
+    assert result["cost_usd"] == pytest.approx(0.05)
+    # Брошенный поток после освобождения ничего не шлёт наружу.
+    time.sleep(0.4)
+    assert len(messages) == calls_at_return
+
+
+def test_local_repair_soft_deadline_already_passed_skips_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_local_engine(monkeypatch, words=_hole_words(12))
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC", "600")
+    result, _ = _coverage_call(
+        monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)], timeout_sec=30.0
+    )
+    coverage = result["coverage"]
+    assert state["clips"] == [] and state["transcribed"] == 0
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert coverage["local_repair"]["stopped"] == "deadline"
+
+
+def test_local_repair_own_time_limit_applies_without_global_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    _install_local_engine(
+        monkeypatch, words=_hole_words(12), on_transcribe=lambda: release.wait(10.0)
+    )
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC", "0.5")
+    started = time.monotonic()
+    try:
+        result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert elapsed < 5.0
+    assert result["coverage"]["local_repair"]["stopped"] == "deadline"
+    assert result["coverage"]["unrecovered_ranges"] == [[60.0, 240.0]]
+
+
+def test_local_repair_settings_new_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC", raising=False)
+    monkeypatch.delenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC", raising=False)
+    default = local_hole_repair.LocalRepairSettings.from_env()
+    assert default.max_sec == 0.0 and default.deadline_reserve_sec > 0
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC", "90")
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC", "7")
+    settings = local_hole_repair.LocalRepairSettings.from_env()
+    assert (settings.max_sec, settings.deadline_reserve_sec) == (90.0, 7.0)
+
+
+class _TrackedClip(_FakeClip):
+    def __init__(self, start: float, end: float, log: list[str]) -> None:
+        super().__init__(start, end)
+        self._log = log
+
+    def cleanup(self) -> None:
+        self._log.append("cleanup")
+
+
+def _direct_repair(
+    monkeypatch: pytest.MonkeyPatch, transcribe, **kwargs: Any
+) -> tuple[local_hole_repair.LocalRepairOutcome, list[str]]:
+    log: list[str] = []
+    monkeypatch.setattr(
+        local_hole_repair, "_load_clip", lambda _p, s, e, **_k: _TrackedClip(s, e, log)
+    )
+    monkeypatch.setattr(local_hole_repair, "_speech_seconds", lambda *_a: 30.0)
+    monkeypatch.setattr(local_hole_repair, "_transcribe_clip", transcribe)
+    segments = [AsrSegment(text="a b", start=0.0, end=5.0, words=[], speaker="ГОЛОС 1")]
+    outcome = local_hole_repair.repair_holes_locally(
+        Path("x.wav"),
+        [(60.0, 120.0), (200.0, 260.0)],
+        segments,
+        [True],
+        duration_sec=300.0,
+        language="ru",
+        settings=local_hole_repair.LocalRepairSettings(),
+        **kwargs,
+    )
+    return outcome, log
+
+
+def test_engine_progress_callback_raises_stop_on_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    cancel = threading.Event()
+
+    def transcribe(_path, _model, _language, progress_callback=None):
+        cancel.set()  # отмена приходит, пока движок работает
+        progress_callback(1.0, 10.0, 0)  # _Stop должен пройти сквозь вызов
+        raise AssertionError("движок не был остановлен колбэком")
+
+    outcome, log = _direct_repair(monkeypatch, transcribe, cancel=cancel)
+    assert outcome.stopped == "cancelled"
+    assert sorted(outcome.unrecovered) == [(60.0, 120.0), (200.0, 260.0)]
+    assert outcome.repaired == [] and log == ["cleanup"]
+
+
+def test_engine_progress_callback_raises_stop_on_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    def transcribe(_path, _model, _language, progress_callback=None):
+        time.sleep(0.15)  # дедлайн наступает во время работы движка
+        progress_callback(1.0, 10.0, 0)
+        raise AssertionError("движок не был остановлен колбэком")
+
+    outcome, log = _direct_repair(
+        monkeypatch, transcribe, deadline_monotonic=time.monotonic() + 0.05
+    )
+    assert outcome.stopped == "deadline"
+    assert sorted(outcome.unrecovered) == [(60.0, 120.0), (200.0, 260.0)]
+    assert log == ["cleanup"]
+    assert outcome.report["stopped"] == "deadline"
+
+
+def test_abort_event_stops_engine_like_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    abort = threading.Event()
+
+    def transcribe(_path, _model, _language, progress_callback=None):
+        abort.set()
+        progress_callback(1.0, 10.0, 0)
+        raise AssertionError("движок не был остановлен колбэком")
+
+    outcome, log = _direct_repair(monkeypatch, transcribe, abort=abort)
+    assert outcome.stopped == "deadline" and log == ["cleanup"]
+
+
+def test_worker_key_includes_local_repair_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from stage2.whisper_process import _worker_key
+
+    names = [
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MARGIN_SEC",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC",
+        "SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC",
+    ]
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    base = _worker_key("cloud-audio", "m", "ru", "fork")
+    for name, value in zip(names, ["0", "large-v3", "5", "2", "60", "9"]):
+        monkeypatch.setenv(name, value)
+        changed = _worker_key("cloud-audio", "m", "ru", "fork")
+        assert changed != base, name
+        monkeypatch.delenv(name)
+        assert _worker_key("cloud-audio", "m", "ru", "fork") == base
+
+
+def test_rescale_does_not_scale_segments_with_real_timestamps() -> None:
+    cloud = AsrSegment(text="облако", start=0.0, end=100.0, words=[])
+    local = AsrSegment(
+        text="точно",
+        start=50.0,
+        end=51.0,
+        words=[AsrWord(word="точно", start=50.0, end=51.0)],
+        timestamp_source="local-whisper",
+    )
+    scaled, scale = _rescale_stretched_timestamps([cloud, local], 50.0)
+    assert scale == pytest.approx(0.5)
+    assert (scaled[0].start, scaled[0].end) == (0.0, 50.0)
+    assert (scaled[1].start, scaled[1].end) == (50.0, 51.0)
+    assert [(w.start, w.end) for w in scaled[1].words] == [(50.0, 51.0)]
+
+
+def test_local_repair_skipped_when_timestamp_scale_is_stretched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_local_engine(monkeypatch, words=_hole_words(12))
+    # Модель выдала метки далеко за концом файла (300 с): шкала будет сжата,
+    # дыры посчитаны в неверном времени.
+    stretched = _SPARSE_PART + f"\n[09:00] ГОЛОС 1: {_words(100)}"
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(stretched, cost=0.05)])
+    assert state["clips"] == [] and state["transcribed"] == 0
+    local = result["coverage"]["local_repair"]
+    assert "scale" in local["skipped_reason"]
+    assert result["coverage"]["holes_repaired_local"] == 0
+
+
+def test_local_repair_progress_exception_keeps_repaired_holes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_local_engine(monkeypatch, words=_hole_words(12))
+
+    def progress(progress):
+        if progress.message.startswith("Локальн"):
+            raise RuntimeError("ui exploded")
+
+    result, _ = _coverage_call(
+        monkeypatch,
+        [lambda: _model_response(_SPARSE_PART, cost=0.05)],
+        progress_callback=progress,
+    )
+    coverage = result["coverage"]
+    assert coverage["local_repaired_ranges"] == [[60.0, 240.0]]
+    assert coverage["unrecovered_ranges"] == []
+
+
+def test_local_repair_progress_never_goes_backwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_local_engine(monkeypatch, words=_hole_words(12))
+    seen: list[tuple[str, float | None]] = []
+    _coverage_call(
+        monkeypatch,
+        [lambda: _model_response(_SPARSE_PART, cost=0.05)],
+        progress_callback=lambda p: seen.append((p.message, p.processed_sec)),
+    )
+    assert any(message.startswith("Локальн") for message, _ in seen)
+    values = [value for _, value in seen if value is not None]
+    assert values == sorted(values)
+
+
+def test_local_repair_inserted_segments_inherit_neighbour_speaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_local_engine(monkeypatch, words=_hole_words(12))
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    local = [seg for seg in result["segments"] if seg.get("timestamp_source") == "local-whisper"]
+    assert local and all(seg["speaker"] == "ГОЛОС 1" for seg in local)
+
+
+def test_local_repair_speaker_falls_back_to_following_segment() -> None:
+    previous = AsrSegment(text="а б", start=0.0, end=5.0, words=[], speaker=None)
+    following = AsrSegment(text="в г", start=300.0, end=305.0, words=[], speaker="ГОЛОС 2")
+    words = [{"word": f"w{i}", "start": 10.0 + i * 4.0, "end": 10.5 + i * 4.0} for i in range(12)]
+    spliced = local_hole_repair._splice(
+        [previous, following], [True, True], (60.0, 240.0), words, 50.0
+    )
+    assert spliced is not None
+    inserted = [s for s in spliced[0] if s.timestamp_source == "local-whisper"]
+    assert inserted and all(s.speaker == "ГОЛОС 2" for s in inserted)
+
+
+def test_local_repair_model_ignores_cloud_whisper_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL", raising=False)
+    monkeypatch.setenv("SYNC_WHISPER_MODEL", "google/gemini-3.7-flash")
+    assert local_hole_repair.LocalRepairSettings.from_env().model == "medium"
+    monkeypatch.setenv("SYNC_WHISPER_MODEL", "mlx-community/whisper-small-mlx")
+    assert local_hole_repair.LocalRepairSettings.from_env().model == "medium"
+    monkeypatch.setenv("SYNC_WHISPER_MODEL", "small")
+    assert local_hole_repair.LocalRepairSettings.from_env().model == "small"
+    # Явная настройка ремонта главнее.
+    monkeypatch.setenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL", "Systran/faster-whisper-small")
+    assert local_hole_repair.LocalRepairSettings.from_env().model == "Systran/faster-whisper-small"
+
+
+def test_stale_local_repair_tempdirs_are_removed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    old_time = time.time() - 2 * 3600
+    stale = tmp_path / "rough_cut_local_repair_old"
+    fresh = tmp_path / "rough_cut_local_repair_new"
+    foreign = tmp_path / "other_prefix_old"
+    for directory in (stale, fresh, foreign):
+        directory.mkdir()
+        (directory / "clip.wav").write_bytes(b"x")
+    stale_file = tmp_path / "rough_cut_local_repair_file"
+    stale_file.write_bytes(b"x")
+    import os
+
+    for path in (stale, foreign, stale_file):
+        os.utime(path, (old_time, old_time))
+    _direct_repair(monkeypatch, lambda *_a, **_k: [])
+    assert not stale.exists()
+    assert fresh.exists() and foreign.exists() and stale_file.exists()

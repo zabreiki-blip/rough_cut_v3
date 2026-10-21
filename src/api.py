@@ -1082,6 +1082,12 @@ def _transcription_config(
         # from 20-minute parts silently lost 30-45% of speech and must not
         # be reused. "4": long holes are re-recognized in pieces of up to
         # 2 minutes; "3" indexes are redone only if speech is still missing.
+        # The local hole repair (SYNC_CLOUD_ASR_LOCAL_REPAIR*, see
+        # stage2.local_hole_repair) is deliberately NOT part of this config or
+        # of the mapping: toggling it must not trigger a paid cloud re-run of
+        # every cached index. The repair result is stored in the index itself
+        # (coverage.local_repaired_ranges / silent_ranges); to apply changed
+        # repair settings to an existing index, re-transcribe it with force.
         "cloud_timestamp_mapping": cloud_timestamp_mapping,
     }
 

@@ -366,6 +366,14 @@ def _worker_key(
         os.getenv("SYNC_WHISPER_BEST_OF", "5").strip(),
         os.getenv("SYNC_WHISPER_BATCH_SIZE", "0").strip(),
         os.getenv("SYNC_WHISPER_CPU_THREADS", "0").strip(),
+        # Локальный ремонт дыр облачного ASR читает эти переменные в самом
+        # worker-процессе: после смены настроек прогретый worker не годится.
+        os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR", "").strip().lower(),
+        os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MODEL", "").strip(),
+        os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MARGIN_SEC", "").strip(),
+        os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MIN_SPEECH_SEC", "").strip(),
+        os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_MAX_SEC", "").strip(),
+        os.getenv("SYNC_CLOUD_ASR_LOCAL_REPAIR_DEADLINE_RESERVE_SEC", "").strip(),
         start_method,
     )
 

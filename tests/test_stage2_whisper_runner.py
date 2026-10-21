@@ -418,6 +418,49 @@ class WhisperRunnerTest(unittest.TestCase):
         self.assertNotIn("segments", meta)
         self.assertEqual(meta["coverage"]["holes_repaired"], 1)
 
+    def test_transcribe_cloud_keeps_exact_word_times_of_local_repair_segments(self) -> None:
+        cloud_result = {
+            "segments": [
+                {"text": "раз два", "start": 0.0, "end": 2.0, "speaker": "ГОЛОС 1",
+                 "has_explicit_end": True},
+                {
+                    "text": "точные слова здесь",
+                    "start": 10.0,
+                    "end": 13.0,
+                    "speaker": None,
+                    "has_explicit_end": True,
+                    "timestamp_source": "local-whisper",
+                    "words": [
+                        {"word": "точные", "start": 10.2, "end": 10.6},
+                        {"word": "слова", "start": 11.5, "end": 11.9},
+                        {"word": "здесь", "start": 12.4, "end": 12.8},
+                    ],
+                },
+            ],
+            "speakers": ["ГОЛОС 1"],
+            "language": "ru",
+            "model": "google/gemini-3.7-flash",
+            "backend": "cloud-audio",
+            "duration_sec": 13.0,
+            "cost_usd": 0.01,
+            "coverage": {"local_repaired_ranges": [[10.0, 13.0]]},
+        }
+        with TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "audio.wav"
+            audio_path.touch()
+            with patch("stage2.whisper_runner.transcribe_cloud", return_value=cloud_result):
+                result = transcribe_audio(audio_path, backend="cloud-audio", model="m")
+
+        local = [w for w in result["words"] if w["start"] >= 10.0]
+        self.assertEqual(
+            [(w["word"], w["start"], w["end"]) for w in local],
+            [("точные", 10.2, 10.6), ("слова", 11.5, 11.9), ("здесь", 12.4, 12.8)],
+        )
+        meta = result["backend_metadata"]
+        # Глобальная точность остаётся "interpolated": облачные реплики интерполируются.
+        self.assertEqual(meta["timestamp_precision"], "interpolated")
+        self.assertEqual(meta["coverage"]["local_repaired_ranges"], [[10.0, 13.0]])
+
     def test_transcribe_cloud_missing_api_key_raises_clear_error(self) -> None:
         with (
             TemporaryDirectory() as directory,

@@ -55,6 +55,10 @@ class AsrSegment:
     вычислен как начало следующей реплики или иной fallback. По умолчанию
     `False` — безопасное значение для адаптеров, которые вообще не
     различают эти два случая.
+
+    `timestamp_source` — происхождение реплики, если оно отличается от
+    основного источника (например, "local-whisper" для вставок локального
+    ремонта дыр, у которых `words` несут реальные пословные таймкоды).
     """
 
     text: str
@@ -63,6 +67,7 @@ class AsrSegment:
     words: list[AsrWord]
     speaker: str | None = None
     has_explicit_end: bool = False
+    timestamp_source: str | None = None
 
 
 @dataclass
