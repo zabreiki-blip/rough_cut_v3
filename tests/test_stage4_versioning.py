@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import re
 import wave
+
+import pytest
 
 from api_core_routes import _active_revision_input_path
 from atomic_io import atomic_write_json
@@ -480,6 +483,13 @@ def test_activation_interrupted_between_files_is_detected_and_recoverable(
     with pytest.raises(RevisionStateConflictError, match="does not match"):
         activate_revision("rev_0001", paths)
 
+    # The journal survives the crash, so a status check would self-heal.  This
+    # test covers the manual reconcile path for a project with no journal
+    # (hand-edited / journal lost), so drop it to emulate that.
+    intent = paths["work"] / "activation_intent.json"
+    assert intent.is_file()
+    intent.unlink()
+
     result = reconcile_revision_state("rev_0002", paths)
 
     assert result["reconciled"] is True
@@ -768,3 +778,236 @@ def test_recover_interrupted_activation_runs_activation_exactly_once(
     assert len(results) == 2
     assert sum(1 for result in results if result is not None and result["recovered"]) == 1
     assert not journal_path.is_file()
+
+
+_ACTIVATION_CRASH_POINTS = [
+    "after_restore_assets",
+    "before_normalized",
+    "after_normalized",
+    "before_sync_matches",
+    "after_sync_matches",
+    "before_timeline",
+    "after_timeline",
+    "before_mapping",
+    "after_mapping",
+    "before_active_revision",
+    "after_active_revision",
+]
+
+
+def _prepare_two_revisions_with_projections(tmp_path: Path) -> dict[str, Path]:
+    """rev_0001 active; rev_0002 imported and given timeline/mapping snapshots."""
+    import json
+
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    blocks = [_block("one", "Первая", "voiceover"), _block("two", "Вторая", "voiceover")]
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": blocks,
+        },
+    )
+    _write_wav(paths["speaker"] / "zk1.wav", 1)
+    _write_wav(paths["speaker"] / "zk2.wav", 2)
+    atomic_write_json(paths["timeline"], {"marker": "timeline_v1"})
+    atomic_write_json(paths["work"] / "stage3_source_mapping.json", {"marker": "mapping_v1"})
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": blocks,
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+    timelines = paths["scenario_versions"].parent / "timelines"
+    atomic_write_json(timelines / "rev_0002.full_timeline.json", {"marker": "timeline_v2"})
+    atomic_write_json(timelines / "rev_0002.stage3_mapping.json", {"marker": "mapping_v2"})
+    manifest_path = paths["scenario_versions"] / "rev_0002.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["timeline_snapshot"] = "rev_0002.full_timeline.json"
+    manifest["stage3_mapping_snapshot"] = "rev_0002.stage3_mapping.json"
+    atomic_write_json(manifest_path, manifest)
+    return paths
+
+
+def _inject_activation_crash(monkeypatch, paths: dict[str, Path], point: str) -> dict[str, bool]:
+    from stage4 import versioning
+
+    when, _, step = point.partition("_")
+    targets = {
+        "normalized": paths["normalized"],
+        "sync_matches": paths["sync_matches"],
+        "timeline": paths["timeline"],
+        "mapping": paths["work"] / "stage3_source_mapping.json",
+        "active_revision": paths["work"] / "active_revision.json",
+    }
+    state = {"fired": False}
+
+    def maybe_crash(label: str, phase: str) -> None:
+        if not state["fired"] and label == step and phase == when:
+            state["fired"] = True
+            raise RuntimeError(f"simulated crash {point}")
+
+    real_restore = versioning.restore_revision_assets
+    real_write = versioning.atomic_write_json
+    real_snapshot = versioning._snapshot_file
+
+    def restore(*args, **kwargs):
+        real_restore(*args, **kwargs)
+        maybe_crash("restore_assets", "after")
+
+    def label_for(path: Path) -> str | None:
+        for label, target in targets.items():
+            if Path(path) == target:
+                return label
+        return None
+
+    def write(path, payload, *args, **kwargs):
+        label = label_for(path)
+        if label:
+            maybe_crash(label, "before")
+        real_write(path, payload, *args, **kwargs)
+        if label:
+            maybe_crash(label, "after")
+
+    def snapshot(source, destination):
+        label = label_for(destination)
+        if label:
+            maybe_crash(label, "before")
+        real_snapshot(source, destination)
+        if label:
+            maybe_crash(label, "after")
+
+    monkeypatch.setattr(versioning, "restore_revision_assets", restore)
+    monkeypatch.setattr(versioning, "atomic_write_json", write)
+    monkeypatch.setattr(versioning, "_snapshot_file", snapshot)
+    return state
+
+
+def test_activation_crash_after_restore_assets_keeps_intent_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Audit item 5: the journal must outlive restore_revision_assets."""
+    import pytest
+
+    paths = _prepare_two_revisions_with_projections(tmp_path)
+    _inject_activation_crash(monkeypatch, paths, "after_restore_assets")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        activate_revision("rev_0002", paths)
+    monkeypatch.undo()
+
+    assert (paths["work"] / "activation_intent.json").is_file()
+    assert inspect_revision_state(paths)["status"] == "ok"
+    assert not (paths["work"] / "activation_intent.json").is_file()
+
+
+@pytest.mark.parametrize("point", _ACTIVATION_CRASH_POINTS)
+def test_activation_crash_at_every_boundary_is_recoverable(
+    tmp_path: Path, monkeypatch, point: str
+) -> None:
+    import json
+
+    paths = _prepare_two_revisions_with_projections(tmp_path)
+    intent = paths["work"] / "activation_intent.json"
+    state = _inject_activation_crash(monkeypatch, paths, point)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        activate_revision("rev_0002", paths)
+    monkeypatch.undo()
+    assert state["fired"]
+
+    # Never "journal absent + inconsistent projections".
+    if not intent.is_file():
+        assert _detect_revision_state(paths)["blocking"] is False
+
+    recovered = inspect_revision_state(paths)
+    assert recovered["status"] == "ok"
+    assert recovered["blocking"] is False
+    assert recovered["active_revision_id"] == "rev_0002"
+    assert not intent.is_file()
+
+    def read(path: Path) -> dict:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    assert read(paths["work"] / "active_revision.json")["revision_id"] == "rev_0002"
+    assert read(paths["normalized"])["scenario_revision_id"] == "rev_0002"
+    assert read(paths["prepared"])["scenario_revision_id"] == "rev_0002"
+    assert read(paths["timeline"])["marker"] == "timeline_v2"
+    assert read(paths["work"] / "stage3_source_mapping.json")["marker"] == "mapping_v2"
+
+
+def test_successful_activation_closes_intent_journal(tmp_path: Path) -> None:
+    paths = _prepare_two_revisions_with_projections(tmp_path)
+    activate_revision("rev_0002", paths)
+    assert not (paths["work"] / "activation_intent.json").is_file()
+    assert inspect_revision_state(paths)["status"] == "ok"
+
+
+def test_resumed_activation_rejects_working_projection_at_a_third_revision(
+    tmp_path: Path,
+) -> None:
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "v1.docx"
+    source_v1.write_bytes(b"v1")
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": [_block("one", "Первая", "voiceover")],
+        },
+    )
+    _write_wav(paths["speaker"] / "zk1.wav", 1)
+    ensure_baseline("demo", paths)
+
+    source_v2 = paths["input"] / "v2.docx"
+    source_v2.write_bytes(b"v2")
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": [_block("one", "Первая", "voiceover")],
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+
+    # The working projection belongs to an unrelated third revision.
+    working = json.loads(paths["normalized"].read_text(encoding="utf-8"))
+    working["scenario_revision_id"] = "rev_0099"
+    working["blocks"] = [_block("x", "Чужая правка", "voiceover")]
+    atomic_write_json(paths["normalized"], working)
+    before = paths["normalized"].read_bytes()
+
+    with pytest.raises(RevisionStateConflictError, match="does not match"):
+        activate_revision("rev_0002", paths, _resume=True)
+
+    assert paths["normalized"].read_bytes() == before

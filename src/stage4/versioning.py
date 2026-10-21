@@ -19,6 +19,7 @@ from atomic_io import atomic_write_json
 from cost_budget import CostBudget
 from stage4.revision_assets import (
     activation_intent_path,
+    clear_activation_intent,
     create_revision_asset_snapshots,
     revision_speaker_alias_dir,
     restore_revision_assets,
@@ -287,7 +288,8 @@ def recover_interrupted_activation(project_paths: dict[str, Path]) -> dict[str, 
     attempt started committing) finishes exactly what was interrupted,
     including the projections ``restore_revision_assets`` itself does not
     own (``scenario_normalized.json``, ``sync_matches.json``, the timeline
-    and ``active_revision.json``).
+    and ``active_revision.json``).  ``activate_revision`` closes the journal
+    only after ``active_revision.json`` is written.
 
     Returns ``None`` when there is nothing to recover. Otherwise returns a
     result describing the outcome and never raises: read-only integrity
@@ -1045,7 +1047,12 @@ def activate_revision(
         active_id = str(_read_json(active_path).get("revision_id") or "")
         working = _read_json(project_paths["normalized"])
         working_id = str(working.get("scenario_revision_id") or "")
-        if active_id and working_id != active_id:
+        # A resumed activation legitimately finds the working projection
+        # already moved to the incoming revision (crash after the
+        # normalization write but before the active pointer write), or not
+        # yet written at all. Any third revision is still a conflict.
+        allowed_working = {active_id, revision_id, ""} if _resume else {active_id}
+        if active_id and working_id not in allowed_working:
             raise RevisionStateConflictError(
                 "active revision does not match the working scenario; "
                 "repair or reconcile the project before switching revisions"
@@ -1092,7 +1099,9 @@ def activate_revision(
         if active_id and active_id != revision_id:
             snapshot_revision_assets(active_id, project_paths)
             manifest = _read_json(manifest_path)
-    restore_revision_assets(revision_id, manifest, normalized, project_paths)
+    # The intent journal stays on disk until the very last write below
+    # (active_revision.json): recovery resumes from every crash point before.
+    restore_revision_assets(revision_id, manifest, normalized, project_paths, keep_intent=True)
     atomic_write_json(project_paths["normalized"], normalized)
     atomic_write_json(project_paths["sync_matches"], matches)
     if manifest.get("timeline_snapshot"):
@@ -1119,6 +1128,7 @@ def activate_revision(
         project_paths["work"] / "active_revision.json",
         {"revision_id": revision_id, "activated_at": _utcnow()},
     )
+    clear_activation_intent(project_paths)
     return {"revision": manifest, "reused_sync_matches": len(kept)}
 
 

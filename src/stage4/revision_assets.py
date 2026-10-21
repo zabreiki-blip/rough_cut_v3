@@ -75,6 +75,11 @@ def activation_intent_path(project_paths: dict[str, Path]) -> Path:
     return project_paths["work"] / _ACTIVATION_INTENT_FILENAME
 
 
+def clear_activation_intent(project_paths: dict[str, Path]) -> None:
+    """Close the activation intent journal; call only after the last write."""
+    activation_intent_path(project_paths).unlink(missing_ok=True)
+
+
 def revision_speaker_alias_dir(project_paths: dict[str, Path], revision_id: str) -> Path:
     """Return the mutable speaker alias projection for one revision.
 
@@ -488,7 +493,17 @@ def restore_revision_assets(
     revision: dict[str, Any],
     normalized: dict[str, Any],
     project_paths: dict[str, Path],
+    *,
+    keep_intent: bool = False,
 ) -> None:
+    """Restore ``revision_id``'s prepared/manifest/alias projections.
+
+    The write-ahead activation intent is closed here by default.  A caller
+    that owns a larger transaction (``stage4.versioning.activate_revision``
+    also writes normalization, matches, timeline, mapping and the active
+    revision pointer afterwards) passes ``keep_intent=True`` and must call
+    ``clear_activation_intent`` itself once every write has been made.
+    """
     prepared_snapshot = str(revision.get("prepared_snapshot") or "")
     if prepared_snapshot and prepared_snapshot != f"{revision_id}.prepared.json":
         raise ValueError("invalid prepared snapshot")
@@ -582,5 +597,7 @@ def restore_revision_assets(
         ):
             alias.unlink()
             alias.with_suffix(".wav.meta").unlink(missing_ok=True)
-    # Every alias now matches revision_id; the intent recorded above is done.
-    intent_path.unlink(missing_ok=True)
+    # Every alias now matches revision_id.  The intent is done only if the
+    # caller has no further writes to make under it.
+    if not keep_intent:
+        clear_activation_intent(project_paths)
