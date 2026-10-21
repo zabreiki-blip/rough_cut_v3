@@ -327,3 +327,55 @@ def test_legacy_alias_rekey_chain_does_not_lose_rows(tmp_path: Path) -> None:
         ("Сергей 2", "сергей 2", "sync", "video_cue"),
         ("Сергей 2 2", "сергей 2 2", "sync", "marker"),
     ]
+
+
+# --- A compound number glued to the marker ("ЗК0.1", "ЗК1.2.3") is a marker
+# index as a whole; no part of it may leak into the spoken text. ---
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ЗК0.1 25 марта 2025 года.", "25 марта 2025 года."),
+        ("ЗК1.10 Продолжение истории.", "Продолжение истории."),
+        ("ЗК1.2.3 Текст реплики.", "Текст реплики."),
+        ("ЗК1: 25 марта 2025 года.", "25 марта 2025 года."),
+        ("ЗК 25 марта 2025 года.", "25 марта 2025 года."),
+        ("Диктор 1915 год был тяжёлым.", "1915 год был тяжёлым."),
+        ("Диктор-1 Текст реплики.", "Текст реплики."),
+        ("ЗК1: Текст реплики.", "Текст реплики."),
+        ("Диктор 2: Текст реплики.", "Текст реплики."),
+    ],
+)
+def test_split_label_compound_marker_number_stays_out_of_content(
+    text: str, expected: str
+) -> None:
+    from stage1.normalizer import _split_label
+
+    _, content = _split_label(text)
+    assert content == expected
+
+
+def test_split_label_compound_marker_number_label_has_no_digits() -> None:
+    from stage1.normalizer import _split_label
+
+    assert _split_label("ЗК0.1 25 марта 2025 года.")[0] == "ЗК"
+    assert _split_label("ЗК1.10 Продолжение истории.")[0] == "ЗК"
+
+
+def test_compound_zk_marker_numbers_do_not_reach_tts_text(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "ЗК0.1 25 марта 2025 года.\nЗК1.10 Продолжение истории.\n", encoding="utf-8"
+    )
+    result = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )
+    assert [b["type"] for b in result["blocks"]] == ["voiceover", "voiceover"]
+    assert [b["normalized_text"] for b in result["blocks"]] == [
+        "25 марта 2025 года.",
+        "Продолжение истории.",
+    ]

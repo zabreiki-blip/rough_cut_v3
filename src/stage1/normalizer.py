@@ -114,10 +114,21 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
 # ``СНХ Имя, роль — файл.wav 00:05:42 — реплика``: the marker is followed by
 # whitespace (no comma), the credit by a dash and an optional media file name.
 _SNH_DASH_CREDIT = re.compile(
-    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<credit>[А-ЯЁA-Z][^—–\n]{1,160}?)\s+[—–-]\s+"
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<credit>[А-ЯЁA-Z][^—–\n]{1,160}?)\s+"
+    # The dash is optional when the credit is directly followed by a timecode
+    # (``СНХ ПОПОВ 00:12:06 — реплика``); such a credit carries no media file.
+    r"(?:(?P<dash>[—–-])\s+|(?=\[?\d{1,2}[:.\-]))"
     r"(?P<rest>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+_MEDIA_EXTENSIONS = r"(?:wav|mp3|mp4|mov|m4a|aiff?|mxf|aac|flac|ogg|avi|mkv)"
+# A media file name (may contain spaces and parentheses) ending the text right
+# before a timecode, optionally followed by a dash.
+_TRAILING_MEDIA_CREDIT = re.compile(
+    rf"(?P<name>[^\n—–]{{1,118}}?\.{_MEDIA_EXTENSIONS})(?![\w.])\s*[—–-]?\s*$",
+    re.IGNORECASE,
+)
+_SENTENCE_BOUNDARY = re.compile(r"[.!?…»\"”]\s+")
 _MEDIA_FILE_NAME = re.compile(r"^(?:.{1,118}\.[A-Za-z0-9]{2,5}|\S{1,120})$")
 _EXPLICIT_SYNC_LABEL = re.compile(r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE)
 _TIMECODE_TOKEN = (
@@ -1519,6 +1530,8 @@ def _parse_snh_dash_credit(text: str) -> dict[str, str] | None:
         if _is_unambiguous_timecode_match(rest, found.start(), found.end()):
             timecode_at = found.start()
             break
+    if not match.group("dash") and timecode_at != 0:
+        return None
     if timecode_at < 0:
         source, content = rest, ""
     else:
@@ -1598,11 +1611,13 @@ def _split_label(text: str) -> tuple[str, str]:
         # It is only unambiguous when either an explicit separator glues it to
         # the marker, or -- when separated by whitespace or glued directly --
         # it is itself immediately followed by a structural separator or the
-        # end of the string. Otherwise the digits are prose (e.g. a year in
+        # end of the string. A compound number glued to the marker ("ЗК0.1",
+        # "ЗК1.2.3") is a marker index as a whole and never reaches the text. Otherwise the digits are prose (e.g. a year in
         # "Диктор 1915 год...") and must stay in the content.
         match = re.match(
             rf"^\s*({re.escape(marker)})"
-            rf"(?:[-.]\d+[A-Za-zА-Яа-я]?"
+            rf"(?:[-.]\d+(?:\.\d+)*[A-Za-zА-Яа-я]?"
+            rf"|\d+(?:\.\d+)+(?=\s|[,.:\-–—]|$)"
             rf"|\s*\d+[A-Za-zА-Яа-я]?(?=\s*[.:\-–—]|\s*$))?"
             rf"(?:\s*[,.:\-–—]\s*|\s+|$)(.*)$",
             text,
@@ -1832,6 +1847,8 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         block.role = dash_credit["role"]
         if dash_credit["source"]:
             block.source_description = dash_credit["source"]
+        elif dash_credit["content"]:
+            block.warnings.append("Sync credit has no source media file")
         fragment_source = dash_credit["content"]
         has_sync_metadata = True
     elif explicit_label:
@@ -1904,6 +1921,28 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     block.normalized_text = " ".join(fragment.text for fragment in fragments if fragment.text)
 
 
+def _strip_trailing_media_credit(text: str) -> str:
+    """Drop a media file name that ends ``text`` right before the next timecode.
+
+    ``... Дональд Трамп. ZOOM0007_Tr1 (1).WAV`` -> ``... Дональд Трамп.``. The
+    name starts after the last sentence boundary; without one only a short
+    all-name text or the last whitespace-free token is treated as the name.
+    """
+    match = _TRAILING_MEDIA_CREDIT.search(text)
+    if not match:
+        return text
+    name = match.group("name")
+    start = match.start("name")
+    boundary = None
+    for boundary in _SENTENCE_BOUNDARY.finditer(name):
+        pass
+    if boundary is not None:
+        start += boundary.end()
+    elif not (start == 0 and len(name.split()) <= 4):
+        start += len(name) - len(name.split()[-1])
+    return text[:start].rstrip(" \t\r\n–—-")
+
+
 def _extract_sync_fragments(text: str) -> list[SyncFragment]:
     # A raw `_TIMECODE` occurrence only becomes a fragment boundary when it is
     # unambiguous (see `_is_unambiguous_timecode_match`). Anything else -- for
@@ -1941,7 +1980,9 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
 
     fragments: list[SyncFragment] = []
     if boundaries:
-        leading = text[: boundaries[0]["token_start"]].strip(" \t\r\n–—-")
+        leading = _strip_trailing_media_credit(text[: boundaries[0]["token_start"]]).strip(
+            " \t\r\n–—-"
+        )
         leading = re.sub(r"\.\s*,", ",", leading)
         if leading:
             fragments.append(SyncFragment(text=leading, timecode_start=""))
@@ -1949,7 +1990,10 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
         text_end = (
             boundaries[index + 1]["token_start"] if index + 1 < len(boundaries) else len(text)
         )
-        fragment_text = text[boundary["content_start"] : text_end].strip(" \t\r\n–—-")
+        fragment_text = text[boundary["content_start"] : text_end]
+        if index + 1 < len(boundaries):
+            fragment_text = _strip_trailing_media_credit(fragment_text)
+        fragment_text = fragment_text.strip(" \t\r\n–—-")
         fragment_text = re.sub(r"\.\s*,", ",", fragment_text)
         if not fragment_text:
             continue

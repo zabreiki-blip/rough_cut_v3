@@ -969,6 +969,65 @@ async function testRevisionsInbox({ state, revisions }) {
   }
 }
 
+async function testBuildTimelineSurfacesWarnings({ state, tts }) {
+  const { ids, appState, toastContainer } = state;
+  const originalFetch = globalThis.fetch;
+  const originalLog = ids.log_box.textContent;
+  const originalChildren = toastContainer.children;
+  const originalReady = appState.timelineReady;
+  const base = { zk: 3, snh: 2, total_duration_sec: 75 };
+  const run = async (result) => {
+    ids.log_box.textContent = "";
+    toastContainer.children = [];
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result }) });
+    await tts.doBuildTimeline();
+    return { log: ids.log_box.textContent, toasts: toastContainer.children.map((t) => t.className) };
+  };
+  try {
+    // Warnings + unresolved sync matches: warnings logged, warn toast, draft marker.
+    const dirty = await run({
+      ...base,
+      matched: 1,
+      review: 1,
+      unmatched: 0,
+      warnings: ["ZK без WAV (будут пропущены в XML): zk_007", "Устаревшие sync matches пропущены: snh_003"],
+    });
+    assert.ok(dirty.log.includes("[WARN] ZK без WAV"), dirty.log);
+    assert.ok(dirty.log.includes("[WARN] Устаревшие sync matches"), dirty.log);
+    assert.ok(/сопоставлено=1.*проверка=1.*без совпадения=0/.test(dirty.log), dirty.log);
+    assert.ok(dirty.log.includes("черновик с заглушками"), dirty.log);
+    assert.ok(!dirty.log.includes("Timeline built:"), "must not read as clean success");
+    assert.ok(dirty.toasts.some((c) => c.includes("warn")), JSON.stringify(dirty.toasts));
+    assert.ok(!dirty.toasts.some((c) => c.includes("success")), JSON.stringify(dirty.toasts));
+    assert.strictEqual(ids.btn_export_xml.disabled, false);
+    assert.strictEqual(appState.timelineReady, true);
+
+    // Clean build: no warnings, no draft marker, no warn toast.
+    const clean = await run({ ...base, matched: 2, review: 0, unmatched: 0, warnings: [] });
+    assert.ok(clean.log.includes("Timeline built:"), clean.log);
+    assert.ok(/сопоставлено=2/.test(clean.log), clean.log);
+    assert.ok(!clean.log.includes("черновик"), clean.log);
+    assert.ok(!clean.log.includes("[WARN]"), clean.log);
+    assert.ok(!clean.toasts.some((c) => c.includes("warn")), JSON.stringify(clean.toasts));
+
+    // Only unmatched sync (no warnings array entries): still a draft.
+    const unmatched = await run({ ...base, matched: 0, review: 0, unmatched: 2 });
+    assert.ok(unmatched.log.includes("черновик с заглушками"), unmatched.log);
+    assert.ok(unmatched.toasts.some((c) => c.includes("warn")), JSON.stringify(unmatched.toasts));
+    assert.strictEqual(ids.btn_export_xml.disabled, false);
+
+    // Old response shape without stats still works.
+    const legacy = await run(base);
+    assert.ok(legacy.log.includes("Timeline built:"), legacy.log);
+    assert.ok(!legacy.log.includes("сопоставлено"), legacy.log);
+  } finally {
+    globalThis.fetch = originalFetch;
+    ids.log_box.textContent = originalLog;
+    toastContainer.children = originalChildren;
+    appState.timelineReady = originalReady;
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
@@ -987,6 +1046,7 @@ async function main() {
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],
     ["testRevisionsInbox", () => testRevisionsInbox(modules)],
     ["testRevisionImportTimeout", () => testRevisionImportTimeout(modules)],
+    ["testBuildTimelineSurfacesWarnings", () => testBuildTimelineSurfacesWarnings(modules)],
   ];
 
   let passed = 0;

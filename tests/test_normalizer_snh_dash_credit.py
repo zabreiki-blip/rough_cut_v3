@@ -174,3 +174,76 @@ def test_splice_inheritance_requires_unambiguous_timecode(tmp_path: Path) -> Non
         "Тринадцатого февраля 1950 года была другая встреча.",
     )
     assert result["blocks"][-1]["speaker"] == ""
+
+
+# --- Repeated media credit inside one СНХ block stays out of spoken text. ---
+
+
+def test_repeated_media_credit_before_timecode_is_not_spoken_text(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ Виктор ЛИТОВКИН, военный обозреватель — ZOOM0007_Tr1 (1).WAV 00:01:10 — "
+        "Первая цитата про Дональд Трамп. ZOOM0007_Tr1 (1).WAV 00:03:20 — Вторая цитата.",
+    )
+    block = result["blocks"][0]
+    assert block["speaker"] == "Виктор ЛИТОВКИН"
+    assert block["source_description"] == "ZOOM0007_Tr1 (1).WAV"
+    texts = [f["text"] for f in block["sync_fragments"]]
+    assert texts == ["Первая цитата про Дональд Трамп.", "Вторая цитата."]
+    assert [f["timecode_start"] for f in block["sync_fragments"]] == ["00:01:10", "00:03:20"]
+    assert "WAV" not in block["normalized_text"]
+    assert validate_for_confirmation(result) == []
+
+
+def test_repeated_media_credit_with_different_file_is_not_spoken_text(
+    tmp_path: Path,
+) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ ПОПОВ — ZOOM0004_Tr1.WAV 00:01:00 — Первая. Попов проверенный.mp3 00:02:00 — Вторая.",
+    )
+    block = result["blocks"][0]
+    fragments = block["sync_fragments"]
+    assert [f["text"] for f in fragments] == ["Первая.", "Вторая."]
+    assert "mp3" not in block["normalized_text"]
+
+
+def test_sentence_ending_with_non_media_dotted_word_is_kept(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ ПОПОВ — ZOOM0004_Tr1.WAV 00:01:00 — Это было в 1950 г. 00:02:00 — Дальше.",
+    )
+    texts = [f["text"] for f in result["blocks"][0]["sync_fragments"]]
+    assert texts[0].endswith("1950 г.")
+
+
+# --- Sync credit without a media file and without a dash before the timecode. ---
+
+
+def test_surname_only_credit_without_dash_or_media(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path, "СНХ ПОПОВ 00:12:06 — Любое конструкторское бюро мечтает об этом."
+    )
+    block = result["blocks"][0]
+    assert block["type"] == "sync"
+    assert block["speaker"] == "ПОПОВ"
+    assert block["timecode_start"] == "00:12:06"
+    assert block["sync_fragments"][0]["text"] == "Любое конструкторское бюро мечтает об этом."
+    assert block["normalized_text"] == "Любое конструкторское бюро мечтает об этом."
+    assert not [e for e in validate_for_confirmation(result) if "has no speaker" in e]
+
+
+def test_name_surname_credit_without_dash_or_media(tmp_path: Path) -> None:
+    result = _normalize(tmp_path, "СНХ Дмитрий ВИННИК 00:01:00 — Это текст цитаты.")
+    block = result["blocks"][0]
+    assert block["speaker"] == "Дмитрий ВИННИК"
+    assert block["sync_fragments"][0]["text"] == "Это текст цитаты."
+    assert [f["timecode_start"] for f in block["sync_fragments"]] == ["00:01:00"]
+    assert not [e for e in validate_for_confirmation(result) if "has no speaker" in e]
+
+
+def test_credit_without_dash_or_media_warns_non_blocking(tmp_path: Path) -> None:
+    result = _normalize(tmp_path, "СНХ ПОПОВ 00:12:06 — Любое бюро.")
+    block = result["blocks"][0]
+    assert any("media" in w.lower() or "медиа" in w.lower() for w in block["warnings"])
+    assert validate_for_confirmation(result) == []

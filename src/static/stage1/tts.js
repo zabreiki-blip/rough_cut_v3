@@ -474,7 +474,34 @@ export async function doBuildTimeline() {
     fps: 25,
   });
   const { zk, snh, total_duration_sec } = result;
-  appendLog(`Timeline built: ЗК=${zk}, Спикеры=${snh}, длит.=${Math.round(total_duration_sec)}с`);
+  const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
+  const summary = result.sync_summary || result;
+  const hasSyncStats = [summary.matched, summary.review, summary.unmatched].some(Number.isFinite);
+  const unresolved = (Number(summary.review) || 0) + (Number(summary.unmatched) || 0);
+  const hasPlaceholders = warnings.some((w) => /placeholder/i.test(String(w)));
+  const isDraft = unresolved > 0 || hasPlaceholders;
+  const stats = `ЗК=${zk}, Спикеры=${snh}, длит.=${Math.round(total_duration_sec)}с`;
+  if (warnings.length || isDraft) {
+    appendLog(`Timeline built with warnings (${warnings.length}): ${stats}`, "warn");
+  } else {
+    appendLog(`Timeline built: ${stats}`);
+  }
+  if (hasSyncStats) {
+    appendLog(
+      `Sync: сопоставлено=${Number(summary.matched) || 0}, проверка=${Number(summary.review) || 0}, без совпадения=${Number(summary.unmatched) || 0}`,
+      unresolved > 0 ? "warn" : undefined,
+    );
+  }
+  warnings.forEach((w) => appendLog(String(w), "warn"));
+  if (isDraft) {
+    appendLog("Таймлайн — черновик с заглушками: есть несопоставленные или требующие проверки sync-фрагменты", "warn");
+  }
+  if (warnings.length || isDraft) {
+    toast(
+      `Таймлайн собран с предупреждениями: ${warnings.length}${isDraft ? " (черновик с заглушками)" : ""} — см. журнал`,
+      "warn",
+    );
+  }
 
   ids.ts_zk.textContent = zk;
   ids.ts_snh.textContent = snh;
