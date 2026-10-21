@@ -1542,6 +1542,21 @@ def test_local_repair_disabled_by_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert coverage["local_repair"]["skipped_reason"] == "disabled"
 
 
+def test_clip_repair_is_left_to_the_retime_when_it_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from stage2 import index_retiming
+
+    state = _install_local_engine(monkeypatch, words=_hole_words(10))
+    monkeypatch.setenv("SYNC_CLOUD_ASR_RETIME", "1")
+    monkeypatch.setattr(index_retiming, "_faster_whisper_available", lambda: True)
+    result, _ = _coverage_call(monkeypatch, [lambda: _model_response(_SPARSE_PART, cost=0.05)])
+    coverage = result["coverage"]
+    assert state["transcribed"] == 0 and state["clips"] == []
+    assert coverage["unrecovered_ranges"] == [[60.0, 240.0]]
+    assert coverage["local_repair"]["skipped_reason"] == "handled-by-retime"
+
+
 def test_local_repair_skipped_when_faster_whisper_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

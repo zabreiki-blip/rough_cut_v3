@@ -1876,6 +1876,20 @@ class CloudAudioAsrAdapter:
         "deadline".
         """
         settings = local_hole_repair.LocalRepairSettings.from_env()
+        from . import index_retiming  # lazy: index_retiming imports this module
+
+        if index_retiming.retime_enabled_and_available():
+            # The whole-file local pass (retime) fills the holes from its own words;
+            # clip-by-clip repair would run Whisper on the same audio twice. When the
+            # retime is rejected or fails, the cached-index repair takes over.
+            return (
+                segments,
+                own_end,
+                unrecovered,
+                [],
+                [],
+                {"enabled": settings.enabled, "skipped_reason": "handled-by-retime"},
+            )
         try:
             skipped = local_hole_repair.unavailable_reason(settings)
         except Exception as exc:  # проверка наличия движка не должна валить прогон

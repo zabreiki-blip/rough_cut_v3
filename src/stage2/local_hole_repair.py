@@ -444,6 +444,44 @@ def _splice_words(
     return merged, len(inside)
 
 
+def fill_holes_from_words(
+    words: list[dict[str, Any]],
+    holes: list[tuple[float, float]],
+    local_words: list[dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    int,
+]:
+    """Вклеивает в дыры готовые локальные слова (абсолютное время), без
+    распознавания: те же правила, что у `repair_words_locally` (`_splice_words`).
+
+    Возвращает `(слова, починенные, тишина, оставшиеся, добавлено слов)`. Дыра без
+    локальных слов и без слов индекса внутри — тишина (локальный Whisper с VAD
+    прошёл весь файл); иначе, если локальных слов не больше, чем есть, остаётся.
+    """
+    current = [dict(w) for w in words]
+    repaired: list[tuple[float, float]] = []
+    silent: list[tuple[float, float]] = []
+    unrecovered: list[tuple[float, float]] = []
+    added = 0
+    for hole in sorted(holes):
+        if not _localize_words(local_words, hole, 0.0):
+            has_words = any(hole[0] - 0.01 <= w["start"] < hole[1] for w in current)
+            (unrecovered if has_words else silent).append(hole)
+            continue
+        spliced = _splice_words(current, hole, local_words, 0.0)
+        if spliced is None:
+            unrecovered.append(hole)
+            continue
+        current, count = spliced
+        repaired.append(hole)
+        added += count
+    return current, repaired, silent, unrecovered, added
+
+
 def _repair_loop(
     audio_path: Path,
     holes: list[tuple[float, float]],

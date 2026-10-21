@@ -42,3 +42,11 @@ def _no_cloud_hole_vad_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     умолчанию включена и запускала бы настоящие ffmpeg/VAD на аудио тестов.
     Тесты, которые её проверяют, включают её явно и мокают VAD."""
     monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_VAD", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_retime_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Перерасчёт времени слов облачного индекса (SYNC_CLOUD_ASR_RETIME) по
+    умолчанию включён и гонял бы настоящий Whisper на аудио тестов. Тесты,
+    которые его проверяют, включают его явно и мокают транскрайбер."""
+    monkeypatch.setenv("SYNC_CLOUD_ASR_RETIME", "0")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -10,7 +12,7 @@ from typing import Any
 from api_final_review_jobs import canonical_decimal_string
 from cost_budget import CostBudget, CostBudgetExceeded
 from job_runtime import asr_slot
-from stage2 import local_hole_repair
+from stage2 import index_retiming, local_hole_repair
 from stage2.cached_index_repair import has_unrecovered_holes, repair_cached_index_holes
 from stage2.cloud_asr import plan_cloud_chunks
 from stage2.whisper_runner import is_no_words_error, resolve_backend
@@ -161,6 +163,154 @@ def _source_label(source: Any) -> str:
         if value:
             return value
     return str(source.id)
+
+
+_RETIME_WARNING_STATUSES = frozenset({"failed", "stopped", "no_audio", "rejected", "no_words"})
+
+
+def _retime_cloud_index(
+    ctx: SyncAsrContext,
+    source: Any,
+    index: Any,
+    index_path: Path,
+    audio_path: Path | None,
+    audio_signature: Any,
+) -> tuple[list[dict[str, str]], bool]:
+    """Recompute word times of a generated cloud index with a local Whisper pass.
+
+    Returns ``(warnings, holes_handled)``. Costs nothing in the cloud and never
+    fails the phase: any problem leaves the index as it was and becomes a
+    per-source warning. ``holes_handled`` means coverage holes were already
+    dealt with from the local words, so the clip-by-clip repair is not needed.
+    Only ``origin == "generated"`` cloud indexes are touched. Cancellation
+    raises ``ctx.job_cancelled_error``.
+    """
+    cache = index.metadata.get(ctx.transcription_cache_key)
+    if not (isinstance(cache, dict) and cache.get("origin") == "generated"):
+        return [], False
+    settings = index_retiming.RetimeSettings.from_env()
+    if not settings.enabled:
+        return [], False
+    label = _source_label(source)
+    cancel_event = ctx.cancel_event
+
+    def on_progress(percent: int) -> None:
+        ctx.update_job(
+            ctx.job_id,
+            persist=ctx.should_persist_progress(),
+            message=f"Уточнение таймкодов: {label} (локальное распознавание {percent}%)",
+        )
+
+    def transcribe_whole(
+        path: Path, model: str, language: str, progress_callback: Any = None
+    ) -> list[dict[str, Any]]:
+        # The same killable Whisper worker process the rest of the app uses.
+        try:
+            result = ctx.transcribe_audio(
+                path,
+                backend="faster-whisper",
+                model=model,
+                language=language,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                timeout_seconds=(
+                    settings.max_sec or ctx.app_config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None
+                ),
+            )
+        except Exception as exc:
+            # No speech at all after VAD is an empty result, not an engine failure.
+            if is_no_words_error(exc):
+                return []
+            raise
+        return list(result.get("words") or [])
+
+    def asr_wait() -> Any:
+        # The global ASR slot is taken by the retime only around the Whisper call:
+        # every check (marker, attempt, cached local words) runs before it.
+        return asr_slot(
+            ctx.asr_semaphore,
+            check_stop=ctx.ensure_not_cancelled,
+            on_wait=lambda: ctx.update_job(
+                ctx.job_id, message="Waiting for an ASR slot", asr_waiting=True
+            ),
+            on_acquired=lambda: ctx.update_job(
+                ctx.job_id, message=f"Уточнение таймкодов: {label}", asr_waiting=False
+            ),
+        )
+
+    previous_words = list(index.words)
+    previous_metadata = dict(index.metadata)
+    identity = hashlib.sha1(
+        json.dumps(cache, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    try:
+        result = index_retiming.retime_cached_index(
+            index,
+            audio_path,
+            audio_signature=audio_signature,
+            local_words_file=index_retiming.local_words_path(index_path, source.id),
+            language=ctx.language,
+            now_iso=ctx.utc_now_iso,
+            transcribe=transcribe_whole,
+            attempt_file=index_retiming.attempt_path(index_path, source.id),
+            index_identity=identity,
+            slot=asr_wait,
+            settings=settings,
+            cancel=cancel_event,
+            on_progress=on_progress,
+            monotonic=ctx.monotonic,
+            passthrough=(ctx.job_cancelled_error, ctx.whisper_cancelled_error),
+        )
+        if result.status == "cancelled":
+            raise ctx.job_cancelled_error("Sync job cancelled")
+        if result.changed:
+            try:
+                ctx.save_word_index(index_path, index)
+            except Exception:
+                index.words = previous_words
+                index.metadata.clear()
+                index.metadata.update(previous_metadata)
+                raise
+    except ctx.job_cancelled_error:
+        raise
+    except ctx.whisper_cancelled_error as exc:
+        raise ctx.job_cancelled_error("Sync job cancelled") from exc
+    except Exception as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ctx.job_cancelled_error("Sync job cancelled") from exc
+        return (
+            [
+                {
+                    "source_id": source.id,
+                    "warning": (
+                        f"Уточнение таймкодов в источнике {source.id} не выполнено: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+            ],
+            False,
+        )
+    warnings: list[dict[str, str]] = []
+    if result.status in _RETIME_WARNING_STATUSES:
+        reason = result.reason
+        if result.status == "stopped":
+            reason = f"превышен {reason}"
+        elif result.status == "rejected":
+            reason = f"локальный текст не подходит ({reason}), время слов оставлено прежним"
+        warnings.append(
+            {
+                "source_id": source.id,
+                "warning": f"Уточнение таймкодов в источнике {source.id} пропущено: {reason}",
+            }
+        )
+    handled = result.holes_handled and result.status in {"retimed", "already_retimed"}
+    if handled:
+        coverage_warning = _coverage_warning(
+            source.id, index.metadata.get("backend_metadata") or {}
+        )
+        if coverage_warning is not None:
+            warnings.append(coverage_warning)
+    return warnings, handled
 
 
 def _repair_cached_index_holes(
@@ -509,13 +659,23 @@ def run_asr_phase(
                 # not invalidate a transcript for unchanged media.
                 index = cached_index
                 reused += 1
-                repair_warnings = _repair_cached_index_holes(
+                retime_warnings, holes_handled = _retime_cloud_index(
                     ctx,
                     source,
                     index,
                     index_path,
                     audio_path if audio_is_available else None,
+                    audio_signature,
                 )
+                repair_warnings = retime_warnings
+                if not holes_handled:
+                    repair_warnings = retime_warnings + _repair_cached_index_holes(
+                        ctx,
+                        source,
+                        index,
+                        index_path,
+                        audio_path if audio_is_available else None,
+                    )
                 if repair_warnings:
                     source_warnings.extend(repair_warnings)
                     _update_sync_job(job_id, source_warnings=list(source_warnings))
@@ -674,9 +834,31 @@ def run_asr_phase(
                 )
                 save_word_index(index_path, index)
                 transcribed += 1
-                warning = _coverage_warning(source.id, result_backend_metadata)
-                if warning is not None:
-                    source_warnings.append(warning)
+                retime_warnings, holes_handled = _retime_cloud_index(
+                    ctx, source, index, index_path, audio_path, input_audio_signature
+                )
+                if retime_warnings:
+                    source_warnings.extend(retime_warnings)
+                retimed = index.metadata.get("timestamp_precision") == index_retiming.PRECISION
+                if retimed:
+                    asr_metrics["asr_timestamp_precision"] = index_retiming.PRECISION
+                    _update_sync_job(job_id, persist=False, **asr_metrics)
+                warning = None
+                if holes_handled:
+                    pass  # the coverage report of the index is the current one
+                elif index_retiming.retime_enabled_and_available():
+                    # The cloud path left the holes to the retime; it did not handle
+                    # them (rejected/failed), so the cached-index repair does.
+                    repair_warnings = _repair_cached_index_holes(
+                        ctx, source, index, index_path, audio_path
+                    )
+                    source_warnings.extend(repair_warnings)
+                    retime_warnings = retime_warnings + repair_warnings
+                else:
+                    warning = _coverage_warning(source.id, result_backend_metadata)
+                    if warning is not None:
+                        source_warnings.append(warning)
+                if retime_warnings or warning is not None:
                     _update_sync_job(job_id, source_warnings=list(source_warnings))
             indexes.append(index)
         except Exception as exc:

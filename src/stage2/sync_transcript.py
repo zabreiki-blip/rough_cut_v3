@@ -169,7 +169,11 @@ def ingest_word_index(
         raise ValueError("source_id is required for a word index")
     if not words:
         raise ValueError("transcript contains no valid timed words")
-    metadata = {**metadata, "timestamp_precision": "interpolated" if interpolated else "word"}
+    precision = "interpolated" if interpolated else "word"
+    if metadata.get("timestamp_precision") == "retimed":
+        # Cloud word times recomputed from a local Whisper pass (index_retiming).
+        precision = "retimed"
+    metadata = {**metadata, "timestamp_precision": precision}
     return WordIndex(
         source_id=actual_source,
         words=words,

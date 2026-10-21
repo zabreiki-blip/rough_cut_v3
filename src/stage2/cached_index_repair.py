@@ -154,6 +154,43 @@ def has_unrecovered_holes(index: Any) -> bool:
     return coverage is not None and bool(_ranges(coverage.get("unrecovered_ranges")))
 
 
+def apply_hole_outcome(
+    index: WordIndex,
+    coverage: dict[str, Any],
+    *,
+    new_words: list[WordTimestamp],
+    still: list[tuple[float, float]],
+    local_repaired: list[tuple[float, float]],
+    silent: list[tuple[float, float]],
+    marker: dict[str, Any],
+) -> None:
+    """Записывает итог ремонта дыр в слова индекса и отчёт покрытия (на месте).
+
+    `still` / `local_repaired` / `silent` — итоговые (уже объединённые с прежними)
+    диапазоны. Общий код локального ремонта по клипам и ремонта из готовых
+    локальных слов (`index_retiming`).
+    """
+    new_coverage = dict(coverage)
+    new_coverage.update(
+        {
+            "unrecovered_ranges": _rounded(still),
+            "unrecovered_sec": round(sum(b - a for a, b in still), 3),
+            "local_repaired_ranges": _rounded(local_repaired),
+            "holes_repaired_local": len(local_repaired),
+            "silent_ranges": _rounded(silent),
+            "silent_sec": round(sum(b - a for a, b in silent), 3),
+            "local_repair": marker,
+        }
+    )
+    # Глобальный metadata.timestamp_precision не трогаем: большая часть слов
+    # по-прежнему интерполирована; происхождение вставок — в coverage.
+    index.words = new_words
+    index.metadata["backend_metadata"] = {
+        **index.metadata["backend_metadata"],
+        "coverage": new_coverage,
+    }
+
+
 def repair_cached_index_holes(
     index: WordIndex,
     audio_path: Path | None,
@@ -269,25 +306,15 @@ def repair_cached_index_holes(
         "stopped": outcome.stopped,
         "complete": settled,
     }
-    new_coverage = dict(coverage)
-    new_coverage.update(
-        {
-            "unrecovered_ranges": _rounded(still),
-            "unrecovered_sec": round(sum(b - a for a, b in still), 3),
-            "local_repaired_ranges": _rounded(local_repaired),
-            "holes_repaired_local": len(local_repaired),
-            "silent_ranges": _rounded(silent),
-            "silent_sec": round(sum(b - a for a, b in silent), 3),
-            "local_repair": marker,
-        }
+    apply_hole_outcome(
+        index,
+        coverage,
+        new_words=new_words,
+        still=still,
+        local_repaired=local_repaired,
+        silent=silent,
+        marker=marker,
     )
-    # Глобальный metadata.timestamp_precision не трогаем: большая часть слов
-    # по-прежнему интерполирована; происхождение вставок — в coverage.
-    index.words = new_words
-    index.metadata["backend_metadata"] = {
-        **index.metadata["backend_metadata"],
-        "coverage": new_coverage,
-    }
     return IndexRepairResult(
         "repaired" if changed_words else "unchanged",
         changed=True,
