@@ -15,7 +15,9 @@ from stage2.sync_offset_clusters import (
 
 
 def _pts(source_id: str, offsets: list[float], prefix: str = "") -> list[OffsetPoint]:
-    return [OffsetPoint(f"{prefix}{source_id}-{i}", source_id, off) for i, off in enumerate(offsets)]
+    return [
+        OffsetPoint(f"{prefix}{source_id}-{i}", source_id, off) for i, off in enumerate(offsets)
+    ]
 
 
 def test_two_clusters_in_one_source_are_promoted_independently() -> None:
@@ -195,6 +197,7 @@ def test_apply_uses_guide_offset_coordinates_and_display_timecode() -> None:
         {"ambiguous": True},
         {"semantic_flags": ["number_mismatch"]},
         {"gap_flags": ["large_time_gap"]},
+        {"timing_flags": ["timing_unrefined"]},
         {"strategy": "near_timecode"},
         {"strategy": "llm_semantic_review"},
         {"approx": ""},
@@ -313,9 +316,14 @@ def test_wide_chain_cluster_is_not_valid() -> None:
     # single linkage chains 0,55,...,330 into one 330 s wide cluster: not a shift
     points = _pts("a", [0, 55, 110, 165, 220, 275, 330])
 
-    assert find_offset_cluster_promotions(points, link_sec=60, min_support=3, max_width_sec=240) == {}
+    assert (
+        find_offset_cluster_promotions(points, link_sec=60, min_support=3, max_width_sec=240) == {}
+    )
     # without the width limit the chain would confirm every point
-    assert len(find_offset_cluster_promotions(points, link_sec=60, min_support=3, max_width_sec=1000)) == 7
+    assert (
+        len(find_offset_cluster_promotions(points, link_sec=60, min_support=3, max_width_sec=1000))
+        == 7
+    )
 
 
 @pytest.mark.parametrize("offsets", [[0, 29, 58, 87], [0, 30, 60, 90, 120, 150]])
@@ -358,9 +366,7 @@ def test_short_quotes_are_neither_promoted_nor_support() -> None:
 
 
 def test_short_quote_is_not_promoted_even_with_support() -> None:
-    matches = _cluster_matches() + [
-        _match("short", speech_in=60 + 645, query_text="да, конечно")
-    ]
+    matches = _cluster_matches() + [_match("short", speech_in=60 + 645, query_text="да, конечно")]
 
     report = _apply(matches)
 
@@ -432,7 +438,10 @@ def test_confirmed_fallback_match_uses_its_current_source_in_not_speech_in() -> 
 def test_manual_anchor_without_speech_in_metadata_uses_default_padding() -> None:
     matches = _cluster_matches()[:3]
     manual = _match(
-        "c", status="needs_review", source_in=60 + 650 - 2, manual_updated_at="2026-01-01T00:00:00+00:00"
+        "c",
+        status="needs_review",
+        source_in=60 + 650 - 2,
+        manual_updated_at="2026-01-01T00:00:00+00:00",
     )
     del manual.metadata["speech_in_sec"]
     matches.append(manual)

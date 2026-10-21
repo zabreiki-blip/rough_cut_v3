@@ -825,9 +825,7 @@ def test_natural_pause_below_threshold_stays_auto_matched() -> None:
 
 def test_internal_gap_threshold_is_configurable() -> None:
     index = _gapped_index("s1", [("мы обязательно", 10.0), ("вернемся завтра", 12.1)])
-    result = SyncMatcher(
-        [_source("s1")], [index], MatcherConfig(max_internal_gap_sec=1.0)
-    ).match(
+    result = SyncMatcher([_source("s1")], [index], MatcherConfig(max_internal_gap_sec=1.0)).match(
         AlignmentRequest(
             segment_id="pause-strict",
             text="мы обязательно вернемся завтра",
@@ -869,13 +867,71 @@ def test_interpolated_segment_with_hidden_pause_needs_review_by_word_duration() 
     assert result.metadata["timestamp_precision"] == "interpolated"
 
 
-def test_normal_interpolated_segment_stays_auto_matched() -> None:
+def test_normal_interpolated_segment_needs_review_for_unrefined_timing() -> None:
+    # Audit 2026-10-21 #3: exact text on interpolated (unrefined) cloud times must
+    # not be admitted to the assembly; text similarity stays separate from timing.
     result = _match_phrase(_interpolated_index(10.0, 12.0))
 
-    assert result.status == "auto_matched"
+    assert result.status == "needs_review"
+    assert result.confidence == pytest.approx(1.0)
     assert result.metadata["gap_flags"] == []
     assert result.metadata["max_word_duration_sec"] == pytest.approx(0.5)
     assert result.metadata["timestamp_precision"] == "interpolated"
+    assert result.metadata["timing_reliable"] is False
+    assert result.metadata["timing_flags"] == ["timing_unrefined"]
+    assert result.metadata["review_reason"] == "timing_unrefined"
+
+
+def test_audit_repro_cloud_audio_interpolated_index_needs_review() -> None:
+    words = [
+        WordTimestamp(word, 10.0 + i * 0.5, 10.5 + i * 0.5)
+        for i, word in enumerate("мы обязательно вернемся завтра".split())
+    ]
+    index = WordIndex(
+        source_id="s1",
+        words=words,
+        metadata={
+            "backend": "cloud-audio",
+            "timestamp_precision": "interpolated",
+            "backend_metadata": {"timestamp_precision": "interpolated"},
+        },
+    )
+    result = _match_phrase(index)
+
+    assert result.status == "needs_review"
+    assert result.confidence == pytest.approx(1.0)
+    assert result.metadata["timing_flags"] == ["timing_unrefined"]
+
+
+@pytest.mark.parametrize("precision", ["retimed", "word", ""])
+def test_refined_or_word_precision_index_stays_auto_matched(precision: str) -> None:
+    index = WordIndex(
+        source_id="s1",
+        words=[
+            WordTimestamp(word, 10.0 + i * 0.5, 10.5 + i * 0.5)
+            for i, word in enumerate("мы обязательно вернемся завтра".split())
+        ],
+        metadata={"backend": "cloud-audio", "timestamp_precision": precision},
+    )
+    result = _match_phrase(index)
+
+    assert result.status == "auto_matched"
+    assert result.metadata["timing_reliable"] is True
+    assert result.metadata["timing_flags"] == []
+    assert "review_reason" not in result.metadata
+
+
+def test_retimed_index_loaded_from_payload_stays_auto_matched() -> None:
+    index = ingest_word_index(
+        {
+            "metadata": {"timestamp_precision": "retimed"},
+            "backend_metadata": {"timestamp_precision": "retimed"},
+            "segments": [{"text": "мы обязательно вернемся завтра", "start": 10.0, "end": 12.0}],
+        },
+        "s1",
+    )
+    assert index.metadata["timestamp_precision"] == "retimed"
+    assert _match_phrase(index).status == "auto_matched"
 
 
 def test_real_word_timestamps_with_stretched_word_need_review() -> None:

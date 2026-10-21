@@ -231,6 +231,56 @@ class NormalizedTimelineTest(unittest.TestCase):
             self.assertEqual(second.duration_sec, 10.0)
             self.assertEqual(second.start_sec, 7.75)
 
+    def test_confirmed_match_pending_retime_review_is_not_admitted_to_build(self) -> None:
+        """Audit 2026-10-21 #1: the kept manual range must wait for explicit re-confirmation."""
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "edited-uid",
+                        "order": 1,
+                        "type": "sync",
+                        "normalized_text": "Ответ героя",
+                    },
+                    {
+                        "uid": "plain-uid",
+                        "order": 2,
+                        "type": "sync",
+                        "normalized_text": "Другой ответ",
+                    },
+                ],
+            }
+            matches = {
+                "edited-uid": {
+                    "source_id": "ivan_01",
+                    "source_in_sec": 8.4,
+                    "source_out_sec": 14.0,
+                    "confidence": 0.9,
+                    "status": "confirmed",
+                    "metadata": {"retime_pending_review": True, "retime_review_for": "fp"},
+                },
+                "plain-uid": {
+                    "source_id": "ivan_01",
+                    "source_in_sec": 20.0,
+                    "source_out_sec": 25.0,
+                    "confidence": 0.9,
+                    "status": "confirmed",
+                    "metadata": {"retime_pending_review": False},
+                },
+            }
+
+            timeline = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches, sync_sources={}
+            )
+
+            edited, plain = timeline.segments
+            self.assertEqual(edited.match_status, "needs_review")
+            self.assertNotEqual(edited.duration_sec, 5.6)
+            self.assertEqual(plain.match_status, "confirmed")
+            self.assertEqual(plain.duration_sec, 5.0)
+
     def test_teaser_and_full_sync_reuse_overlapping_source_range(self) -> None:
         with TemporaryDirectory() as tmp:
             base = Path(tmp)

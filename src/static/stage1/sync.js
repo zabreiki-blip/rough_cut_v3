@@ -30,6 +30,13 @@ function normalizedMatchStatus(value) {
   return status;
 }
 
+// A confirmed match whose word times were retimed under kept manual boundaries is
+// not ready for the build: it goes back to the review queue until re-confirmed.
+function retimePendingReview(match) {
+  return Boolean(match?.metadata?.retime_pending_review)
+    && normalizedMatchStatus(match.status) === "confirmed";
+}
+
 function matchCandidate(match) {
   const alternatives = Array.isArray(match.alternatives) ? match.alternatives : [];
   const nested = match.candidate || match.best_candidate || alternatives[0] || {};
@@ -236,6 +243,7 @@ function syncCounts(document) {
   return syncMatches.reduce((counts, match) => {
     const status = normalizedMatchStatus(match.status);
     if (status === "auto_matched") counts.auto += 1;
+    else if (retimePendingReview(match)) counts.review += 1;
     else if (status === "confirmed") counts.confirmed += 1;
     else if (status === "needs_review") counts.review += 1;
     else if (match.metadata?.unmatched_reason === "no_eligible_source") counts.noSource += 1;
@@ -264,7 +272,7 @@ function renderSyncMatches(document) {
 
   const reviewItems = syncMatches.filter((match) => {
     const status = normalizedMatchStatus(match.status);
-    return status === "needs_review" || status === "unmatched";
+    return status === "needs_review" || status === "unmatched" || retimePendingReview(match);
   });
   ids.sync_review_count.textContent = `${reviewItems.length} фрагментов`;
 
@@ -331,6 +339,16 @@ function renderSyncMatches(document) {
             или укажите у него верные имена спикеров.</div>`;
         })()
       : "";
+    const retimeHint = retimePendingReview(match)
+      ? `<div class="sync-match-llm">Время слов в расшифровке пересчитано, а ваши границы
+          сохранены без изменений. Проверьте аудио и подтвердите границы заново — до этого
+          фрагмент не попадёт в сборку.</div>`
+      : "";
+    const timingHint = Array.isArray(match.metadata?.timing_flags)
+      && match.metadata.timing_flags.includes("timing_unrefined")
+      ? `<div class="sync-match-llm">Текст совпал, но время слов в расшифровке приблизительное
+          (не уточнено локальным Whisper). Проверьте границы по аудио и подтвердите вручную.</div>`
+      : "";
     const unmatchedReasons = {
       query_too_short: "Фраза слишком короткая для поиска по записи.",
       no_eligible_source: "Нет записи: для этого спикера ещё нет источника — реплика будет найдена после загрузки.",
@@ -342,7 +360,10 @@ function renderSyncMatches(document) {
     const sourceOut = Number(candidate.source_out_sec);
     const hasCandidate = Boolean(candidate.source_id)
       && Number.isFinite(sourceIn) && Number.isFinite(sourceOut) && sourceOut > sourceIn;
-    const label = llmReview
+    const retimeReview = retimePendingReview(match);
+    const label = retimeReview
+      ? "границы изменились — проверьте"
+      : llmReview
       ? "LLM · проверить"
       : (status === "unmatched"
         ? (match.metadata?.unmatched_reason === "no_eligible_source" ? "нет записи" : "не найдено")
@@ -399,6 +420,8 @@ function renderSyncMatches(document) {
           ? escaped(matchedText)
           : "Whisper-фрагмент не найден"}</div>
         ${llmHint}
+        ${retimeHint}
+        ${timingHint}
         ${unmatchedReason ? `<div class="sync-match-speaker-filter">${escaped(unmatchedReason)}</div>` : ""}
         ${speakerFilterHint}
         <div class="sync-match-meta" data-sync-meta>

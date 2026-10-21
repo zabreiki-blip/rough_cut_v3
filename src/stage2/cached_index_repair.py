@@ -228,7 +228,11 @@ def repair_cached_index_holes(
         return IndexRepairResult("unavailable", unavailable, remaining=remaining)
     fingerprint = settings_fingerprint(settings)
     previous = coverage.get("local_repair")
-    if _marker_fingerprint(previous) == fingerprint and _marker_is_complete(previous):
+    if (
+        isinstance(previous, dict)
+        and _marker_fingerprint(previous) == fingerprint
+        and _marker_is_complete(previous)
+    ):
         return IndexRepairResult("already_repaired", remaining=remaining)
     if index.metadata.get("timestamp_scale_repair"):
         # Дыры измерены в шкале модели, а индекс уже сжат к длительности

@@ -10,8 +10,9 @@ from flask import Flask, jsonify
 import pytest
 
 import api_stage3_routes
-from stage2.sync_models import SyncSource
+from stage2.sync_models import SyncMatch, SyncSource
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
+from stage_common import sync_matches_fingerprint
 
 
 class _ImmediateThread:
@@ -206,6 +207,51 @@ def test_stage3_export_rejects_other_revision_and_accepts_legacy_identity(client
         encoding="utf-8",
     )
     assert http.get("/stage3/export/xml?project=BRIK").status_code == 409
+
+
+def test_stage3_rejects_timeline_built_before_sync_matches_changed(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "BRIK_nested_timeline.xml").write_text("<xml/>", encoding="utf-8")
+    monkeypatch.setattr(
+        api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {"sources": []}
+    )
+    match = SyncMatch(
+        segment_id="uid-1",
+        query_text="q",
+        source_id="s1",
+        source_in_sec=1.0,
+        source_out_sec=2.0,
+        status="confirmed",
+        metadata={"normalization_revision": "norm-1"},
+    )
+    store = SyncMatchStore(paths["sync_matches"])
+    store.replace_all([match])
+    built_fingerprint = sync_matches_fingerprint([match])
+    timeline_path = paths["work"] / "full_timeline.json"
+    timeline_path.write_text(
+        json.dumps(
+            {
+                "normalization_revision": "norm-1",
+                "sync_matches_fingerprint": built_fingerprint,
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert http.get("/stage3/export/xml?project=BRIK").status_code == 200
+
+    # A sync/retime pass flags the confirmed match after the timeline was built.
+    match.metadata["retime_pending_review"] = True
+    store.replace_all([match])
+    exported = http.get("/stage3/export/xml?project=BRIK")
+    assert exported.status_code == 409
+    assert "timeline_rebuild_required" in exported.get_json()["error"]
+    prepared = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+    assert prepared.status_code == 409
+    assert "timeline_rebuild_required" in prepared.get_json()["error"]
 
 
 def test_prepare_versioned_nested_export_persists_its_filename_for_download(client) -> None:

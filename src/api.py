@@ -51,7 +51,12 @@ from job_runtime import (
     trim_terminal_jobs,
     update_job,
 )
-from openrouter_usage import make_usage_callback, reconcile_pending, usage_summary
+from openrouter_usage import (
+    has_due_pending,
+    make_usage_callback,
+    reconcile_pending,
+    usage_summary,
+)
 from inbox_service import discover_project_inbox
 from logging_config import configure_logging
 from project_service import (
@@ -118,6 +123,7 @@ from stage2.assembly_manifest import (
     validate_assembly_manifest,
 )
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
+from stage_common import _timeline_matches_are_current
 from stage2.sync_transcript import (
     ingest_word_index,
     load_word_index,
@@ -402,21 +408,64 @@ def _make_openrouter_usage_callback(
     )
 
 
-def _openrouter_usage_summary(project: str, *, reconcile: bool = False) -> dict:
-    paths = _ensure_project(project)
-    if reconcile:
-        try:
-            import requests
+_OPENROUTER_RECONCILE_ACTIVE: set[str] = set()
+_OPENROUTER_RECONCILE_GUARD = threading.Lock()
 
-            settings = get_settings()
-            reconcile_pending(
-                paths["openrouter_usage"],
-                api_key=settings.openrouter_api_key,
-                request_fn=requests.get,
-            )
-        except Exception:
-            app.logger.exception("Could not reconcile OpenRouter TTS usage")
-    return usage_summary(paths["openrouter_usage"])
+
+def _reconcile_openrouter_usage(project: str) -> None:
+    """Синхронный шаг уточнения pending-расходов (внешние запросы к OpenRouter)."""
+    try:
+        import requests
+
+        paths = _ensure_project(project)
+        reconcile_pending(
+            paths["openrouter_usage"],
+            api_key=get_settings().openrouter_api_key,
+            request_fn=requests.get,
+        )
+    except Exception:
+        app.logger.exception("Could not reconcile OpenRouter TTS usage")
+
+
+def _run_openrouter_reconcile(project: str) -> None:
+    try:
+        _reconcile_openrouter_usage(project)
+    finally:
+        with _OPENROUTER_RECONCILE_GUARD:
+            _OPENROUTER_RECONCILE_ACTIVE.discard(project)
+
+
+def _schedule_openrouter_reconcile(project: str, ledger_path: Path) -> bool:
+    """Запускает фоновое уточнение, не более одного на проект."""
+    if not get_settings().openrouter_api_key or not has_due_pending(ledger_path):
+        return False
+    with _OPENROUTER_RECONCILE_GUARD:
+        if project in _OPENROUTER_RECONCILE_ACTIVE:
+            return False
+        _OPENROUTER_RECONCILE_ACTIVE.add(project)
+    worker = threading.Thread(
+        target=_run_openrouter_reconcile,
+        args=(project,),
+        daemon=True,
+        name=f"openrouter-usage-{project}",
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _OPENROUTER_RECONCILE_GUARD:
+            _OPENROUTER_RECONCILE_ACTIVE.discard(project)
+        app.logger.exception("Could not start OpenRouter usage reconciliation")
+        return False
+    return True
+
+
+def _openrouter_usage_summary(project: str, *, reconcile: bool = False) -> dict:
+    """Возвращает сохранённую сводку; уточнение pending идёт в фоне, не в запросе."""
+    paths = _ensure_project(project)
+    summary = usage_summary(paths["openrouter_usage"])
+    if reconcile and summary.get("pending_count"):
+        _schedule_openrouter_reconcile(project, paths["openrouter_usage"])
+    return summary
 
 
 def _save_voiceover_revision_assets(project: str, result: dict) -> dict:
@@ -635,6 +684,9 @@ def _build_status(project: str) -> dict:
             paths["timeline"].is_file()
             and confirmed_normalization
             and timeline.get("normalization_revision") == confirmed_normalization.get("revision")
+            and _timeline_matches_are_current(
+                timeline, confirmed_normalization, SyncMatchStore(paths["sync_matches"])
+            )
         ),
         "openrouter_usage": _openrouter_usage_summary(project),
     }
@@ -753,6 +805,7 @@ def _run_tts_job(
     speed: float = 1.0,
     tts_model: str | None = None,
     tts_style: str = "",
+    expected_revision_id: str | None = None,
 ) -> None:
     stage1_jobs.run_tts_job(
         _tts_job_services(),
@@ -767,6 +820,7 @@ def _run_tts_job(
         speed=speed,
         tts_model=tts_model,
         tts_style=tts_style,
+        expected_revision_id=expected_revision_id,
     )
 
 
@@ -1335,14 +1389,21 @@ def _sync_alignment_units(
 
 
 def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
+    # A confirmed match flagged ``retime_pending_review`` (word times were retimed, the
+    # kept manual range awaits re-confirmation) counts as needing review, not as ready.
+    pending = [bool(item.metadata.get("retime_pending_review")) for item in matches]
     auto_matched = sum(item.status == "auto_matched" for item in matches)
-    confirmed = sum(item.status == "confirmed" for item in matches)
-    needs_review = sum(item.status == "needs_review" for item in matches)
+    confirmed = sum(
+        item.status == "confirmed" and not flagged for item, flagged in zip(matches, pending)
+    )
+    needs_review = sum(
+        item.status == "needs_review" or (item.status == "confirmed" and flagged)
+        for item, flagged in zip(matches, pending)
+    )
     not_found = sum(item.status == "not_found" for item in matches)
     # Speaker has no recording yet: the quote is expected to match once it is loaded.
     no_source = sum(
-        item.status == "not_found"
-        and item.metadata.get("unmatched_reason") == "no_eligible_source"
+        item.status == "not_found" and item.metadata.get("unmatched_reason") == "no_eligible_source"
         for item in matches
     )
     return {
@@ -1424,7 +1485,7 @@ def _sync_matching_fingerprint(
 ) -> str:
     """Identify every durable input that can change a matching decision."""
     payload = {
-        "version": 3,
+        "version": 4,
         "normalization_revision": normalization_revision,
         "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,

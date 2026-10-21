@@ -195,9 +195,7 @@ def _metadata(match: Any) -> dict[str, Any] | None:
 
 
 def _is_manual(match: Any, metadata: dict[str, Any]) -> bool:
-    return getattr(match, "status", None) == "confirmed" or bool(
-        metadata.get("manual_updated_at")
-    )
+    return getattr(match, "status", None) == "confirmed" or bool(metadata.get("manual_updated_at"))
 
 
 def _was_promoted(match: Any, metadata: dict[str, Any]) -> bool:
@@ -238,6 +236,8 @@ def is_promotion_candidate(
         return False
     if metadata.get("semantic_flags") or metadata.get("gap_flags"):
         return False
+    if metadata.get("timing_flags"):
+        return False  # unrefined (interpolated) word times must stay under review
     return True
 
 

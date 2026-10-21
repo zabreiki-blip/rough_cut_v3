@@ -16,6 +16,9 @@ LOGGER = logging.getLogger(__name__)
 UsageCallback = Callable[[dict[str, Any]], None]
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
+# События, по которым прямо сейчас идёт внешний запрос (claim). Хранится
+# только в памяти: после падения процесса «зависшей» пометки не остаётся.
+_CLAIMED: set[tuple[str, str]] = set()
 _SCHEMA_VERSION = 2
 
 
@@ -35,6 +38,22 @@ def _lock_for(path: Path) -> threading.RLock:
     key = str(path.resolve())
     with _LOCKS_GUARD:
         return _LOCKS.setdefault(key, threading.RLock())
+
+
+def _claim_key(path: Path, event: Mapping[str, Any]) -> tuple[str, str]:
+    return (str(path.resolve()), str(event.get("event_id")))
+
+
+def _is_due(event: Mapping[str, Any], now: datetime) -> bool:
+    # record_usage always assigns an event_id. An event without one (hand-edited or
+    # legacy ledger) cannot be claimed or written back unambiguously, so it is skipped
+    # instead of colliding with every other id-less event under the key "None".
+    return bool(
+        str(event.get("event_id") or "").strip()
+        and event.get("status") == "pending"
+        and event.get("generation_id")
+        and _parse_iso(event.get("next_retry_at")) <= now
+    )
 
 
 def _new_ledger() -> dict[str, Any]:
@@ -233,16 +252,55 @@ def reconcile_pending(
 ) -> None:
     if not api_key:
         return
-    with _lock_for(path):
-        ledger = _load(path, create=True)
-        now = _now()
-        due = [
-            dict(event)
-            for event in ledger["events"]
-            if event.get("status") == "pending"
-            and event.get("generation_id")
-            and _parse_iso(event.get("next_retry_at")) <= now
-        ][:max_items]
+    # Дедупликация claim-ов действует только внутри процесса: несколько воркеров
+    # gunicorn могут продублировать безвредный запрос generation. Дубль не портит
+    # леджер: закрытые события (status != pending) пропускаются при записи результата.
+    due: list[dict[str, Any]] = []
+    try:
+        # Claim-ы набираются внутри try: любой сбой посреди набора освобождает
+        # уже занятые ключи в finally, а не оставляет их навсегда.
+        with _lock_for(path):
+            ledger = _load(path, create=True)
+            now = _now()
+            with _LOCKS_GUARD:
+                for event in ledger["events"]:
+                    if len(due) >= max_items:
+                        break
+                    key = _claim_key(path, event)
+                    if _is_due(event, now) and key not in _CLAIMED:
+                        due.append(dict(event))
+                        _CLAIMED.add(key)
+        _reconcile_claimed(path, due, api_key=api_key, request_fn=request_fn)
+    finally:
+        with _LOCKS_GUARD:
+            for event in due:
+                _CLAIMED.discard(_claim_key(path, event))
+
+
+def has_due_pending(path: Path) -> bool:
+    """Есть ли pending-события, которые пора уточнять и которые никто не уточняет."""
+    try:
+        with _lock_for(path):
+            if not path.exists():
+                return False
+            ledger = _load(path)
+            now = _now()
+            with _LOCKS_GUARD:
+                return any(
+                    _is_due(event, now) and _claim_key(path, event) not in _CLAIMED
+                    for event in ledger["events"]
+                )
+    except UsageLedgerError:
+        return False
+
+
+def _reconcile_claimed(
+    path: Path,
+    due: list[dict[str, Any]],
+    *,
+    api_key: str,
+    request_fn: Callable[..., Any],
+) -> None:
     for event in due:
         generation_id = str(event["generation_id"])
         cost: Decimal | None = None

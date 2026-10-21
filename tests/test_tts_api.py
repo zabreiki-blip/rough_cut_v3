@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 import wave
 from unittest.mock import patch
@@ -233,6 +234,96 @@ class TtsCoordinationTests(unittest.TestCase):
         with api_module._TTS_JOBS_LOCK:
             self.assertNotIn("demo", api_module._TTS_ACTIVE_PROJECTS)
             self.assertNotIn(created["id"], api_module._TTS_CANCEL_EVENTS)
+
+    def test_activation_cannot_interleave_between_revision_resolution_and_reservation(
+        self,
+    ) -> None:
+        paths = api_module._ensure_project("demo")
+        atomic_write_json(paths["prepared"], {"scenario_revision_id": "rev_0001", "items": []})
+        real_thread = threading.Thread
+        started: list[dict] = []
+        activation: dict[str, object] = {}
+
+        class _CapturingThread:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs.get("kwargs", {})
+
+            def start(self):
+                started.append(self.kwargs)
+
+        def activate_rev_0002() -> None:
+            # Mirrors /stage4/revisions/<id>/activate: transition lock first,
+            # then refuse while a project job is active, then swap prepared.
+            with api_module._project_transition_lock("demo"):
+                if api_module._project_has_active_mutation("demo"):
+                    activation["result"] = "blocked"
+                    return
+                atomic_write_json(
+                    paths["prepared"], {"scenario_revision_id": "rev_0002", "items": []}
+                )
+                activation["result"] = "activated"
+
+        real_reserve = api_module._reserve_tts_project
+
+        def reserve_with_concurrent_activation(project: str) -> bool:
+            activator = real_thread(target=activate_rev_0002)
+            activation["thread"] = activator
+            activator.start()
+            activator.join(timeout=0.5)
+            return real_reserve(project)
+
+        with (
+            patch.object(api_module, "_normalization_required", return_value=None),
+            patch.object(api_module, "_prepared_projection_required", return_value=None),
+            patch.object(
+                api_module, "_reserve_tts_project", side_effect=reserve_with_concurrent_activation
+            ),
+            patch.object(api_module.threading, "Thread", _CapturingThread),
+        ):
+            response = self.client.post("/stage1/tts-jobs/start", json=self._job_payload())
+        activation["thread"].join(timeout=5)  # type: ignore[attr-defined]
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(started), 1)
+        worker_kwargs = started[0]
+        prepared_revision = json.loads(
+            Path(worker_kwargs["prepared_path"]).read_text(encoding="utf-8")
+        )["scenario_revision_id"]
+        self.assertEqual(
+            Path(worker_kwargs["speaker_dir"]).name,
+            prepared_revision,
+            "worker would mix prepared data and speaker dir of different revisions",
+        )
+        self.assertEqual(worker_kwargs["expected_revision_id"], prepared_revision)
+        self.assertEqual(activation["result"], "blocked")
+
+    def test_worker_fails_cleanly_when_prepared_revision_changed(self) -> None:
+        paths = api_module._ensure_project("demo")
+        atomic_write_json(paths["prepared"], {"scenario_revision_id": "rev_0002", "items": []})
+        self.assertTrue(api_module._reserve_tts_project("demo"))
+        created = api_module._create_tts_job("demo")
+
+        with patch.object(api_module, "synthesize_tts") as synthesize:
+            api_module._run_tts_job(
+                job_id=created["id"],
+                project="demo",
+                prepared_path=paths["prepared"],
+                speaker_dir=paths["speaker"] / "revisions" / "rev_0001",
+                provider=None,
+                voice_name=None,
+                gender=None,
+                dry_run=True,
+                expected_revision_id="rev_0001",
+            )
+
+        synthesize.assert_not_called()
+        state = api_module._get_tts_job(created["id"])
+        self.assertIsNotNone(state)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("rev_0001", state["error"])
+        self.assertIn("rev_0002", state["error"])
+        with api_module._TTS_JOBS_LOCK:
+            self.assertNotIn("demo", api_module._TTS_ACTIVE_PROJECTS)
 
 
 def _write_wav(path: Path, marker: int) -> bytes:

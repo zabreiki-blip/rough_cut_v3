@@ -392,10 +392,7 @@ def _patch_async_client(monkeypatch: pytest.MonkeyPatch, handler) -> None:
 
 
 def test_transcribe_cloud_returns_expected_structure(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Two lines: only the FIRST one keeps its own model-provided end — the
-    # transcript's last segment always has its end forced to the technical
-    # chunk boundary (see transcribe_words), so has_explicit_end is checked
-    # on the non-last segment.
+    # Two lines; has_explicit_end is checked on the first one.
     text = "[00:01.0 — 00:02.0] ГОЛОС 1: Привет мир\n[00:03.0 — 00:04.0] ГОЛОС 1: Вторая реплика"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -415,6 +412,80 @@ def test_transcribe_cloud_returns_expected_structure(monkeypatch: pytest.MonkeyP
     assert seg["text"] == "Привет мир"
     assert seg["has_explicit_end"] is True
     assert result["speakers"] == [seg["speaker"]]
+
+
+def test_last_utterance_keeps_own_end_before_trailing_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 2026-10-21 #4: 45-50 s in a chunk that ends at 60 s must stay 45-50 s,
+    # otherwise the interpolated words are smeared over 15 s of silence.
+    text = "[00:01.0 — 00:02.0] ГОЛОС 1: Первая реплика\n[00:45.0 — 00:50.0] ГОЛОС 1: Последняя реплика"
+    _patch_async_client(monkeypatch, lambda request: _model_response(text))
+
+    result = transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    last = result["segments"][-1]
+    assert last["start"] == pytest.approx(45.0)
+    assert last["end"] == pytest.approx(50.0)
+    assert last["has_explicit_end"] is True
+
+
+def test_last_utterance_own_end_in_last_part_is_not_extended_to_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Регрессия: последняя часть файла (60 s), реплика 45-50 s с собственным концом
+    # не должна растягиваться до duration_sec.
+    text = "[00:01.0 — 00:02.0] ГОЛОС 1: Первая реплика\n[00:45.0 — 00:50.0] ГОЛОС 1: Последняя реплика"
+    _patch_async_client(monkeypatch, lambda request: _model_response(text))
+
+    result = transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    last = result["segments"][-1]
+    assert last["start"] == pytest.approx(45.0)
+    assert last["end"] == pytest.approx(50.0)
+    assert last["has_explicit_end"] is True
+
+
+def test_last_utterance_without_own_end_is_still_extended_to_part_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "[00:01] ГОЛОС 1: Первая реплика\n[00:45] ГОЛОС 1: Последняя реплика"
+    _patch_async_client(monkeypatch, lambda request: _model_response(text))
+
+    result = transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    last = result["segments"][-1]
+    assert last["start"] == pytest.approx(45.0)
+    assert last["end"] == pytest.approx(60.0)
+    assert last["has_explicit_end"] is False
+
+
+def test_last_utterance_own_end_beyond_part_end_is_clamped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "[00:01.0 — 00:02.0] ГОЛОС 1: Первая реплика\n[00:45.0 — 01:30.0] ГОЛОС 1: Последняя"
+    _patch_async_client(monkeypatch, lambda request: _model_response(text))
+
+    result = transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    last = result["segments"][-1]
+    assert last["end"] == pytest.approx(60.0)
+    assert last["has_explicit_end"] is False
+
+
+def test_tail_after_kept_own_end_is_still_a_coverage_hole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The kept end must not hide the unrecognised tail: it is still reported.
+    text = "[00:01.0 — 00:02.0] ГОЛОС 1: Первая реплика\n[00:45.0 — 00:50.0] ГОЛОС 1: Последняя реплика"
+    _patch_async_client(monkeypatch, lambda request: _model_response(text))
+    monkeypatch.setenv("SYNC_CLOUD_ASR_HOLE_MIN_SEC", "5")
+
+    result = transcribe_cloud(Path("/tmp/does-not-matter.wav"), api_key="test-key")
+
+    coverage = result["coverage"]
+    assert [round(a) for a, _ in coverage["unrecovered_ranges"]] == [2, 50]
+    assert result["segments"][-1]["end"] == pytest.approx(50.0)
 
 
 def test_transcribe_cloud_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -> None:

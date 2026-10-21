@@ -539,6 +539,16 @@ def _stage1_tts_job_start(services: ModuleType):
     except ValueError as exc:
         return services._json_error(str(exc), 400)
 
+    # Revision activation takes the same lock.  Holding it from the
+    # confirmation check until the project is reserved guarantees that the
+    # prepared scenario, its revision id and the revision speaker dir are all
+    # resolved from one state; once reserved, activation is refused while the
+    # job is active.
+    with services._project_transition_lock(project):
+        return _stage1_tts_job_start_locked(services, payload, project)
+
+
+def _stage1_tts_job_start_locked(services: ModuleType, payload: dict, project: str):
     paths = services._ensure_project(project)
     gate = services._normalization_required(project)
     if gate:
@@ -568,12 +578,8 @@ def _stage1_tts_job_start(services: ModuleType):
 
     try:
         prepared_path = services._confirmed_prepared_path(payload, paths)
-        speaker_dir = _revision_speaker_dir(
-            services,
-            payload,
-            paths,
-            services._read_json_safe(prepared_path).get("scenario_revision_id"),
-        )
+        revision_id = str(services._read_json_safe(prepared_path).get("scenario_revision_id") or "")
+        speaker_dir = _revision_speaker_dir(services, payload, paths, revision_id)
     except ValueError as exc:
         return services._json_error(str(exc), 400)
 
@@ -606,6 +612,7 @@ def _stage1_tts_job_start(services: ModuleType):
                 "speed": speed,
                 "tts_model": tts_model,
                 "tts_style": tts_style,
+                "expected_revision_id": revision_id,
             },
             daemon=True,
         )

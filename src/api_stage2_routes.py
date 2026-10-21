@@ -19,7 +19,14 @@ from export_naming import xml_export_filename
 from stage2.cloud_asr import DEFAULT_OVERLAP_SEC, plan_cloud_chunks, resolve_chunk_minutes
 from sync_asr_phase import _cloud_index_is_outdated, index_coverage_report
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
-from stage_common import _scenario_revision_matches, _timeline_is_current
+from stage_common import (
+    TIMELINE_MATCHES_CHANGED_ERROR,
+    _scenario_revision_matches,
+    _timeline_is_current,
+    _timeline_matches_are_current,
+    current_sync_matches,
+    sync_matches_fingerprint,
+)
 
 if TYPE_CHECKING:
     from stage2.sync_models import SyncMatch
@@ -764,6 +771,9 @@ def _stage2_timeline(services: ModuleType):
             "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
             409,
         )
+    _source_store, match_store = services._sync_stores(paths)
+    if not _timeline_matches_are_current(timeline, confirmed, match_store):
+        return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
     return jsonify({"ok": True, "result": timeline})
 
 
@@ -826,22 +836,7 @@ def _stage2_build(services: ModuleType):
         source_store, match_store = services._sync_stores(paths)
         sources = source_store.list()
         stored_matches = match_store.list()
-        normalization_revision = normalization.get("revision")
-        scenario_revision_id = normalization.get("scenario_revision_id")
-        stale_match_ids: list[str] = []
-        current_matches: list[SyncMatch] = []
-        for match in stored_matches:
-            match_revision = match.metadata.get("normalization_revision")
-            if match_revision not in (None, "", normalization_revision):
-                stale_match_ids.append(match.segment_id)
-                continue
-            if not _scenario_revision_matches(
-                match.metadata.get("scenario_revision_id"),
-                scenario_revision_id,
-            ):
-                stale_match_ids.append(match.segment_id)
-                continue
-            current_matches.append(match)
+        current_matches, stale_match_ids = current_sync_matches(stored_matches, normalization)
         timeline = services.parse_normalized_timeline(
             normalization=normalization,
             speaker_dir=speaker_dir,
@@ -902,6 +897,7 @@ def _stage2_build(services: ModuleType):
     timeline_payload = timeline.to_dict()
     timeline_payload["normalization_revision"] = normalization.get("revision")
     timeline_payload["scenario_revision_id"] = str(normalization.get("scenario_revision_id") or "")
+    timeline_payload["sync_matches_fingerprint"] = sync_matches_fingerprint(current_matches)
     services._atomic_write_json_file(timeline_path, timeline_payload)
 
     zk_count = sum(1 for s in timeline.segments if s.type == "zk")
@@ -984,6 +980,9 @@ def _stage2_export_xml(services: ModuleType):
             "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
             409,
         )
+    _source_store, match_store = services._sync_stores(paths)
+    if not _timeline_matches_are_current(data, confirmed, match_store):
+        return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
 
     from stage2.models import FullTimeline
 

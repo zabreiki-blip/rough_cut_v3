@@ -188,6 +188,7 @@ def run_tts_job(
     speed: float = 1.0,
     tts_model: str | None = None,
     tts_style: str = "",
+    expected_revision_id: str | None = None,
 ) -> None:
     cancel_event = services._tts_cancel_event(job_id)
     project_paths = services._project_paths(project)
@@ -281,6 +282,14 @@ def run_tts_job(
     try:
         # One budget per job, shared by every (concurrent) TTS attempt.
         budget = CostBudget.for_llm_tts(os.environ)
+        if expected_revision_id is not None and expected_revision_id != tts_revision_id:
+            # The route resolved speaker_dir for expected_revision_id under the
+            # transition lock; a different revision in the shared prepared file
+            # would mix data of two revisions.
+            raise RuntimeError(
+                f"Prepared scenario revision changed from {expected_revision_id or '<none>'} "
+                f"to {tts_revision_id or '<none>'} before TTS started"
+            )
         services._update_tts_job(
             job_id,
             status="running",

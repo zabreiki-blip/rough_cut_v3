@@ -392,6 +392,31 @@ def _extract_numbers(text: str) -> list[int]:
     return numbers
 
 
+TIMING_UNREFINED_FLAG = "timing_unrefined"
+# Precisions whose word boundaries are NOT trustworthy for automatic assembly:
+# "interpolated" = words spread evenly over a cloud segment span.  Reliable ones:
+# "word" (genuine per-word engine times), "retimed" (cloud words re-aligned by the
+# local Whisper pass, see stage2.index_retiming) and "" (hand-built index with no
+# provenance, kept as before).
+_UNRELIABLE_TIMESTAMP_PRECISIONS = frozenset({"interpolated"})
+
+
+def _timing_gate_flags(index: WordIndex) -> list[str]:
+    """``["timing_unrefined"]`` when the index word times are still interpolated.
+
+    The top-level ``timestamp_precision`` is authoritative (a successful local
+    retime sets it to ``retimed``); the backend value is only a fallback for
+    indexes that carry no top-level marker.
+    """
+    metadata = index.metadata if isinstance(index.metadata, dict) else {}
+    precision = str(metadata.get("timestamp_precision") or "").strip().lower()
+    if not precision:
+        backend = metadata.get("backend_metadata")
+        if isinstance(backend, dict):
+            precision = str(backend.get("timestamp_precision") or "").strip().lower()
+    return [TIMING_UNREFINED_FLAG] if precision in _UNRELIABLE_TIMESTAMP_PRECISIONS else []
+
+
 def _semantic_gate_flags(query_text: str, candidate_text: str) -> list[str]:
     """Detect meaning-inverting divergences that a purely textual similarity
     score cannot see (negation, changed numbers), so a strong fuzzy match can
@@ -1076,10 +1101,7 @@ class _StartSearch:
             text=" ".join(item.word.word for item in span),
             strategy=search.strategy,
             max_gap_sec=max(
-                (
-                    max(0.0, right.word.start - left.word.end)
-                    for left, right in zip(span, span[1:])
-                ),
+                (max(0.0, right.word.start - left.word.end) for left, right in zip(span, span[1:])),
                 default=0.0,
             ),
             max_word_duration_sec=max(item.word.end - item.word.start for item in span),
@@ -1620,15 +1642,23 @@ class SyncMatcher:
             or best.max_word_duration_sec > self.config.max_internal_gap_sec
             else []
         )
+        # Text similarity (confidence) says nothing about how trustworthy the word
+        # boundaries are: segment-spread (interpolated) cloud times that no local
+        # retiming refined can be seconds off even for an exact quote.
+        timestamp_precision = str(
+            self.indexes[best.source_id].metadata.get("timestamp_precision") or ""
+        )
+        timing_flags = _timing_gate_flags(self.indexes[best.source_id])
         # A strong global fallback is useful, but its disagreement with the
         # supplied timecode must remain visible to an editor.
-        auto = (
+        text_auto = (
             best.confidence >= self.config.auto_threshold
             and not ambiguous
             and best.strategy != "fallback_full"
             and not semantic_flags
             and not gap_flags
         )
+        auto = text_auto and not timing_flags
         status: MatchStatus = "auto_matched" if auto else "needs_review"
         alternatives = []
         for item in candidates[1 : 1 + self.config.max_alternatives]:
@@ -1643,6 +1673,12 @@ class SyncMatcher:
                 )
             )
         source_in, source_out = _padded_range(best, self.sources[best.source_id], self.config)
+        timing_metadata: dict[str, object] = {
+            "timing_reliable": not timing_flags,
+            "timing_flags": timing_flags,
+        }
+        if text_auto and timing_flags:
+            timing_metadata["review_reason"] = timing_flags[0]
         return SyncMatch(
             segment_id=request.segment_id,
             query_text=request.text,
@@ -1665,9 +1701,8 @@ class SyncMatcher:
                     "max_internal_gap_sec": round(best.max_gap_sec, 4),
                     "max_word_duration_sec": round(best.max_word_duration_sec, 4),
                     "max_internal_gap_threshold_sec": self.config.max_internal_gap_sec,
-                    "timestamp_precision": str(
-                        self.indexes[best.source_id].metadata.get("timestamp_precision") or ""
-                    ),
+                    "timestamp_precision": timestamp_precision,
+                    **timing_metadata,
                     "speech_in_sec": round(best.start, 4),
                     "speech_out_sec": round(best.end, 4),
                     "head_padding_sec": self.config.head_padding_sec,

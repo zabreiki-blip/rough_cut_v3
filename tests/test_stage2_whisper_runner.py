@@ -421,8 +421,13 @@ class WhisperRunnerTest(unittest.TestCase):
     def test_transcribe_cloud_keeps_exact_word_times_of_local_repair_segments(self) -> None:
         cloud_result = {
             "segments": [
-                {"text": "раз два", "start": 0.0, "end": 2.0, "speaker": "ГОЛОС 1",
-                 "has_explicit_end": True},
+                {
+                    "text": "раз два",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "speaker": "ГОЛОС 1",
+                    "has_explicit_end": True,
+                },
                 {
                     "text": "точные слова здесь",
                     "start": 10.0,

@@ -2154,10 +2154,22 @@ class CloudAudioAsrAdapter:
                 )
                 holes_detected += sum(len(split_hole(h, hole_split_sec)) for h in part_holes)
                 if part_segments:
-                    part_segments[-1] = replace(part_segments[-1], end=part_end)
-                    # Конец принудительно дотянут до технической границы
-                    # части — это уже не «свой» конец от модели.
-                    part_own_end[-1] = False
+                    last = part_segments[-1]
+                    last_own_end_ok = (
+                        bool(part_own_end)
+                        and part_own_end[-1]
+                        and last.end > last.start
+                        and last.end <= part_end
+                    )
+                    if not last_own_end_ok:
+                        # Модель не дала валидного конца последней реплики —
+                        # тянем её до технической границы части; это уже не
+                        # «свой» конец от модели.
+                        part_segments[-1] = replace(last, end=part_end)
+                        part_own_end[-1] = False
+                    # Валидный явный конец (например 45–50 с в части до 60 с)
+                    # сохраняем: иначе слова интерполируются по тишине. Хвост
+                    # после него уже учтён как дыра в find_coverage_holes выше.
 
                 boundary = None if idx == 0 else idx * chunk_len
                 to_add, own_end_to_add, next_speaker_number, label_map = _stitch_chunk(

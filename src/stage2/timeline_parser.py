@@ -523,6 +523,10 @@ def parse_normalized_timeline(
                     match_metadata = {}
                 speech_in = float(match_metadata.get("speech_in_sec", source_in) or source_in)
                 speech_out = float(match_metadata.get("speech_out_sec", source_out) or source_out)
+                if match_status == "confirmed" and match_metadata.get("retime_pending_review"):
+                    # Word times were retimed under a kept manual range: not admitted to
+                    # the build until the editor re-confirms (which clears the flag).
+                    match_status = "needs_review"
                 matched = (
                     match_status in {"auto_matched", "confirmed"}
                     and source_id

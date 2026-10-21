@@ -19,7 +19,12 @@ from job_runtime import trim_terminal_jobs
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
-from stage_common import _scenario_revision_matches, _timeline_is_current
+from stage_common import (
+    TIMELINE_MATCHES_CHANGED_ERROR,
+    _scenario_revision_matches,
+    _timeline_is_current,
+    _timeline_matches_are_current,
+)
 
 _MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
 _STAGE3_JOB_KINDS = ("scan", "prepare")
@@ -449,6 +454,9 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
             "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
             409,
         )
+    _source_store, match_store = services._sync_stores(paths)
+    if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
+        raise Stage3OperationError(TIMELINE_MATCHES_CHANGED_ERROR, 409)
     if progress:
         progress(25, "Проверка доступных просмотровок")
     catalog = _scan_project_media(project, paths, services)
@@ -903,6 +911,9 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
                 409,
             )
+        _source_store, match_store = services._sync_stores(paths)
+        if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
+            return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
         mapping_path = paths["work"] / "stage3_source_mapping.json"
         try:
             mapping_data = json.loads(mapping_path.read_text(encoding="utf-8"))

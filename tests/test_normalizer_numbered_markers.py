@@ -192,7 +192,9 @@ def _legacy_rekey_db(path: Path) -> None:
         memory.record_manual("Сергей 2", "sync")
         memory.record_manual("Диктор 3", "voiceover")
         memory.suppress_marker("Анна 4")
-        memory._conn.execute("UPDATE aliases SET normalized_marker='сергей' WHERE marker='Сергей 2'")
+        memory._conn.execute(
+            "UPDATE aliases SET normalized_marker='сергей' WHERE marker='Сергей 2'"
+        )
         memory._conn.execute(
             "UPDATE alias_suppressions SET normalized_marker='анна' WHERE marker='Анна 4'"
         )
@@ -268,7 +270,9 @@ def test_legacy_suppression_rekey_keeps_correct_rows_and_chains(tmp_path: Path) 
     with NormalizationMemory(db) as memory:
         rows = {
             r["marker"]: r["normalized_marker"]
-            for r in memory._conn.execute("SELECT marker, normalized_marker FROM alias_suppressions")
+            for r in memory._conn.execute(
+                "SELECT marker, normalized_marker FROM alias_suppressions"
+            )
         }
     assert rows == {
         "Сергей 2": "сергей 2",
@@ -306,7 +310,9 @@ def test_legacy_alias_rekey_chain_does_not_lose_rows(tmp_path: Path) -> None:
         memory._conn.execute(insert, ("Сергей 2", "сергей", "sync", "marker"))  # stale
         memory._conn.execute(insert, ("Сергей 2 2", "сергей 2", "sync", "marker"))  # stale
         memory._conn.execute(insert, ("Сергей", "сергей", "voiceover", "marker"))  # correct
-        memory._conn.execute(insert, ("Сергей 2", "сергей", "sync", "video_cue"))  # other scope, stale
+        memory._conn.execute(
+            insert, ("Сергей 2", "сергей", "sync", "video_cue")
+        )  # other scope, stale
         memory._conn.commit()
     with NormalizationMemory(db) as memory:
         rows = sorted(

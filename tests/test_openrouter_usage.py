@@ -157,3 +157,141 @@ def test_normalizer_reports_paid_response_before_content_parse_fails() -> None:
 
     assert usage[0]["generation_id"] == "gen-invalid"
     assert usage[0]["cost_usd"] == "0.003"
+
+
+def test_concurrent_reconcile_queries_each_pending_event_once(tmp_path: Path) -> None:
+    import threading
+
+    path = tmp_path / "usage.json"
+    record_usage(
+        path,
+        stage="tts",
+        operation="x",
+        model="m",
+        generation_id="gen-1",
+        pending=True,
+        base_url="https://or.test/api",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": {"total_cost": 0.01}}
+
+    def blocking_request(*args, **kwargs):
+        calls.append(kwargs["params"]["id"])
+        entered.set()
+        assert release.wait(5)
+        return Response()
+
+    def counting_request(*args, **kwargs):
+        calls.append(kwargs["params"]["id"])
+        return Response()
+
+    first = threading.Thread(
+        target=reconcile_pending,
+        args=(path,),
+        kwargs={"api_key": "k", "request_fn": blocking_request},
+    )
+    first.start()
+    try:
+        assert entered.wait(5)
+        reconcile_pending(path, api_key="k", request_fn=counting_request)
+        assert calls == ["gen-1"]
+    finally:
+        release.set()
+        first.join(5)
+
+    assert calls == ["gen-1"]
+    assert usage_summary(path)["pending_count"] == 0
+
+
+def test_reconcile_releases_claim_when_request_fails(tmp_path: Path) -> None:
+    path = tmp_path / "usage.json"
+    record_usage(
+        path,
+        stage="tts",
+        operation="x",
+        model="m",
+        generation_id="gen-1",
+        pending=True,
+        base_url="https://or.test/api",
+    )
+
+    def failing_request(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    reconcile_pending(path, api_key="k", request_fn=failing_request)
+
+    from openrouter_usage import _CLAIMED, has_due_pending
+
+    assert not _CLAIMED
+    assert usage_summary(path)["pending_count"] == 1
+    # после неудачи действует backoff, но claim снят
+    assert has_due_pending(path) is False
+
+
+def test_partial_claims_are_released_when_claiming_fails_midway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import openrouter_usage
+
+    path = tmp_path / "usage.json"
+    for index in range(3):
+        record_usage(
+            path,
+            stage="tts",
+            operation="x",
+            model="m",
+            generation_id=f"gen-{index}",
+            pending=True,
+            base_url="https://or.test/api",
+        )
+    real_is_due = openrouter_usage._is_due
+    calls = {"count": 0}
+
+    def flaky_is_due(event, now):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("boom while claiming")
+        return real_is_due(event, now)
+
+    monkeypatch.setattr(openrouter_usage, "_is_due", flaky_is_due)
+    with pytest.raises(RuntimeError, match="boom while claiming"):
+        reconcile_pending(path, api_key="k", request_fn=lambda *a, **k: None)
+
+    assert not openrouter_usage._CLAIMED
+
+
+def test_events_without_event_id_are_not_claimed_or_reconciled(tmp_path: Path) -> None:
+    import openrouter_usage
+
+    path = tmp_path / "usage.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "events": [
+                    {"generation_id": "gen-a", "status": "pending"},
+                    {"generation_id": "gen-b", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests: list[object] = []
+
+    def request_fn(*args, **kwargs):
+        requests.append(kwargs)
+        raise RuntimeError("must not be called")
+
+    reconcile_pending(path, api_key="k", request_fn=request_fn)
+
+    assert requests == []
+    assert openrouter_usage.has_due_pending(path) is False
+    assert not openrouter_usage._CLAIMED

@@ -120,6 +120,31 @@ def test_matching_fingerprint_changes_when_a_source_is_added() -> None:
     assert api._sync_matching_fingerprint(**added) != before
 
 
+def test_sync_summary_counts_pending_retime_review_as_needs_review() -> None:
+    def match(uid: str, **metadata: object) -> api.SyncMatch:
+        return api.SyncMatch(
+            segment_id=uid,
+            query_text="q",
+            source_id="s",
+            source_in_sec=1.0,
+            source_out_sec=2.0,
+            status="confirmed",
+            metadata=metadata,
+        )
+
+    summary = api._sync_summary(
+        [
+            match("a"),
+            match("b", retime_pending_review=True),
+            match("c", retime_pending_review=False),
+        ]
+    )
+
+    assert summary["confirmed"] == 2
+    assert summary["needs_review"] == 1 and summary["review"] == 1
+    assert summary["matched"] == 2
+
+
 def test_sync_summary_splits_no_source_from_other_not_found() -> None:
     def match(segment_id: str, status: str, reason: str = "") -> SyncMatch:
         return SyncMatch(
@@ -1842,6 +1867,48 @@ def test_scenario_revision_identity_flows_through_matches_and_timeline(
     timeline = client.get("/stage2/timeline?project=demo")
     assert timeline.status_code == 200
     assert timeline.get_json()["result"]["scenario_revision_id"] == "rev_0002"
+
+
+def test_timeline_built_before_retime_flag_or_match_edit_requires_rebuild(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects, revision=7, scenario_revision_id="rev_0002")
+    assert _post_source(client).status_code == 201
+    confirm = {
+        "project": "demo",
+        "status": "confirmed",
+        "source_id": "vasilieva_01",
+        "source_in_sec": 1.0,
+        "source_out_sec": 2.0,
+    }
+    assert client.patch("/stage2/sync-matches/stable-sync-uid", json=confirm).status_code == 200
+    with patch.object(api, "generate_placeholder", return_value=None):
+        assert client.post("/stage2/build", json={"project": "demo"}).status_code == 200
+    assert client.get("/stage2/timeline?project=demo").status_code == 200
+    assert client.get("/stage2/export/xml?project=demo").status_code == 200
+    ready = client.get("/stage1/status?project=demo").get_json()["result"]["timeline_ready"]
+    assert ready is True
+
+    # A later sync/retime pass flags the confirmed match: the built timeline still holds
+    # the old interval as confirmed, so it must not be served until rebuilt.
+    match_path = projects / "demo" / "work" / "sync_matches.json"
+    payload = json.loads(match_path.read_text(encoding="utf-8"))
+    payload["matches"][0]["metadata"]["retime_pending_review"] = True
+    match_path.write_text(json.dumps(payload), encoding="utf-8")
+    for url in ("/stage2/timeline?project=demo", "/stage2/export/xml?project=demo"):
+        stale = client.get(url)
+        assert stale.status_code == 409, url
+        assert "timeline_rebuild_required" in stale.get_json()["error"]
+    assert client.get("/stage1/status?project=demo").get_json()["result"]["timeline_ready"] is False
+
+    # Rebuild admits the flagged match as needs_review and the timeline is current again.
+    with patch.object(api, "generate_placeholder", return_value=None):
+        assert client.post("/stage2/build", json={"project": "demo"}).status_code == 200
+    segments = client.get("/stage2/timeline?project=demo").get_json()["result"]["segments"]
+    assert segments[0]["match_status"] == "needs_review"
+
+    # A manual match edit after the build also invalidates the snapshot.
+    assert client.patch("/stage2/sync-matches/stable-sync-uid", json=confirm).status_code == 200
+    assert client.get("/stage2/timeline?project=demo").status_code == 409
 
 
 def test_explicit_other_scenario_revision_is_stale_but_legacy_match_is_accepted(

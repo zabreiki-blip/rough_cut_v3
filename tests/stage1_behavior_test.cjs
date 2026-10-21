@@ -121,7 +121,8 @@ async function loadModules() {
   const sync = await import(moduleUrl("sync.js"));
   const tts = await import(moduleUrl("tts.js"));
   const revisions = await import(moduleUrl("revisions.js"));
-  return { state, core, normalization, sync, tts, revisions };
+  const usage = await import(moduleUrl("usage.js"));
+  return { state, core, normalization, sync, tts, revisions, usage };
 }
 
 function testRestoredSpeakerDirectory({ state, tts }) {
@@ -152,6 +153,137 @@ async function testPhraseTtsTimeout({ core, tts }) {
     await core.postJSON("/stage1/tts-jobs/start", {});
     assert.deepStrictEqual(requestedTimeouts, [20 * 60 * 1000, core.FETCH_TIMEOUT_MS]);
   } finally {
+    globalThis.fetch = originalFetch;
+    window.setTimeout = originalSetTimeout;
+    window.clearTimeout = originalClearTimeout;
+  }
+}
+
+async function testOpenRouterUsagePollingSinglePending({ usage }) {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+  const timers = [];
+  let nextTimerId = 1;
+  let fetchCalls = 0;
+  let pending = 0;
+  let maxPending = 0;
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const fire = async (delay) => {
+    const index = timers.findIndex((timer) => timer.delay === delay);
+    assert.ok(index >= 0, `no timer scheduled with delay ${delay}`);
+    const [timer] = timers.splice(index, 1);
+    timer.callback();
+    await flush();
+  };
+  try {
+    window.setTimeout = (callback, delay) => {
+      timers.push({ id: nextTimerId, callback, delay });
+      return nextTimerId++;
+    };
+    window.clearTimeout = (id) => {
+      const index = timers.findIndex((timer) => timer.id === id);
+      if (index >= 0) timers.splice(index, 1);
+    };
+    // Сервер «завис»: fetch не завершается, пока его не прервут через signal.
+    globalThis.fetch = (_url, options = {}) => {
+      fetchCalls += 1;
+      pending += 1;
+      maxPending = Math.max(maxPending, pending);
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          pending -= 1;
+          reject(new Error("aborted"));
+        });
+      });
+    };
+
+    usage.startOpenRouterUsagePolling();
+    await flush();
+    assert.strictEqual(fetchCalls, 1);
+    // Повторный старт не создаёт второй опрос.
+    usage.startOpenRouterUsagePolling();
+    await flush();
+    assert.strictEqual(fetchCalls, 1);
+    // Пока запрос висит, интервальных тиков нет: следующий опрос не запланирован.
+    assert.ok(!timers.some((timer) => timer.delay === usage.USAGE_POLL_INTERVAL_MS));
+    // Таймаут прерывает запрос; только после этого планируется следующий опрос.
+    await fire(usage.USAGE_FETCH_TIMEOUT_MS);
+    assert.strictEqual(pending, 0);
+    assert.strictEqual(fetchCalls, 1);
+    for (let round = 2; round <= 4; round += 1) {
+      await fire(usage.USAGE_POLL_INTERVAL_MS);
+      assert.strictEqual(fetchCalls, round);
+      assert.strictEqual(pending, 1);
+      await fire(usage.USAGE_FETCH_TIMEOUT_MS);
+      assert.strictEqual(pending, 0);
+    }
+    assert.strictEqual(maxPending, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    window.setTimeout = originalSetTimeout;
+    window.clearTimeout = originalClearTimeout;
+  }
+}
+
+async function testOpenRouterUsagePollingSurvivesRenderError({ state }) {
+  // Свежий экземпляр модуля: флаг pollingActive у общего экземпляра уже взведён предыдущим тестом.
+  const usage = await import(`${moduleUrl("usage.js")}?fresh=polling-render-error`);
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+  const originalUsageElement = state.ids.openrouter_usage;
+  const timers = [];
+  let nextTimerId = 1;
+  let fetchCalls = 0;
+  let renderFails = false;
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const fire = async (delay) => {
+    const index = timers.findIndex((timer) => timer.delay === delay);
+    assert.ok(index >= 0, `no timer scheduled with delay ${delay}`);
+    const [timer] = timers.splice(index, 1);
+    timer.callback();
+    await flush();
+  };
+  try {
+    // Элемент виджета: рендер падает только после старта, когда уже идёт опрос.
+    state.ids.openrouter_usage = {
+      dataset: {},
+      querySelector() {
+        if (renderFails) throw new Error("render failed");
+        return null;
+      },
+    };
+    window.setTimeout = (callback, delay) => {
+      timers.push({ id: nextTimerId, callback, delay });
+      return nextTimerId++;
+    };
+    window.clearTimeout = (id) => {
+      const index = timers.findIndex((timer) => timer.id === id);
+      if (index >= 0) timers.splice(index, 1);
+    };
+    // Сеть падает сразу: запрос завершается ошибкой, затем срабатывает ошибка рендера.
+    globalThis.fetch = () => {
+      fetchCalls += 1;
+      return Promise.reject(new Error("network down"));
+    };
+
+    usage.startOpenRouterUsagePolling();
+    // Рендер начинает падать уже после старта, когда опрос запущен.
+    renderFails = true;
+    await flush();
+    assert.strictEqual(fetchCalls, 1);
+    // Даже при ошибке рендера следующий опрос должен быть запланирован.
+    assert.ok(
+      timers.some((timer) => timer.delay === usage.USAGE_POLL_INTERVAL_MS),
+      "next poll must be scheduled even when render throws",
+    );
+    for (let round = 2; round <= 3; round += 1) {
+      await fire(usage.USAGE_POLL_INTERVAL_MS);
+      assert.strictEqual(fetchCalls, round);
+    }
+  } finally {
+    state.ids.openrouter_usage = originalUsageElement;
     globalThis.fetch = originalFetch;
     window.setTimeout = originalSetTimeout;
     window.clearTimeout = originalClearTimeout;
@@ -489,6 +621,81 @@ async function testSyncMatchSpeakerFilterHint({ state, sync }) {
   }
 }
 
+// Audit 2026-10-21 #1: a confirmed match flagged retime_pending_review (word times
+// were retimed under kept manual boundaries) must reappear in the review queue,
+// be labelled, show the kept boundaries, and count as needing review.
+async function testSyncRetimePendingReviewQueue({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+
+  function jsonResponse(body) {
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  }
+
+  function installFetch(matchesDoc) {
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      if (target.includes("/sync-sources")) return jsonResponse({ ok: true, result: { items: [] } });
+      if (target.includes("/sync-matches")) return jsonResponse({ ok: true, result: matchesDoc });
+      if (target.includes("/sync-jobs/status")) return { ok: false, status: 404, text: async () => "" };
+      throw new Error(`testSyncRetimePendingReviewQueue: unexpected fetch ${target}`);
+    };
+  }
+
+  const confirmed = (segmentId, metadata) => ({
+    segment_id: segmentId,
+    status: "confirmed",
+    speaker: "ЕЛЕНА МИНЧЕНКО",
+    source_id: "media_a1",
+    source_in_sec: 8.4,
+    source_out_sec: 14.0,
+    metadata,
+  });
+
+  try {
+    // Flagged confirmed match: in the queue, labelled, kept boundaries visible.
+    installFetch({
+      items: [confirmed("snh1", { retime_pending_review: true }), confirmed("snh2", {})],
+    });
+    await sync.loadSyncWorkspace(true);
+    const html = ids.sync_review_list.innerHTML;
+    assert.match(html, /data-match-id="snh1"/, "flagged confirmed match must be in the review queue");
+    assert.ok(!html.includes('data-match-id="snh2"'), "plain confirmed match must stay out of the queue");
+    assert.match(html, /границы изменились — проверьте/, "card must carry the retime review label");
+    assert.match(html, /data-sync-in[^>]*value="8\.400"/, "kept manual Source in must be shown");
+    assert.match(html, /data-sync-out[^>]*value="14\.000"/, "kept manual Source out must be shown");
+    assert.match(html, /confirm-sync-match/, "editor must be able to re-confirm explicitly");
+    assert.strictEqual(ids.sync_count_review.textContent, "1", "flagged match counts as review");
+    assert.strictEqual(ids.sync_count_confirmed.textContent, "1", "only the plain match counts as confirmed");
+
+    // Falsy flag: nothing to review.
+    installFetch({ items: [confirmed("snh3", { retime_pending_review: false })] });
+    await sync.loadSyncWorkspace(true);
+    assert.ok(!ids.sync_review_list.innerHTML.includes("sync-match-card"));
+
+    // Audit 2026-10-21 #3: needs_review caused by unrefined (interpolated) times
+    // explains itself on the card.
+    installFetch({
+      items: [{
+        ...confirmed("snh4", { timing_flags: ["timing_unrefined"], review_reason: "timing_unrefined" }),
+        status: "needs_review",
+      }],
+    });
+    await sync.loadSyncWorkspace(true);
+    assert.match(
+      ids.sync_review_list.innerHTML,
+      /время слов в расшифровке приблизительное/,
+      "unrefined timing reason must be shown on the review card",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+  }
+}
+
 // Card 6: the editable sync-sources list added to the web panel so an
 // operator no longer has to reopen the CEP panel in Premiere to fix a
 // source's speaker names or "all speakers" flag - a wrong/missing speaker
@@ -721,8 +928,11 @@ async function main() {
     ["testStyleDegradedWarning", () => testStyleDegradedWarning(modules)],
     ["testRestoredSpeakerDirectory", () => testRestoredSpeakerDirectory(modules)],
     ["testPhraseTtsTimeout", () => testPhraseTtsTimeout(modules)],
+    ["testOpenRouterUsagePollingSinglePending", () => testOpenRouterUsagePollingSinglePending(modules)],
+    ["testOpenRouterUsagePollingSurvivesRenderError", () => testOpenRouterUsagePollingSurvivesRenderError(modules)],
     ["testConfirmDialog", () => testConfirmDialog(modules)],
     ["testSyncMatchSpeakerFilterHint", () => testSyncMatchSpeakerFilterHint(modules)],
+    ["testSyncRetimePendingReviewQueue", () => testSyncRetimePendingReviewQueue(modules)],
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],
     ["testRevisionsInbox", () => testRevisionsInbox(modules)],
   ];

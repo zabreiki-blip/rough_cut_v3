@@ -177,8 +177,8 @@ def _flatten(words: list[WordTimestamp], *, timed: bool) -> tuple[list[_Token], 
         else:
             merged.extend(items)
     touching = [0] * len(words)
-    for token in merged:
-        for word_index in range(token.first_word, token.last_word + 1):
+    for merged_token in merged:
+        for word_index in range(merged_token.first_word, merged_token.last_word + 1):
             touching[word_index] += 1
     return merged, touching
 
@@ -275,9 +275,11 @@ def _find_anchors(
         total, consumed = sum(lengths), 0
         span = ltoken.t1 - ltoken.t0
         for k, length in zip(indices, lengths):
-            a = ltoken.t0 + span * consumed / total
+            piece_start = ltoken.t0 + span * consumed / total
             consumed += length
-            pieces.setdefault(k, []).append((a, ltoken.t0 + span * consumed / total, False))
+            pieces.setdefault(k, []).append(
+                (piece_start, ltoken.t0 + span * consumed / total, False)
+            )
 
     anchors = []
     for word in sorted(pieces):
