@@ -8,6 +8,9 @@ import {
 } from "./core.js";
 import { saveNormalization } from "./normalization.js";
 
+// Import runs LLM normalization synchronously on the server and may take minutes.
+export const REVISION_IMPORT_TIMEOUT_MS = 20 * 60 * 1000;
+
 const versionStatusLabels = {
   unchanged: "без изменений", moved: "переставлен", edited: "изменён",
   added: "добавлен", removed: "удалён", type_changed: "сменён тип",
@@ -429,12 +432,26 @@ export async function importRevision() {
   }
   ids.btn_import_revision.textContent = "Сравнение…";
   try {
-    const result = await postJSON("/stage4/revisions/import", {
-      project,
-      input_path: inputPath,
-      use_llm: Boolean(ids.normalization_use_llm?.checked),
-      hint: ids.normalization_hint?.value?.trim() || "",
-    });
+    let result;
+    try {
+      result = await postJSON("/stage4/revisions/import", {
+        project,
+        input_path: inputPath,
+        use_llm: Boolean(ids.normalization_use_llm?.checked),
+        hint: ids.normalization_hint?.value?.trim() || "",
+      }, REVISION_IMPORT_TIMEOUT_MS);
+    } catch (err) {
+      if (err && err.status === 408) {
+        // The server may still have created the revision: refresh the list.
+        try { await loadRevisionsScreen(true); } catch (_) { /* best-effort */ }
+        const timeout = new Error(
+          "Сервер не ответил вовремя; импорт мог завершиться — проверьте список редакций"
+        );
+        timeout.status = 408;
+        throw timeout;
+      }
+      throw err;
+    }
     await loadRevisionsScreen(true);
     openTab("versions");
     toast(`Создана ${revisionTitle(result.revision || {}) || "новая версия"}`, "success");

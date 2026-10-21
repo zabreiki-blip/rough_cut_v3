@@ -159,6 +159,57 @@ async function testPhraseTtsTimeout({ core, tts }) {
   }
 }
 
+async function testRevisionImportTimeout({ state, revisions }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+  const originalNormalization = appState.normalization;
+  const select = ids.inbox_scenario_select;
+  const originalSelectValue = select.value;
+  assert.strictEqual(revisions.REVISION_IMPORT_TIMEOUT_MS, 20 * 60 * 1000);
+  const requestedTimeouts = [];
+  const requests = [];
+  try {
+    appState.normalization = { blocks: [] };
+    select.value = "Сценарии/slow.docx";
+    // Fire only the import timer immediately: the mocked fetch then rejects
+    // once its AbortSignal is aborted, like a browser giving up on the request.
+    window.setTimeout = (callback, delay) => {
+      requestedTimeouts.push(delay);
+      if (delay === revisions.REVISION_IMPORT_TIMEOUT_MS) callback();
+      return 1;
+    };
+    window.clearTimeout = () => {};
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      requests.push(target);
+      if (target.includes("/stage4/revisions/import")) {
+        throw new Error("aborted");
+      }
+      return { ok: true, json: async () => ({ ok: true, result: { revisions: [] } }) };
+    };
+    await assert.rejects(revisions.importRevision(), (err) => {
+      assert.ok(err.message.includes("импорт мог завершиться"), err.message);
+      assert.strictEqual(err.status, 408);
+      return true;
+    });
+    assert.deepStrictEqual(requestedTimeouts.slice(0, 1), [20 * 60 * 1000]);
+    const importIndex = requests.findIndex((target) => target.includes("/stage4/revisions/import"));
+    assert.ok(importIndex >= 0);
+    assert.ok(
+      requests.slice(importIndex + 1).some((target) => target.includes("/stage4/revisions?")),
+      "timeout must re-read the revision list",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    window.setTimeout = originalSetTimeout;
+    window.clearTimeout = originalClearTimeout;
+    appState.normalization = originalNormalization;
+    select.value = originalSelectValue;
+  }
+}
+
 async function testOpenRouterUsagePollingSinglePending({ usage }) {
   const originalFetch = globalThis.fetch;
   const originalSetTimeout = window.setTimeout;
@@ -935,6 +986,7 @@ async function main() {
     ["testSyncRetimePendingReviewQueue", () => testSyncRetimePendingReviewQueue(modules)],
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],
     ["testRevisionsInbox", () => testRevisionsInbox(modules)],
+    ["testRevisionImportTimeout", () => testRevisionImportTimeout(modules)],
   ];
 
   let passed = 0;
