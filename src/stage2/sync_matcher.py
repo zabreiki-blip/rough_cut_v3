@@ -408,6 +408,7 @@ TAIL_TRUNCATED_FLAG = "tail_truncated_vs_local"
 HEAD_TRUNCATED_FLAG = "head_truncated_vs_local"
 RANGE_DISAGREES_FLAG = "range_disagrees_with_local"
 LOCAL_TEXT_MISMATCH_FLAG = "local_text_mismatch"
+RANGE_SOURCE_LOCAL = "local_transcript"
 LOCAL_FALLBACK_STRATEGY = "local_index_fallback"
 _LOCAL_INDEX_KIND = "local_whisper"
 _MIN_WORDS_FOR_RATE = 5
@@ -1690,13 +1691,18 @@ class SyncMatcher:
 
     def _local_consistency(
         self, request: AlignmentRequest, best: _Candidate
-    ) -> tuple[list[str], dict[str, Any], SyncAlternative | None]:
+    ) -> tuple[list[str], dict[str, Any], SyncAlternative | None, SyncMatch | None]:
         """Cross-check the chosen speech range against the local transcript.
 
         Only a near-timecode search around ``speech_in`` runs (no global fallback).
+        The fourth item is the local match to adopt instead of the cloud range: it is set
+        only when the range disagrees/is truncated AND the local transcript holds the
+        whole query unambiguously (the local search itself is ``auto_matched``: the usual
+        ``auto_threshold``, ambiguity margin, semantic/gap/rate gates).  Weak or ambiguous
+        local evidence leaves the cloud range under review.
         """
         if best.source_id not in self.local_indexes:
-            return [], {}, None
+            return [], {}, None, None
         probe = AlignmentRequest(
             segment_id=request.segment_id,
             text=request.text,
@@ -1710,8 +1716,13 @@ class SyncMatcher:
             reason = found.metadata.get("unmatched_reason")
             # No local words around the range is absence of evidence, not a contradiction.
             if reason == "below_review_threshold" and best.confidence >= self.config.auto_threshold:
-                return [LOCAL_TEXT_MISMATCH_FLAG], {"local_confidence": found.confidence}, None
-            return [], {}, None
+                return (
+                    [LOCAL_TEXT_MISMATCH_FLAG],
+                    {"local_confidence": found.confidence},
+                    None,
+                    None,
+                )
+            return [], {}, None, None
         local_in = float(found.metadata.get("speech_in_sec", best.start))
         local_out = float(found.metadata.get("speech_out_sec", best.end))
         tolerance = self.config.local_boundary_tolerance_sec
@@ -1725,7 +1736,16 @@ class SyncMatcher:
         if local_length > 0 and overlap < _MIN_LOCAL_OVERLAP_SHARE * local_length:
             flags.append(RANGE_DISAGREES_FLAG)
         if not flags:
-            return [], {}, None
+            return [], {}, None, None
+        adopted = (
+            found
+            if found.status == "auto_matched"
+            and found.source_id == best.source_id
+            and found.source_in_sec is not None
+            and found.source_out_sec is not None
+            and local_out > local_in
+            else None
+        )
         alternative = SyncAlternative(
             best.source_id,
             found.source_in_sec if found.source_in_sec is not None else local_in,
@@ -1741,6 +1761,67 @@ class SyncMatcher:
                 "local_confidence": found.confidence,
             },
             alternative,
+            adopted,
+        )
+
+    def _corrected_match(
+        self,
+        request: AlignmentRequest,
+        best: _Candidate,
+        local_range: SyncMatch,
+        *,
+        status: MatchStatus,
+        cloud_range: tuple[float, float],
+        cloud_flags: list[str],
+        cloud_timing_flags: list[str],
+        alternatives: list[SyncAlternative],
+        speaker_filtered: list[dict[str, Any]],
+    ) -> SyncMatch:
+        """Match whose range comes from the local transcript; the cloud range is kept for audit."""
+        assert local_range.source_in_sec is not None and local_range.source_out_sec is not None
+        metadata: dict[str, Any] = {
+            **local_range.metadata,
+            "timecode_mode": request.timecode_mode,
+            "range_source": RANGE_SOURCE_LOCAL,
+            "range_corrected_flags": cloud_flags,
+            "cloud_speech_in_sec": round(best.start, 4),
+            "cloud_speech_out_sec": round(best.end, 4),
+            "cloud_source_in_sec": round(cloud_range[0], 4),
+            "cloud_source_out_sec": round(cloud_range[1], 4),
+            "cloud_confidence": round(best.confidence, 4),
+            "cloud_timing_flags": cloud_timing_flags,
+        }
+        if speaker_filtered:
+            metadata["speaker_filtered_sources"] = speaker_filtered
+        if self.config.max_alternatives > 0:
+            # The replaced cloud range stays selectable for the editor.
+            alternatives = _merge_alternatives(
+                [
+                    SyncAlternative(
+                        best.source_id,
+                        cloud_range[0],
+                        cloud_range[1],
+                        round(best.confidence, 4),
+                        best.text,
+                    )
+                ],
+                alternatives,
+                limit=self.config.max_alternatives,
+            )
+        return SyncMatch(
+            segment_id=request.segment_id,
+            query_text=request.text,
+            speaker=request.speaker,
+            approximate_timecode=str(request.approximate_timecode or ""),
+            source_id=best.source_id,
+            source_in_sec=local_range.source_in_sec,
+            source_out_sec=local_range.source_out_sec,
+            confidence=local_range.confidence,
+            status=status,
+            matched_text=local_range.matched_text,
+            strategy=best.strategy,
+            alternatives=alternatives,
+            metadata=metadata,
         )
 
     def _search_match(
@@ -1897,7 +1978,9 @@ class SyncMatcher:
         # Text similarity also says nothing about whether the range is physically
         # plausible (collapsed word times) or complete (cut short vs the local transcript).
         rate_flags = self._rate_flags(best)
-        local_flags, local_metadata, local_alternative = self._local_consistency(request, best)
+        local_flags, local_metadata, local_alternative, local_range = self._local_consistency(
+            request, best
+        )
         plausibility_flags = [*rate_flags, *local_flags]
         # A strong global fallback is useful, but its disagreement with the
         # supplied timecode must remain visible to an editor.
@@ -1909,6 +1992,15 @@ class SyncMatcher:
             and not gap_flags
         )
         auto = text_auto and not timing_flags and not plausibility_flags
+        if local_range is not None:
+            # The cloud range is demonstrably wrong (collapsed/shifted/truncated) but the
+            # local transcript holds the whole query unambiguously.  The cloud text still
+            # has to agree (auto_threshold, no semantic flags): two independent
+            # transcripts confirm the words and the word-level local times give the range.
+            # Cloud ambiguity is ignored on purpose (duplicated cloud text is typical for
+            # a broken cloud range).  Local-only discoveries stay review-only
+            # (``local_fallback_auto``); this is a correction of an existing cloud match.
+            auto = best.confidence >= self.config.auto_threshold and not semantic_flags
         status: MatchStatus = "auto_matched" if auto else "needs_review"
         alternatives = []
         for item in candidates[1 : 1 + self.config.max_alternatives]:
@@ -1929,6 +2021,18 @@ class SyncMatcher:
                 limit=self.config.max_alternatives,
             )
         source_in, source_out = _padded_range(best, self.sources[best.source_id], self.config)
+        if local_range is not None:
+            return self._corrected_match(
+                request,
+                best,
+                local_range,
+                status=status,
+                cloud_range=(source_in, source_out),
+                cloud_flags=[*plausibility_flags],
+                cloud_timing_flags=timing_flags,
+                alternatives=alternatives,
+                speaker_filtered=speaker_filtered,
+            )
         timing_metadata: dict[str, object] = {
             "timing_reliable": not timing_flags and not rate_flags,
             "timing_flags": timing_flags,

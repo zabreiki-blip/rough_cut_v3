@@ -194,9 +194,11 @@ def test_dense_words_over_rate_limit_are_flagged_without_collapse() -> None:
 
 
 def test_tail_truncated_vs_local_adds_local_range_first() -> None:
+    # Два одинаковых локальных кандидата в окне: коррекция диапазона не применяется
+    # (неоднозначно), остаются флаги и локальный диапазон первой альтернативой.
     head17 = " ".join(PHRASE.split()[:17])
     primary = _index("s1", _words(head17, 277.3) + _words(FILLER, 284.5))
-    local = _local(_words(PHRASE, 277.3))
+    local = _local(_words(PHRASE, 277.3) + _words(FILLER, 290.0) + _words(PHRASE, 330.0))
     request = _request(approx=277.0)
 
     assert SyncMatcher([_source()], [primary]).match(request).status == "auto_matched"
@@ -204,6 +206,7 @@ def test_tail_truncated_vs_local_adds_local_range_first() -> None:
     result = SyncMatcher([_source()], [primary], local_indexes=[local]).match(request)
 
     assert result.status == "needs_review"
+    assert "range_source" not in result.metadata
     assert "tail_truncated_vs_local" in result.metadata["plausibility_flags"]
     assert result.metadata["review_reason"] == result.metadata["plausibility_flags"][0]
     assert result.metadata["local_speech_in_sec"] == pytest.approx(277.3, abs=0.01)
@@ -219,7 +222,7 @@ def test_tail_truncated_vs_local_adds_local_range_first() -> None:
 def test_head_truncated_vs_local() -> None:
     tail17 = " ".join(PHRASE.split()[3:])
     primary = _index("s1", _words(tail17, 101.2))
-    local = _local(_words(PHRASE, 100.0))
+    local = _local(_words(PHRASE, 100.0) + _words(FILLER, 120.0) + _words(PHRASE, 150.0))
     result = SyncMatcher([_source()], [primary], local_indexes=[local]).match(_request())
     assert result.status == "needs_review"
     assert "head_truncated_vs_local" in result.metadata["plausibility_flags"]
@@ -228,7 +231,7 @@ def test_head_truncated_vs_local() -> None:
 
 def test_range_disagrees_with_local_when_ranges_do_not_overlap() -> None:
     primary = _index("s1", _words(PHRASE, 100.0))
-    local = _local(_words(PHRASE, 150.0))
+    local = _local(_words(PHRASE, 150.0) + _words(FILLER, 160.0) + _words(PHRASE, 200.0))
     result = SyncMatcher([_source()], [primary], local_indexes=[local]).match(_request())
     assert result.status == "needs_review"
     assert "range_disagrees_with_local" in result.metadata["plausibility_flags"]
@@ -277,7 +280,7 @@ def test_guide_offset_does_not_break_local_consistency() -> None:
 def test_zero_max_alternatives_does_not_add_local_alternative() -> None:
     head17 = " ".join(PHRASE.split()[:17])
     primary = _index("s1", _words(head17, 277.3) + _words(FILLER, 284.5))
-    local = _local(_words(PHRASE, 277.3))
+    local = _local(_words(PHRASE, 277.3) + _words(FILLER, 290.0) + _words(PHRASE, 330.0))
     config = MatcherConfig(max_alternatives=0)
     result = SyncMatcher([_source()], [primary], config, local_indexes=[local]).match(
         _request(approx=277.0)

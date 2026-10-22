@@ -71,6 +71,18 @@
   флагов 1/2. Без флагов поведение и метаданные не меняются.
 - Производительность: проверка 3 — один near-timecode поиск по local-индексу на
   не-`not_found` результат.
+- Коррекция диапазона: если проверка 3 дала флаги диапазона (`range_disagrees_with_local`,
+  `head/tail_truncated_vs_local`) и local-поиск нашёл весь запрос однозначно
+  (`auto_matched` по обычным порогам: `auto_threshold`, `ambiguity_margin`, семантика/gap/rate),
+  берётся локальный диапазон (speech_in/out из local-слов, те же head/tail padding).
+  Метаданные: `range_source="local_transcript"`, `range_corrected_flags` (сработавшие флаги),
+  `cloud_speech_in/out_sec`, `cloud_source_in/out_sec`, `cloud_confidence`, `cloud_timing_flags`;
+  облачный диапазон — первой альтернативой; `plausibility_flags` не ставятся. Статус
+  `auto_matched`, если облачный текст тоже проходит `auto_threshold` без семантических флагов
+  (двойное подтверждение текста; облачная неоднозначность игнорируется — дубли типичны для
+  сломанного диапазона), иначе `needs_review`. Слабое/неоднозначное local-свидетельство —
+  прежнее поведение (облачный диапазон + флаги + `needs_review`). Подтверждённые не
+  пересчитываются (фаза). Версия отпечатка матчинга 6.
 
 ## C. Подключение
 

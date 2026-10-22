@@ -1470,6 +1470,11 @@ def _sync_job_with_live_summary(job: dict) -> dict:
     return snapshot
 
 
+# Bump when matcher logic changes decisions (cached non-confirmed matches are recomputed).
+# 6: ranges are corrected from the local transcript when the cloud range is implausible.
+_SYNC_MATCHING_FINGERPRINT_VERSION = 6
+
+
 def _sync_matching_fingerprint(
     *,
     units: list[dict[str, object]],
@@ -1487,7 +1492,7 @@ def _sync_matching_fingerprint(
 ) -> str:
     """Identify every durable input that can change a matching decision."""
     payload = {
-        "version": 5,
+        "version": _SYNC_MATCHING_FINGERPRINT_VERSION,
         "normalization_revision": normalization_revision,
         "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,
@@ -1575,6 +1580,14 @@ _CANDIDATE_SPECIFIC_METADATA_KEYS = (
     "local_speech_in_sec",
     "local_speech_out_sec",
     "local_confidence",
+    "range_source",
+    "range_corrected_flags",
+    "cloud_speech_in_sec",
+    "cloud_speech_out_sec",
+    "cloud_source_in_sec",
+    "cloud_source_out_sec",
+    "cloud_confidence",
+    "cloud_timing_flags",
     "speech_in_sec",
     "speech_out_sec",
     "gap_flags",
