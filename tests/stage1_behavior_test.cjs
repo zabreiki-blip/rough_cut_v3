@@ -1175,6 +1175,203 @@ async function testExportXmlPreExportSummary({ state, stage3 }) {
   }
 }
 
+// Audit U2/U3: edits typed while a save/preview/confirm request is in flight must
+// survive the response; the server revision is still accepted.
+function normalizationRaceHarness({ state }) {
+  const { appState } = state;
+  const originals = {
+    fetch: globalThis.fetch,
+    normalization: appState.normalization,
+    dirty: appState.normalizationDirty,
+    eligible: appState.normalizationEligible,
+  };
+  const jsonResponse = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body), json: async () => body });
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((res) => { resolve = res; });
+    return { promise, resolve };
+  };
+  const settle = async () => { for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r)); };
+  const doc = (text, revision, status = "draft") => ({
+    revision, status, warnings: [],
+    blocks: [{ id: "b1", order: 1, type: "voiceover", text_for_tts: text, normalized_text: text }],
+  });
+  const reset = (text, revision, { status = "draft", dirty = false } = {}) => {
+    appState.normalization = doc(text, revision, status);
+    appState.normalizationDirty = dirty;
+    appState.normalizationEligible = false;
+  };
+  const restore = () => {
+    globalThis.fetch = originals.fetch;
+    appState.normalization = originals.normalization;
+    appState.normalizationDirty = originals.dirty;
+    appState.normalizationEligible = originals.eligible;
+  };
+  return { appState, jsonResponse, deferred, settle, reset, restore, doc };
+}
+
+async function testNormalizationEditDuringConfirm({ state, normalization }) {
+  const h = normalizationRaceHarness({ state });
+  const { appState } = h;
+  const userEdit = (text) => {
+    appState.normalization.blocks[0].text_for_tts = text;
+    normalization.markNormalizationDirty();
+  };
+  // gate: "preview" or "confirm" request is held until released.
+  const run = async (gate) => {
+    const held = h.deferred();
+    const calls = [];
+    globalThis.fetch = async (url, options = {}) => {
+      const target = String(url);
+      const body = options.body ? JSON.parse(options.body) : null;
+      if (target.includes("/normalization/confirm/preview")) {
+        calls.push("preview");
+        if (gate === "preview") await held.promise;
+        return h.jsonResponse({ ok: true, result: { candidates: [] } });
+      }
+      if (target.includes("/normalization/confirm")) {
+        calls.push("confirm");
+        assert.strictEqual(body.revision, 5, "confirm must be sent with the revision it started from");
+        if (gate === "confirm") await held.promise;
+        return h.jsonResponse({ ok: true, result: h.doc("original", 6, "confirmed") });
+      }
+      if (target.includes("/normalization/memory")) return h.jsonResponse({ ok: true, result: [] });
+      if (target.includes("/stage1/status")) {
+        return h.jsonResponse({ ok: true, result: { normalization_confirmed: true, normalization_status: "confirmed" } });
+      }
+      throw new Error(`testNormalizationEditDuringConfirm: unexpected fetch ${target}`);
+    };
+    h.reset("original", 5);
+    const done = normalization.confirmNormalization();
+    await h.settle();
+    assert.ok(calls.includes(gate), `${gate} request must be in flight`);
+    userEdit("new edit during confirm");
+    held.resolve();
+    await done;
+  };
+  try {
+    for (const gate of ["preview", "confirm"]) {
+      await run(gate);
+      const doc = appState.normalization;
+      assert.strictEqual(doc.blocks[0].text_for_tts, "new edit during confirm", `${gate}: newer local text must survive`);
+      assert.strictEqual(appState.normalizationDirty, true, `${gate}: draft must stay dirty`);
+      assert.strictEqual(appState.normalizationEligible, false, `${gate}: edited text is not confirmed-eligible`);
+      assert.notStrictEqual(doc.status, "confirmed", `${gate}: edited text must not read as confirmed`);
+      assert.strictEqual(doc.revision, 6, `${gate}: server revision must be accepted`);
+    }
+
+    // Control: no edit during the request -> confirmed and clean.
+    const calls = [];
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/normalization/confirm/preview")) return h.jsonResponse({ ok: true, result: { candidates: [] } });
+      if (target.includes("/normalization/confirm")) return h.jsonResponse({ ok: true, result: h.doc("original", 6, "confirmed") });
+      if (target.includes("/normalization/memory")) return h.jsonResponse({ ok: true, result: [] });
+      return h.jsonResponse({ ok: true, result: { normalization_confirmed: true, normalization_status: "confirmed" } });
+    };
+    h.reset("original", 5);
+    await normalization.confirmNormalization();
+    assert.strictEqual(appState.normalization.status, "confirmed");
+    assert.strictEqual(appState.normalizationDirty, false);
+    assert.strictEqual(appState.normalizationEligible, true);
+    assert.strictEqual(appState.normalization.revision, 6);
+  } finally {
+    h.restore();
+  }
+}
+
+async function testNormalizationSaveAcceptsRevisionAfterEdit({ state, normalization }) {
+  const h = normalizationRaceHarness({ state });
+  const { appState } = h;
+  let serverRevision = 5;
+  const puts = [];
+  const gates = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url);
+    if (!(target.includes("/stage1/normalization") && options.method === "PUT")) {
+      throw new Error(`testNormalizationSaveAcceptsRevisionAfterEdit: unexpected fetch ${target}`);
+    }
+    const body = JSON.parse(options.body);
+    puts.push({ revision: body.revision, text: body.blocks[0].text_for_tts });
+    if (gates.length) await gates.shift().promise;
+    if (body.revision !== serverRevision) {
+      return { ok: false, status: 409, text: async () => JSON.stringify({ ok: false, error: `Expected revision ${body.revision}, current revision is ${serverRevision}` }) };
+    }
+    serverRevision += 1;
+    return h.jsonResponse({ ok: true, result: { ...body, revision: serverRevision } });
+  };
+  try {
+    h.reset("v1", 5, { dirty: true });
+    const gate = h.deferred();
+    gates.push(gate);
+    const first = normalization.saveNormalization();
+    await h.settle();
+    appState.normalization.blocks[0].text_for_tts = "v2 typed during save";
+    normalization.markNormalizationDirty();
+    gate.resolve();
+    await first;
+    assert.strictEqual(appState.normalization.revision, 6, "server revision from the first PUT must be accepted");
+    assert.strictEqual(appState.normalization.blocks[0].text_for_tts, "v2 typed during save");
+    assert.strictEqual(appState.normalizationDirty, true, "newer edit stays unsaved");
+
+    await normalization.saveNormalization();
+    assert.deepStrictEqual(puts.map((p) => p.revision), [5, 6]);
+    assert.strictEqual(puts[1].text, "v2 typed during save");
+    assert.strictEqual(appState.normalization.revision, 7);
+    assert.strictEqual(appState.normalization.blocks[0].text_for_tts, "v2 typed during save");
+    assert.strictEqual(appState.normalizationDirty, false);
+  } finally {
+    h.restore();
+  }
+}
+
+function testApplyStatusSyncsTimelineReady({ state, normalization }) {
+  const { ids, appState } = state;
+  const originals = {
+    ready: appState.timelineReady,
+    normalization: appState.normalization,
+    eligible: appState.normalizationEligible,
+    dirty: appState.normalizationDirty,
+    running: appState.stage3JobRunning,
+  };
+  const confirmedStatus = { normalization_confirmed: true, normalization_status: "confirmed" };
+  try {
+    appState.normalization = { status: "confirmed", revision: 3, warnings: [], blocks: [{ id: "b1", type: "voiceover" }] };
+    appState.normalizationDirty = false;
+    appState.normalizationEligible = true;
+    appState.stage3JobRunning = false;
+    appState.timelineReady = true;
+
+    normalization.applyStatus({ ...confirmedStatus, timeline_ready: false });
+    assert.strictEqual(appState.timelineReady, false, "true -> false transition must be applied");
+    assert.strictEqual(ids.btn_export_xml.disabled, true);
+
+    normalization.applyStatus({ ...confirmedStatus, timeline_ready: true });
+    assert.strictEqual(appState.timelineReady, true, "false -> true transition must be applied");
+    assert.strictEqual(ids.btn_export_xml.disabled, false);
+
+    // Parallel Stage 3 job keeps export disabled even when the timeline is ready.
+    appState.stage3JobRunning = true;
+    normalization.applyStatus({ ...confirmedStatus, timeline_ready: true });
+    assert.strictEqual(ids.btn_export_xml.disabled, true);
+    appState.stage3JobRunning = false;
+
+    // Missing / non-boolean timeline_ready leaves the state untouched.
+    normalization.applyStatus({ ...confirmedStatus });
+    normalization.applyStatus({ ...confirmedStatus, timeline_ready: "no" });
+    assert.strictEqual(appState.timelineReady, true);
+    assert.strictEqual(ids.btn_export_xml.disabled, false);
+  } finally {
+    appState.timelineReady = originals.ready;
+    appState.normalization = originals.normalization;
+    appState.normalizationEligible = originals.eligible;
+    appState.normalizationDirty = originals.dirty;
+    appState.stage3JobRunning = originals.running;
+    normalization.applyStatus({});
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
@@ -1196,6 +1393,9 @@ async function main() {
     ["testBuildTimelineSurfacesWarnings", () => testBuildTimelineSurfacesWarnings(modules)],
     ["testSyncMatchVerificationReasons", () => testSyncMatchVerificationReasons(modules)],
     ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
+    ["testNormalizationEditDuringConfirm", () => testNormalizationEditDuringConfirm(modules)],
+    ["testNormalizationSaveAcceptsRevisionAfterEdit", () => testNormalizationSaveAcceptsRevisionAfterEdit(modules)],
+    ["testApplyStatusSyncsTimelineReady", () => testApplyStatusSyncsTimelineReady(modules)],
   ];
 
   let passed = 0;

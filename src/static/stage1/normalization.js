@@ -24,6 +24,19 @@ function canonicalDocument(value) {
   return doc;
 }
 
+// A response arrived for an older snapshot while the user kept typing: accept the
+// server revision but keep the newer local text as an unconfirmed dirty draft.
+function keepLocalDraftWithRevision(result) {
+  const serverDoc = canonicalDocument(result);
+  if (!appState.normalization || !serverDoc) return;
+  appState.normalization.revision = serverDoc.revision;
+  if (appState.normalization.status === "confirmed") appState.normalization.status = "draft";
+  appState.normalizationDirty = true;
+  appState.normalizationEligible = false;
+  renderNormalizationStatus();
+  updateActionAvailability();
+}
+
 export function hasUnsavedChanges() {
   return Boolean(appState.normalizationDirty);
 }
@@ -323,6 +336,7 @@ export async function saveNormalization() {
   const savedGeneration = normalizationEditGeneration;
   const result = await requestJSON("/stage1/normalization", "PUT", normalizationPayload());
   if (normalizationEditGeneration !== savedGeneration) {
+    keepLocalDraftWithRevision(result);
     toast("Черновик сохранён; новые правки ещё не сохранены", "success");
     return appState.normalization;
   }
@@ -390,6 +404,7 @@ export async function resetNormalization() {
 }
 
 export async function confirmNormalization() {
+  const startGeneration = normalizationEditGeneration;
   const unknown = appState.normalization.blocks.filter((block) => (block.type || block.block_type) === "unknown").length;
   if (unknown) throw new Error(`Исправьте неопределённые блоки: ${unknown}`);
   if (appState.normalizationDirty) await saveNormalization();
@@ -402,6 +417,13 @@ export async function confirmNormalization() {
   const result = await requestJSON("/stage1/normalization/confirm", "POST", {
     project, revision: appState.normalization.revision, learning_decisions: learningDecisions,
   });
+  if (normalizationEditGeneration !== startGeneration) {
+    keepLocalDraftWithRevision(result);
+    toast("Подтверждена сохранённая версия; новые правки не подтверждены и не сохранены", "warn");
+    await loadMemory(true);
+    await refreshStatus();
+    return;
+  }
   appState.normalization = canonicalDocument(result);
   appState.normalization.status = "confirmed";
   appState.normalizationEligible = true;
@@ -556,7 +578,10 @@ export function applyStatus(status) {
 
   renderSpeaker(Array.isArray(status.speaker_files) ? status.speaker_files : []);
   const normalizationStatus = status.normalization_status || (status.normalization && status.normalization.status);
-  if (typeof status.normalization_confirmed === "boolean") appState.normalizationEligible = status.normalization_confirmed;
+  if (typeof status.normalization_confirmed === "boolean") {
+    appState.normalizationEligible = status.normalization_confirmed && !appState.normalizationDirty;
+  }
+  if (typeof status.timeline_ready === "boolean") appState.timelineReady = status.timeline_ready;
   if (normalizationStatus && appState.normalization && !appState.normalizationDirty) {
     appState.normalization.status = normalizationStatus;
     renderNormalizationStatus();
