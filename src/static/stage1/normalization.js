@@ -118,6 +118,32 @@ export function renderNormalizationStatus() {
   ids.normalization_status.textContent = labels[state] || state;
 }
 
+function normalizationWarningMessage(raw) {
+  const messages = {
+    "LLM returned an unknown type": "Не удалось определить тип блока — выберите его после проверки исходника",
+    "Stand-up label: speaker is not identified, check manually": "В стендапе не определён ведущий — укажите имя",
+    "Lead-in label: speaker is not identified, check manually": "В подводке не определён ведущий — укажите имя",
+    "all-caps section heading treated as technical (not spoken): check manually": "Строка распознана как заголовок раздела и не озвучивается — проверьте",
+    "all-caps line: heading or spoken text? check manually": "Уточните, является ли строка заголовком или речью",
+    "leading '+' splice has no previous LIFE/SYNC block to continue: check manually": "Не удалось связать склейку «+» с предыдущей сценой — проверьте границу блоков",
+    "leading '+' splice continues previous block: check manually": "Склейка «+» связана с предыдущей сценой — проверьте переход",
+    "Capitalised lead-in line is kept as description, not speech: check manually": "Подпись перед таймкодом сохранена как описание, вне речи — проверьте",
+  };
+  if (messages[raw]) return messages[raw];
+  const repeated = raw.match(/^Repeated author number (.+) \((\d+) occurrences, first in block (\d+)\)/);
+  if (repeated) return `Повтор авторского номера ${repeated[1]}: ${repeated[2]} вхождения, первое в блоке ${repeated[3]} — проверьте нумерацию`;
+  const timecode = raw.match(/^Ambiguous timecode '(.+)' read as (.+): check manually$/);
+  if (timecode) return `Неоднозначный таймкод «${timecode[1]}» прочитан как ${timecode[2]} — уточните время`;
+  const label = raw.match(/^Ambiguous label combination '(.+)':/);
+  if (label) return `Противоречивые метки «${label[1]}» — выберите тип блока`;
+  const confidence = raw.match(/^LLM confidence\s+([^\s]+)\s+is below/i);
+  if (confidence) return `Низкая уверенность LLM (${confidence[1]}) — требуется проверка`;
+  if (/^LLM classification failed:\s*JSONDecodeError/i.test(raw)) {
+    return "LLM вернул некорректный JSON — автоклассификация не применена";
+  }
+  return raw;
+}
+
 export function renderNormalization() {
   renderNormalizationStatus();
   const blocks = appState.normalization && Array.isArray(appState.normalization.blocks) ? appState.normalization.blocks : [];
@@ -133,32 +159,25 @@ export function renderNormalization() {
   ids.norm_count_unknown.textContent = String(counts.unknown || 0);
   updateIssueNavigation(blocks);
 
-  const warnings = (appState.normalization && appState.normalization.warnings ? appState.normalization.warnings : []).concat(
-    blocks.flatMap((block) => Array.isArray(block.warnings) ? block.warnings : [])
-  ).filter(Boolean);
   const warningGroups = new Map();
-  warnings.forEach((warning) => {
+  function addWarning(warning, order) {
     const raw = String(warning || "").trim();
-    let message = raw;
-    if (/^LLM classification failed:\s*JSONDecodeError/i.test(raw)) {
-      message = "LLM вернул некорректный JSON — автоклассификация не применена";
-    } else {
-      const confidence = raw.match(/^LLM confidence\s+([^\s]+)\s+is below/i);
-      if (confidence) {
-        message = `Низкая уверенность LLM (${confidence[1]}) — требуется проверка`;
-      }
-    }
-    warningGroups.set(message, (warningGroups.get(message) || 0) + 1);
+    if (!raw) return;
+    const message = normalizationWarningMessage(raw);
+    if (!warningGroups.has(message)) warningGroups.set(message, new Set());
+    if (order != null) warningGroups.get(message).add(order);
+  }
+  (appState.normalization?.warnings || []).forEach((warning) => addWarning(warning));
+  blocks.forEach((block, index) => {
+    (block.warnings || []).forEach((warning) => addWarning(warning, block.order ?? index + 1));
   });
   const groupedWarnings = Array.from(warningGroups.entries());
-  const visibleWarnings = groupedWarnings.slice(0, 8);
+  const renderWarning = ([message, orders]) => `${escaped(message)}${orders.size
+    ? ` <span class="warning-count">· ${orders.size === 1 ? "блок" : "блоки"}: ${escaped(Array.from(orders).join(", "))}</span>` : ""}`;
   ids.normalization_warnings.hidden = groupedWarnings.length === 0;
   ids.normalization_warnings.innerHTML = groupedWarnings.length
-    ? `<strong>Требует внимания:</strong><br>${visibleWarnings.map(([message, count]) =>
-        `${escaped(message)}${count > 1 ? ` <span class="warning-count">· ${count} блоков</span>` : ""}`
-      ).join("<br>")}${groupedWarnings.length > visibleWarnings.length
-        ? `<br>Ещё ${groupedWarnings.length - visibleWarnings.length} типов предупреждений`
-        : ""}`
+    ? `<strong>Требует внимания:</strong><br>${groupedWarnings.slice(0, 8).map(renderWarning).join("<br>")}${groupedWarnings.length > 8
+      ? `<details><summary>Остальные предупреждения (${groupedWarnings.length - 8})</summary>${groupedWarnings.slice(8).map(renderWarning).join("<br>")}</details>` : ""}`
     : "";
   ids.normalization_empty.hidden = blocks.length > 0;
   ids.normalization_blocks.innerHTML = "";
@@ -218,7 +237,7 @@ export function renderNormalization() {
             <label class="field sync-fragment-text"><span>Текст фрагмента</span><textarea data-fragment-field="text">${escaped(fragment.text || "")}</textarea></label>
           </div>`).join("")}
       </div>` : ""}
-      ${blockWarnings.length ? `<div class="block-warning">${blockWarnings.map(escaped).join(" · ")}</div>` : ""}`;
+      ${blockWarnings.length ? `<div class="block-warning">${blockWarnings.map((warning) => escaped(normalizationWarningMessage(String(warning)))).join(" · ")}</div>` : ""}`;
     ids.normalization_blocks.appendChild(card);
   });
   updateActionAvailability();

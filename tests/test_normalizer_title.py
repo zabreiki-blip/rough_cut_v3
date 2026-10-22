@@ -52,10 +52,15 @@ class ScenarioTitleDetectionTests(unittest.TestCase):
                 use_llm=False,
             )["blocks"]
             self.assertEqual(blocks[0]["type"], "voiceover")
-            # Unmarked, all-caps, but not the first block: the title
-            # heuristic must not fire here. It continues the preceding
-            # voiceover section instead (existing continuation behavior).
-            self.assertEqual(blocks[1]["type"], "voiceover")
+            # Unmarked, verb-less, all-caps and short, but with no strong
+            # heading signal (not repeated, nothing marked after it): it may
+            # be spoken text, so it stays for a human (unknown, TTS empty).
+            self.assertEqual(blocks[1]["type"], "unknown")
+            self.assertEqual(blocks[1]["suggested_type"], "technical")
+            self.assertEqual(blocks[1]["text_for_tts"], "")
+            self.assertTrue(
+                any("heading or spoken text" in warning for warning in blocks[1]["warnings"])
+            )
 
     def test_ordinary_mixed_case_opening_is_not_forced_technical(self) -> None:
         block = self._classify_first_block(

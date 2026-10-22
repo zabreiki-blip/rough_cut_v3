@@ -27,10 +27,13 @@ _GLUED_NUMBER_STRIPPABLE_PREFIXES = frozenset(
         "техн",
         "зк",
         "з",
+        "zk",
         "снх",
         "синхр",
         "синхрон",
         "лайф",
+        "лайфы",
+        "стендап",
         "вид",
         "видео",
         "титр",
@@ -48,6 +51,7 @@ _GLUED_NUMBER_STRIPPABLE_PREFIXES = frozenset(
 _SPACED_NUMBER_STRIPPABLE_PREFIXES = _GLUED_NUMBER_STRIPPABLE_PREFIXES | frozenset(
     {
         "narrator",
+        "подводка",
         "з к",
         "закадр",
         "закадровый текст",

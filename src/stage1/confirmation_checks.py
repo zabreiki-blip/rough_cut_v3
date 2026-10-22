@@ -1,0 +1,229 @@
+"""Structural quality checks that gate normalization confirmation.
+
+The checks catch defects that a saved (possibly LLM-edited) block can carry
+without any warning: a service label inside the TTS text, a timecode fragment
+in a role, a false hero made of a technical cue, a lost ``+`` splice and speech
+that the block no longer contains.  They are deliberately conservative: each
+needs concrete evidence in the block itself, so correct data never trips them.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import re
+from typing import Any, Callable
+
+from .scenario_structure import (
+    ParagraphStructure,
+    find_structural_timecodes,
+    normalize_timecode_value,
+)
+
+ERROR = "error"
+WARNING = "warning"
+
+# Blocking codes introduced for the saved-block defect classes.
+SERVICE_LABEL_IN_TTS = "service_label_in_tts"
+TIMECODE_IN_ROLE = "timecode_in_role"
+TIMECODE_REMNANT_IN_TEXT = "timecode_remnant_in_text"
+FALSE_HERO_FROM_CUE = "false_hero_from_cue"
+LOST_SPLICE = "lost_splice"
+UNMATCHED_SPEECH = "unmatched_speech"
+
+
+@dataclass(frozen=True)
+class ConfirmationIssue:
+    code: str
+    uid: str
+    order: int
+    message: str
+    severity: str = ERROR
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+StructureOf = Callable[[str], ParagraphStructure]
+
+_SERVICE_LABELS = frozenset({"ЗК", "СНХ", "ЛАЙФ", "СТЕНДАП", "ПОДВОДКА"})
+# Words that name a montage directive or a service label; never a person.
+_SERVICE_WORDS = frozenset(
+    {
+        "быстрая",
+        "быстрый",
+        "нарезка",
+        "нарезки",
+        "возвращаемся",
+        "перебивка",
+        "перебивки",
+        "монтаж",
+        "заставка",
+        "стендап",
+        "подводка",
+        "лайф",
+        "лайфы",
+        "снх",
+        "синхрон",
+        "зк",
+        "закадр",
+        "life",
+        "sync",
+    }
+)
+_TIMECODE_FRAGMENT = re.compile(
+    r"\(\s*[\d:.]*\s*$|(?<![\d:.])\d{1,2}[:.][0-5]\d[:.][0-5]\d(?![\d:.])"
+)
+_TEXT_REMNANT = re.compile(r"^\s*(?:\)|\d{1,2}[:.][0-5]\d(?:[:.][0-5]\d)?\s*\))")
+_WORD = re.compile(r"[^\W\d_]{4,}")
+_MIN_MISSING_WORDS = 4
+_MIN_MISSING_RATIO = 0.25
+_PREFIX = 5
+
+
+def _fold(word: str) -> str:
+    return word.casefold().replace("ё", "е")
+
+
+def _words(text: str) -> list[str]:
+    return [_fold(match.group(0)) for match in _WORD.finditer(text)]
+
+
+def check_service_label_in_tts(block: Any, structure_of: StructureOf) -> list[tuple[str, str]]:
+    tts = str(block.text_for_tts or "")
+    if not tts.strip() or block.absorbed_by_uid:
+        return []
+    head = structure_of(tts)
+    if head.label in _SERVICE_LABELS and (head.author_number or head.label_raw.isupper()):
+        return [
+            (
+                SERVICE_LABEL_IN_TTS,
+                f"Block {block.order} has a service label '{head.label_raw}' in its TTS text",
+            )
+        ]
+    return []
+
+
+def check_timecode_in_fields(block: Any) -> list[tuple[str, str]]:
+    issues: list[tuple[str, str]] = []
+    for field_name in ("speaker", "role", "source_description"):
+        value = str(getattr(block, field_name, "") or "")
+        if value and _TIMECODE_FRAGMENT.search(value):
+            issues.append(
+                (
+                    TIMECODE_IN_ROLE,
+                    f"Block {block.order} has a timecode fragment in {field_name}: '{value}'",
+                )
+            )
+    if block.type in {"voiceover", "unknown", "technical"}:
+        return issues
+    original_start = block.original_text.lstrip()
+    texts = [("normalized_text", block.normalized_text)] + [
+        (f"sync fragment {index}", fragment.text)
+        for index, fragment in enumerate(block.sync_fragments, start=1)
+    ]
+    for name, text in texts:
+        if _TEXT_REMNANT.match(text) and not _TEXT_REMNANT.match(original_start):
+            issues.append(
+                (
+                    TIMECODE_REMNANT_IN_TEXT,
+                    f"Block {block.order} {name} starts with a timecode remnant: "
+                    f"'{text.strip()[:20]}'",
+                )
+            )
+            break
+    return issues
+
+
+def check_false_hero(block: Any) -> list[tuple[str, str]]:
+    if block.type not in {"sync", "host"} or not block.speaker.strip():
+        return []
+    words = {_fold(w) for w in re.findall(r"[^\W\d_]+", block.speaker)}
+    hit = sorted(words & _SERVICE_WORDS)
+    if not hit:
+        return []
+    return [
+        (
+            FALSE_HERO_FROM_CUE,
+            f"Block {block.order} speaker '{block.speaker}' is a technical cue, not a person",
+        )
+    ]
+
+
+def _splice_starts(text: str) -> list[str]:
+    """Stored starts of the first timecode and of every ``+``-joined one."""
+    spans = find_structural_timecodes(text)
+    starts: list[str] = []
+    spliced = False
+    for index, span in enumerate(spans):
+        joined = index > 0 and text[spans[index - 1].end : span.start].rstrip().endswith("+")
+        if index == 0 or joined:
+            starts.append(span.first.stored)
+        spliced = spliced or joined
+    return starts if spliced else []
+
+
+def check_lost_splice(block: Any) -> list[tuple[str, str]]:
+    if block.type not in {"life", "sync", "host"} or block.absorbed_by_uid:
+        return []
+    starts = _splice_starts(block.original_text)
+    if not starts:
+        return []
+    covered = {normalize_timecode_value(f.timecode_start) for f in block.sync_fragments}
+    missing = [value for value in starts if normalize_timecode_value(value) not in covered]
+    if not missing:
+        return []
+    return [
+        (
+            LOST_SPLICE,
+            f"Block {block.order} lost the explicit '+' splice: no fragment starts at "
+            f"{', '.join(missing)}",
+        )
+    ]
+
+
+def check_unmatched_speech(block: Any, structure_of: StructureOf) -> list[tuple[str, str]]:
+    if block.type not in {"voiceover", "sync", "life", "host"} or block.absorbed_by_uid:
+        return []
+    original = block.original_text
+    structure = structure_of(original)
+    speech = structure.speech if structure.has_label else original
+    spans = find_structural_timecodes(original)
+    if spans and structure.has_label:
+        # Drop timecode wrappers so remnants such as "00" never count as words.
+        speech = re.sub(r"\(\s*\d[\d:.\s\-–—]*\)?", " ", speech)
+    words = [w for w in _words(speech)]
+    if len(words) < _MIN_MISSING_WORDS:
+        return []
+    haystack: list[str] = []
+    for value in (
+        block.normalized_text,
+        block.original_label,
+        block.speaker,
+        block.role,
+        block.source_description,
+        block.notes,
+        *(fragment.text for fragment in block.sync_fragments),
+    ):
+        haystack.extend(_words(str(value or "")))
+    prefixes = {word[:_PREFIX] for word in haystack}
+    missing = [word for word in words if word[:_PREFIX] not in prefixes]
+    if len(missing) >= _MIN_MISSING_WORDS and len(missing) / len(words) >= _MIN_MISSING_RATIO:
+        return [
+            (
+                UNMATCHED_SPEECH,
+                f"Block {block.order} lost {len(missing)} of {len(words)} spoken words "
+                f"(e.g. '{missing[0]}')",
+            )
+        ]
+    return []
+
+
+def structural_checks(block: Any, structure_of: StructureOf) -> list[tuple[str, str]]:
+    """All blocking structural defects of one block as ``(code, message)``."""
+    return [
+        *check_service_label_in_tts(block, structure_of),
+        *check_timecode_in_fields(block),
+        *check_false_hero(block),
+        *check_lost_splice(block),
+        *check_unmatched_speech(block, structure_of),
+    ]

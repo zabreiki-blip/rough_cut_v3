@@ -345,6 +345,16 @@ def test_legacy_alias_rekey_chain_does_not_lose_rows(tmp_path: Path) -> None:
         ("Диктор-1 Текст реплики.", "Текст реплики."),
         ("ЗК1: Текст реплики.", "Текст реплики."),
         ("Диктор 2: Текст реплики.", "Текст реплики."),
+        ("ЗК14 В том году…", "В том году…"),
+        ("ЗК1 Текст реплики.", "Текст реплики."),
+        ("ЗК 1: Текст реплики.", "Текст реплики."),
+        ("ЗК 5: Текст реплики.", "Текст реплики."),
+        ("ЗК 5. Текст реплики.", "Текст реплики."),
+        # A number that may be speech is never dropped.
+        ("ЗК 1915 год был тяжёлым.", "1915 год был тяжёлым."),
+        ("ЗК 3 года спустя он вернулся.", "3 года спустя он вернулся."),
+        ("ЗК1915 год был тяжёлым.", "1915 год был тяжёлым."),
+        ("З.К. 12 июня 1942 года.", "12 июня 1942 года."),
     ],
 )
 def test_split_label_compound_marker_number_stays_out_of_content(text: str, expected: str) -> None:
@@ -375,3 +385,110 @@ def test_compound_zk_marker_numbers_do_not_reach_tts_text(tmp_path: Path) -> Non
         "25 марта 2025 года.",
         "Продолжение истории.",
     ]
+
+
+@pytest.mark.parametrize(
+    ("text", "tts"),
+    [
+        ("ЗК14 В том году…", "В том году…"),
+        ("ЗК 5: Текст пять.", "Текст пять."),
+        ("ЗК 1915 год был тяжёлым.", "1915 год был тяжёлым."),
+        ("ЗК 3 года спустя он вернулся.", "3 года спустя он вернулся."),
+        ("ЗК1 000 рублей стоил билет.", "1 000 рублей стоил билет."),
+        ("ЗК10 000 рублей стоил билет.", "10 000 рублей стоил билет."),
+        ("ЗК1 июля он вернулся.", "1 июля он вернулся."),
+        ("ЗК2 Июля Текст", "2 Июля Текст"),
+        ("ЗК 5:30 утра он вышел.", "5:30 утра он вышел."),
+        ("ЗК 12:30 вечера он вернулся.", "12:30 вечера он вернулся."),
+        ("ЗК 5 — это много", "5 — это много"),
+        ("ЗК 3 - это три", "3 - это три"),
+        ("Диктор 5 — это много", "5 — это много"),
+        ("ЗК 12 - Текст двенадцать.", "Текст двенадцать."),
+        ("ЗК1 Текст", "Текст"),
+        ("ZK 5: text", "text"),
+        ("ZK5 text", "text"),
+    ],
+)
+def test_numbered_zk_tts_text_is_exact(text: str, tts: str) -> None:
+    block = _classify_block(text)
+    assert block["type"] == "voiceover"
+    assert block["text_for_tts"] == tts
+
+
+def test_zk_followed_by_snh_is_left_unknown_and_flagged(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "ЗК СНХ ИВАН ПЕТРОВ, историк - (01:32:12) Донской монастырь.\n", encoding="utf-8"
+    )
+    result = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )
+    (block,) = result["blocks"]
+    assert block["type"] == "unknown"
+    assert block["text_for_tts"] == ""
+    assert any("Ambiguous label" in warning for warning in block["warnings"])
+
+
+def test_zk_snh_conflict_is_not_sent_to_llm(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        "ЗК СНХ ИВАН ПЕТРОВ, историк - (01:32:12) Донской монастырь.\n", encoding="utf-8"
+    )
+    sent: list[list[dict]] = []
+
+    def classifier(batch: list[dict], hint: str) -> list[dict]:
+        sent.append(batch)
+        return []
+
+    generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        classifier=classifier,
+    )
+    assert sent == []
+
+
+def test_repeated_zk_number_warns_on_both_blocks_and_keeps_distinct_uids(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("ЗК7: Первый.\n\nЗК8: Второй.\n\nЗК7: Третий.\n", encoding="utf-8")
+    first, middle, last = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )["blocks"]
+    assert len({first["uid"], middle["uid"], last["uid"]}) == 3
+    assert [b["text_for_tts"] for b in (first, middle, last)] == ["Первый.", "Второй.", "Третий."]
+    expected = "Repeated author number ЗК7 (2 occurrences, first in block 1): check numbering"
+    assert expected in first["warnings"]
+    assert expected in last["warnings"]
+    assert not any("numbering" in w for w in middle["warnings"])
+
+
+def test_leading_zero_author_number_counts_as_repeat(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("ЗК7: Первый.\n\nЗК07: Второй.\n\nЗК7: Третий.\n", encoding="utf-8")
+    blocks = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )["blocks"]
+    expected = "Repeated author number ЗК7 (3 occurrences, first in block 1): check numbering"
+    assert all(expected in b["warnings"] for b in blocks)
+    # The warning does not grow with the number of occurrences.
+    assert all(len(w) < 100 for b in blocks for w in b["warnings"])
+
+
+def test_rerun_keeps_uids_of_repeated_number_blocks(tmp_path: Path) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text("ЗК7: Первый.\n\nЗК7: Второй.\n", encoding="utf-8")
+    out = tmp_path / "normalized.json"
+    kwargs = {"memory_path": tmp_path / "memory.sqlite3", "use_llm": False}
+    before = generate_normalization(source, out, **kwargs)["blocks"]
+    after = generate_normalization(source, out, **kwargs)["blocks"]
+    assert [b["uid"] for b in before] == [b["uid"] for b in after]

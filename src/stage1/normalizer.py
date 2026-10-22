@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from hashlib import sha256
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import threading
 import time
+from functools import lru_cache
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -31,6 +33,31 @@ from .normalization_models import (
     SyncFragment,
     VALID_BLOCK_TYPES,
     VALID_DECISION_SOURCES,
+)
+from .scenario_context import (
+    AMBIGUOUS_CAPS_WARNING,
+    SCENE_OPENER_CHANGED_WARNING,
+    SCENE_TYPES,
+    SECTION_HEADING_WARNING,
+    SceneLink,
+    classify_section_headings,
+    is_plus_splice,
+    is_section_heading,
+    neighbour_context,
+    plan_scene_context,
+)
+from .confirmation_checks import ConfirmationIssue, structural_checks
+from .presenter_cues import parse_presenter_parts
+from .scenario_structure import (
+    LEAD_IN_WARNING,
+    STANDUP_WARNING,
+    ParagraphStructure,
+    canonicalize_timecodes,
+    find_repeated_author_numbers,
+    parse_paragraph,
+    parse_timecode,
+    split_timed_parts,
+    timecode_warnings,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,8 +84,10 @@ class RevisionConflictError(NormalizationError):
 
 
 class NormalizationValidationError(NormalizationError):
-    def __init__(self, errors: list[str]):
+    def __init__(self, errors: list[str], issues: list[dict[str, Any]] | None = None):
         self.errors = errors
+        # Structured blocking issues: {code, uid, order, message, severity}.
+        self.issues = list(issues or [])
         super().__init__("; ".join(errors))
 
 
@@ -70,6 +99,7 @@ _BUILTIN_MARKERS = {
     "vo": BlockType.VOICEOVER.value,
     "narrator": BlockType.VOICEOVER.value,
     "зк": BlockType.VOICEOVER.value,
+    "zk": BlockType.VOICEOVER.value,
     "з к": BlockType.VOICEOVER.value,
     "з": BlockType.VOICEOVER.value,
     "закадр": BlockType.VOICEOVER.value,
@@ -83,7 +113,13 @@ _BUILTIN_MARKERS = {
     "ведущий": BlockType.HOST.value,
     "ведущая": BlockType.HOST.value,
     "лайф": BlockType.LIFE.value,
+    "лайфы": BlockType.LIFE.value,
     "life": BlockType.LIFE.value,
+    # Stand-up: the presenter speaks on camera, but who exactly is not stated
+    # by the label -- the block is flagged for a manual speaker check.
+    "стендап": BlockType.SYNC.value,
+    # Lead-in (capitals only, see ``scenario_structure``): same treatment.
+    "подводка": BlockType.SYNC.value,
 }
 _TECH_MARKERS = {
     "видео",
@@ -102,8 +138,27 @@ _TECH_MARKERS = {
     "тех",
     "техн",
 }
+_MARKER_TYPES = {**_BUILTIN_MARKERS, **dict.fromkeys(_TECH_MARKERS, BlockType.TECHNICAL.value)}
+
+
+@lru_cache(maxsize=1024)
+def _paragraph_structure(text: str) -> ParagraphStructure:
+    """Shared structural parse (label, author number, speech) of one paragraph."""
+    return parse_paragraph(text, _MARKER_TYPES)
+
+
+def _structural_text(text: str) -> str:
+    """Parsing view of a paragraph with its timecodes in the stored colon form.
+
+    ``(00:42:32)`` -> ``00:42:32``, ``01.24.08`` -> ``01:24:08``, an unclosed
+    ``(00:35:45`` loses its bracket.  Only the view changes: ``original_text``
+    stays exactly as written, and narration is never rewritten.
+    """
+    return canonicalize_timecodes(text)
+
+
 _LIFE_PREFIX = re.compile(
-    r"^\s*(?P<label>ЛАЙФ|LIFE)\b\s*(?:[,.:\-–—]\s*)?(?P<body>.*)$",
+    r"^\s*(?P<label>ЛАЙФЫ?|LIFE)\b\s*(?:[,.:\-–—]\s*)?(?P<body>.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 _EXPLICIT_SYNC_CREDIT = re.compile(
@@ -137,6 +192,8 @@ _TIMECODE_TOKEN = (
     r"(?!\w)"
 )
 _TIMECODE = re.compile(rf"({_TIMECODE_TOKEN})")
+# ``T1 - T2`` as one range.  LIFE parts joined by ``+`` are separate inserts.
+_TIMECODE_RANGE = re.compile(rf"{_TIMECODE_TOKEN}\s*[-–—]\s*{_TIMECODE_TOKEN}")
 _SYNC_METADATA = re.compile(
     r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*"
     # The role fragment must stop at the first sentence-ending punctuation:
@@ -177,23 +234,6 @@ _EDITORIAL_TIMECODE_PREFIX = re.compile(
 )
 _PLAYBACK_LIFE_CUE = re.compile(
     r"(?:\bзвучит\s+песня\b|\bпереход\s+на\s+клип\b|\bклип\b.{0,60}\bна\s+припев\b)",
-    re.IGNORECASE | re.DOTALL,
-)
-_VOICEOVER_ZK_PREFIX = re.compile(
-    r"^\s*(?P<label>з\s*\.?\s*[кК]\.?)"
-    r"(?:(?=\s)|(?<=\.)(?=[А-ЯЁA-Z«(])|\s*[:\-–—]\s*|$)"
-    r"(?P<content>.*)$",
-    re.IGNORECASE | re.DOTALL,
-)
-_VOICEOVER_ZK_GLUED_PREFIX = re.compile(
-    r"^\s*(?P<label>з\s*\.\s*[кК]\.?)"
-    r"(?=[А-ЯЁA-Z«(])(?P<content>.*)$",
-    re.IGNORECASE | re.DOTALL,
-)
-_VOICEOVER_Z_PREFIX = re.compile(
-    r"^\s*(?P<label>з\.?)"
-    r"(?:\s+|\s*[:\-–—]\s*|$)"
-    r"(?P<content>.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 _BARE_SPEAKER_PREFIX = re.compile(
@@ -422,6 +462,9 @@ _OPENROUTER_INSTRUCTIONS = (
     "An item with continuation_of_type=voiceover is an unlabelled paragraph "
     "continuing the preceding voiceover unless its text clearly starts a new "
     "speaker or technical cue. "
+    "An item may carry a context object with truncated neighbouring "
+    "paragraphs (before/after). It is for reference only: classify the item "
+    "itself, never the neighbours, and never copy their text. "
 )
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -507,6 +550,12 @@ def _generate_normalization_unlocked(
                 original_label=label,
             )
             _classify_by_rules(block, memory, video_cue_re)
+            for warning in (
+                *_paragraph_structure(original).warnings,
+                *timecode_warnings(original),
+            ):
+                if warning not in block.warnings:
+                    block.warnings.append(warning)
             if block.type != BlockType.UNKNOWN.value and block.original_label:
                 block.label_confirmed = True
                 if content:
@@ -528,6 +577,8 @@ def _generate_normalization_unlocked(
                 block.text_for_tts = block.normalized_text
             blocks.append(block)
 
+        _warn_repeated_author_numbers(blocks)
+        _annotate_section_headings(blocks)
         _annotate_continuation_context(blocks, video_cue_re)
         # Continuation context can supply a speaker only after the first
         # metadata pass.  Re-extract its fragments now so a bare timecoded
@@ -539,7 +590,14 @@ def _generate_normalization_unlocked(
                 and not block.sync_fragments
             ):
                 _extract_block_metadata(block)
-        unresolved = [block for block in blocks if block.type == BlockType.UNKNOWN.value]
+        _annotate_scene_context(blocks)
+        unresolved = [
+            block
+            for block in blocks
+            if block.type == BlockType.UNKNOWN.value
+            and AMBIGUOUS_CAPS_WARNING not in block.warnings
+            and not _paragraph_structure(block.original_text).has_label_conflict
+        ]
         if unresolved and use_llm:
             if classifier is not None:
                 llm = classifier
@@ -556,8 +614,13 @@ def _generate_normalization_unlocked(
                 llm = lambda batch, author_hint: _openrouter_classifier(
                     batch, author_hint, **llm_kwargs
                 )
-            batches = _llm_batches(unresolved)
-            payloads = [[_llm_input(block) for block in batch] for batch in batches]
+            block_index = {block.uid: position for position, block in enumerate(blocks)}
+            llm_inputs = {
+                block.uid: _llm_input(block, neighbour_context(blocks, block_index[block.uid]))
+                for block in unresolved
+            }
+            batches = _llm_batches(unresolved, inputs=llm_inputs)
+            payloads = [[llm_inputs[block.uid] for block in batch] for batch in batches]
             cache_path = _llm_cache_path(Path(output_path))
             cache = _load_llm_cache(cache_path)
             rules_signature = _llm_rules_signature(memory)
@@ -630,7 +693,12 @@ def _generate_normalization_unlocked(
 
             for batch, (batch_result, error) in zip(batches, batch_results):
                 if error is None:
-                    _apply_llm_results(batch, batch_result or [], video_cue_re=video_cue_re)
+                    _apply_llm_results(
+                        batch,
+                        batch_result or [],
+                        video_cue_re=video_cue_re,
+                        all_blocks=blocks,
+                    )
                     continue
                 message = f"LLM classification failed: {type(error).__name__}: {error}"
                 for block in batch:
@@ -652,6 +720,7 @@ def _generate_normalization_unlocked(
         scenario.revision = previous.revision + 1
         scenario.scenario_revision_id = previous.scenario_revision_id
         scenario.parent_revision_id = previous.parent_revision_id
+        uid_map: dict[str, str] = {}
         previous_by_text: dict[str, deque[NormalizedBlock]] = defaultdict(deque)
         for block in previous.blocks:
             previous_by_text[block.original_text].append(block)
@@ -660,12 +729,32 @@ def _generate_normalization_unlocked(
             if not candidates:
                 continue
             old = candidates.popleft()
+            uid_map[block.uid] = old.uid
             block.uid = old.uid
             block.versioning = dict(old.versioning)
+        for block in scenario.blocks:
+            if block.scene_uid:
+                block.scene_uid = uid_map.get(block.scene_uid, block.scene_uid)
     scenario_payload = scenario.to_dict()
     _atomic_write_json(Path(output_path), scenario_payload)
     logger.info("Normalization draft written source=%s blocks=%d", input_path, len(blocks))
     return scenario_payload
+
+
+def _warn_repeated_author_numbers(blocks: list[NormalizedBlock]) -> None:
+    """Flag each block that shares an author number (``ЗК7`` twice) with another.
+
+    Block level (not scenario level): the reviewer sees the warning on the very
+    block to renumber, and every block keeps its own UID -- the author's number
+    is never an identifier and repeated numbers never merge blocks.
+    """
+    structures = [_paragraph_structure(block.original_text) for block in blocks]
+    for (label, number), indexes in find_repeated_author_numbers(structures).items():
+        for index in indexes:
+            blocks[index].warnings.append(
+                f"Repeated author number {label}{number} ({len(indexes)} occurrences, "
+                f"first in block {blocks[indexes[0]].order}): check numbering"
+            )
 
 
 def load_normalization(path: Path) -> dict[str, Any]:
@@ -768,6 +857,7 @@ def _save_normalization_unlocked(
     else:
         incoming.revision = max(1, incoming.revision)
         incoming.created_at = incoming.created_at or _utcnow()
+    _flag_changed_scene_openers(incoming.blocks)
     incoming.status = NormalizationStatus.DRAFT.value
     incoming.confirmed_at = ""
     incoming.updated_at = _utcnow()
@@ -775,6 +865,24 @@ def _save_normalization_unlocked(
     result = incoming.to_dict()
     _atomic_write_json(path, result)
     return result
+
+
+def _flag_changed_scene_openers(blocks: list[NormalizedBlock]) -> None:
+    """Warn on replies whose scene opener is no longer a LIFE/SYNC/HOST block.
+
+    The reply type is never changed here: the user decides.  The warning is
+    removed again once the opener is a scene block.
+    """
+    by_uid = {block.uid: block for block in blocks}
+    for block in blocks:
+        if not block.scene_uid:
+            continue
+        opener = by_uid.get(block.scene_uid)
+        if opener is None or opener.type not in SCENE_TYPES:
+            if SCENE_OPENER_CHANGED_WARNING not in block.warnings:
+                block.warnings.append(SCENE_OPENER_CHANGED_WARNING)
+        elif SCENE_OPENER_CHANGED_WARNING in block.warnings:
+            block.warnings.remove(SCENE_OPENER_CHANGED_WARNING)
 
 
 def confirm_normalization(
@@ -822,9 +930,15 @@ def _confirm_normalization_unlocked(
     source_path = Path(source_path_override) if source_path_override else Path(scenario.source)
     if not source_path.exists() or _file_hash(source_path) != scenario.source_hash:
         raise SourceChangedError("Source scenario changed after normalization")
-    errors = validate_for_confirmation(scenario)
-    if errors:
-        raise NormalizationValidationError(errors)
+    issues = [
+        issue
+        for issue in validate_for_confirmation_detailed(scenario)
+        if issue["severity"] == "error"
+    ]
+    if issues:
+        raise NormalizationValidationError(
+            list(dict.fromkeys(issue["message"] for issue in issues)), issues
+        )
 
     resolved_memory_path = memory_path or DEFAULT_MEMORY_PATH
     with NormalizationMemory(resolved_memory_path) as memory:
@@ -875,17 +989,62 @@ def preview_learning_candidates(
             return _infer_learning_candidates(scenario, memory)
 
 
-def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> list[str]:
+_WARNING_CODES: tuple[tuple[str, str], ...] = (
+    ("Repeated author number", "repeated_author_number"),
+    (STANDUP_WARNING, "standup_label"),
+    (LEAD_IN_WARNING, "lead_in_label"),
+    (SECTION_HEADING_WARNING, "section_heading"),
+    (AMBIGUOUS_CAPS_WARNING, "ambiguous_caps_heading"),
+    (SCENE_OPENER_CHANGED_WARNING, "scene_opener_changed"),
+    ("Ambiguous timecode", "ambiguous_timecode"),
+    ("Ambiguous label combination", "ambiguous_label_combination"),
+    ("Sync credit has no source media file", "sync_credit_no_media"),
+    ("LLM", "low_confidence_llm"),
+    ("Possible learned alias", "learned_alias_suggestion"),
+    ("leading '+' splice", "leading_splice"),
+)
+
+
+def _warning_code(message: str) -> str:
+    for prefix, code in _WARNING_CODES:
+        if message.startswith(prefix):
+            return code
+    return "block_warning"
+
+
+def _structure_issue_uid(message: str, scenario: NormalizedScenario) -> tuple[str, int]:
+    match = re.search(r"Block (\d+)", message)
+    order = int(match.group(1)) if match else 0
+    if match and 1 <= order <= len(scenario.blocks):
+        return scenario.blocks[order - 1].uid, order
+    return "", order
+
+
+def validate_for_confirmation_detailed(
+    scenario: NormalizedScenario | dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Confirmation issues as ``{code, uid, order, message, severity}`` dicts.
+
+    ``severity == "error"`` blocks confirmation; ``"warning"`` is informational
+    (repeated author number, low LLM confidence, stand-up/lead-in label, section
+    heading and similar).  ``validate_for_confirmation`` is the legacy view.
+    """
     value = (
         scenario
         if isinstance(scenario, NormalizedScenario)
         else NormalizedScenario.from_dict(scenario)
     )
-    errors: list[str] = []
+    issues: list[ConfirmationIssue] = []
+
+    def add(code: str, block: NormalizedBlock, message: str, severity: str = "error") -> None:
+        issues.append(ConfirmationIssue(code, block.uid, block.order, message, severity))
+
     try:
         _validate_structure(value)
     except NormalizationValidationError as exc:
-        errors.extend(exc.errors)
+        for message in exc.errors:
+            uid, order = _structure_issue_uid(message, value)
+            issues.append(ConfirmationIssue("invalid_structure", uid, order, message))
     blocks_by_uid = {block.uid: block for block in value.blocks}
     for block in value.blocks:
         if block.absorbed_by_uid:
@@ -897,22 +1056,34 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
                 or target.type != BlockType.VOICEOVER.value
                 or target.absorbed_by_uid
             ):
-                errors.append(f"Block {block.order} has an invalid absorbed-by link")
+                add(
+                    "invalid_absorbed_link",
+                    block,
+                    f"Block {block.order} has an invalid absorbed-by link",
+                )
             if block.text_for_tts.strip():
-                errors.append(f"Block {block.order} is absorbed but still has TTS text")
+                add(
+                    "absorbed_block_has_tts",
+                    block,
+                    f"Block {block.order} is absorbed but still has TTS text",
+                )
         if block.type == BlockType.UNKNOWN.value:
-            errors.append(f"Block {block.order} has unknown type")
+            add("unknown_type", block, f"Block {block.order} has unknown type")
         if (
             block.type == BlockType.VOICEOVER.value
             and not block.absorbed_by_uid
             and not block.text_for_tts.strip()
         ):
-            errors.append(f"Voiceover block {block.order} has empty TTS text")
+            add("empty_tts", block, f"Voiceover block {block.order} has empty TTS text")
         if (
             block.type == BlockType.VOICEOVER.value
             and clean_voiceover_tts_text(block.text_for_tts) != block.text_for_tts.strip()
         ):
-            errors.append(f"Voiceover block {block.order} contains a speech-direction cue")
+            add(
+                "speech_direction_in_tts",
+                block,
+                f"Voiceover block {block.order} contains a speech-direction cue",
+            )
         if block.type == BlockType.VOICEOVER.value and not block.absorbed_by_uid:
             label, content = _split_label(block.original_text)
             marked_cue = normalize_marker(label) in _BUILTIN_MARKERS and (
@@ -920,16 +1091,28 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
                 or (content.endswith(":") and re.search(r"\bголос\b", content, re.IGNORECASE))
             )
             if _EDITORIAL_VOICEOVER_CUE.match(block.original_text.strip()) or marked_cue:
-                errors.append(f"Voiceover block {block.order} contains an editorial cue")
+                add(
+                    "editorial_cue_in_voiceover",
+                    block,
+                    f"Voiceover block {block.order} contains an editorial cue",
+                )
         if block.type == BlockType.SYNC.value:
             if not block.speaker.strip():
-                errors.append(f"Sync block {block.order} has no speaker")
+                add("sync_no_speaker", block, f"Sync block {block.order} has no speaker")
             elif re.search(r"\b(?:читает|по[её]т)\s*$", block.speaker, re.IGNORECASE):
-                errors.append(f"Sync block {block.order} has a direction instead of a speaker")
+                add(
+                    "sync_direction_as_speaker",
+                    block,
+                    f"Sync block {block.order} has a direction instead of a speaker",
+                )
             if block.original_text.strip().endswith(":") and not _TIMECODE.search(
                 block.original_text
             ):
-                errors.append(f"Sync block {block.order} contains only a speaker credit")
+                add(
+                    "sync_only_credit",
+                    block,
+                    f"Sync block {block.order} contains only a speaker credit",
+                )
             if (
                 block.original_label
                 and _SYNC_NAME_ONLY_LABEL.fullmatch(block.original_label.strip())
@@ -937,14 +1120,58 @@ def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> 
                 and block.speaker
                 and normalize_marker(block.original_label) != normalize_marker(block.speaker)
             ):
-                errors.append(f"Sync block {block.order} speaker conflicts with its credit")
+                add(
+                    "sync_speaker_conflict",
+                    block,
+                    f"Sync block {block.order} speaker conflicts with its credit",
+                )
             for fragment in block.sync_fragments:
                 if not re.search(r"\w", fragment.text):
-                    errors.append(f"Sync block {block.order} contains an empty fragment")
+                    add(
+                        "sync_empty_fragment",
+                        block,
+                        f"Sync block {block.order} contains an empty fragment",
+                    )
                 for timecode in (fragment.timecode_start, fragment.timecode_end):
                     if timecode and not _TIMECODE.fullmatch(timecode):
-                        errors.append(f"Sync block {block.order} has invalid timecode {timecode}")
-    return list(dict.fromkeys(errors))
+                        add(
+                            "invalid_timecode",
+                            block,
+                            f"Sync block {block.order} has invalid timecode {timecode}",
+                        )
+        for code, message in structural_checks(block, _paragraph_structure):
+            add(code, block, message)
+        for message in block.warnings:
+            add(_warning_code(message), block, message, "warning")
+        if (
+            block.source == DecisionSource.LLM.value
+            and 0 < block.confidence < _LLM_CONFIDENCE_THRESHOLD
+        ):
+            add(
+                "low_confidence_llm",
+                block,
+                f"Block {block.order} LLM confidence {block.confidence:.0%} is low",
+                "warning",
+            )
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for issue in issues:
+        key = (issue.code, issue.uid, issue.message)
+        if key not in seen:
+            seen.add(key)
+            unique.append(issue.to_dict())
+    return unique
+
+
+def validate_for_confirmation(scenario: NormalizedScenario | dict[str, Any]) -> list[str]:
+    """Blocking confirmation errors as messages (legacy view of the detailed result)."""
+    return list(
+        dict.fromkeys(
+            issue["message"]
+            for issue in validate_for_confirmation_detailed(scenario)
+            if issue["severity"] == "error"
+        )
+    )
 
 
 def is_normalization_confirmed(path: Path, *, source_path: Path | None = None) -> bool:
@@ -1114,6 +1341,69 @@ def _snapshot_proposals(blocks: list[NormalizedBlock]) -> None:
         block.proposed_memory_rule_id = block.memory_rule_id
 
 
+CAPS_HEADING_AMBIGUOUS_NOTE = "caps_heading_ambiguous"
+
+
+def _annotate_section_headings(blocks: list[NormalizedBlock]) -> None:
+    """Unlabelled all-caps lines (``ПОСЛУШАНИЕ В САДУ``): heading or speech?
+
+    A strong signal (repeated paragraph, or a complete block before and an
+    explicit scene/technical block after; see
+    ``scenario_context.classify_section_headings``) makes the line a
+    ``technical`` heading: no TTS, no inheriting voiceover/life, closes the
+    scene.  Otherwise the line stays ``unknown`` (suggested ``technical``), is
+    kept away from voiceover inheritance and the LLM, and warns: only a human
+    may decide that a slogan like ``СЛАВА РОССИИ`` is not spoken.
+    """
+    candidates = []
+    for block in blocks:
+        candidate = False
+        if block.type == BlockType.UNKNOWN.value and not block.original_label:
+            structure = _paragraph_structure(block.original_text)
+            candidate = not (
+                structure.has_label or structure.has_label_conflict
+            ) and is_section_heading(block.original_text)
+        candidates.append(candidate)
+    for block, verdict in zip(blocks, classify_section_headings(blocks, candidates)):
+        if verdict == "technical":
+            _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.85)
+            block.notes = block.notes or "section_heading"
+            block.text_for_tts = ""
+            if SECTION_HEADING_WARNING not in block.warnings:
+                block.warnings.append(SECTION_HEADING_WARNING)
+        elif verdict == "ambiguous":
+            block.notes = block.notes or CAPS_HEADING_AMBIGUOUS_NOTE
+            block.text_for_tts = ""
+            if not block.suggested_type:
+                block.suggested_type = BlockType.TECHNICAL.value
+            if AMBIGUOUS_CAPS_WARNING not in block.warnings:
+                block.warnings.append(AMBIGUOUS_CAPS_WARNING)
+
+
+def _annotate_scene_context(blocks: list[NormalizedBlock]) -> None:
+    """Attach dialogue replies and ``+`` splices to the preceding scene.
+
+    The speaker is never filled in here: a reply proves scene membership only.
+    ``scene_uid`` points at the block that opened the scene.
+    """
+    plan: list[SceneLink | None] = plan_scene_context(blocks)
+    for block, link in zip(blocks, plan):
+        if link is None:
+            continue
+        if link.scene_index >= 0:
+            block.scene_uid = blocks[link.scene_index].uid
+        if link.scene_type and link.kind != "continuation":
+            block.continuation_of_type = link.scene_type
+            if not block.suggested_type:
+                block.suggested_type = link.scene_type
+            _apply_type(block, link.scene_type, DecisionSource.BUILTIN_RULE.value, 0.8)
+            block.speaker = ""
+            block.role = ""
+            _extract_block_metadata(block)
+        if link.warning and link.warning not in block.warnings:
+            block.warnings.append(link.warning)
+
+
 def _annotate_continuation_context(
     blocks: list[NormalizedBlock], video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
 ) -> None:
@@ -1156,6 +1446,7 @@ def _annotate_continuation_context(
         elif (
             previous is not None
             and block.type == BlockType.UNKNOWN.value
+            and AMBIGUOUS_CAPS_WARNING not in block.warnings
             and not block.original_label
             and (
                 previous.type == BlockType.VOICEOVER.value
@@ -1165,6 +1456,9 @@ def _annotate_continuation_context(
             # because it follows one without its own marker (see
             # _looks_like_video_cue).
             and not _looks_like_video_cue(block.original_text, video_cue_re)
+            # A leading "+ 00.43.25" splice is not narration (see
+            # scenario_context.plan_scene_context).
+            and not is_plus_splice(block.original_text)
         ):
             block.continuation_of_type = BlockType.VOICEOVER.value
             if not block.suggested_type:
@@ -1427,6 +1721,25 @@ def _technical_heuristic_confidence(
     return None
 
 
+_CLOCK_PREPOSITIONS = frozenset(
+    {"в", "к", "до", "с", "около", "после", "перед", "ровно", "примерно", "часов", "где-то"}
+)
+
+
+def _is_clock_time_in_speech(text: str, start: int, end: int, inner: str) -> bool:
+    """``служба в 6:30`` is a clock time, not a timecode.
+
+    Only a two-component token right after a lower-case time preposition and
+    without an explicit range counts as one.
+    """
+    if inner.count(":") != 1 or "." in inner or text[start : start + 1] == "[":
+        return False
+    words = text[:start].split()
+    if not words or words[-1] not in _CLOCK_PREPOSITIONS:
+        return False
+    return not re.match(r"\s*[-–—]\s*\d", text[end:])
+
+
 def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
     """Decide whether a `_TIMECODE`-shaped match at ``text[start:end]`` is an
     actual timecode boundary, as opposed to prose (e.g. a two-component date
@@ -1437,6 +1750,16 @@ def _is_unambiguous_timecode_match(text: str, start: int, end: int) -> bool:
     if start and text[start - 1] in "0123456789:.-":
         return False
     inner = token.strip("[]")
+    if _is_clock_time_in_speech(text, start, end, inner):
+        return False
+    # After a ``+`` only a two-digit hour is a splice timecode: ``+ 5:30 утра``
+    # is a clock time and ``+ 3.10.20`` a date (see scenario_structure).
+    if (
+        not token.startswith("[")
+        and text[:start].rstrip().endswith("+")
+        and re.match(r"\d[:.\-]", inner)
+    ):
+        return False
     if token.startswith("[") or ":" in inner or inner.count(".") >= 2 or "-" in inner:
         return True
 
@@ -1498,31 +1821,132 @@ def _looks_like_plausible_sync_credit(candidate: str) -> bool:
 
 def _starts_with_unambiguous_timecode(text: str) -> bool:
     """Recognize a bare timecode without mistaking a prose-leading date for one."""
-    stripped = text.lstrip()
+    stripped = _structural_text(text).lstrip()
     match = re.match(rf"^\(\s*({_TIMECODE_TOKEN})\s*\)", stripped) or _TIMECODE.match(stripped)
     if not match:
         return False
     return _is_unambiguous_timecode_match(stripped, match.start(1), match.end(1))
 
 
+_CREDIT_SOURCE_MARK = re.compile(r"(?:^|\s)ИСХ(?:ОДНИК)?\.?\s+(?P<name>\S.*)$")
+_CREDIT_NAME_WITH_BRACKET = re.compile(
+    r"[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*"
+    r"(?:\s*\([А-ЯЁа-яёA-Za-z\-\s]{2,40}\))?"
+)
+
+
+def _is_credit_name(speaker: str) -> bool:
+    """A name, optionally with a surname in brackets: ``ИГУМЕН НИКИТА (ВИХЛЯЕВ)``."""
+    return bool(_CREDIT_NAME_WITH_BRACKET.fullmatch(speaker))
+
+
+_CREDIT_FILE_TOKEN = re.compile(r"(?:\d{1,3}|[^\s_]*_\S*|(?=\S*\d)(?=\S*[A-Za-z])\S+)")
+_CREDIT_FILE_TAIL_WORD = re.compile(r"[A-Z][A-Za-z0-9_\-.]*")
+
+
+def _split_credit_media_tail(speaker: str) -> tuple[str, str]:
+    """Split ``ОТЕЦ АВРААМ 01`` / ``ИМЯ 03_09_26_ARHITECTOR DEMIDOV`` into name and file tail.
+
+    The tail starts at the first take number (``01``) or file-like token (``_``
+    or Latin letters with digits) and may continue with Latin capital words.  A
+    speaker without such a tail (or consisting only of one) is returned as is.
+    """
+    words = speaker.split()
+    for position in range(1, len(words)):
+        if not _CREDIT_FILE_TOKEN.fullmatch(words[position]):
+            continue
+        tail = words[position + 1 :]
+        if all(
+            _CREDIT_FILE_TOKEN.fullmatch(w) or _CREDIT_FILE_TAIL_WORD.fullmatch(w) for w in tail
+        ):
+            return " ".join(words[:position]), " ".join(words[position:])
+        break
+    return speaker, ""
+
+
+_SNH_SPOKEN_CREDIT = re.compile(r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<rest>\S.*)$", re.DOTALL)
+_SPOKEN_CREDIT_MAX_WORDS = 4
+_SPOKEN_CONTENT_MIN_CHARS = 20
+
+
+def _parse_snh_spoken_credit(text: str) -> dict[str, str] | None:
+    """Parse ``СНХ ИМЯ ФАМИЛИЯ речь…`` with no timecode and no dash.
+
+    The credit is the leading run of all-caps words; speech starts at the first
+    word that is not all-caps, or at a one-letter capital preposition followed
+    by a lowercase word (``СНХ АЛЕНА САДОВНИЦА К некоторым вещам``).
+    """
+    match = _SNH_SPOKEN_CREDIT.match(_structural_text(text))
+    if not match:
+        return None
+    rest = match.group("rest")
+    if _TIMECODE.search(rest[:80]):
+        return None
+    words = rest.split()
+    count = 0
+    while count < len(words):
+        word = words[count]
+        bare = word.strip(",;:")
+        if len(bare) < 2 or not re.fullmatch(r"[А-ЯЁ][А-ЯЁ\-]+", bare):
+            break
+        count += 1
+    if not 1 <= count <= _SPOKEN_CREDIT_MAX_WORDS or count == len(words):
+        return None
+    speaker = " ".join(w.strip(",;:") for w in words[:count])
+    content = " ".join(words[count:])
+    first = words[count]
+    follower = words[count + 1] if count + 1 < len(words) else ""
+    speech_start = (
+        first[0].islower()
+        or (len(first) == 1 and first.isupper() and follower[:1].islower())
+        or (first[0].isupper() and first[1:2].islower())
+    )
+    if not speech_start or len(content) < _SPOKEN_CONTENT_MIN_CHARS:
+        return None
+    if not _is_credit_name(speaker) or not _looks_like_plausible_sync_credit(speaker):
+        return None
+    return {
+        "marker": match.group("marker"),
+        "speaker": speaker,
+        "role": "",
+        "source": "",
+        "content": content,
+        "header_only": "",
+        "dashed": "",
+    }
+
+
 def _parse_snh_dash_credit(text: str) -> dict[str, str] | None:
+    """Credit of a ``СНХ`` paragraph: timed form first, then spoken (no timecode)."""
+    return _parse_snh_timed_credit(text) or _parse_snh_spoken_credit(text)
+
+
+def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
     """Parse ``СНХ Имя[, роль] — [файл] 00:05:42 — реплика``.
 
     Returns marker/speaker/role/source/content (``content`` starts at the first
     timecode and is empty for a header-only paragraph), or ``None`` when the
     paragraph is not this form.
     """
-    match = _SNH_DASH_CREDIT.match(text)
+    match = _SNH_DASH_CREDIT.match(_structural_text(text))
     if not match:
         return None
     credit = match.group("credit").strip()
     if _TIMECODE.search(credit):
         return None
+    # ``ИСХ <имя файла>`` names the source recording, never the person or role.
+    credit_source = ""
+    source_mark = _CREDIT_SOURCE_MARK.search(credit)
+    if source_mark:
+        credit_source = source_mark.group("name").strip()
+        credit = credit[: source_mark.start()].strip()
     speaker, _, role = credit.partition(",")
     speaker, role = speaker.strip(), role.strip(" \t,;:")
-    if not _SYNC_NAME_ONLY_LABEL.fullmatch(speaker) or not _looks_like_plausible_sync_credit(
-        speaker
-    ):
+    speaker, name_tail = _split_credit_media_tail(speaker)
+    credit_source = credit_source or name_tail
+    if "(" in speaker and ")" not in speaker:
+        speaker += ")"  # ``ИГУМЕН НИКИТА (ВИХЛЯЕВ``: the author left the bracket open
+    if not _is_credit_name(speaker) or not _looks_like_plausible_sync_credit(speaker):
         return None
     rest = match.group("rest").strip()
     timecode_at = -1
@@ -1537,7 +1961,10 @@ def _parse_snh_dash_credit(text: str) -> dict[str, str] | None:
     else:
         source, content = rest[:timecode_at], rest[timecode_at:].strip()
     source = source.strip(" \t–—-")
-    if (not source and timecode_at < 0) or (source and not _MEDIA_FILE_NAME.match(source)):
+    if source and not _MEDIA_FILE_NAME.match(source):
+        return None
+    source = source or credit_source
+    if not source and timecode_at < 0:
         return None
     return {
         "marker": match.group("marker"),
@@ -1546,6 +1973,7 @@ def _parse_snh_dash_credit(text: str) -> dict[str, str] | None:
         "source": source,
         "content": content,
         "header_only": "" if content else "1",
+        "dashed": "1" if match.group("dash") else "",
     }
 
 
@@ -1571,6 +1999,9 @@ def _merge_snh_credit_headers(paragraphs: list[str]) -> list[str]:
 
 
 def _split_label(text: str) -> tuple[str, str]:
+    # Timecodes are located first: a colon inside ``(00:42:32)`` must never be
+    # taken for a label/description separator.
+    text = _structural_text(text)
     # Generic labels are deliberately limited: prose containing an ordinary colon
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
@@ -1583,48 +2014,24 @@ def _split_label(text: str) -> tuple[str, str]:
     dash_credit = _parse_snh_dash_credit(text)
     if dash_credit:
         return dash_credit["marker"], dash_credit["content"]
-    life = _LIFE_PREFIX.match(text)
-    if life:
-        body = life.group("body").strip()
-        described = re.match(r"^([^:\n«»]{2,100}):\s*(.+)$", body, flags=re.DOTALL)
-        if described:
-            body = described.group(2).strip()
-        return life.group("label").strip(), body
-    # Real editorial drafts commonly spell the voice-over marker as ``З.к.``,
-    # ``З.К`` or glue it directly to the first word (``З.КВ 1915 году``).
-    # Marker normalization alone cannot recover that punctuation, so split it
-    # before the generic label machinery.
-    voiceover = (
-        _VOICEOVER_ZK_GLUED_PREFIX.match(text)
-        or _VOICEOVER_ZK_PREFIX.match(text)
-        or _VOICEOVER_Z_PREFIX.match(text)
-    )
-    if voiceover:
-        return voiceover.group("label").strip(), voiceover.group("content").strip()
-    # Built-in structural markers take precedence over generic dash-separated
-    # labels. Documentary headings such as "ЗК Стратегия Лили — ..." otherwise
-    # look like one long, unknown label instead of a known voiceover marker.
-    known = sorted(set(_BUILTIN_MARKERS) | _TECH_MARKERS, key=len, reverse=True)
-    for marker in known:
-        # A numeric suffix right after the marker (e.g. "Диктор-1", "ЗК1:",
-        # "Диктор 2:") denotes a speaker index and is dropped from the label.
-        # It is only unambiguous when either an explicit separator glues it to
-        # the marker, or -- when separated by whitespace or glued directly --
-        # it is itself immediately followed by a structural separator or the
-        # end of the string. A compound number glued to the marker ("ЗК0.1",
-        # "ЗК1.2.3") is a marker index as a whole and never reaches the text. Otherwise the digits are prose (e.g. a year in
-        # "Диктор 1915 год...") and must stay in the content.
-        match = re.match(
-            rf"^\s*({re.escape(marker)})"
-            rf"(?:[-.]\d+(?:\.\d+)*[A-Za-zА-Яа-я]?"
-            rf"|\d+(?:\.\d+)+(?=\s|[,.:\-–—]|$)"
-            rf"|\s*\d+[A-Za-zА-Яа-я]?(?=\s*[.:\-–—]|\s*$))?"
-            rf"(?:\s*[,.:\-–—]\s*|\s+|$)(.*)$",
-            text,
-            flags=re.I | re.DOTALL,
-        )
-        if match and normalize_marker(match.group(1)) == marker:
-            return match.group(1).strip(), match.group(2).strip()
+    # Service labels (ЗК/З.К./СНХ/ЛАЙФ/ЛАЙФЫ/СТЕНДАП/technical markers) and
+    # montage cues are recognised by the shared structural parser BEFORE any
+    # "capitalised words are a hero" heuristic below. The author's block
+    # number is dropped only when it is unambiguous (see scenario_structure).
+    structure = _paragraph_structure(text)
+    if structure.is_technical_cue:
+        return "", text.strip()
+    if structure.has_label:
+        body = structure.speech
+        if structure.label == "ЛАЙФ":
+            timed = _life_timed_body(body)
+            if timed is not None:
+                _description, parts = timed
+                return structure.label_raw, " ".join(part.text for part in parts if part.text)
+            described = _LIFE_DESCRIBED.match(body)
+            if described:
+                body = described.group(2).strip()
+        return structure.label_raw, body
     # A formal speaker credit can be much longer than an ordinary marker. It
     # is safe to accept only when its content starts with a structural timecode
     # (optionally after a "Продолжение синхрона" note).
@@ -1668,7 +2075,13 @@ def _split_label(text: str) -> tuple[str, str]:
     generic = re.match(r"^\s*([^:\n]{1,60}?)\s*:\s*(.+)$", text, flags=re.DOTALL)
     if generic:
         candidate = generic.group(1).strip()
-        if not candidate.startswith("(") and len(candidate.split()) <= 3:
+        # A candidate without any letter ("- 00" from "- (00:34:21) ...") is the
+        # head of a timecode, never a label.
+        if (
+            not candidate.startswith("(")
+            and len(candidate.split()) <= 3
+            and re.search(r"[^\W\d_]", candidate)
+        ):
             return candidate, generic.group(2).strip()
     bare_speaker = _BARE_SPEAKER_PREFIX.match(text)
     if bare_speaker:
@@ -1682,13 +2095,38 @@ def _split_label(text: str) -> tuple[str, str]:
     return "", text.strip()
 
 
+_LIFE_SCENE_HEAD_MAX = 160
+# ``Description: quote``; a colon followed by a digit belongs to a timecode.
+_LIFE_DESCRIBED = re.compile(r"^([^:\n«»]{2,100}):(?!\d)\s*(.+)$", re.DOTALL)
+
+
+def _life_timed_body(body: str) -> tuple[str, tuple[Any, ...]] | None:
+    """Scene description and timed parts of a LIFE body, or ``None``.
+
+    The description is the text before the first timecode; it must look like a
+    scene title (short, no sentence punctuation), otherwise the old
+    description/quote handling stays in charge.
+    """
+    timed = split_timed_parts(body)
+    if not timed.parts:
+        return None
+    head = timed.head
+    # A closing ``.``/``!`` belongs to the title (``Драка.``); sentence
+    # punctuation inside it means the head is speech, not a scene title.
+    head = re.sub(r"[\s.!?…]+$", "", head) if re.search(r"\w", head) else head
+    if len(head) > _LIFE_SCENE_HEAD_MAX or re.search(r"[.!?…]", head):
+        return None
+    quoted = re.fullmatch(r"«([^»]*)»", head)
+    return (quoted.group(1).strip() if quoted else head), timed.parts
+
+
 def _classify_by_rules(
     block: NormalizedBlock,
     memory: NormalizationMemory,
     video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
 ) -> None:
     marker = normalize_marker(block.original_label)
-    stripped = block.original_text.strip()
+    stripped = _structural_text(block.original_text).strip()
     label_only_sync = _SYNC_LABEL_ONLY_MARKER.match(stripped)
     if label_only_sync:
         # A label-only paragraph ("Синх Сторожевой") carries no quote of its
@@ -1699,6 +2137,15 @@ def _classify_by_rules(
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
         block.speaker = label_only_sync.group(1).strip()
         block.text_for_tts = ""
+        return
+    structure = _paragraph_structure(block.original_text)
+    if structure.has_label_conflict:
+        # ``ЗК СНХ ...``: two competing service labels. Which one the author
+        # meant is not decidable from the text; leave the block unknown so a
+        # human decides and nothing from the credit reaches TTS.
+        return
+    if structure.is_technical_cue and not marker:
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
         return
     if marker:
         exact = memory.resolve_exact(marker)
@@ -1809,23 +2256,69 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
         block.text_for_tts = block.normalized_text
     elif block.type == BlockType.LIFE.value:
         block.text_for_tts = ""
-    timecodes = _TIMECODE.findall(block.original_text)
-    if timecodes:
-        block.timecode_start = _canonicalize_timecode(timecodes[0])
-        if len(timecodes) > 1 and block.type != BlockType.SYNC.value:
+    if block.type != BlockType.LIFE.value:
+        _assign_first_timecodes(block)
+
+
+def _assign_first_timecodes(block: NormalizedBlock) -> None:
+    """Take the first (and, for non-sync, second) timecode of the paragraph."""
+    view = _structural_text(block.original_text)
+    timecodes = _TIMECODE.findall(view)
+    if not timecodes:
+        return
+    block.timecode_start = _canonicalize_timecode(timecodes[0])
+    if len(timecodes) > 1 and block.type != BlockType.SYNC.value:
+        # LIFE parts joined by ``+`` are separate inserts: only an explicit
+        # ``T1 - T2`` range gives a LIFE block an end.
+        if block.type != BlockType.LIFE.value or _TIMECODE_RANGE.search(view):
             block.timecode_end = _canonicalize_timecode(timecodes[1])
 
 
 def _extract_block_metadata(block: NormalizedBlock) -> None:
     if block.type == BlockType.LIFE.value:
-        life = _LIFE_PREFIX.match(block.original_text)
+        life = _LIFE_PREFIX.match(_structural_text(block.original_text))
         block.speaker = ""
         block.role = ""
         block.text_for_tts = ""
+        body = life.group("body").strip() if life else ""
+        if not life and block.continuation_of_type == BlockType.LIFE.value:
+            body = _structural_text(block.original_text).lstrip(" \t-‐‑‒–—―+")
+        timed = _life_timed_body(body) if body else None
+        if timed is not None:
+            description, parts = timed
+            block.source_description = description
+            block.sync_fragments = []
+            kept = [part for part in parts if part.text]
+            if not life and kept:
+                block.normalized_text = " ".join(part.text for part in kept)
+            if len(parts) > 1:
+                # A timecode with no text is never dropped silently.
+                for part in parts:
+                    if not part.text and part.start:
+                        block.warnings.append(
+                            f"Timecode {part.start.stored} in a '+' splice has no text: "
+                            "check manually"
+                        )
+            first = kept[0] if kept else parts[0]
+            block.timecode_start = first.start.stored if first.start else ""
+            block.timecode_end = first.end.stored if first.end else ""
+            if len(kept) > 1:
+                # A ``+`` splice is two independent inserts (each with its own
+                # entry point and no exit), serialised like sync fragments.
+                block.sync_fragments = [
+                    SyncFragment(
+                        text=part.text,
+                        timecode_start=part.start.stored if part.start else "",
+                        timecode_end=part.end.stored if part.end else "",
+                    )
+                    for part in kept
+                ]
+            return
+        _assign_first_timecodes(block)
         if life:
             body = life.group("body").strip()
             quoted = re.match(r"^«([^»]*)»", body)
-            described = re.match(r"^([^:\n«»]{2,100}):\s*(.+)$", body, flags=re.DOTALL)
+            described = _LIFE_DESCRIBED.match(body)
             if quoted:
                 block.source_description = quoted.group(1).strip()
             elif described:
@@ -1835,19 +2328,56 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         block.speaker = block.original_label or "ВЕДУЩИЙ"
     if block.type != BlockType.SYNC.value:
         return
-    fragment_source = _SYNC_CONTINUATION_NOTE.sub("", block.normalized_text)
+    normalized_view = _structural_text(block.normalized_text)
+    fragment_source = _SYNC_CONTINUATION_NOTE.sub("", normalized_view)
     has_sync_metadata = False
     explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
-    match = _SYNC_METADATA.match(block.normalized_text)
+    match = _SYNC_METADATA.match(normalized_view)
     dash_credit = _parse_snh_dash_credit(block.original_text)
-    if dash_credit and normalize_marker(block.original_label) == normalize_marker(
+    unnamed_label = _paragraph_structure(block.original_text).metadata.get("service_label")
+    if unnamed_label:
+        presenter_parts = parse_presenter_parts(block.original_text)
+        if presenter_parts and len({part.speaker for part in presenter_parts}) == 1:
+            # Attribution is explicit in the caption. Keep every splice, even
+            # without clocks; different presenters still need a manual split.
+            block.speaker = presenter_parts[0].speaker
+            block.source_description = " / ".join(
+                dict.fromkeys(part.description for part in presenter_parts if part.description)
+            )
+            fragments = []
+            for part in presenter_parts:
+                fragments.extend(
+                    _extract_sync_fragments(_structural_text(part.text))
+                    or [SyncFragment(text=part.text, timecode_start="")]
+                )
+            block.sync_fragments = fragments
+            block.normalized_text = " ".join(fragment.text for fragment in fragments)
+            block.timecode_start = fragments[0].timecode_start
+            block.timecode_end = fragments[0].timecode_end
+            block.warnings = [
+                warning
+                for warning in block.warnings
+                if warning not in {STANDUP_WARNING, LEAD_IN_WARNING}
+            ]
+            return
+        # ``СТЕНДАП`` / ``ПОДВОДКА``: a presenter is announced, not named. The
+        # speaker stays empty (the structure parser already warned); timecoded
+        # parts are still extracted below.
+        fragment_source = normalized_view
+        has_sync_metadata = True
+    elif dash_credit and normalize_marker(block.original_label) == normalize_marker(
         dash_credit["marker"]
     ):
         block.speaker = dash_credit["speaker"]
         block.role = dash_credit["role"]
         if dash_credit["source"]:
             block.source_description = dash_credit["source"]
-        elif dash_credit["content"]:
+        elif dash_credit["content"] and (
+            dash_credit["dashed"] or re.match(rf"{_TIMECODE_TOKEN}\s*[—–]", dash_credit["content"])
+        ):
+            # Only the dash forms (``СНХ Имя — … 00:05:42``, ``СНХ ИМЯ 00:12:06 — …``)
+            # imply a media file; the author format ``СНХ ИМЯ ТАЙМКОД текст`` has
+            # none (Stage 2 binds media).
             block.warnings.append("Sync credit has no source media file")
         fragment_source = dash_credit["content"]
         has_sync_metadata = True
@@ -1867,12 +2397,12 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         elif match:
             block.speaker = match.group(1).strip()
             block.role = match.group(2).strip()
-            fragment_source = block.normalized_text[match.start(3) :].strip()
+            fragment_source = normalized_view[match.start(3) :].strip()
             has_sync_metadata = True
     elif match:
         block.speaker = match.group(1).strip()
         block.role = match.group(2).strip()
-        fragment_source = block.normalized_text[match.start(3) :].strip()
+        fragment_source = normalized_view[match.start(3) :].strip()
         has_sync_metadata = True
     else:
         label_match = _SYNC_LABEL_METADATA.match(block.original_label)
@@ -1910,6 +2440,17 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     if not has_sync_metadata:
         return
     fragments = _extract_sync_fragments(fragment_source)
+    if unnamed_label and fragments and not fragments[0].timecode_start:
+        lead = fragments[0].text
+        if lead and lead == lead.upper() and any(ch.isalpha() for ch in lead):
+            # ``ДАРЬЯ У БОЛЬШОГО СОБОРА`` before the first timecode is the
+            # presenter's caption, not a spoken fragment: keep it as the
+            # description (the text itself stays in ``original_text``).
+            block.source_description = lead
+            block.warnings.append(
+                "Capitalised lead-in line is kept as description, not speech: check manually"
+            )
+            fragments = fragments[1:]
     if not fragments:
         return
     block.sync_fragments = fragments
@@ -1992,6 +2533,8 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
         )
         fragment_text = text[boundary["content_start"] : text_end]
         if index + 1 < len(boundaries):
+            # A ``+`` right before the next timecode is the splice mark, not speech.
+            fragment_text = re.sub(r"\s\+\s*$", "", fragment_text)
             fragment_text = _strip_trailing_media_credit(fragment_text)
         fragment_text = fragment_text.strip(" \t\r\n–—-")
         fragment_text = re.sub(r"\.\s*,", ",", fragment_text)
@@ -2043,7 +2586,10 @@ def _canonicalize_timecode(value: str) -> str:
     if re.fullmatch(r"\d{1,2}[.:]\d{2}\s+\d{2}", value):
         parts = re.split(r"[.:\s]+", value)
         return ":".join(parts)
-    return value
+    # ``01.24.08`` / ``00.35:30`` -> ``01:24:08``; ``30:42.20`` -> ``30:42``.
+    # A dotted ``23.05`` is kept as written (it can be a date).
+    timecode = parse_timecode(value)
+    return timecode.stored if timecode else value
 
 
 def _llm_sync_suggestion_has_signal(block: NormalizedBlock, item: dict[str, Any]) -> bool:
@@ -2077,8 +2623,10 @@ def _apply_llm_results(
     results: list[dict[str, Any]],
     *,
     video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+    all_blocks: list[NormalizedBlock] | None = None,
 ) -> None:
     by_uid = {str(item.get("uid", "")): item for item in results}
+    position = {b.uid: i for i, b in enumerate(all_blocks or [])}
     for block in blocks:
         item = by_uid.get(block.uid)
         if not item:
@@ -2130,6 +2678,23 @@ def _apply_llm_results(
             else:
                 block.warnings.append("LLM returned an unknown type")
             continue
+        if (
+            target_type == BlockType.VOICEOVER.value
+            and not block.original_label
+            and all_blocks is not None
+            and position.get(block.uid, 0) > 0
+            and all_blocks[position[block.uid] - 1].type == BlockType.LIFE.value
+        ):
+            # An unmarked paragraph straight after a LIFE scene cannot be
+            # turned into narration by the model alone: keep it unresolved.
+            block.source = DecisionSource.LLM.value
+            block.confidence = max(0.0, min(1.0, confidence))
+            if not block.suggested_type:
+                block.suggested_type = target_type
+            block.warnings.append(
+                "LLM voiceover suggestion contradicts the preceding LIFE scene: check manually"
+            )
+            continue
         _apply_type(block, target_type, DecisionSource.LLM.value, confidence)
         if block.original_label:
             if item.get("label_is_marker"):
@@ -2147,14 +2712,89 @@ def _apply_llm_results(
                 # silently drop the omitted middle. Keep the full local text.
                 block.text_for_tts = block.normalized_text
             else:
-                block.text_for_tts = (
-                    str(item.get("text_for_tts", "")).strip() or block.normalized_text
-                )
+                proposed = str(item.get("text_for_tts", "")).strip()
+                # TTS preparation (numbers to words, dropped cues) is allowed;
+                # a text that no longer resembles the source is not.
+                if proposed and not _llm_text_close_to_source(proposed, block.normalized_text):
+                    block.warnings.append(
+                        "LLM text_for_tts differs from the source text and was ignored"
+                    )
+                    proposed = ""
+                block.text_for_tts = proposed or block.normalized_text
         if _llm_text_truncated(block):
             block.warnings.append(
                 "LLM classified a truncated excerpt of this oversized block (head and tail only)"
             )
         _extract_block_metadata(block)
+
+
+_NUMERAL_ENDING = (
+    r"(?:ого|его|ому|ему|ыми|ими|ой|ей|ым|им|ом|ем|ый|ий|ая|яя|ое|ее|ые|ие|ую|юю|ых|их|ью"
+    r"|ть|ти|ми|ах|ях|а|я|е|и|о|у|ы|ь|ю|й)?"
+)
+_NUMERAL_STEMS = (
+    "одиннадцат|двенадцат|тринадцат|четырнадцат|пятнадцат|шестнадцат|семнадцат|восемнадцат|"
+    "девятнадцат|двадцат|тридцат|сороков|сорок|пятидесят|шестидесят|семидесят|восьмидесят|"
+    "девяност|пятьдесят|шестьдесят|семьдесят|восемьдесят|десят|девят|восьм|восем|седьм|сем|"
+    "шест|пят|четверт|четыр|трет|трех|три|втор|перв|двух|две|два|одн|один|нол|тысяч|миллион|"
+    "миллиард|двест|трист|четыреста|пятьсот|шестьсот|семьсот|восемьсот|девятьсот|сотн|сот|"
+    "полтор|пол"
+)
+_NUMERAL_WORD_RE = re.compile(rf"(?:{_NUMERAL_STEMS}){_NUMERAL_ENDING}|сто|ста|стам|стами|стах")
+# Words that exist only to carry a date/number ("1915 г." -> "тысяча девятьсот
+# пятнадцатого года"); dropped on both sides before comparing.
+_DATE_UNIT_WORD_RE = re.compile(
+    r"год(?:а|у|ом|е|ы|ов|ах|ам|ами)?|ве[кч](?:а|у|ом|е|ов|ах|ам|ами)?|процент\w*|"
+    r"январ[яе]|феврал[яе]|март[ае]?|апрел[яе]|ма[яе]|июн[яе]|июл[яе]|август[ае]?|"
+    r"сентябр[яе]|октябр[яе]|ноябр[яе]|декабр[яе]"
+)
+# Digit tokens of the source: numbers, dates (12.05.1920), ranges (1915-1917),
+# ordinal suffixes (1915-го) and following abbreviations (г., гг., в., вв.).
+_SOURCE_NUMBER_RE = re.compile(
+    r"\d+(?:[.,:/\-\u2013\u2014]\d+)*(?:[-\u2013]?[а-яё]{1,3}(?![а-яё]))?"
+    r"(?:\s*(?:гг?|вв?|г\.г)\.)?|%",
+    re.IGNORECASE,
+)
+_WORD_RE = re.compile(r"[a-zа-я]+")
+
+
+def _words_without_numbers(text: str, *, source: bool) -> str:
+    if source:
+        text = _SOURCE_NUMBER_RE.sub(" ", text)
+    words = _WORD_RE.findall(text.lower().replace("ё", "е"))
+    kept = [
+        word
+        for word in words
+        if not _NUMERAL_WORD_RE.fullmatch(word) and not _DATE_UNIT_WORD_RE.fullmatch(word)
+    ]
+    return " ".join(kept)
+
+
+def _llm_text_close_to_source(proposed: str, source: str) -> bool:
+    """True when an LLM ``text_for_tts`` is still the same speech as the source.
+
+    TTS preparation spells numbers out (``В 1915 году`` -> ``В тысяча девятьсот
+    пятнадцатом году``), so digits (and ``г./гг./в.``) are removed from the
+    source and numeral words from both texts before comparing the rest.
+    """
+    a, b = " ".join(proposed.split()), " ".join(source.split())
+    if a == b:
+        return True
+    if not b:
+        return False
+    rest_a = _words_without_numbers(a, source=False)
+    rest_b = _words_without_numbers(b, source=True)
+    if not rest_a and not rest_b:
+        # Nothing but numbers on both sides: the proposal must still be speech.
+        return bool(_WORD_RE.search(a.lower()))
+    if not rest_a or not rest_b or not (0.5 <= len(rest_a) / len(rest_b) <= 2.0):
+        return False
+    if SequenceMatcher(None, rest_a, rest_b, autojunk=False).ratio() < 0.6:
+        return False
+    # Short texts can pass the character check by accident: the shared words
+    # must also be a good part of both texts.
+    words_a, words_b = rest_a.split(), rest_b.split()
+    return SequenceMatcher(None, words_a, words_b, autojunk=False).ratio() >= 0.5
 
 
 def _llm_cache_path(output_path: Path) -> Path:
@@ -2392,13 +3032,17 @@ def _cache_llm_results(
 
 
 def _llm_batches(
-    blocks: list[NormalizedBlock], max_chars: int = 12_000
+    blocks: list[NormalizedBlock],
+    max_chars: int = 12_000,
+    *,
+    inputs: dict[str, dict[str, Any]] | None = None,
 ) -> list[list[NormalizedBlock]]:
     batches: list[list[NormalizedBlock]] = []
     current: list[NormalizedBlock] = []
     current_size = 0
     for block in blocks:
-        block_size = len(json.dumps(_llm_input(block), ensure_ascii=False))
+        item = inputs[block.uid] if inputs is not None else _llm_input(block)
+        block_size = len(json.dumps(item, ensure_ascii=False))
         if current and current_size + block_size > max_chars:
             batches.append(current)
             current = []
@@ -2425,8 +3069,12 @@ def _llm_text_excerpt(text: str) -> str:
     return text[:_LLM_BLOCK_HEAD_CHARS] + _LLM_TRUNCATION_MARKER + text[-_LLM_BLOCK_TAIL_CHARS:]
 
 
-def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
-    """Return only classification context, avoiding duplicated draft fields."""
+def _llm_input(block: NormalizedBlock, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return only classification context, avoiding duplicated draft fields.
+
+    ``context`` carries a few truncated neighbouring paragraphs and is added
+    only for unresolved blocks (it is reference material, not a target).
+    """
     item: dict[str, Any] = {
         "uid": block.uid,
         "original_text": _llm_text_excerpt(block.original_text),
@@ -2437,6 +3085,8 @@ def _llm_input(block: NormalizedBlock) -> dict[str, Any]:
     }
     if _llm_text_truncated(block):
         item["text_truncated"] = True
+    if context:
+        item["context"] = context
     return item
 
 

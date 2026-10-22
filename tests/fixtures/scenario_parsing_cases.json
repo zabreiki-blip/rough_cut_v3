@@ -1,0 +1,457 @@
+{
+  "version": 1,
+  "note": "Depersonalised minimal cases; the full SPAS DOCX is intentionally not in git.",
+  "parse_cases": [
+    {
+      "id": "zk_glued_number",
+      "task": 2,
+      "defect": "ZK label with glued author number and no colon is not recognized",
+      "paragraphs": [
+        "ЗК14 В том году…"
+      ],
+      "expected_blocks": [
+        {
+          "type": "voiceover",
+          "text_for_tts": "В том году…"
+        }
+      ]
+    },
+    {
+      "id": "zk_year_in_speech",
+      "task": 2,
+      "defect": "control: a year after a spaced ZK label belongs to speech",
+      "paragraphs": [
+        "ЗК 1915 год был тяжёлым."
+      ],
+      "expected_blocks": [
+        {
+          "type": "voiceover",
+          "text_for_tts": "1915 год был тяжёлым."
+        }
+      ]
+    },
+    {
+      "id": "zk_spaced_number_colon",
+      "task": 2,
+      "defect": "author number with colon after a spaced ZK label leaks into TTS",
+      "paragraphs": [
+        "ЗК 5: Текст пять."
+      ],
+      "expected_blocks": [
+        {
+          "type": "voiceover",
+          "text_for_tts": "Текст пять."
+        }
+      ]
+    },
+    {
+      "id": "zk_colon_control",
+      "task": 2,
+      "defect": "control: glued number with colon already works",
+      "paragraphs": [
+        "ЗК14: Текст"
+      ],
+      "expected_blocks": [
+        {
+          "type": "voiceover",
+          "text_for_tts": "Текст"
+        }
+      ]
+    },
+    {
+      "id": "technical_cue_not_hero",
+      "task": 2,
+      "defect": "capitalized montage cue is taken for a hero name",
+      "paragraphs": [
+        "БЫСТРАЯ НАРЕЗКА красивых кадров (улей, пчелы, служба)"
+      ],
+      "expected_blocks": [
+        {
+          "type": "technical",
+          "speaker": "",
+          "text_for_tts": ""
+        }
+      ]
+    },
+    {
+      "id": "real_hero_without_timecode",
+      "task": 2,
+      "defect": "control: a real hero credit without timecode stays sync",
+      "paragraphs": [
+        "СНХ, ИВАН ПЕТРОВ: Это моя речь без таймкода."
+      ],
+      "expected_blocks": [
+        {
+          "type": "sync",
+          "speaker": "ИВАН ПЕТРОВ",
+          "text_for_tts": ""
+        }
+      ]
+    },
+    {
+      "id": "life_timecode_in_parentheses",
+      "task": 3,
+      "defect": "colon inside a parenthesised timecode splits the description",
+      "paragraphs": [
+        "ЛАЙФ СЦЕНА (00:42:32) Реплика"
+      ],
+      "expected_blocks": [
+        {
+          "type": "life",
+          "source_description": "СЦЕНА",
+          "timecode_start": "00:42:32",
+          "normalized_text": "Реплика",
+          "text_for_tts": ""
+        }
+      ]
+    },
+    {
+      "id": "snh_role_with_timecode",
+      "task": 3,
+      "defect": "timecode contaminates the role and the speech",
+      "paragraphs": [
+        "СНХ ИМЯ ФАМИЛИЯ, ИСТОРИК (00:03:37) Реплика"
+      ],
+      "expected_blocks": [
+        {
+          "type": "sync",
+          "speaker": "ИМЯ ФАМИЛИЯ",
+          "role": "ИСТОРИК",
+          "timecode_start": "00:03:37",
+          "normalized_text": "Реплика"
+        }
+      ],
+      "expected_fragments": [
+        [
+          {
+            "text": "Реплика",
+            "timecode_start": "00:03:37",
+            "timecode_end": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "life_splice",
+      "task": 3,
+      "defect": "a '+' splice is taken for one continuous range",
+      "paragraphs": [
+        "ЛАЙФ СЦЕНА (00:05:20) Первый текст + 00.52.40 Второй текст"
+      ],
+      "expected_blocks": [
+        {
+          "type": "life",
+          "source_description": "СЦЕНА",
+          "timecode_end": ""
+        }
+      ],
+      "expected_fragments": [
+        [
+          {
+            "text": "Первый текст",
+            "timecode_start": "00:05:20",
+            "timecode_end": ""
+          },
+          {
+            "text": "Второй текст",
+            "timecode_start": "00:52:40",
+            "timecode_end": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "lifes_variant",
+      "task": 2,
+      "defect": "plural LIFE label is taken for a speaker name",
+      "paragraphs": [
+        "ЛАЙФЫ СЦЕНА С ГЕРОЕМ - (00:28:40) Вопрос? - Ответ."
+      ],
+      "expected_blocks": [
+        {
+          "type": "life",
+          "speaker": ""
+        }
+      ]
+    },
+    {
+      "id": "dialog_in_life_scene",
+      "task": 4,
+      "defect": "short dialogue replies lose their LIFE scene; hero must not be invented",
+      "paragraphs": [
+        "ЛАЙФ СЦЕНА (00:34:00) Идут по тропинке.",
+        "— Вот эту?",
+        "— Да.",
+        "ЗК5: Дальше текст диктора."
+      ],
+      "expected_blocks": [
+        {
+          "type": "life"
+        },
+        {
+          "type": "life",
+          "speaker": "",
+          "role": "",
+          "text_for_tts": ""
+        },
+        {
+          "type": "life",
+          "speaker": "",
+          "role": "",
+          "text_for_tts": ""
+        },
+        {
+          "type": "voiceover",
+          "text_for_tts": "Дальше текст диктора."
+        }
+      ]
+    },
+    {
+      "id": "dialog_in_life_scene_hyphen",
+      "task": 4,
+      "defect": "same as above with the hyphen used by the real script",
+      "paragraphs": [
+        "ЛАЙФ СЦЕНА (00:34:00) Идут по тропинке.",
+        "- Вот эту?",
+        "- Да.",
+        "ЗК5: Дальше текст диктора."
+      ],
+      "expected_blocks": [
+        {
+          "type": "life"
+        },
+        {
+          "type": "life",
+          "speaker": "",
+          "role": "",
+          "text_for_tts": ""
+        },
+        {
+          "type": "life",
+          "speaker": "",
+          "role": "",
+          "text_for_tts": ""
+        },
+        {
+          "type": "voiceover",
+          "text_for_tts": "Дальше текст диктора."
+        }
+      ]
+    },
+    {
+      "id": "zk_repeated_author_number",
+      "task": 2,
+      "defect": "a repeated author number in the source gives no numbering warning",
+      "paragraphs": [
+        "ЗК7: Первый текст.",
+        "ЗК7: Второй текст."
+      ],
+      "expected_blocks": [
+        {
+          "type": "voiceover",
+          "text_for_tts": "Первый текст."
+        },
+        {
+          "type": "voiceover",
+          "text_for_tts": "Второй текст."
+        }
+      ]
+    }
+  ],
+  "saved_state_cases": [
+    {
+      "id": "zk_label_in_tts",
+      "task": 5,
+      "defect": "service label reaches TTS text",
+      "bad": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "ЗК14 В том году…",
+          "normalized_text": "ЗК14 В том году…",
+          "type": "voiceover",
+          "text_for_tts": "ЗК14 В том году…",
+          "original_label": "",
+          "source": "llm",
+          "confidence": 1.0
+        }
+      ],
+      "fixed": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "ЗК14 В том году…",
+          "normalized_text": "В том году…",
+          "type": "voiceover",
+          "text_for_tts": "В том году…",
+          "original_label": "ЗК",
+          "source": "llm",
+          "confidence": 1.0,
+          "label_confirmed": true
+        }
+      ]
+    },
+    {
+      "id": "false_hero_from_cue",
+      "task": 5,
+      "defect": "technical cue saved as sync with a made-up speaker",
+      "bad": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "БЫСТРАЯ НАРЕЗКА красивых кадров (улей, пчелы, служба)",
+          "normalized_text": "НАРЕЗКА красивых кадров (улей, пчелы, служба)",
+          "type": "sync",
+          "text_for_tts": "",
+          "original_label": "БЫСТРАЯ",
+          "source": "llm",
+          "confidence": 1.0,
+          "speaker": "БЫСТРАЯ"
+        }
+      ],
+      "fixed": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "БЫСТРАЯ НАРЕЗКА красивых кадров (улей, пчелы, служба)",
+          "normalized_text": "БЫСТРАЯ НАРЕЗКА красивых кадров (улей, пчелы, служба)",
+          "type": "technical",
+          "text_for_tts": "",
+          "original_label": "",
+          "source": "llm",
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "id": "life_description_broken_by_timecode",
+      "task": 5,
+      "defect": "LIFE description ends with '(00' and speech starts with '42:32)'",
+      "bad": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "ЛАЙФ СЦЕНА (00:42:32) Реплика",
+          "normalized_text": "42:32) Реплика",
+          "type": "life",
+          "text_for_tts": "",
+          "original_label": "ЛАЙФ",
+          "source": "llm",
+          "confidence": 1.0,
+          "source_description": "СЦЕНА (00",
+          "timecode_start": "00:42:32"
+        }
+      ],
+      "fixed": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "ЛАЙФ СЦЕНА (00:42:32) Реплика",
+          "normalized_text": "Реплика",
+          "type": "life",
+          "text_for_tts": "",
+          "original_label": "ЛАЙФ",
+          "source": "llm",
+          "confidence": 1.0,
+          "source_description": "СЦЕНА",
+          "timecode_start": "00:42:32"
+        }
+      ]
+    },
+    {
+      "id": "role_contains_timecode",
+      "task": 5,
+      "defect": "role keeps '(00' and speech starts with ')'",
+      "bad": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "СНХ ИМЯ ФАМИЛИЯ, ИСТОРИК (00:03:37) Реплика",
+          "normalized_text": ") Реплика",
+          "type": "sync",
+          "text_for_tts": "",
+          "original_label": "СНХ",
+          "source": "llm",
+          "confidence": 1.0,
+          "speaker": "ИМЯ ФАМИЛИЯ",
+          "role": "ИСТОРИК (00",
+          "timecode_start": "03:37",
+          "sync_fragments": [
+            {
+              "text": ") Реплика",
+              "timecode_start": "03:37"
+            }
+          ]
+        }
+      ],
+      "fixed": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "СНХ ИМЯ ФАМИЛИЯ, ИСТОРИК (00:03:37) Реплика",
+          "normalized_text": "Реплика",
+          "type": "sync",
+          "text_for_tts": "",
+          "original_label": "СНХ",
+          "source": "llm",
+          "confidence": 1.0,
+          "speaker": "ИМЯ ФАМИЛИЯ",
+          "role": "ИСТОРИК",
+          "timecode_start": "00:03:37",
+          "sync_fragments": [
+            {
+              "text": "Реплика",
+              "timecode_start": "00:03:37"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "life_splice_saved_as_range",
+      "task": 5,
+      "defect": "explicit splice saved as one start/end range without fragments",
+      "bad": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "ЛАЙФ СЦЕНА (00:05:20) Первый текст + 00.52.40 Второй текст",
+          "normalized_text": "05:20) Первый текст + 00.52.40 Второй текст",
+          "type": "life",
+          "text_for_tts": "",
+          "original_label": "ЛАЙФ",
+          "source": "llm",
+          "confidence": 1.0,
+          "source_description": "СЦЕНА (00",
+          "timecode_start": "00:05:20",
+          "timecode_end": "00.52.40"
+        }
+      ],
+      "fixed": [
+        {
+          "uid": "fx-1",
+          "order": 1,
+          "original_text": "ЛАЙФ СЦЕНА (00:05:20) Первый текст + 00.52.40 Второй текст",
+          "normalized_text": "Первый текст + Второй текст",
+          "type": "life",
+          "text_for_tts": "",
+          "original_label": "ЛАЙФ",
+          "source": "llm",
+          "confidence": 1.0,
+          "source_description": "СЦЕНА",
+          "timecode_start": "00:05:20",
+          "sync_fragments": [
+            {
+              "text": "Первый текст",
+              "timecode_start": "00:05:20"
+            },
+            {
+              "text": "Второй текст",
+              "timecode_start": "00:52:40"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -153,3 +153,103 @@ def test_section_headings_and_production_notes_are_technical_by_builtin_rule(tex
 def test_speech_and_voiceover_lines_stay_non_technical(text: str) -> None:
     block = _classify_block(text)
     assert block["type"] != "technical"
+
+
+# F. Capitalised montage directives are technical cues, never a hero name.
+MONTAGE_CUE_TEXTS = (
+    "БЫСТРАЯ НАРЕЗКА красивых кадров (улей, пчелы, служба)",
+    "БЫСТРАЯ НАРЕЗКА красивых кадров",
+    "БЫСТРАЯ НАРЕЗКА",
+    "ВОЗВРАЩАЕМСЯ В МОСКВУ ПО КАРТИНКЕ – показываем монастырь",
+)
+
+
+@pytest.mark.parametrize(
+    "text", MONTAGE_CUE_TEXTS, ids=[f"montage-cue-{i}" for i in range(len(MONTAGE_CUE_TEXTS))]
+)
+def test_montage_cue_is_technical_with_empty_speaker_and_tts(text: str) -> None:
+    block = _classify_block(text)
+    assert block["type"] == "technical"
+    assert block["source"] == "builtin_rule"
+    assert block["speaker"] == ""
+    assert block["text_for_tts"] == ""
+    assert block["normalized_text"] == text  # the cue text is kept for the reviewer
+
+
+def test_real_hero_in_capitals_without_timecode_stays_sync() -> None:
+    block = _classify_block("СНХ, ИВАН ПЕТРОВ: Это моя речь без таймкода.")
+    assert block["type"] == "sync"
+    assert block["speaker"] == "ИВАН ПЕТРОВ"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "ЛАЙФЫ СЦЕНА С ГЕРОЕМ - (00:28:40) Вопрос? - Ответ.",
+        "ЛАЙФ СЦЕНА С ГЕРОЕМ - (00:28:40) Вопрос?",
+    ),
+)
+def test_life_and_lifes_labels_are_life_not_a_speaker(text: str) -> None:
+    block = _classify_block(text)
+    assert block["type"] == "life"
+    assert block["speaker"] == ""
+    assert block["text_for_tts"] == ""
+
+
+def test_named_standup_extracts_presenter_instead_of_service_label() -> None:
+    block = _classify_block("СТЕНДАП ДАРЬЯ У СОБОРА Мы привыкли видеть этот собор издалека.")
+    assert block["speaker"] == "ДАРЬЯ"
+    assert block["text_for_tts"] == ""
+    assert block["warnings"] == []
+    assert block["normalized_text"] == "Мы привыкли видеть этот собор издалека."
+
+
+def test_unnamed_standup_still_needs_manual_speaker_check() -> None:
+    block = _classify_block("СТЕНДАП Здесь мы расскажем об истории собора.")
+    assert block["speaker"] == ""
+    assert block["warnings"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "МОНТАЖ был сложным, говорит режиссёр.",
+        "ПЕРЕБИВКА: Иван говорит своё",
+        "Я ВОЗВРАЩАЕМСЯ домой",
+        "ВОЗВРАЩАЕМСЯ В 1941 ГОД",
+    ),
+)
+def test_speech_starting_with_a_cue_word_is_not_technical(text: str) -> None:
+    block = _classify_block(text)
+    assert block["type"] != "technical"
+    assert block["normalized_text"] == text
+
+
+def test_lifes_scene_dash_timecode_keeps_the_question_intact() -> None:
+    block = _classify_block("ЛАЙФЫ СЦЕНА - (00:28:40) Вопрос?")
+    assert block["type"] == "life"
+    assert block["timecode_start"] == "00:28:40"
+    assert block["normalized_text"] == "Вопрос?"
+    assert block["text_for_tts"] == ""
+
+
+@pytest.mark.parametrize("prefix", ("", "СНХ "))
+def test_named_lead_in_extracts_presenter_and_keeps_caption_out_of_speech(
+    prefix: str,
+) -> None:
+    block = _classify_block(
+        f"{prefix}ПОДВОДКА ДАРЬЯ У БОЛЬШОГО СОБОРА [29:41.93 - 30:42.20] "
+        "Мы привыкли видеть большой собор вот таким красным с белыми деталями."
+    )
+    assert block["type"] == "sync"
+    assert block["speaker"] == "ДАРЬЯ"
+    assert block["text_for_tts"] == ""
+    assert block["warnings"] == []
+    assert block["timecode_start"] == "29:41"
+    assert block["timecode_end"] == "30:42"
+    fragments = block["sync_fragments"]
+    assert [f["text"] for f in fragments] == [
+        "Мы привыкли видеть большой собор вот таким красным с белыми деталями."
+    ]
+    assert [f["timecode_start"] for f in fragments] == ["29:41"]
+    assert block["source_description"] == "У БОЛЬШОГО СОБОРА"

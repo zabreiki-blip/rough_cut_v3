@@ -82,6 +82,11 @@ class NormalizedBlock:
     proposed_memory_rule_id: int | None = None
     continuation_of_type: str = ""
     absorbed_by_uid: str = ""
+    # UID of the block that opened the LIFE/SYNC/HOST scene this block belongs
+    # to (dialogue replies, ``+`` splices, continuations).  Empty for the
+    # opening block itself and for blocks outside a scene.  Optional: older
+    # JSON without the key reads with the default.
+    scene_uid: str = ""
     # Stage 4 attaches the block's relationship to the previous scenario
     # revision here.  It must survive normalization model round-trips so the
     # timeline exporter can highlight changed clips in Premiere.

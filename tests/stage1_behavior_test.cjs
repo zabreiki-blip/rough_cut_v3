@@ -1372,9 +1372,31 @@ function testApplyStatusSyncsTimelineReady({ state, normalization }) {
   }
 }
 
+function testNormalizationWarningLocations({ state, normalization }) {
+  const previous = state.appState.normalization;
+  try {
+    state.appState.normalization = { status: "draft", blocks: [
+      { uid: "a", order: 6, type: "unknown", warnings: ["LLM returned an unknown type"] },
+      { uid: "b", order: 94, type: "unknown", warnings: ["LLM returned an unknown type"] },
+      ...Array.from({ length: 9 }, (_, i) => ({
+        uid: `extra-${i}`, order: 100 + i, type: "technical", warnings: [`Additional warning ${i}`],
+      })),
+    ] };
+    normalization.renderNormalization();
+    const html = state.ids.normalization_warnings.innerHTML;
+    assert.ok(html.includes("Не удалось определить тип блока"), html);
+    assert.ok(html.includes("6, 94"), "warning must locate affected blocks");
+    assert.ok(html.includes("Additional warning 8"), "last warning must remain visible");
+    assert.ok(!html.includes("LLM returned an unknown type"), "known warnings must be translated");
+  } finally {
+    state.appState.normalization = previous;
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
+    ["testNormalizationWarningLocations", () => testNormalizationWarningLocations(modules)],
     ["testComputeEtaSeconds", () => testComputeEtaSeconds(modules)],
     ["testRenderEtaCells", () => testRenderEtaCells(modules)],
     ["testCloudDisablesLocalWhisperModel", () => testCloudDisablesLocalWhisperModel(modules)],

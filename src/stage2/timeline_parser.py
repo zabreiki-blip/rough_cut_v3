@@ -4,7 +4,9 @@ import re
 import logging
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+from stage1.scenario_structure import find_timecodes, iter_timecode_tokens, normalize_timecode_value
 
 from .models import FullTimeline, TimelineSegment
 
@@ -174,10 +176,57 @@ def normalized_sync_fragments(block: dict, *, preserve_whole: bool = False) -> l
     return expanded or fragments
 
 
-def _spoken_text(text: str, *, block_type: str, speaker: str = "") -> str:
+def life_parts(block: dict) -> list[dict[str, str]]:
+    """Independent LIFE inserts of a block (a ``+`` splice), or ``[]``.
+
+    Stored in the existing ``sync_fragments`` as ``text/timecode_start/
+    timecode_end``.  Fewer than two usable parts means the legacy single-block
+    behaviour, so older LIFE blocks (empty list) are read exactly as before.
+    """
+    if not block.get("sync_fragments"):
+        return []
+    parts = normalized_sync_fragments(block, preserve_whole=True)
+    return parts if len(parts) > 1 else []
+
+
+_LEADING_LABELS = re.compile(r"\s*(?:(?:СНХ|ЛАЙФ)\s*[,.:–-]?\s*)*", re.IGNORECASE)
+
+
+def _strip_structural_timecodes(text: str, known: Iterable[str]) -> str:
+    """Drop timecodes that are scenario structure, keep numbers that are speech.
+
+    Structural: bracketed, leading (after SNH/LIFE labels) or equal to a
+    timecode stored on the block (``timecode_start``/``timecode_end``/
+    fragments).  ``12.05.1915`` or ``в 5:30 утра`` in a quote stay.
+    """
+    wanted = {normalize_timecode_value(item) for item in known if item}
+    leading_match = _LEADING_LABELS.match(text)
+    assert leading_match is not None  # The label prefix also matches an empty string.
+    leading_end = leading_match.end()
+    bracketed = {span.start: span for span in find_timecodes(text) if span.wrapper}
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, parsed in iter_timecode_tokens(text):
+        if start < cursor:
+            continue
+        span = next((s for s in bracketed.values() if s.start <= start < s.end), None)
+        if span is not None:
+            start, end = span.start, span.end
+        elif not (start == leading_end or parsed.stored in wanted):
+            continue
+        pieces.append(text[cursor:start])
+        pieces.append(" ")
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _spoken_text(
+    text: str, *, block_type: str, speaker: str = "", timecodes: Iterable[str] = ()
+) -> str:
     """Return speech-only text without changing the canonical scenario."""
     value = re.sub(r"\b(?:СКЛ|СКЛЕЙКА)\b", " ", text, flags=re.IGNORECASE)
-    value = re.sub(r"(?<!\d)\d{1,2}[:.]\d{2}(?:[:.]\d{2})?(?!\d)", " ", value)
+    value = _strip_structural_timecodes(value, timecodes)
     life_cue = bool(re.match(r"^\s*ЛАЙФ\b", value, flags=re.IGNORECASE))
     value = re.sub(r"^\s*(?:(?:СНХ|ЛАЙФ)\s*[,.:–-]?\s*)+", "", value, flags=re.IGNORECASE)
     if life_cue:
@@ -568,30 +617,52 @@ def parse_normalized_timeline(
                             fragment["text"],
                             block_type=block_type,
                             speaker=str(block.get("speaker") or ""),
+                            timecodes=(
+                                str(fragment.get("timecode_start") or ""),
+                                str(fragment.get("timecode_end") or ""),
+                                str(block.get("timecode_start") or ""),
+                                str(block.get("timecode_end") or ""),
+                            ),
                         ),
                     )
                 )
             continue
 
         if block_type == "life":
-            counters["life"] += 1
-            seg_id = f"life{counters['life']}"
-            segments.append(
-                TimelineSegment(
-                    id=seg_id,
-                    type="life",
-                    text=text,
-                    duration_sec=SNH_PLACEHOLDER_DURATION,
-                    block_uid=block_uid,
-                    revision_status=revision_status,
-                    speaker="ЛАЙФ",
-                    role=str(block.get("source_description") or "ОРИГИНАЛЬНЫЙ ЗВУК").strip(),
-                    timecode=str(block.get("timecode_start") or "").strip(),
-                    timecode_end=str(block.get("timecode_end") or "").strip(),
-                    placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
-                    spoken_text="",
+            parts = life_parts(block)
+            for part_index, part in enumerate(
+                parts
+                or [
+                    {
+                        "text": text,
+                        "timecode_start": str(block.get("timecode_start") or "").strip(),
+                        "timecode_end": str(block.get("timecode_end") or "").strip(),
+                    }
+                ]
+            ):
+                counters["life"] += 1
+                seg_id = f"life{counters['life']}"
+                segments.append(
+                    TimelineSegment(
+                        id=seg_id,
+                        type="life",
+                        text=part["text"],
+                        duration_sec=SNH_PLACEHOLDER_DURATION,
+                        block_uid=(
+                            sync_fragment_id(block_uid, part_index, len(parts))
+                            if parts
+                            else block_uid
+                        ),
+                        parent_block_uid=block_uid if parts else "",
+                        revision_status=revision_status,
+                        speaker="ЛАЙФ",
+                        role=str(block.get("source_description") or "ОРИГИНАЛЬНЫЙ ЗВУК").strip(),
+                        timecode=part["timecode_start"],
+                        timecode_end=part["timecode_end"],
+                        placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+                        spoken_text="",
+                    )
                 )
-            )
             continue
 
         counters["tech"] += 1

@@ -99,8 +99,10 @@ from stage1.normalizer import (
     reset_normalization,
     save_normalization,
 )
+from stage1.scenario_structure import find_timecodes, normalize_timecode_value
 from stage1.validator import validate_stage1
 from stage2.timeline_parser import (
+    life_parts,
     normalized_sync_fragments,
     parse_normalized_timeline,
     sync_fragment_id,
@@ -861,6 +863,9 @@ def _normalization_exception(exc: Exception):
                 "error": "normalization_validation_failed",
                 "message": str(exc),
                 "errors": list(getattr(exc, "errors", []) or []),
+                # Structured reasons: [{code, uid, order, message, severity}].
+                "issues": list(getattr(exc, "issues", []) or []),
+                "codes": sorted({i["code"] for i in getattr(exc, "issues", []) or []}),
             }
         ), 422
     if isinstance(exc, FileNotFoundError):
@@ -1256,6 +1261,47 @@ def _cleanup_stale_uploads(directory: Path, *, max_age_seconds: int = 24 * 60 * 
     return removed
 
 
+def _sync_prefix_end(text: str, timecode: str, timecode_end: str) -> int | None:
+    """End offset of the leading timecode prefix of ``text``, or ``None``.
+
+    Stored timecodes are normalized (``01:02:03``) while the text keeps the
+    author's spelling (``01.02.03``, ``(00:42:32)``, ``[29:41.93 - 30:42.20]``),
+    so the match is structural and compares normalized values.  Older projects
+    stored the spot spelling; both forms normalize alike.  Only a timestamp in
+    the scenario prefix is structural: one mentioned later in the quote stays
+    part of the quote.
+    """
+    wanted = normalize_timecode_value(timecode)
+    wanted_end = normalize_timecode_value(timecode_end)
+    spans = find_timecodes(text, header_zone=True)
+    for index, span in enumerate(spans):
+        if span.start > 180:
+            break
+        if span.first.stored != wanted:
+            continue
+        end = span.end
+        if span.last is None and wanted_end and index + 1 < len(spans):
+            following = spans[index + 1]
+            between = text[end : following.start]
+            if (
+                following.start - end <= 32
+                and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", between)
+                and following.first.stored == wanted_end
+            ):
+                end = following.end
+        return end
+    # Spelling that is not a structural timecode (e.g. a legacy ``MM.SS``).
+    position = text.find(timecode)
+    if 0 <= position <= 180:
+        end = position + len(timecode)
+        if timecode_end:
+            end_position = text.find(timecode_end, end, end + 32)
+            if end_position >= 0 and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", text[end:end_position]):
+                end = end_position + len(timecode_end)
+        return end
+    return None
+
+
 def _sync_quote(block: dict) -> str:
     """Remove a scenario speaker/role/timecode prefix before fuzzy matching."""
     text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
@@ -1265,17 +1311,8 @@ def _sync_quote(block: dict) -> str:
     timecode = str(block.get("timecode_start") or "").strip()
     timecode_end = str(block.get("timecode_end") or "").strip()
     if timecode:
-        position = text.find(timecode)
-        # Only a timestamp in the scenario prefix is structural. A timestamp
-        # mentioned later in the quote must remain part of the quote.
-        if 0 <= position <= 180:
-            end = position + len(timecode)
-            if timecode_end:
-                end_position = text.find(timecode_end, end, end + 32)
-                if end_position >= 0:
-                    between = text[end:end_position]
-                    if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", between):
-                        end = end_position + len(timecode_end)
+        end = _sync_prefix_end(text, timecode, timecode_end)
+        if end is not None:
             quote = text[end:].lstrip(" \t\r\n:;,.…—–-")
             if quote:
                 return quote
@@ -1357,22 +1394,24 @@ def _sync_alignment_units(
             speaker = speaker_selector
             if speaker:
                 last_speaker[block_type] = speaker
-        fragments = (
-            normalized_sync_fragments(
+        if block_type == "sync":
+            fragments = normalized_sync_fragments(
                 block
                 if block.get("sync_fragments")
                 else {**block, "normalized_text": _sync_quote(block)},
                 preserve_whole=parent_uid in (preserve_whole_uids or set()),
             )
-            if block_type == "sync"
-            else [
+        else:
+            # A LIFE ``+`` splice is stored as several independent inserts; a
+            # block without them (or with a single one) stays one unit.
+            fragments = life_parts(block) if block_type == "life" else []
+            fragments = fragments or [
                 {
                     "text": _sync_quote(block),
                     "timecode_start": str(block.get("timecode_start") or "").strip(),
                     "timecode_end": str(block.get("timecode_end") or "").strip(),
                 }
             ]
-        )
         for index, fragment in enumerate(fragments):
             units.append(
                 {

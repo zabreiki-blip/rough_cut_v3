@@ -225,3 +225,73 @@ def test_legacy_import_is_a_projection_of_the_legacy_timeline_parser(
     assert imported["blocks"][0]["text_for_tts"] == "TTS"
     assert imported["status"] == "draft"
     assert imported["warnings"] == ["Imported legacy data requires confirmation"]
+
+
+def test_life_splice_survives_normalization_and_timeline(tmp_path: Path) -> None:
+    import api
+    from stage1.normalizer import load_normalization, save_normalization
+    from stage2.timeline_parser import parse_normalized_timeline, sync_fragment_id
+
+    text = "ЛАЙФ СЦЕНА (00:05:20) Первый текст + 00.52.40 Второй текст"
+    draft = _normalize_canonical(tmp_path, text)
+    path = tmp_path / "scenario_normalized.json"
+    save_normalization(path, draft)
+    block = load_normalization(path)["blocks"][0]
+
+    assert block["type"] == "life" and block["source_description"] == "СЦЕНА"
+    # The original spelling is untouched; the stored values are computable.
+    assert block["original_text"] == text
+    assert [
+        (item["text"], item["timecode_start"], item.get("timecode_end", ""))
+        for item in block["sync_fragments"]
+    ] == [("Первый текст", "00:05:20", ""), ("Второй текст", "00:52:40", "")]
+
+    units = api._sync_alignment_units([block])
+    parent = block["uid"]
+    assert [unit["text"] for unit in units] == ["Первый текст", "Второй текст"]
+    assert [unit["timecode_start"] for unit in units] == ["00:05:20", "00:52:40"]
+    assert {unit["parent_block_uid"] for unit in units} == {parent}
+    assert [unit["segment_id"] for unit in units] == [
+        sync_fragment_id(parent, 0, 2),
+        sync_fragment_id(parent, 1, 2),
+    ]
+    assert len({unit["segment_id"] for unit in units}) == 2
+
+    timeline = parse_normalized_timeline(
+        {"status": "confirmed", "blocks": [block]}, tmp_path, tmp_path, "contract"
+    )
+    life = [segment for segment in timeline.segments if segment.type == "life"]
+    assert [segment.text for segment in life] == ["Первый текст", "Второй текст"]
+    assert [segment.timecode for segment in life] == ["00:05:20", "00:52:40"]
+    # Two independent inserts, never one continuous 47:20 interval.
+    assert [segment.timecode_end for segment in life] == ["", ""]
+    assert {segment.parent_block_uid for segment in life} == {parent}
+    assert [segment.block_uid for segment in life] == [
+        units[0]["segment_id"],
+        units[1]["segment_id"],
+    ]
+    assert all(segment.role == "СЦЕНА" for segment in life)
+
+
+def test_legacy_life_without_sync_fragments_stays_one_segment(tmp_path: Path) -> None:
+    import api
+    from stage2.timeline_parser import parse_normalized_timeline
+
+    block = {
+        "uid": "life-old",
+        "order": 1,
+        "type": "life",
+        "source_description": "СЦЕНА",
+        "normalized_text": "Старый текст",
+        "timecode_start": "00:05:20",
+        "timecode_end": "00:05:40",
+        "sync_fragments": [],
+    }
+    units = api._sync_alignment_units([block])
+    assert [unit["segment_id"] for unit in units] == ["life-old"]
+    timeline = parse_normalized_timeline(
+        {"status": "confirmed", "blocks": [block]}, tmp_path, tmp_path, "contract"
+    )
+    assert [(s.block_uid, s.timecode, s.timecode_end) for s in timeline.segments] == [
+        ("life-old", "00:05:20", "00:05:40")
+    ]

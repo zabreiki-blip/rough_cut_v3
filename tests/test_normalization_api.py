@@ -541,6 +541,59 @@ class NormalizationApiTest(unittest.TestCase):
         with NormalizationMemory(self.memory) as memory:
             self.assertEqual(memory.list_rules(scope="marker"), [])
 
+    def test_defective_block_cannot_be_confirmed_by_any_request(self) -> None:
+        source = self._source()
+        generated = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "demo", "input_path": str(source), "use_llm": False},
+        ).get_json()["result"]
+        blocks = generated["blocks"]
+        bad = dict(blocks[0], normalized_text="ЗК14 Первый закадровый блок.")
+        bad["text_for_tts"] = "ЗК14 Первый закадровый блок."
+        defective = [bad, *blocks[1:]]
+
+        # 1. Save the defect, then confirm it plainly.
+        saved = self.client.put(
+            "/stage1/normalization",
+            json={
+                "project": "demo",
+                "revision": 1,
+                "blocks": defective,
+                "status": "confirmed",
+                "confirmed_at": "2026-01-01T00:00:00+00:00",
+            },
+        ).get_json()["result"]
+        self.assertEqual(saved["status"], "draft")
+        direct = self.client.post(
+            "/stage1/normalization/confirm", json={"project": "demo", "revision": 2}
+        )
+        # 2. Save-and-confirm in one request.
+        combined = self.client.post(
+            "/stage1/normalization/confirm",
+            json={"project": "demo", "revision": 2, "blocks": defective},
+        )
+        for response in (direct, combined):
+            self.assertEqual(response.status_code, 422, response.get_json())
+            body = response.get_json()
+            self.assertEqual(body["error"], "normalization_validation_failed")
+            self.assertTrue(body["errors"])
+            self.assertIn("service_label_in_tts", body["codes"])
+            hit = [i for i in body["issues"] if i["code"] == "service_label_in_tts"]
+            self.assertEqual([i["uid"] for i in hit], [bad["uid"]])
+        # Nothing was published: TTS and the confirmed gate stay closed.
+        self.assertFalse((self.projects / "demo" / "work" / "scenario_prepared.json").exists())
+        current = self.client.get("/stage1/normalization?project=demo").get_json()["result"]
+        self.assertEqual(current["status"], "draft")
+        tts = self.client.post("/stage1/tts", json={"project": "demo", "dry_run": True})
+        self.assertGreaterEqual(tts.status_code, 400)
+
+        # The same data after the fix is confirmable.
+        fixed = self.client.post(
+            "/stage1/normalization/confirm",
+            json={"project": "demo", "revision": current["revision"], "blocks": blocks},
+        )
+        self.assertEqual(fixed.status_code, 200, fixed.get_json())
+
     def test_confirm_rejects_forged_learning_candidate(self) -> None:
         source = self.projects / "demo" / "input" / "scenario.txt"
         source.parent.mkdir(parents=True, exist_ok=True)

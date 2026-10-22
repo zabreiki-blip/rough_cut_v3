@@ -405,14 +405,14 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(block["type"], "sync")
             self.assertEqual(block["speaker"], "Иван Иванов")
             self.assertEqual(block["role"], "эксперт")
-            self.assertEqual(block["timecode_start"], "01.02.03")
+            self.assertEqual(block["timecode_start"], "01:02:03")
             self.assertEqual(block["normalized_text"], "Ответ героя")
             self.assertEqual(
                 block["sync_fragments"],
                 [
                     {
                         "text": "Ответ героя",
-                        "timecode_start": "01.02.03",
+                        "timecode_start": "01:02:03",
                     }
                 ],
             )
@@ -490,7 +490,7 @@ class NormalizerTests(unittest.TestCase):
             self.assertNotIn(". ,", block["normalized_text"])
             self.assertEqual(
                 [item["timecode_start"] for item in block["sync_fragments"]],
-                ["", "00.45.07", "00.27.15"],
+                ["", "00:45:07", "00:27:15"],
             )
 
     def test_explicit_snh_tolerates_colon_comma_and_never_uses_type_as_role(self) -> None:

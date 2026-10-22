@@ -17,6 +17,7 @@ import unicodedata
 
 from atomic_io import atomic_write_json
 from cost_budget import CostBudget
+from stage1.scenario_structure import normalize_timecode_value
 from stage4.revision_assets import (
     activation_intent_path,
     clear_activation_intent,
@@ -48,6 +49,7 @@ _CLASSIFICATION_FIELDS = (
     "proposed_memory_rule_id",
     "continuation_of_type",
 )
+_TIMECODE_FIELDS = ("timecode_start", "timecode_end")
 _DOWNSTREAM_FIELDS = (
     "type",
     "speaker",
@@ -131,15 +133,31 @@ def _block_uid(block: dict[str, Any]) -> str:
     return str(block.get("uid") or block.get("block_uid") or "").strip()
 
 
+def _normalized_fragments(value: Any) -> list[Any]:
+    """Fragments with timecodes in their stored form (``01.02.03`` -> ``01:02:03``)."""
+    fragments = deepcopy(value) if isinstance(value, list) else []
+    for fragment in fragments:
+        if isinstance(fragment, dict):
+            for key in _TIMECODE_FIELDS:
+                if key in fragment:
+                    fragment[key] = normalize_timecode_value(fragment[key])
+    return fragments
+
+
 def _downstream_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
     changed = []
+    old_value: str | list[Any]
+    new_value: str | list[Any]
     for field in _DOWNSTREAM_FIELDS:
         if field == "sync_fragments":
-            old_value = old.get(field) if isinstance(old.get(field), list) else []
-            new_value = new.get(field) if isinstance(new.get(field), list) else []
+            old_value = _normalized_fragments(old.get(field))
+            new_value = _normalized_fragments(new.get(field))
         elif field == "speaker":
             old_value = _speaker(old)
             new_value = _speaker(new)
+        elif field in _TIMECODE_FIELDS:
+            old_value = normalize_timecode_value(old.get(field))
+            new_value = normalize_timecode_value(new.get(field))
         else:
             old_value = str(old.get(field) or "")
             new_value = str(new.get(field) or "")
@@ -172,7 +190,13 @@ def _restore_exact_auto_classifications(old_blocks: list[dict], new_blocks: list
             continue
         for field in inherited_fields:
             if field in old:
-                new[field] = deepcopy(old[field])
+                # Never bring back an older spelling over the normalized one.
+                if field == "sync_fragments":
+                    new[field] = _normalized_fragments(old[field])
+                elif field in _TIMECODE_FIELDS:
+                    new[field] = normalize_timecode_value(old[field])
+                else:
+                    new[field] = deepcopy(old[field])
 
 
 def _paths(project_paths: dict[str, Path]) -> dict[str, Path]:
