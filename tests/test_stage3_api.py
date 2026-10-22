@@ -1083,9 +1083,7 @@ def test_timeline_sync_summary_agrees_with_exporter_placeholder_predicate() -> N
                     if kind not in {"snh", "host"}:
                         assert summary["total"] == 0
                         continue
-                    exported = is_exportable_match(
-                        kind, status, source_id, source_in, source_out
-                    )
+                    exported = is_exportable_match(kind, status, source_id, source_in, source_out)
                     assert summary["placeholders"] == (0 if exported else 1), segment
                     # the dict-based placeholder pass in the route uses the same predicate
                     replaced = api_stage3_routes._placeholder_unmapped_sources(

@@ -1588,7 +1588,8 @@ class SyncMatcher:
         if (
             result.status == "not_found"
             and self.local_indexes
-            and result.metadata.get("unmatched_reason") in {"no_candidate", "below_review_threshold"}
+            and result.metadata.get("unmatched_reason")
+            in {"no_candidate", "below_review_threshold"}
         ):
             return self._local_fallback(request, result)
         return result
@@ -1598,9 +1599,7 @@ class SyncMatcher:
         # Speaker eligibility is decided on the primary sources; the local matcher only
         # sees the ones that also have a local index (it must not re-filter a reduced set).
         eligible, _filtered = self._eligible_sources(request)
-        source_ids = tuple(
-            source.id for source in eligible if source.id in self.local_indexes
-        )
+        source_ids = tuple(source.id for source in eligible if source.id in self.local_indexes)
         if not source_ids:
             return primary  # no local index for the eligible sources: nothing was tried
         local_request = replace(request, source_ids=source_ids)
@@ -1744,7 +1743,9 @@ class SyncMatcher:
             alternative,
         )
 
-    def _search_match(self, request: AlignmentRequest, *, global_fallback: bool = True) -> SyncMatch:
+    def _search_match(
+        self, request: AlignmentRequest, *, global_fallback: bool = True
+    ) -> SyncMatch:
         query = normalize_text(request.text)
         sources, speaker_filtered = self._eligible_sources(request)
 

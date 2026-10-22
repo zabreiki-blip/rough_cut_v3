@@ -347,9 +347,7 @@ def test_legacy_alias_rekey_chain_does_not_lose_rows(tmp_path: Path) -> None:
         ("Диктор 2: Текст реплики.", "Текст реплики."),
     ],
 )
-def test_split_label_compound_marker_number_stays_out_of_content(
-    text: str, expected: str
-) -> None:
+def test_split_label_compound_marker_number_stays_out_of_content(text: str, expected: str) -> None:
     from stage1.normalizer import _split_label
 
     _, content = _split_label(text)
@@ -365,9 +363,7 @@ def test_split_label_compound_marker_number_label_has_no_digits() -> None:
 
 def test_compound_zk_marker_numbers_do_not_reach_tts_text(tmp_path: Path) -> None:
     source = tmp_path / "scenario.txt"
-    source.write_text(
-        "ЗК0.1 25 марта 2025 года.\nЗК1.10 Продолжение истории.\n", encoding="utf-8"
-    )
+    source.write_text("ЗК0.1 25 марта 2025 года.\nЗК1.10 Продолжение истории.\n", encoding="utf-8")
     result = generate_normalization(
         source,
         tmp_path / "normalized.json",

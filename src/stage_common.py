@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, SupportsFloat
 
 
 TIMELINE_MATCHES_CHANGED_ERROR = (
@@ -99,6 +99,13 @@ def _timeline_matches_are_current(timeline: dict, normalization: dict, match_sto
 MATCHED_STATUSES = frozenset({"", "auto_matched", "confirmed"})
 
 
+def _as_float(value: object) -> float:
+    """float() restricted to the types float() accepts; anything else raises TypeError."""
+    if isinstance(value, (str, bytes, bytearray, SupportsFloat)):
+        return float(value)
+    raise TypeError(f"unsupported type for float: {type(value).__name__}")
+
+
 def is_exportable_match(
     segment_type: object,
     match_status: object,
@@ -113,7 +120,7 @@ def is_exportable_match(
     a source id and a non-empty source range.
     """
     try:
-        has_range = float(source_out_sec or 0) > float(source_in_sec or 0)
+        has_range = _as_float(source_out_sec or 0) > _as_float(source_in_sec or 0)
     except (TypeError, ValueError):
         has_range = False
     return bool(

@@ -118,15 +118,16 @@ def test_fallback_keeps_primary_alternatives_after_local_best() -> None:
     partial = " ".join(PHRASE.split()[:6]) + " " + FILLER
     primary = _index("s1", _words(partial, 100.0))
     local = _local(_words(PHRASE, 300.0))
-    result = SyncMatcher([_source()], [primary], local_indexes=[local]).match(
-        _request(approx=None)
-    )
+    result = SyncMatcher([_source()], [primary], local_indexes=[local]).match(_request(approx=None))
     assert result.strategy == "local_index_fallback"
     assert result.alternatives
     assert len(result.alternatives) <= MatcherConfig().max_alternatives
     # локальный лучший не дублируется среди альтернатив
     assert all(
-        not (alt.source_in_sec == result.source_in_sec and alt.source_out_sec == result.source_out_sec)
+        not (
+            alt.source_in_sec == result.source_in_sec
+            and alt.source_out_sec == result.source_out_sec
+        )
         for alt in result.alternatives
     )
 
@@ -309,9 +310,7 @@ def test_config_validation_of_new_options() -> None:
 # ------------------------------ загрузчик -------------------------------------
 
 
-def _write_local(
-    index_path: Path, words: list[dict[str, Any]] | None, **overrides: Any
-) -> Path:
+def _write_local(index_path: Path, words: list[dict[str, Any]] | None, **overrides: Any) -> Path:
     payload: dict[str, Any] = {
         "version": LOCAL_WORDS_VERSION,
         "model": "small",
@@ -319,7 +318,10 @@ def _write_local(
         "audio": {"size": 10, "mtime_ns": 1, "sample_sha256": "abc"},
         "words": words
         if words is not None
-        else [{"word": "привет", "start": 1.0, "end": 1.4}, {"word": "мир", "start": 1.5, "end": 1.9}],
+        else [
+            {"word": "привет", "start": 1.0, "end": 1.4},
+            {"word": "мир", "start": 1.5, "end": 1.9},
+        ],
     }
     payload.update(overrides)
     path = local_words_path(index_path, "s1")
@@ -398,7 +400,9 @@ def test_fingerprint_changes_when_local_index_appears_or_changes() -> None:
     local = _local([WordTimestamp("цитата", 10.0, 10.5)])
     with_local = api._sync_matching_fingerprint(**_fingerprint_arguments(local_indexes=[local]))
     assert with_local != without
-    assert with_local == api._sync_matching_fingerprint(**_fingerprint_arguments(local_indexes=[local]))
+    assert with_local == api._sync_matching_fingerprint(
+        **_fingerprint_arguments(local_indexes=[local])
+    )
 
     other = _local([WordTimestamp("другая", 10.0, 10.5)])
     assert (
