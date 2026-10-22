@@ -4,7 +4,7 @@ import { ids, appState, project } from "./state.js";
 import {
   toast, appendLog, escaped, formatMediaDuration, formatMediaSize,
   renderEtaCells, updateActionAvailability, isTransientPollingError,
-  pollingBackoffMs, postJSON, getJSON, optionalRequestJSON, safely,
+  pollingBackoffMs, postJSON, getJSON, optionalRequestJSON, confirmDialog, safely,
 } from "./core.js";
 import { loadSyncWorkspace } from "./sync.js";
 
@@ -276,7 +276,56 @@ async function scanStage3Media() {
   return startStage3Job("scan");
 }
 
-async function exportTimelineXml() {
+// Pre-export gate (docs/UIP_ATOM_AUDIT.md item 4): show what is about to be exported
+// and require an explicit confirmation while unchecked fragments or placeholders remain.
+async function confirmExportSummary() {
+  let summary;
+  try {
+    const status = await getJSON(`/stage1/status?project=${encodeURIComponent(project)}`);
+    summary = status.timeline_sync_summary;
+  } catch (err) {
+    appendLog(`Export XML: не удалось получить сводку сопоставления: ${err.message || err}`, "warn");
+    const proceed = await confirmDialog({
+      title: "Сводка сопоставления недоступна",
+      message: "Не удалось получить сводку сопоставления. Экспортировать без проверки?",
+      confirmLabel: "Экспортировать",
+      cancelLabel: "Отмена",
+      danger: true,
+    });
+    if (!proceed) appendLog("Export XML: отменён редактором до запуска", "warn");
+    return proceed;
+  }
+  if (!summary || typeof summary !== "object") return true;
+  const count = (key) => Number(summary[key]) || 0;
+  const review = count("needs_review");
+  const placeholders = count("not_found");
+  const warnings = Number.isFinite(appState.lastBuildWarningCount) ? appState.lastBuildWarningCount : null;
+  appendLog(
+    `Export XML: auto_matched=${count("auto_matched")}, confirmed=${count("confirmed")}, `
+    + `needs_review=${review}, not_found=${placeholders}`
+    + (warnings === null ? "" : `, build_warnings=${warnings}`),
+    review + placeholders > 0 ? "warn" : undefined,
+  );
+  if (review + placeholders === 0) return true;
+  const accepted = await confirmDialog({
+    title: "Экспорт XML с непроверенными фрагментами",
+    message:
+      `Экспортировать черновик: ${review} фрагментов требуют проверки и войдут заглушками, `
+      + `${placeholders} не найдено?\n`
+      + `Автосопоставлено: ${count("auto_matched")}, подтверждено: ${count("confirmed")}, `
+      + `требуют проверки (заглушки): ${review}, не найдено (заглушки): ${placeholders}`
+      + (warnings === null ? "" : `, предупреждений сборки: ${warnings}`) + ".",
+    confirmLabel: "Экспортировать",
+    cancelLabel: "Отмена",
+    danger: true,
+  });
+  if (!accepted) appendLog("Export XML: отменён редактором до запуска", "warn");
+  return accepted;
+}
+
+export async function exportTimelineXml() {
+  if (appState.stage3JobRunning || stage3MediaScanning) return undefined;
+  if (!(await confirmExportSummary())) return undefined;
   return startStage3Job("prepare");
 }
 

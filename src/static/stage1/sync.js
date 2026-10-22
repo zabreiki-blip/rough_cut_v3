@@ -261,6 +261,17 @@ function updateSyncAsrControls() {
     : "Выберите локальную модель Whisper";
 }
 
+// Reasons set by the matcher (docs/SYNC_MATCH_VERIFICATION.md) that send a match to review.
+const MATCH_REVIEW_REASON_LABELS = {
+  local_index_fallback: "Найдено только в локальной расшифровке — проверьте",
+  implausible_word_rate: "Слишком много слов за длительность фрагмента",
+  collapsed_word_times: "Таймкоды слов схлопнуты — границы недостоверны",
+  tail_truncated_vs_local: "По локальной расшифровке обрезан конец",
+  head_truncated_vs_local: "По локальной расшифровке обрезано начало",
+  range_disagrees_with_local: "Диапазон расходится с локальной расшифровкой",
+  local_text_mismatch: "На этом месте локальная расшифровка содержит другой текст",
+};
+
 function renderSyncMatches(document) {
   if (!ids.sync_review_list) return;
   const counts = syncCounts(document || {});
@@ -349,6 +360,15 @@ function renderSyncMatches(document) {
       ? `<div class="sync-match-llm">Текст совпал, но время слов в расшифровке приблизительное
           (не уточнено локальным Whisper). Проверьте границы по аудио и подтвердите вручную.</div>`
       : "";
+    const verificationHint = (() => {
+      const flags = Array.isArray(match.metadata?.plausibility_flags) ? match.metadata.plausibility_flags : [];
+      const labels = [match.metadata?.review_reason, ...flags]
+        .map((reason) => MATCH_REVIEW_REASON_LABELS[reason])
+        .filter(Boolean);
+      return [...new Set(labels)]
+        .map((text) => `<div class="sync-match-llm">${escaped(text)}.</div>`)
+        .join("");
+    })();
     const unmatchedReasons = {
       query_too_short: "Фраза слишком короткая для поиска по записи.",
       no_eligible_source: "Нет записи: для этого спикера ещё нет источника — реплика будет найдена после загрузки.",
@@ -422,6 +442,7 @@ function renderSyncMatches(document) {
         ${llmHint}
         ${retimeHint}
         ${timingHint}
+        ${verificationHint}
         ${unmatchedReason ? `<div class="sync-match-speaker-filter">${escaped(unmatchedReason)}</div>` : ""}
         ${speakerFilterHint}
         <div class="sync-match-meta" data-sync-meta>

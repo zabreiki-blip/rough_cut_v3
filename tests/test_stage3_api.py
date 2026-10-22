@@ -12,7 +12,7 @@ import pytest
 import api_stage3_routes
 from stage2.sync_models import SyncMatch, SyncSource
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
-from stage_common import sync_matches_fingerprint
+from stage_common import sync_matches_fingerprint, timeline_sync_summary
 
 
 class _ImmediateThread:
@@ -1013,3 +1013,126 @@ def test_stage3_legacy_shared_job_status_file_is_still_read(client) -> None:
     assert by_kind.get_json()["result"]["id"] == "legacyjob"
     assert restarted.get("/stage3/jobs/legacyjob?project=BRIK").status_code == 200
     assert restarted.get("/stage3/jobs/status?project=BRIK&kind=prepare").status_code == 404
+
+
+def test_timeline_sync_summary_counts_sync_segments_only() -> None:
+    def seg(kind: str, status: str, a: float = 0.0, b: float = 0.0, source: str = "s") -> dict:
+        return {
+            "id": f"{kind}-{status}-{a}-{source}",
+            "type": kind,
+            "match_status": status,
+            "source_id": source,
+            "source_in_sec": a,
+            "source_out_sec": b,
+        }
+
+    summary = timeline_sync_summary(
+        {
+            "segments": [
+                seg("zk", "confirmed", 1, 2),
+                seg("snh", "auto_matched", 1, 2),
+                seg("snh", "confirmed", 3, 4),
+                seg("host", "confirmed", 5, 6),
+                seg("snh", "needs_review", 1, 2),
+                seg("snh", "not_found"),
+                seg("snh", "confirmed", 2, 2),  # matched status but empty range = placeholder
+                seg("snh", "auto_matched", 1, 2, source=""),  # no source = placeholder
+                seg("snh", "", 1, 2),  # legacy empty status with a range is exported as matched
+                seg("snh", "", 0, 0),  # ... but without a range it is a placeholder
+                seg("life", "not_found"),
+            ]
+        }
+    )
+
+    assert summary == {
+        "total": 9,
+        "auto_matched": 1,
+        "confirmed": 2,
+        "matched_unlabeled": 1,
+        "needs_review": 1,
+        "not_found": 4,
+        "placeholders": 5,
+    }
+    assert timeline_sync_summary({}) == {
+        "total": 0,
+        "auto_matched": 0,
+        "confirmed": 0,
+        "matched_unlabeled": 0,
+        "needs_review": 0,
+        "not_found": 0,
+        "placeholders": 0,
+    }
+
+
+def test_timeline_sync_summary_agrees_with_exporter_placeholder_predicate() -> None:
+    from stage_common import is_exportable_match
+
+    statuses = ["", "auto_matched", "confirmed", "needs_review", "not_found", "weird"]
+    for kind in ("snh", "host", "zk"):
+        for status in statuses:
+            for source_id in ("s", ""):
+                for source_in, source_out in ((1.0, 2.0), (2.0, 2.0), (0.0, 0.0)):
+                    segment = {
+                        "type": kind,
+                        "match_status": status,
+                        "source_id": source_id,
+                        "source_in_sec": source_in,
+                        "source_out_sec": source_out,
+                    }
+                    summary = timeline_sync_summary({"segments": [segment]})
+                    if kind not in {"snh", "host"}:
+                        assert summary["total"] == 0
+                        continue
+                    exported = is_exportable_match(
+                        kind, status, source_id, source_in, source_out
+                    )
+                    assert summary["placeholders"] == (0 if exported else 1), segment
+                    # the dict-based placeholder pass in the route uses the same predicate
+                    replaced = api_stage3_routes._placeholder_unmapped_sources(
+                        {"segments": [segment]}, set()
+                    )[1]
+                    assert replaced == (1 if exported else 0), segment
+
+
+def test_prepare_result_reports_sync_summary_of_exported_timeline(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    segments = [
+        {
+            "id": "snh1",
+            "type": "snh",
+            "match_status": "needs_review",
+            "source_in_sec": 1.0,
+            "source_out_sec": 2.0,
+        },
+        {"id": "snh2", "type": "snh", "match_status": "not_found"},
+    ]
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps({"project": "BRIK", "normalization_revision": "norm-1", "segments": segments}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "scan_media_directory",
+        lambda *_a, **_k: {
+            "directory": "x",
+            "relative_directory": "x",
+            "recursive": False,
+            "sources": [],
+        },
+    )
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    assert response.get_json()["result"]["sync_summary"] == {
+        "total": 2,
+        "auto_matched": 0,
+        "confirmed": 0,
+        "matched_unlabeled": 0,
+        "needs_review": 1,
+        "not_found": 1,
+        "placeholders": 2,
+    }

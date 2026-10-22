@@ -478,6 +478,7 @@ export async function doBuildTimeline() {
   const summary = result.sync_summary || result;
   const hasSyncStats = [summary.matched, summary.review, summary.unmatched].some(Number.isFinite);
   const unresolved = (Number(summary.review) || 0) + (Number(summary.unmatched) || 0);
+  appState.lastBuildWarningCount = warnings.length;
   const hasPlaceholders = warnings.some((w) => /placeholder/i.test(String(w)));
   const isDraft = unresolved > 0 || hasPlaceholders;
   const stats = `ЗК=${zk}, Спикеры=${snh}, длит.=${Math.round(total_duration_sec)}с`;

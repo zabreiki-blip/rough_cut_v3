@@ -122,7 +122,8 @@ async function loadModules() {
   const tts = await import(moduleUrl("tts.js"));
   const revisions = await import(moduleUrl("revisions.js"));
   const usage = await import(moduleUrl("usage.js"));
-  return { state, core, normalization, sync, tts, revisions, usage };
+  const stage3 = await import(moduleUrl("stage3.js"));
+  return { state, core, normalization, sync, tts, revisions, usage, stage3 };
 }
 
 function testRestoredSpeakerDirectory({ state, tts }) {
@@ -1028,6 +1029,152 @@ async function testBuildTimelineSurfacesWarnings({ state, tts }) {
   }
 }
 
+// Matcher verification reasons (docs/SYNC_MATCH_VERIFICATION.md): every new
+// review_reason / plausibility flag must read as a Russian explanation on the card.
+async function testSyncMatchVerificationReasons({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+  const render = async (metadata) => {
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      const body = target.includes("/sync-matches")
+        ? { items: [{
+            segment_id: "snh9", status: "needs_review", speaker: "ИВАН", source_id: "media_a1",
+            source_in_sec: 1, source_out_sec: 4, metadata,
+          }] }
+        : { items: [] };
+      if (target.includes("/sync-jobs/status")) return { ok: false, status: 404, text: async () => "" };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: body }) };
+    };
+    await sync.loadSyncWorkspace(true);
+    return ids.sync_review_list.innerHTML;
+  };
+  const expected = {
+    local_index_fallback: "Найдено только в локальной расшифровке — проверьте",
+    implausible_word_rate: "Слишком много слов за длительность фрагмента",
+    collapsed_word_times: "Таймкоды слов схлопнуты — границы недостоверны",
+    tail_truncated_vs_local: "По локальной расшифровке обрезан конец",
+    head_truncated_vs_local: "По локальной расшифровке обрезано начало",
+    range_disagrees_with_local: "Диапазон расходится с локальной расшифровкой",
+    local_text_mismatch: "На этом месте локальная расшифровка содержит другой текст",
+  };
+  try {
+    for (const [reason, text] of Object.entries(expected)) {
+      const html = await render({ review_reason: reason });
+      assert.ok(html.includes(text), `${reason}: ${html}`);
+    }
+    // plausibility_flags rendered as a list; review_reason is not duplicated.
+    const html = await render({
+      review_reason: "tail_truncated_vs_local",
+      plausibility_flags: ["tail_truncated_vs_local", "range_disagrees_with_local"],
+    });
+    assert.strictEqual(html.split(expected.tail_truncated_vs_local).length - 1, 1, html);
+    assert.ok(html.includes(expected.range_disagrees_with_local), html);
+    // Unknown values and markup never reach the DOM raw.
+    const unknown = await render({ review_reason: "<b>x</b>", plausibility_flags: ["<i>y</i>"] });
+    assert.ok(!unknown.includes("<b>x</b>") && !unknown.includes("<i>y</i>"), unknown);
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+  }
+}
+
+// Audit item 4: the editor sees fragment counts and build warnings BEFORE export;
+// unresolved fragments need an explicit confirmation, cancel aborts the export.
+async function testExportXmlPreExportSummary({ state, stage3 }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalLog = ids.log_box.textContent;
+  const originalWarnings = appState.lastBuildWarningCount;
+  const originalRunning = appState.stage3JobRunning;
+  const calls = [];
+  let summary;
+  let statusFails = false;
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    calls.push(target);
+    if (target.includes("/stage1/status")) {
+      if (statusFails) return { ok: false, status: 500, json: async () => ({ ok: false, error: "status-down" }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { timeline_sync_summary: summary } }) };
+    }
+    // Stop the flow at job start; this test only covers the pre-export gate.
+    return { ok: false, status: 500, json: async () => ({ ok: false, error: "stop-after-start" }) };
+  };
+  const started = () => calls.some((url) => url.includes("/stage3/jobs/prepare/start"));
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const run = async (decision) => {
+    calls.length = 0;
+    ids.log_box.textContent = "";
+    ids.confirm_dialog_message.textContent = "";
+    const promise = stage3.exportTimelineXml().catch((err) => err);
+    for (let i = 0; i < 20 && !ids.confirm_dialog_message.textContent && !started(); i += 1) await settle();
+    const message = ids.confirm_dialog_message.textContent;
+    if (message && decision) {
+      const button = decision === "accept" ? ids.btn_confirm_dialog_accept : ids.btn_confirm_dialog_cancel;
+      button.onclick();
+    }
+    return { result: await promise, message, log: ids.log_box.textContent };
+  };
+  try {
+    appState.lastBuildWarningCount = 4;
+    summary = { total: 8, auto_matched: 3, confirmed: 2, needs_review: 2, not_found: 1 };
+
+    const cancelled = await run("cancel");
+    assert.ok(
+      cancelled.message.includes(
+        "Экспортировать черновик: 2 фрагментов требуют проверки и войдут заглушками, 1 не найдено?",
+      ),
+      cancelled.message,
+    );
+    assert.ok(/Автосопоставлено: 3/.test(cancelled.message) && /подтверждено: 2/.test(cancelled.message), cancelled.message);
+    assert.ok(cancelled.message.includes("предупреждений сборки: 4"), cancelled.message);
+    assert.ok(!started(), "cancel must abort before the export job starts");
+    assert.strictEqual(cancelled.result, undefined);
+    assert.ok(/Export XML.*needs_review=2.*not_found=1/.test(cancelled.log), cancelled.log);
+    assert.strictEqual(appState.stage3JobRunning, false);
+
+    const accepted = await run("accept");
+    assert.ok(started(), "accepted export must start the job");
+    assert.ok(accepted.result instanceof Error && /stop-after-start/.test(accepted.result.message));
+
+    // Nothing unresolved: no dialog, export proceeds, summary still logged.
+    summary = { total: 5, auto_matched: 3, confirmed: 2, needs_review: 0, not_found: 0 };
+    const clean = await run(null);
+    assert.strictEqual(clean.message, "", "clean timeline must not ask for confirmation");
+    assert.ok(started());
+    assert.ok(/auto_matched=3/.test(clean.log), clean.log);
+
+    // Old backend without the field: export is not blocked.
+    summary = undefined;
+    const legacy = await run(null);
+    assert.strictEqual(legacy.message, "");
+    assert.ok(started());
+
+    // Summary request failed: no silent export, the editor decides; cancel aborts.
+    statusFails = true;
+    const failedCancel = await run("cancel");
+    assert.ok(
+      failedCancel.message.includes("Не удалось получить сводку сопоставления. Экспортировать без проверки?"),
+      failedCancel.message,
+    );
+    assert.ok(!started(), "cancel must abort the export when the summary is unavailable");
+    assert.strictEqual(failedCancel.result, undefined);
+    assert.ok(/status-down/.test(failedCancel.log), failedCancel.log);
+    const failedAccept = await run("accept");
+    assert.ok(started(), "accepted export without a summary must start the job");
+    assert.ok(failedAccept.result instanceof Error && /stop-after-start/.test(failedAccept.result.message));
+    statusFails = false;
+  } finally {
+    globalThis.fetch = originalFetch;
+    ids.log_box.textContent = originalLog;
+    appState.lastBuildWarningCount = originalWarnings;
+    appState.stage3JobRunning = originalRunning;
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
@@ -1047,6 +1194,8 @@ async function main() {
     ["testRevisionsInbox", () => testRevisionsInbox(modules)],
     ["testRevisionImportTimeout", () => testRevisionImportTimeout(modules)],
     ["testBuildTimelineSurfacesWarnings", () => testBuildTimelineSurfacesWarnings(modules)],
+    ["testSyncMatchVerificationReasons", () => testSyncMatchVerificationReasons(modules)],
+    ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
   ];
 
   let passed = 0;

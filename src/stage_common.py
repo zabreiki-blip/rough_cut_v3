@@ -94,3 +94,68 @@ def _timeline_matches_are_current(timeline: dict, normalization: dict, match_sto
     except (OSError, ValueError):
         return False
     return stored == sync_matches_fingerprint(matches)
+
+
+MATCHED_STATUSES = frozenset({"", "auto_matched", "confirmed"})
+
+
+def is_exportable_match(
+    segment_type: object,
+    match_status: object,
+    source_id: object,
+    source_in_sec: object,
+    source_out_sec: object,
+) -> bool:
+    """True when the Stage 3 export cuts this fragment from a source (not a placeholder).
+
+    Single predicate shared by the exporter and the pre-export summary so they cannot
+    drift: an SNH/host fragment with a matched status (legacy empty status included),
+    a source id and a non-empty source range.
+    """
+    try:
+        has_range = float(source_out_sec or 0) > float(source_in_sec or 0)
+    except (TypeError, ValueError):
+        has_range = False
+    return bool(
+        segment_type in {"snh", "host"}
+        and str(match_status or "") in MATCHED_STATUSES
+        and source_id
+        and has_range
+    )
+
+
+def timeline_sync_summary(timeline: object) -> dict[str, int]:
+    """Count SNH/host fragments of a built timeline by how they will be exported.
+
+    ``needs_review`` and ``not_found`` fragments (and matched ones without a usable
+    source range) are exported as placeholders: ``placeholders`` is their sum.
+    A legacy empty status with a valid range is exported as a match
+    (``matched_unlabeled``).
+    """
+    counts = {
+        "total": 0,
+        "auto_matched": 0,
+        "confirmed": 0,
+        "matched_unlabeled": 0,
+        "needs_review": 0,
+        "not_found": 0,
+        "placeholders": 0,
+    }
+    segments = timeline.get("segments") if isinstance(timeline, dict) else None
+    for segment in segments if isinstance(segments, list) else []:
+        if not isinstance(segment, dict) or segment.get("type") not in {"snh", "host"}:
+            continue
+        counts["total"] += 1
+        status = str(segment.get("match_status") or "")
+        if is_exportable_match(
+            segment.get("type"),
+            status,
+            segment.get("source_id"),
+            segment.get("source_in_sec"),
+            segment.get("source_out_sec"),
+        ):
+            counts[status or "matched_unlabeled"] += 1
+        else:
+            counts["needs_review" if status == "needs_review" else "not_found"] += 1
+            counts["placeholders"] += 1
+    return counts

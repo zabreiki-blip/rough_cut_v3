@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -24,9 +25,11 @@ from stage_common import (
     _scenario_revision_matches,
     _timeline_is_current,
     _timeline_matches_are_current,
+    is_exportable_match,
+    timeline_sync_summary,
 )
 
-_MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
+_logger = logging.getLogger(__name__)
 _STAGE3_JOB_KINDS = ("scan", "prepare")
 _STAGE3_JOBS_MAX = 200
 _STAGE3_JOBS_TTL_SECONDS = 24 * 60 * 60
@@ -98,11 +101,12 @@ def _placeholder_unmapped_sources(data: dict, mapped_source_ids: set[str]) -> tu
         if not isinstance(segment, dict):
             continue
         source_id = str(segment.get("source_id") or "")
-        matched = (
-            segment.get("type") in {"snh", "host"}
-            and str(segment.get("match_status") or "") in _MATCHED_STATUSES
-            and source_id
-            and float(segment.get("source_out_sec") or 0) > float(segment.get("source_in_sec") or 0)
+        matched = is_exportable_match(
+            segment.get("type"),
+            segment.get("match_status"),
+            source_id,
+            segment.get("source_in_sec"),
+            segment.get("source_out_sec"),
         )
         if not matched or source_id in mapped_source_ids:
             continue
@@ -459,6 +463,15 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         raise Stage3OperationError(TIMELINE_MATCHES_CHANGED_ERROR, 409)
     if progress:
         progress(25, "Проверка доступных просмотровок")
+    sync_summary = timeline_sync_summary(timeline_data)
+    _logger.info(
+        "Stage 3 export %s: sync summary auto=%d confirmed=%d needs_review=%d not_found=%d",
+        project,
+        sync_summary["auto_matched"],
+        sync_summary["confirmed"],
+        sync_summary["needs_review"],
+        sync_summary["not_found"],
+    )
     catalog = _scan_project_media(project, paths, services)
     logical_catalog = _timeline_catalog(catalog)
     if not logical_catalog.get("sources"):
@@ -477,6 +490,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
                 if isinstance(segment, dict) and segment.get("type") in {"snh", "host", "life"}
             ),
             "source_mapping": [],
+            "sync_summary": sync_summary,
         }
     if progress:
         progress(50, "Подготовка заменяемых subsequence")
@@ -540,6 +554,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         "unmapped_source_ids": list(mapping.unmapped_source_ids),
         "placeholder_segments": placeholder_count,
         "source_mapping": _mapping_summary(mapping),
+        "sync_summary": sync_summary,
     }
 
 

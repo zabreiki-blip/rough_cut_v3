@@ -197,6 +197,7 @@ export const appState = {
   stage3SourceMapping: [],
   stage3JobRunning: false,
   timelineReady: Boolean(initialStatus.timeline_ready),
+  lastBuildWarningCount: null,
 };
 
 export const live = {

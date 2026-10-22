@@ -80,7 +80,11 @@ def test_stage3_headless_media_scan_contract() -> None:
     assert "/stage3/jobs/status?project=" in STAGE1_JS
     assert "stage3PollTimer = window.setTimeout" in STAGE1_JS
     assert "stage3JobRunning" in STAGE1_JS
-    assert 'async function exportTimelineXml() {\n  return startStage3Job("prepare");' in STAGE1_JS
+    assert (
+        "export async function exportTimelineXml() {" in STAGE1_JS
+        and "confirmExportSummary()" in STAGE1_JS
+        and 'return startStage3Job("prepare");' in STAGE1_JS
+    )
     assert "function exportTimelineXml()" in STAGE1_JS
     assert "ids.btn_export_xml.href" not in STAGE1_JS
     assert "stage3MediaScanAttempted" in STAGE1_JS
@@ -219,7 +223,7 @@ def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
     assert 'acceptBtn.classList.toggle("danger", Boolean(danger));' in STAGE1_JS
     assert "if (acceptBtn.disabled) return;" in STAGE1_JS
     assert "acceptBtn.disabled = true;" in STAGE1_JS
-    assert STAGE1_JS.count("await confirmDialog({") == 6
+    assert STAGE1_JS.count("await confirmDialog({") == 8
 
 
 def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None:

@@ -918,6 +918,55 @@ def test_semantic_review_selects_only_a_real_candidate_and_stays_manual():
     }
 
 
+def test_semantic_review_drops_stale_candidate_metadata_when_other_candidate_chosen():
+    original = SyncMatch(
+        segment_id="block-1",
+        query_text="длинная цитата сценария для смысловой проверки",
+        speaker="Спикер",
+        source_id="source-a",
+        source_in_sec=10.0,
+        source_out_sec=15.0,
+        confidence=0.62,
+        status="needs_review",
+        matched_text="первый вариант",
+        strategy="full_transcript",
+        alternatives=[SyncAlternative("source-a", 30.0, 37.0, 0.57, "второй вариант")],
+        metadata={
+            "plausibility_flags": ["tail_truncated_vs_local"],
+            "review_reason": "tail_truncated_vs_local",
+            "local_speech_in_sec": 10.0,
+            "local_speech_out_sec": 18.0,
+            "local_confidence": 0.9,
+            "speech_in_sec": 10.5,
+            "speech_out_sec": 14.5,
+            "gap_flags": ["large_time_gap"],
+            "timestamp_precision": "word",
+        },
+    )
+    candidates = api._semantic_review_candidates(original)
+    kwargs = {"llm_confidence": 0.9, "reason": "r", "model": "m"}
+
+    other = api._apply_semantic_review(original, candidates, 1, **kwargs)
+    for key in (
+        "plausibility_flags",
+        "review_reason",
+        "local_speech_in_sec",
+        "local_speech_out_sec",
+        "local_confidence",
+        "speech_in_sec",
+        "speech_out_sec",
+        "gap_flags",
+    ):
+        assert key not in other.metadata, key
+    assert other.metadata["timestamp_precision"] == "word"
+    assert other.status == "needs_review"
+    assert original.metadata["plausibility_flags"] == ["tail_truncated_vs_local"]
+
+    same = api._apply_semantic_review(original, candidates, 0, **kwargs)
+    assert same.metadata["plausibility_flags"] == ["tail_truncated_vs_local"]
+    assert same.metadata["speech_in_sec"] == 10.5
+
+
 def test_background_job_uses_llm_for_low_confidence_blocks_without_auto_confirming(
     sync_api,
 ) -> None:
@@ -1887,6 +1936,9 @@ def test_timeline_built_before_retime_flag_or_match_edit_requires_rebuild(sync_a
     assert client.get("/stage2/export/xml?project=demo").status_code == 200
     ready = client.get("/stage1/status?project=demo").get_json()["result"]["timeline_ready"]
     assert ready is True
+    status_result = client.get("/stage1/status?project=demo").get_json()["result"]
+    assert status_result["timeline_sync_summary"]["confirmed"] == 1
+    assert status_result["timeline_sync_summary"]["needs_review"] == 0
 
     # A later sync/retime pass flags the confirmed match: the built timeline still holds
     # the old interval as confirmed, so it must not be served until rebuilt.
@@ -1905,6 +1957,9 @@ def test_timeline_built_before_retime_flag_or_match_edit_requires_rebuild(sync_a
         assert client.post("/stage2/build", json={"project": "demo"}).status_code == 200
     segments = client.get("/stage2/timeline?project=demo").get_json()["result"]["segments"]
     assert segments[0]["match_status"] == "needs_review"
+    rebuilt = client.get("/stage1/status?project=demo").get_json()["result"]
+    assert rebuilt["timeline_sync_summary"]["needs_review"] == 1
+    assert rebuilt["timeline_sync_summary"]["confirmed"] == 0
 
     # A manual match edit after the build also invalidates the snapshot.
     assert client.patch("/stage2/sync-matches/stable-sync-uid", json=confirm).status_code == 200

@@ -19,10 +19,9 @@ import wave
 from xml.etree import ElementTree as ET
 
 from stage2.models import FullTimeline, TimelineSegment
+from stage_common import is_exportable_match
 
 logger = logging.getLogger(__name__)
-
-_MATCHED_STATUSES = {"", "auto_matched", "confirmed"}
 
 
 @dataclass(frozen=True)
@@ -244,12 +243,12 @@ def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> Non
         if segment.type != "tech":
             previous_end = segment.end_sec
 
-        has_range = segment.source_out_sec > segment.source_in_sec
-        matched = (
-            segment.type in {"snh", "host"}
-            and segment.match_status in _MATCHED_STATUSES
-            and bool(segment.source_id)
-            and has_range
+        matched = is_exportable_match(
+            segment.type,
+            segment.match_status,
+            segment.source_id,
+            segment.source_in_sec,
+            segment.source_out_sec,
         )
         if segment.match_status in {"auto_matched", "confirmed"} and not matched:
             raise ValueError(f"matched segment {segment.id} has no valid source range")
@@ -609,10 +608,12 @@ def build_nested_xml(
         if segment.type == "tech" or segment.duration_sec <= 0:
             continue
         entry = sequence_by_source.get(segment.source_id)
-        is_nested = entry is not None and (
-            segment.type in {"snh", "host"}
-            and segment.match_status in _MATCHED_STATUSES
-            and segment.source_out_sec > segment.source_in_sec
+        is_nested = entry is not None and is_exportable_match(
+            segment.type,
+            segment.match_status,
+            segment.source_id,
+            segment.source_in_sec,
+            segment.source_out_sec,
         )
         if is_nested and entry is not None:
             source, sequence_id, _, sequence_name = entry

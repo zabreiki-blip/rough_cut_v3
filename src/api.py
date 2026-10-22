@@ -123,7 +123,7 @@ from stage2.assembly_manifest import (
     validate_assembly_manifest,
 )
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
-from stage_common import _timeline_matches_are_current
+from stage_common import _timeline_matches_are_current, timeline_sync_summary
 from stage2.sync_transcript import (
     ingest_word_index,
     load_word_index,
@@ -688,6 +688,7 @@ def _build_status(project: str) -> dict:
                 timeline, confirmed_normalization, SyncMatchStore(paths["sync_matches"])
             )
         ),
+        "timeline_sync_summary": timeline_sync_summary(timeline),
         "openrouter_usage": _openrouter_usage_summary(project),
     }
 
