@@ -78,9 +78,9 @@ Silicon (`requirements-macos-apple-silicon.txt`, MLX) has a separate
 requirements surface and is not represented by the locks. A fully reproducible
 release would also need a digest-pinned base image.
 
-CI measures branch coverage for `src/` and enforces a 79% floor. The initial
-measured baseline on 2026-08-04 was 77.5%. New work should raise the floor
-gradually rather than introducing a large unreviewed test rewrite.
+CI measures branch coverage for `src/` and enforces an 85% floor
+(`pyproject.toml`, `[tool.coverage.report]`). New work should preserve this
+floor; change it only alongside an explicit coverage review.
 
 Ruff enforces correctness rules and the repository-wide formatting baseline.
 Both pre-commit and CI run `ruff check src tests`; pre-commit formats the same

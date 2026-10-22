@@ -601,8 +601,13 @@ Docker устанавливает `faster-whisper` и хранит модели 
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q
+pytest -q --cov=src --cov-report=term-missing
+ruff check src tests
+ruff format --check src tests
+mypy src
 node tests/cep_behavior_test.cjs
+node tests/stage1_behavior_test.cjs
+node tests/scroll_jump_test.cjs
 python -m compileall -q src tests
 docker compose config --quiet
 ```
@@ -760,5 +765,8 @@ curl -X POST http://localhost:8000/stage1/analyze \
   синхронизация → conform → XML).
 - [`docs/DEPENDENCY_POLICY.md`](docs/DEPENDENCY_POLICY.md) — политика
   зависимостей и поддерживаемых платформ (Docker, macOS Apple Silicon, CI).
+- [`docs/TECH_DEBT.md`](docs/TECH_DEBT.md) — текущие открытые задачи и проверки.
+- [`docs/GENERAL_AUDIT_2026-10-21.md`](docs/GENERAL_AUDIT_2026-10-21.md) —
+  находки аудита и статус последующих исправлений.
 - [`docs/archive/README.md`](docs/archive/README.md) — исторические аудиты,
   планы и исследования. Их выводы не являются текущим backlog.
