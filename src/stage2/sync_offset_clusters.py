@@ -238,6 +238,8 @@ def is_promotion_candidate(
         return False
     if metadata.get("timing_flags"):
         return False  # unrefined (interpolated) word times must stay under review
+    if metadata.get("plausibility_flags"):
+        return False  # implausible/inconsistent range (stage2.sync_matcher plausibility gates)
     return True
 
 

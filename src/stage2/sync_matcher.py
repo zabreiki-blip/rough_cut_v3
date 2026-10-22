@@ -6,9 +6,10 @@ import heapq
 import os
 import re
 import unicodedata
+from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from math import isfinite
 from typing import Any, Iterable
@@ -400,6 +401,20 @@ TIMING_UNREFINED_FLAG = "timing_unrefined"
 # provenance, kept as before).
 _UNRELIABLE_TIMESTAMP_PRECISIONS = frozenset({"interpolated"})
 
+# Timing plausibility flags (docs/SYNC_MATCH_VERIFICATION.md).
+IMPLAUSIBLE_WORD_RATE_FLAG = "implausible_word_rate"
+COLLAPSED_WORD_TIMES_FLAG = "collapsed_word_times"
+TAIL_TRUNCATED_FLAG = "tail_truncated_vs_local"
+HEAD_TRUNCATED_FLAG = "head_truncated_vs_local"
+RANGE_DISAGREES_FLAG = "range_disagrees_with_local"
+LOCAL_TEXT_MISMATCH_FLAG = "local_text_mismatch"
+LOCAL_FALLBACK_STRATEGY = "local_index_fallback"
+_LOCAL_INDEX_KIND = "local_whisper"
+_MIN_WORDS_FOR_RATE = 5
+_MIN_WORDS_FOR_COLLAPSE = 4
+_COLLAPSED_SHARE = 0.6
+_MIN_LOCAL_OVERLAP_SHARE = 0.5
+
 
 def _timing_gate_flags(index: WordIndex) -> list[str]:
     """``["timing_unrefined"]`` when the index word times are still interpolated.
@@ -501,6 +516,13 @@ class MatcherConfig:
     # A candidate stitched across a longer silence between neighbouring words
     # is not one continuous phrase and must be reviewed by an editor.
     max_internal_gap_sec: float = field(default_factory=_default_max_internal_gap_sec)
+    # Timing plausibility gates (see docs/SYNC_MATCH_VERIFICATION.md).
+    max_words_per_sec: float = 6.0
+    collapsed_word_sec: float = 0.03
+    # Tolerated disagreement of a match boundary with the local transcript.
+    local_boundary_tolerance_sec: float = 0.4
+    # A match found only in the local index is never auto-assembled by default.
+    local_fallback_auto: bool = False
 
     def __post_init__(self) -> None:
         if self.search_window_sec <= 0:
@@ -519,6 +541,14 @@ class MatcherConfig:
             raise ValueError("max_alternatives must not be negative")
         if not (isfinite(self.max_internal_gap_sec) and self.max_internal_gap_sec > 0):
             raise ValueError("max_internal_gap_sec must be positive")
+        for name in ("max_words_per_sec", "collapsed_word_sec"):
+            value = getattr(self, name)
+            if not (isfinite(value) and value > 0):
+                raise ValueError(f"{name} must be positive")
+        if not (
+            isfinite(self.local_boundary_tolerance_sec) and self.local_boundary_tolerance_sec >= 0
+        ):
+            raise ValueError("local_boundary_tolerance_sec must not be negative")
 
 
 @dataclass(frozen=True)
@@ -1341,12 +1371,49 @@ def _by_position(entry: tuple[int, int, _Candidate]) -> tuple[int, int]:
     return entry[0], entry[1]
 
 
+def _overlap_share(first: tuple[float, float], second: tuple[float, float]) -> float:
+    """Intersection as a share of the shorter range."""
+    shorter = min(first[1] - first[0], second[1] - second[0])
+    if shorter <= 0:
+        return 0.0
+    return max(0.0, min(first[1], second[1]) - max(first[0], second[0])) / shorter
+
+
+def _merge_alternatives(
+    first: Iterable[SyncAlternative],
+    second: Iterable[SyncAlternative],
+    *,
+    limit: int,
+    exclude: tuple[str, float | None, float | None] | None = None,
+) -> list[SyncAlternative]:
+    """``first`` then ``second``, dropping ranges that duplicate an earlier one."""
+    kept: list[SyncAlternative] = []
+    for item in [*first, *second]:
+        span = (item.source_in_sec, item.source_out_sec)
+        duplicate = any(
+            other.source_id == item.source_id
+            and _overlap_share(span, (other.source_in_sec, other.source_out_sec))
+            >= _DUPLICATE_MIN_OVERLAP_RATIO
+            for other in kept
+        )
+        if exclude is not None and exclude[1] is not None and exclude[2] is not None:
+            duplicate = duplicate or (
+                item.source_id == exclude[0]
+                and _overlap_share(span, (exclude[1], exclude[2])) >= _DUPLICATE_MIN_OVERLAP_RATIO
+            )
+        if not duplicate:
+            kept.append(item)
+    return kept[: max(0, limit)]
+
+
 class SyncMatcher:
     def __init__(
         self,
         sources: Iterable[SyncSource],
         indexes: Iterable[WordIndex],
         config: MatcherConfig | None = None,
+        *,
+        local_indexes: Iterable[WordIndex] | None = None,
     ):
         self.sources = {item.id: item for item in sources}
         self.indexes = {item.source_id: item for item in indexes}
@@ -1358,6 +1425,22 @@ class SyncMatcher:
             for source_id, source in self.sources.items()
         }
         self.config = config or MatcherConfig()
+        # Local-Whisper word indexes (same time base): a fallback search for phrases the
+        # primary index lacks and a cross-check of the chosen speech range.
+        self.local_indexes = {
+            item.source_id: item
+            for item in (local_indexes or ())
+            if item.source_id in self.sources and item.words
+        }
+        self._local_matcher_instance: SyncMatcher | None = None
+        self._sorted_words: dict[str, tuple[list[WordTimestamp], list[float]]] = {}
+
+    def _local_matcher(self) -> "SyncMatcher":
+        if self._local_matcher_instance is None:
+            self._local_matcher_instance = SyncMatcher(
+                self.sources.values(), self.local_indexes.values(), self.config
+            )
+        return self._local_matcher_instance
 
     def _eligible_sources(
         self, request: AlignmentRequest
@@ -1501,6 +1584,167 @@ class SyncMatcher:
         return selected, filtered
 
     def match(self, request: AlignmentRequest) -> SyncMatch:
+        result = self._search_match(request)
+        if (
+            result.status == "not_found"
+            and self.local_indexes
+            and result.metadata.get("unmatched_reason") in {"no_candidate", "below_review_threshold"}
+        ):
+            return self._local_fallback(request, result)
+        return result
+
+    def _local_fallback(self, request: AlignmentRequest, primary: SyncMatch) -> SyncMatch:
+        """Retry a weak/absent primary result against the local-Whisper index."""
+        # Speaker eligibility is decided on the primary sources; the local matcher only
+        # sees the ones that also have a local index (it must not re-filter a reduced set).
+        eligible, _filtered = self._eligible_sources(request)
+        source_ids = tuple(
+            source.id for source in eligible if source.id in self.local_indexes
+        )
+        if not source_ids:
+            return primary  # no local index for the eligible sources: nothing was tried
+        local_request = replace(request, source_ids=source_ids)
+        found = self._local_matcher()._search_match(local_request)
+        if found.metadata.get("unmatched_reason") in {"no_eligible_source", "query_too_short"}:
+            return primary
+        if found.status == "not_found":
+            primary.metadata["local_fallback_tried"] = True
+            primary.metadata["local_best_confidence"] = found.confidence
+            return primary
+        status: MatchStatus = (
+            "auto_matched"
+            if self.config.local_fallback_auto and found.status == "auto_matched"
+            else "needs_review"
+        )
+        metadata = dict(found.metadata)
+        metadata.update(
+            {
+                "index_kind": _LOCAL_INDEX_KIND,
+                "primary_confidence": primary.confidence,
+                "primary_unmatched_reason": primary.metadata.get("unmatched_reason"),
+                "local_search_strategy": found.strategy,
+            }
+        )
+        if status != "auto_matched":
+            metadata["review_reason"] = LOCAL_FALLBACK_STRATEGY
+        if "speaker_filtered_sources" in primary.metadata:
+            metadata.setdefault(
+                "speaker_filtered_sources", primary.metadata["speaker_filtered_sources"]
+            )
+        alternatives = _merge_alternatives(
+            found.alternatives,
+            primary.alternatives,
+            limit=self.config.max_alternatives,
+            exclude=(found.source_id, found.source_in_sec, found.source_out_sec),
+        )
+        return SyncMatch(
+            segment_id=found.segment_id,
+            query_text=found.query_text,
+            speaker=found.speaker,
+            approximate_timecode=found.approximate_timecode,
+            source_id=found.source_id,
+            source_in_sec=found.source_in_sec,
+            source_out_sec=found.source_out_sec,
+            confidence=found.confidence,
+            status=status,
+            matched_text=found.matched_text,
+            strategy=LOCAL_FALLBACK_STRATEGY,
+            alternatives=alternatives,
+            metadata=metadata,
+        )
+
+    def _words_in_range(self, source_id: str, start: float, end: float) -> list[WordTimestamp]:
+        """Index words inside a candidate range (candidate times include guide_offset)."""
+        cached = self._sorted_words.get(source_id)
+        if cached is None:
+            # The bisect below needs words ordered by start; do not rely on the caller.
+            ordered = sorted(self.indexes[source_id].words, key=lambda word: word.start)
+            cached = self._sorted_words[source_id] = (ordered, [word.start for word in ordered])
+        words, starts = cached
+        offset = self.sources[source_id].guide_offset_sec
+        low, high = start - offset - 1e-6, end - offset + 1e-6
+        result: list[WordTimestamp] = []
+        position = bisect_left(starts, low)
+        while position < len(words) and words[position].start <= high:
+            if words[position].end <= high:
+                result.append(words[position])
+            position += 1
+        return result
+
+    def _rate_flags(self, best: _Candidate) -> list[str]:
+        """Impossible speech density: too many words per second, or collapsed words."""
+        words = self._words_in_range(best.source_id, best.start, best.end)
+        count = len(words)
+        flags: list[str] = []
+        duration = best.end - best.start
+        if count >= _MIN_WORDS_FOR_RATE and (
+            duration <= 0 or count / duration > self.config.max_words_per_sec
+        ):
+            flags.append(IMPLAUSIBLE_WORD_RATE_FLAG)
+        if count >= _MIN_WORDS_FOR_COLLAPSE:
+            collapsed = sum(
+                1 for word in words if word.end - word.start <= self.config.collapsed_word_sec
+            )
+            if collapsed / count >= _COLLAPSED_SHARE:
+                flags.append(COLLAPSED_WORD_TIMES_FLAG)
+        return flags
+
+    def _local_consistency(
+        self, request: AlignmentRequest, best: _Candidate
+    ) -> tuple[list[str], dict[str, Any], SyncAlternative | None]:
+        """Cross-check the chosen speech range against the local transcript.
+
+        Only a near-timecode search around ``speech_in`` runs (no global fallback).
+        """
+        if best.source_id not in self.local_indexes:
+            return [], {}, None
+        probe = AlignmentRequest(
+            segment_id=request.segment_id,
+            text=request.text,
+            speaker=request.speaker,
+            approximate_timecode=best.start,
+            source_ids=(best.source_id,),
+            timecode_mode="relative",
+        )
+        found = self._local_matcher()._search_match(probe, global_fallback=False)
+        if found.status == "not_found":
+            reason = found.metadata.get("unmatched_reason")
+            # No local words around the range is absence of evidence, not a contradiction.
+            if reason == "below_review_threshold" and best.confidence >= self.config.auto_threshold:
+                return [LOCAL_TEXT_MISMATCH_FLAG], {"local_confidence": found.confidence}, None
+            return [], {}, None
+        local_in = float(found.metadata.get("speech_in_sec", best.start))
+        local_out = float(found.metadata.get("speech_out_sec", best.end))
+        tolerance = self.config.local_boundary_tolerance_sec
+        flags: list[str] = []
+        if local_out > best.end + tolerance:
+            flags.append(TAIL_TRUNCATED_FLAG)
+        if local_in < best.start - tolerance:
+            flags.append(HEAD_TRUNCATED_FLAG)
+        local_length = local_out - local_in
+        overlap = max(0.0, min(local_out, best.end) - max(local_in, best.start))
+        if local_length > 0 and overlap < _MIN_LOCAL_OVERLAP_SHARE * local_length:
+            flags.append(RANGE_DISAGREES_FLAG)
+        if not flags:
+            return [], {}, None
+        alternative = SyncAlternative(
+            best.source_id,
+            found.source_in_sec if found.source_in_sec is not None else local_in,
+            found.source_out_sec if found.source_out_sec is not None else local_out,
+            found.confidence,
+            found.matched_text,
+        )
+        return (
+            flags,
+            {
+                "local_speech_in_sec": round(local_in, 4),
+                "local_speech_out_sec": round(local_out, 4),
+                "local_confidence": found.confidence,
+            },
+            alternative,
+        )
+
+    def _search_match(self, request: AlignmentRequest, *, global_fallback: bool = True) -> SyncMatch:
         query = normalize_text(request.text)
         sources, speaker_filtered = self._eligible_sources(request)
 
@@ -1554,7 +1798,7 @@ class SyncMatcher:
                 )
 
         needs_fallback = False
-        if has_approx:
+        if has_approx and global_fallback:
             # Whether the global fallback runs depends only on the best local
             # candidate, so score locally until that is known.
             trigger = self.config.fallback_trigger
@@ -1649,6 +1893,11 @@ class SyncMatcher:
             self.indexes[best.source_id].metadata.get("timestamp_precision") or ""
         )
         timing_flags = _timing_gate_flags(self.indexes[best.source_id])
+        # Text similarity also says nothing about whether the range is physically
+        # plausible (collapsed word times) or complete (cut short vs the local transcript).
+        rate_flags = self._rate_flags(best)
+        local_flags, local_metadata, local_alternative = self._local_consistency(request, best)
+        plausibility_flags = [*rate_flags, *local_flags]
         # A strong global fallback is useful, but its disagreement with the
         # supplied timecode must remain visible to an editor.
         text_auto = (
@@ -1658,7 +1907,7 @@ class SyncMatcher:
             and not semantic_flags
             and not gap_flags
         )
-        auto = text_auto and not timing_flags
+        auto = text_auto and not timing_flags and not plausibility_flags
         status: MatchStatus = "auto_matched" if auto else "needs_review"
         alternatives = []
         for item in candidates[1 : 1 + self.config.max_alternatives]:
@@ -1672,13 +1921,23 @@ class SyncMatcher:
                     item.text,
                 )
             )
+        if local_alternative is not None and self.config.max_alternatives > 0:
+            alternatives = _merge_alternatives(
+                [local_alternative],
+                alternatives,
+                limit=self.config.max_alternatives,
+            )
         source_in, source_out = _padded_range(best, self.sources[best.source_id], self.config)
         timing_metadata: dict[str, object] = {
-            "timing_reliable": not timing_flags,
+            "timing_reliable": not timing_flags and not rate_flags,
             "timing_flags": timing_flags,
         }
         if text_auto and timing_flags:
             timing_metadata["review_reason"] = timing_flags[0]
+        if plausibility_flags:
+            timing_metadata.setdefault("review_reason", plausibility_flags[0])
+            timing_metadata["plausibility_flags"] = plausibility_flags
+            timing_metadata.update(local_metadata)
         return SyncMatch(
             segment_id=request.segment_id,
             query_text=request.text,

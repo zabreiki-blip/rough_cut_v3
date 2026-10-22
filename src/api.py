@@ -1482,10 +1482,11 @@ def _sync_matching_fingerprint(
     llm_threshold: float,
     llm_limit: int,
     scenario_revision_id: object = "",
+    local_indexes: list[WordIndex] | None = None,
 ) -> str:
     """Identify every durable input that can change a matching decision."""
     payload = {
-        "version": 4,
+        "version": 5,
         "normalization_revision": normalization_revision,
         "scenario_revision_id": str(scenario_revision_id or ""),
         "timecode_mode": timecode_mode,
@@ -1510,6 +1511,22 @@ def _sync_matching_fingerprint(
         # Hash the actual words, not only their count/duration. A manual word
         # correction or regenerated transcript must invalidate old decisions.
         "indexes": [item.to_dict() for item in indexes],
+        # Local-Whisper indexes feed the fallback search and the plausibility checks,
+        # so the appearance or change of one must recompute non-confirmed matches.
+        "local_indexes": [
+            {
+                "source_id": item.source_id,
+                "words": len(item.words),
+                "sha256": hashlib.sha256(
+                    json.dumps(
+                        [[word.word, word.start, word.end] for word in item.words],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+            for item in sorted(local_indexes or [], key=lambda value: value.source_id)
+        ],
     }
     encoded = json.dumps(
         payload,
@@ -1551,6 +1568,21 @@ def _semantic_review_candidates(match: SyncMatch) -> list[SemanticCandidate]:
     return candidates
 
 
+_CANDIDATE_SPECIFIC_METADATA_KEYS = (
+    "plausibility_flags",
+    "review_reason",
+    "local_speech_in_sec",
+    "local_speech_out_sec",
+    "local_confidence",
+    "speech_in_sec",
+    "speech_out_sec",
+    "gap_flags",
+    "max_internal_gap_sec",
+    "max_word_duration_sec",
+    "semantic_flags",
+)
+
+
 def _apply_semantic_review(
     match: SyncMatch,
     candidates: list[SemanticCandidate],
@@ -1573,6 +1605,14 @@ def _apply_semantic_review(
         if index != selected_index
     ]
     metadata = dict(match.metadata)
+    if (selected.source_id, selected.source_in_sec, selected.source_out_sec) != (
+        match.source_id,
+        match.source_in_sec,
+        match.source_out_sec,
+    ):
+        # Range-specific diagnostics describe the replaced candidate, not the chosen one.
+        for key in _CANDIDATE_SPECIFIC_METADATA_KEYS:
+            metadata.pop(key, None)
     metadata["llm_semantic_review"] = {
         "selected_candidate": selected_index,
         "confidence": round(llm_confidence, 4),

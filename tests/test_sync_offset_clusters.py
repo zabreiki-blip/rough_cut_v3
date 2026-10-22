@@ -198,6 +198,7 @@ def test_apply_uses_guide_offset_coordinates_and_display_timecode() -> None:
         {"semantic_flags": ["number_mismatch"]},
         {"gap_flags": ["large_time_gap"]},
         {"timing_flags": ["timing_unrefined"]},
+        {"plausibility_flags": ["collapsed_word_times"]},
         {"strategy": "near_timecode"},
         {"strategy": "llm_semantic_review"},
         {"approx": ""},

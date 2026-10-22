@@ -15,6 +15,7 @@ from stage2.match_retiming import (
     load_retime_map,
     retime_map_path,
 )
+from stage2.match_verification import load_local_word_index
 from stage2.sync_models import AlignmentRequest, TimecodeMode
 from stage2.sync_offset_clusters import (
     DEFAULT_AUTO_THRESHOLD,
@@ -358,6 +359,27 @@ def _review_match(
     return match
 
 
+def _load_local_indexes(ctx: SyncMatchContext, indexes: Sequence[Any]) -> list[Any]:
+    """Local-Whisper word indexes (``<source_id>.local_words.json``) of the indexed sources."""
+    if ctx.word_index_path is None:
+        return []
+    loaded: list[Any] = []
+    for index in indexes:
+        source_id = index.source_id
+        try:
+            local = load_local_word_index(
+                ctx.word_index_path(ctx.paths, source_id), source_id, primary_index=index
+            )
+        except Exception:  # an unreadable cache only disables the extra checks
+            ctx.logger.warning(
+                "Sync job=%s: local words of %s unreadable", ctx.job_id, source_id, exc_info=True
+            )
+            continue
+        if local is not None:
+            loaded.append(local)
+    return loaded
+
+
 def run_match_phase(
     ctx: SyncMatchContext,
     sources: Sequence[Any],
@@ -416,7 +438,15 @@ def run_match_phase(
         preserve_whole_uids=confirmed_parent_ids,
     )
     matcher_config = ctx.matcher_config_cls(search_window_sec=ctx.search_window_sec)
-    matcher = ctx.matcher_cls(matching_sources, indexes, matcher_config)
+    local_indexes = _load_local_indexes(ctx, indexes)
+    # The kwarg is passed only when local indexes exist, so matchers without the option
+    # (and projects without local_words.json files) behave exactly as before.
+    matcher = ctx.matcher_cls(
+        matching_sources,
+        indexes,
+        matcher_config,
+        **({"local_indexes": local_indexes} if local_indexes else {}),
+    )
     auto_threshold = float(getattr(matcher_config, "auto_threshold", DEFAULT_AUTO_THRESHOLD))
     offset_cluster_config = OffsetClusterConfig.from_env(getenv)
     settings = ctx.get_settings()
@@ -495,6 +525,7 @@ def run_match_phase(
         units=units,
         sources=matching_sources,
         indexes=indexes,
+        local_indexes=local_indexes,
         normalization_revision=normalization_revision,
         timecode_mode=ctx.timecode_mode,
         search_window_sec=ctx.search_window_sec,
