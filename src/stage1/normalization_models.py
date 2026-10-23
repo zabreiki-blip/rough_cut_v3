@@ -65,6 +65,14 @@ class NormalizedBlock:
     source: str = DecisionSource.UNKNOWN.value
     confidence: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    # Exact warning strings explicitly cleared by a reviewer. Kept separately
+    # so a same-source re-run does not recreate already resolved warnings.
+    reviewed_warnings: list[str] = field(default_factory=list)
+    # Tracks reviewer edits to any editable block field without changing the
+    # classification source used by the learning pipeline.
+    manually_edited: bool = False
+    # Server-maintained field-level overrides for same-source regeneration.
+    manual_fields: list[str] = field(default_factory=list)
     memory_rule_id: int | None = None
     suggested_type: str = ""
     suggested_label: str = ""

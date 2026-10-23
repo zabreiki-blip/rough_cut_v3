@@ -541,6 +541,49 @@ class NormalizationApiTest(unittest.TestCase):
         with NormalizationMemory(self.memory) as memory:
             self.assertEqual(memory.list_rules(scope="marker"), [])
 
+    def test_confirm_preview_reports_validation_and_tts_projection(self) -> None:
+        source = self._source()
+        generated = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "demo", "input_path": str(source), "use_llm": False},
+        ).get_json()["result"]
+        blocks = generated["blocks"]
+        bad = dict(blocks[0], normalized_text="СНХ Первый закадровый блок.")
+        bad["text_for_tts"] = "СНХ Первый закадровый блок."
+        saved = self.client.put(
+            "/stage1/normalization",
+            json={"project": "demo", "revision": 1, "blocks": [bad, *blocks[1:]]},
+        ).get_json()["result"]
+        normalized_path = self.projects / "demo" / "work" / "scenario_normalized.json"
+        before = normalized_path.read_bytes()
+
+        preview = self.client.post(
+            "/stage1/normalization/confirm/preview",
+            json={"project": "demo", "revision": saved["revision"]},
+        )
+
+        self.assertEqual(preview.status_code, 200, preview.get_json())
+        result = preview.get_json()["result"]
+        self.assertEqual(result["revision"], saved["revision"])
+        self.assertIn("candidates", result)
+        blocking = [i for i in result["validation"] if i["severity"] == "error"]
+        self.assertIn("service_label_in_tts", {i["code"] for i in blocking})
+        hit = [i for i in blocking if i["code"] == "service_label_in_tts"]
+        self.assertEqual([i["uid"] for i in hit], [bad["uid"]])
+        self.assertEqual(set(hit[0]), {"code", "uid", "order", "message", "severity"})
+        self.assertEqual(
+            result["tts_preview"],
+            [
+                {
+                    "uid": bad["uid"],
+                    "order": bad["order"],
+                    "text_for_tts": bad["text_for_tts"],
+                }
+            ],
+        )
+        self.assertEqual(normalized_path.read_bytes(), before, "preview must stay read-only")
+        self.assertFalse((self.projects / "demo" / "work" / "scenario_prepared.json").exists())
+
     def test_defective_block_cannot_be_confirmed_by_any_request(self) -> None:
         source = self._source()
         generated = self.client.post(
@@ -548,8 +591,8 @@ class NormalizationApiTest(unittest.TestCase):
             json={"project": "demo", "input_path": str(source), "use_llm": False},
         ).get_json()["result"]
         blocks = generated["blocks"]
-        bad = dict(blocks[0], normalized_text="ЗК14 Первый закадровый блок.")
-        bad["text_for_tts"] = "ЗК14 Первый закадровый блок."
+        bad = dict(blocks[0], normalized_text="СНХ Первый закадровый блок.")
+        bad["text_for_tts"] = "СНХ Первый закадровый блок."
         defective = [bad, *blocks[1:]]
 
         # 1. Save the defect, then confirm it plainly.
@@ -626,6 +669,125 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.get_json())
         with NormalizationMemory(self.memory) as memory:
             self.assertEqual(memory.list_rules(scope="marker"), [])
+
+    def _history_project(self) -> tuple[dict, Path]:
+        """generate, edit, confirm, regenerate, edit again.
+
+        History then holds the confirmed revision (edited text); the current draft differs.
+        """
+        source = self._source()
+        generate = {"project": "demo", "input_path": str(source), "use_llm": False}
+        draft = self.client.post("/stage1/normalization/generate", json=generate).get_json()[
+            "result"
+        ]
+        draft["blocks"][0]["normalized_text"] = "Исправленный текст."
+        saved = self.client.put(
+            "/stage1/normalization",
+            json={"project": "demo", "revision": 1, "blocks": draft["blocks"]},
+        ).get_json()["result"]
+        confirmed = self.client.post(
+            "/stage1/normalization/confirm",
+            json={"project": "demo", "revision": saved["revision"]},
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
+        regenerated = self.client.post("/stage1/normalization/generate", json=generate)
+        self.assertEqual(regenerated.status_code, 200, regenerated.get_json())
+        current = regenerated.get_json()["result"]
+        current["blocks"][1]["normalized_text"] = "Другой ответ героя."
+        edited = self.client.put(
+            "/stage1/normalization",
+            json={"project": "demo", "revision": current["revision"], "blocks": current["blocks"]},
+        )
+        self.assertEqual(edited.status_code, 200, edited.get_json())
+        return edited.get_json()["result"], source
+
+    def _first_snapshot(self) -> dict:
+        response = self.client.get("/stage1/normalization/history?project=demo")
+        self.assertEqual(response.status_code, 200, response.get_json())
+        return response.get_json()["history"][0]
+
+    def test_history_lists_snapshots_without_filesystem_paths(self) -> None:
+        self._history_project()
+
+        response = self.client.get("/stage1/normalization/history?project=demo")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        items = response.get_json()["history"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            sorted(items[0]),
+            ["blocks", "confirmed_at", "created_at", "name", "revision", "status"],
+        )
+        self.assertEqual(items[0]["status"], "confirmed")
+        self.assertNotIn(self.temp.name, json.dumps(response.get_json()))
+        self.assertNotIn("path", items[0])
+        empty = self.client.get("/stage1/normalization/history?project=empty")
+        self.assertEqual(empty.get_json()["history"], [])
+
+    def test_history_diff_and_error_statuses(self) -> None:
+        self._history_project()
+        name = self._first_snapshot()["name"]
+
+        ok = self.client.get(f"/stage1/normalization/history/{name}/diff?project=demo")
+
+        self.assertEqual(ok.status_code, 200, ok.get_json())
+        result = ok.get_json()["result"]
+        self.assertIn("summary", result)
+        self.assertTrue([c for c in result["changes"] if c["status"] != "unchanged"])
+        bad = self.client.get("/stage1/normalization/history/evil.json/diff?project=demo")
+        self.assertEqual(bad.status_code, 400)
+        missing = self.client.get(
+            "/stage1/normalization/history/20000101T000000000000Z_rev1.json/diff?project=demo"
+        )
+        self.assertEqual(missing.status_code, 404)
+
+    def test_history_restore_makes_draft_and_keeps_prepared(self) -> None:
+        current, _ = self._history_project()
+        prepared = self.projects / "demo" / "work" / "scenario_prepared.json"
+        prepared_before = prepared.read_bytes()
+        name = self._first_snapshot()["name"]
+        url = f"/stage1/normalization/history/{name}/restore"
+        revision = current["revision"]
+
+        no_revision = self.client.post(url, json={"project": "demo"})
+        self.assertEqual(no_revision.status_code, 400)
+        conflict = self.client.post(url, json={"project": "demo", "expected_revision": 1})
+        self.assertEqual(conflict.status_code, 409)
+        bad_name = self.client.post(
+            "/stage1/normalization/history/evil.json/restore",
+            json={"project": "demo", "expected_revision": revision},
+        )
+        self.assertEqual(bad_name.status_code, 400)
+        missing = self.client.post(
+            "/stage1/normalization/history/20000101T000000000000Z_rev1.json/restore",
+            json={"project": "demo", "expected_revision": revision},
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        response = self.client.post(url, json={"project": "demo", "expected_revision": revision})
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        restored = response.get_json()["result"]
+        self.assertEqual(restored["status"], "draft")
+        self.assertEqual(restored["revision"], revision + 1)
+        self.assertEqual(restored["blocks"][0]["normalized_text"], "Исправленный текст.")
+        self.assertNotEqual(restored["blocks"][1]["normalized_text"], "Другой ответ героя.")
+        self.assertEqual(prepared.read_bytes(), prepared_before)
+        loaded = self.client.get("/stage1/normalization?project=demo").get_json()["result"]
+        self.assertEqual(loaded["status"], "draft")
+        self.assertEqual(loaded["revision"], revision + 1)
+
+    def test_history_restore_source_changed_is_409(self) -> None:
+        current, source = self._history_project()
+        name = self._first_snapshot()["name"]
+        source.write_text("ДИКТОР: Совсем другой текст.\n", encoding="utf-8")
+
+        response = self.client.post(
+            f"/stage1/normalization/history/{name}/restore",
+            json={"project": "demo", "expected_revision": current["revision"]},
+        )
+
+        self.assertEqual(response.status_code, 409, response.get_json())
 
 
 if __name__ == "__main__":

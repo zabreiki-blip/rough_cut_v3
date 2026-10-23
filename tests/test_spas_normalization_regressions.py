@@ -333,7 +333,7 @@ _GATE_IDS = [case["id"] for case in _SAVED]
 
 
 _EXPECTED_CODES = {
-    "zk_label_in_tts": {"service_label_in_tts"},
+    "snh_label_in_tts": {"service_label_in_tts"},
     "false_hero_from_cue": {"false_hero_from_cue"},
     "life_description_broken_by_timecode": {"timecode_in_role", "timecode_remnant_in_text"},
     "role_contains_timecode": {"timecode_in_role", "timecode_remnant_in_text"},
@@ -482,3 +482,33 @@ def test_sync_label_with_only_caps_words_gets_no_invented_speech() -> None:
     (block,) = _parse_paragraphs(["СНХ ИВАН ПЕТРОВ"])
     assert block["speaker"] in ("", "ИВАН ПЕТРОВ")
     assert block["text_for_tts"] == ""
+
+
+_UNLABELED_CREDIT_WARNING = "sync credit without СНХ label: check manually"
+
+
+def test_unlabeled_credit_with_source_mark_keeps_whole_credit_and_source() -> None:
+    (block,) = _normalize(
+        "ИГУМЕН ИМЯ (ФАМИЛИЯ) ИСХ АВТОР ИМЯ ФАМИЛИЯ 00.35:30 речь продолжается здесь."
+    )
+    assert block["type"] == "sync" and block["speaker"] == "ИГУМЕН ИМЯ (ФАМИЛИЯ)"
+    assert block["source_description"] == "АВТОР ИМЯ ФАМИЛИЯ"
+    assert block["timecode_start"] == "00:35:30"
+    assert _frags(block) == [("речь продолжается здесь.", "00:35:30", "")]
+    assert _UNLABELED_CREDIT_WARNING in block["warnings"]
+
+
+def test_unlabeled_credit_without_source_mark_keeps_bracketed_credit() -> None:
+    (block,) = _normalize("ИГУМЕН ИМЯ (ФАМИЛИЯ) 00.35:30 речь продолжается здесь.")
+    assert block["type"] == "sync" and block["speaker"] == "ИГУМЕН ИМЯ (ФАМИЛИЯ)"
+    assert block["source_description"] == ""
+    assert _frags(block) == [("речь продолжается здесь.", "00:35:30", "")]
+    assert _UNLABELED_CREDIT_WARNING in block["warnings"]
+
+
+def test_unlabeled_plain_caps_credit_and_headings_are_unchanged() -> None:
+    sync, heading = _normalize(
+        "ИГУМЕН ИМЯ ФАМИЛИЯ 00.35:30 речь продолжается здесь.", "ИСТОРИЯ ОДНОГО МОНАСТЫРЯ"
+    )
+    assert sync["speaker"] == "ИГУМЕН ИМЯ ФАМИЛИЯ" and sync["warnings"] == []
+    assert heading["type"] != "sync" and heading["speaker"] == ""

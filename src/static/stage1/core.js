@@ -229,7 +229,11 @@ export async function requestJSON(url, method, payload) {
   if (!response.ok || data.ok === false) {
     const plainText = raw && !raw.trimStart().startsWith("<") ? raw.trim().slice(0, 500) : "";
     const detail = data.message || data.error || plainText;
-    throw new Error(detail || `HTTP ${response.status}: сервер прервал запрос без JSON-ответа`);
+    const failure = new Error(detail || `HTTP ${response.status}: сервер прервал запрос без JSON-ответа`);
+    failure.status = response.status;
+    // Structured reasons (e.g. 422 confirmation issues) stay available to callers.
+    failure.payload = data;
+    throw failure;
   }
   if (raw && Object.keys(data).length === 0) {
     throw new Error(`HTTP ${response.status}: сервер вернул некорректный JSON`);

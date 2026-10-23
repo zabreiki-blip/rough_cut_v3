@@ -60,6 +60,11 @@ from typing import Iterable, Mapping, Sequence
 
 from .normalization_memory import normalize_marker
 
+# Bump whenever the structural parse (labels, author numbers, timecodes,
+# technical cues) changes behaviour.  It is part of the LLM cache fingerprint,
+# so a cached answer produced for an older, wrong parse is never reused.
+STRUCTURE_PARSER_VERSION = 1
+
 # Core label -> block type candidates.  ``normalizer`` passes its own, wider
 # table (``_BUILTIN_MARKERS`` + ``_TECH_MARKERS``); this one covers the
 # families the pure functions must understand on their own.
@@ -183,6 +188,34 @@ class ParagraphStructure:
     @property
     def has_label_conflict(self) -> bool:
         return "label_conflict" in self.metadata
+
+
+_ZK_FAMILY_MARKERS = frozenset({"зк", "з к", "zk"})
+
+
+def is_zk_label(label_raw: str) -> bool:
+    """True for the voiceover marker family ``ЗК`` / ``З.К.`` / ``зк`` / ``ZK``."""
+    return normalize_marker(label_raw) in _ZK_FAMILY_MARKERS
+
+
+def strip_leading_zk_label(text: str) -> str:
+    """Drop a leading ``ЗК`` voiceover label (with number and separator) from ``text``.
+
+    The label marks a voiceover block and is not speech, so it never belongs in
+    TTS.  The "number vs speech" rule of ``parse_paragraph`` decides what is part
+    of the label (``ЗК14: Текст`` -> ``Текст``, ``ЗК 1915 год`` keeps the year).
+    The rest of the text is returned unchanged; text without a leading label, an
+    ambiguous ``ЗК СНХ ...`` or a label with no speech after it is left as is.
+    """
+    structure = parse_paragraph(text)
+    if (
+        not structure.label_raw
+        or not is_zk_label(structure.label_raw)
+        or structure.has_label_conflict
+        or not structure.speech
+    ):
+        return text
+    return text[structure.speech_start :]
 
 
 def match_author_number(text: str, pos: int) -> tuple[str, int] | None:

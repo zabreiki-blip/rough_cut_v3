@@ -8,7 +8,15 @@ from types import ModuleType
 from flask import Flask, jsonify, request
 
 from cost_budget import CostBudget, CostBudgetExceeded
-from stage1.normalizer import invalidate_video_cue_seed_cache
+from stage1.normalization_models import NormalizedScenario
+from stage1.normalizer import (
+    _prepared_projection,
+    diff_normalization_snapshot,
+    list_normalization_history,
+    restore_normalization_snapshot,
+    invalidate_video_cue_seed_cache,
+    validate_for_confirmation_detailed,
+)
 
 
 def _resolve_tts_direction(services: ModuleType, payload: dict, provider: str | None):
@@ -334,6 +342,46 @@ def _stage1_normalization_confirm(services: ModuleType):
     return jsonify({"ok": True, "project": project, "result": result})
 
 
+def _stage1_normalization_history(services: ModuleType):
+    try:
+        project = services._resolve_project_name(request.args.get("project"))
+        paths = services._ensure_project(project)
+        # ``path`` is a server filesystem location; the UI addresses snapshots by name only.
+        history = [
+            {key: value for key, value in item.items() if key != "path"}
+            for item in list_normalization_history(paths["normalized"])
+        ]
+    except Exception as exc:
+        return services._normalization_exception(exc)
+    return jsonify({"ok": True, "project": project, "history": history})
+
+
+def _stage1_normalization_history_diff(services: ModuleType, name: str):
+    try:
+        project = services._resolve_project_name(request.args.get("project"))
+        paths = services._ensure_project(project)
+        result = diff_normalization_snapshot(paths["normalized"], name)
+    except Exception as exc:
+        return services._normalization_exception(exc)
+    return jsonify({"ok": True, "project": project, "result": result})
+
+
+def _stage1_normalization_history_restore(services: ModuleType, name: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        project = services._resolve_project_name(payload.get("project"))
+        paths = services._ensure_project(project)
+        revision_value = payload.get("expected_revision", payload.get("revision"))
+        if revision_value is None:
+            return services._json_error("expected_revision is required", 400)
+        result = restore_normalization_snapshot(
+            paths["normalized"], name, expected_revision=int(revision_value)
+        )
+    except Exception as exc:
+        return services._normalization_exception(exc)
+    return jsonify({"ok": True, "project": project, "result": result})
+
+
 def _stage1_normalization_learning_preview(services: ModuleType):
     payload = request.get_json(silent=True) or {}
     try:
@@ -356,9 +404,32 @@ def _stage1_normalization_learning_preview(services: ModuleType):
             "result": {
                 "revision": int(revision_value),
                 "candidates": candidates,
+                **_confirmation_preview(services.load_normalization(paths["normalized"])),
             },
         }
     )
+
+
+def _confirmation_preview(document: dict) -> dict:
+    """Read-only view of what confirming the current draft would do.
+
+    ``validation`` is the detailed confirmation check
+    (``{code, uid, order, message, severity}``); ``tts_preview`` lists the blocks
+    that would be voiced, exactly as the prepared projection would publish them.
+    """
+    scenario = NormalizedScenario.from_dict(document)
+    orders = {block.uid: block.order for block in scenario.blocks}
+    return {
+        "validation": validate_for_confirmation_detailed(scenario),
+        "tts_preview": [
+            {
+                "uid": item["block_uid"],
+                "order": orders.get(item["block_uid"], 0),
+                "text_for_tts": item["text_for_tts"],
+            }
+            for item in _prepared_projection(scenario)["items"]
+        ],
+    }
 
 
 def _stage1_normalization_memory_get(services: ModuleType):
@@ -944,6 +1015,19 @@ def register_stage1_routes(app: Flask, services: ModuleType) -> None:
     @serialize_project_mutation
     def stage1_normalization_confirm():
         return _stage1_normalization_confirm(services)
+
+    @app.get("/stage1/normalization/history")
+    def stage1_normalization_history():
+        return _stage1_normalization_history(services)
+
+    @app.get("/stage1/normalization/history/<name>/diff")
+    def stage1_normalization_history_diff(name: str):
+        return _stage1_normalization_history_diff(services, name)
+
+    @app.post("/stage1/normalization/history/<name>/restore")
+    @serialize_project_mutation
+    def stage1_normalization_history_restore(name: str):
+        return _stage1_normalization_history_restore(services, name)
 
     @app.post("/stage1/normalization/confirm/preview")
     def stage1_normalization_learning_preview():

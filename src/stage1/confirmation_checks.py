@@ -16,6 +16,7 @@ from typing import Any, Callable
 from .scenario_structure import (
     ParagraphStructure,
     find_structural_timecodes,
+    is_zk_label,
     normalize_timecode_value,
 )
 
@@ -88,16 +89,34 @@ def _words(text: str) -> list[str]:
     return [_fold(match.group(0)) for match in _WORD.finditer(text)]
 
 
-def check_service_label_in_tts(block: Any, structure_of: StructureOf) -> list[tuple[str, str]]:
+def check_service_label_in_tts(block: Any, structure_of: StructureOf) -> list[tuple[str, str, str]]:
+    """Service label at the start of voiced TTS as ``(code, message, severity)``.
+
+    A leading ``ЗК`` label only marks the voiceover and the sanitizer removes it
+    from TTS, so it is a warning -- but only when the sanitizer can really remove
+    it.  A label conflict (``ЗК СНХ воздух``) or a bare label is left in place on
+    purpose and would be voiced, so it blocks, like any other service label
+    (``СНХ``, ``ЛАЙФ``, ``СТЕНДАП``, ``ПОДВОДКА``).
+    """
+    # Only a voiceover block that is not absorbed is actually voiced: the prepared
+    # projection (the only TTS input) contains nothing else.  sync/host/life/
+    # technical blocks may carry a TTS string, but it is silent and never exported.
+    if block.type != "voiceover" or block.absorbed_by_uid:
+        return []
     tts = str(block.text_for_tts or "")
-    if not tts.strip() or block.absorbed_by_uid:
+    if not tts.strip():
         return []
     head = structure_of(tts)
     if head.label in _SERVICE_LABELS and (head.author_number or head.label_raw.isupper()):
+        removable = (
+            is_zk_label(head.label_raw) and not head.has_label_conflict and bool(head.speech)
+        )
+        severity = WARNING if removable else ERROR
         return [
             (
                 SERVICE_LABEL_IN_TTS,
                 f"Block {block.order} has a service label '{head.label_raw}' in its TTS text",
+                severity,
             )
         ]
     return []
@@ -181,7 +200,26 @@ def check_lost_splice(block: Any) -> list[tuple[str, str]]:
     ]
 
 
-def check_unmatched_speech(block: Any, structure_of: StructureOf) -> list[tuple[str, str]]:
+_SPEECH_FIELDS = frozenset({"normalized_text", "text_for_tts"})
+
+
+def _speech_edited_by_human(block: Any) -> bool:
+    """True when a reviewer deliberately authored the block's speech text."""
+    fields = set(getattr(block, "manual_fields", None) or [])
+    if fields & _SPEECH_FIELDS:
+        return True
+    # Legacy manual blocks pin every reviewed field without listing them.  The
+    # block stores no pre-edit text (only proposed_type/label/source), so a real
+    # text change cannot be told from an untouched one here; the downgrade to a
+    # warning is kept for them deliberately.
+    return block.source == "manual" and not fields
+
+
+def check_unmatched_speech(block: Any, structure_of: StructureOf) -> list[tuple[str, str, str]]:
+    """Lost-speech findings as ``(code, message, severity)``.
+
+    A deliberate manual shortening is only a warning; automatic loss blocks.
+    """
     if block.type not in {"voiceover", "sync", "life", "host"} or block.absorbed_by_uid:
         return []
     original = block.original_text
@@ -213,17 +251,21 @@ def check_unmatched_speech(block: Any, structure_of: StructureOf) -> list[tuple[
                 UNMATCHED_SPEECH,
                 f"Block {block.order} lost {len(missing)} of {len(words)} spoken words "
                 f"(e.g. '{missing[0]}')",
+                WARNING if _speech_edited_by_human(block) else ERROR,
             )
         ]
     return []
 
 
-def structural_checks(block: Any, structure_of: StructureOf) -> list[tuple[str, str]]:
-    """All blocking structural defects of one block as ``(code, message)``."""
-    return [
-        *check_service_label_in_tts(block, structure_of),
+def structural_checks(block: Any, structure_of: StructureOf) -> list[tuple[str, str, str]]:
+    """Structural defects of one block as ``(code, message, severity)``."""
+    plain = [
         *check_timecode_in_fields(block),
         *check_false_hero(block),
         *check_lost_splice(block),
+    ]
+    return [
+        *check_service_label_in_tts(block, structure_of),
+        *((code, message, ERROR) for code, message in plain),
         *check_unmatched_speech(block, structure_of),
     ]

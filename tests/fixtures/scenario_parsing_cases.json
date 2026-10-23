@@ -260,17 +260,17 @@
   ],
   "saved_state_cases": [
     {
-      "id": "zk_label_in_tts",
+      "id": "snh_label_in_tts",
       "task": 5,
       "defect": "service label reaches TTS text",
       "bad": [
         {
           "uid": "fx-1",
           "order": 1,
-          "original_text": "ЗК14 В том году…",
-          "normalized_text": "ЗК14 В том году…",
+          "original_text": "СНХ В том году…",
+          "normalized_text": "СНХ В том году…",
           "type": "voiceover",
-          "text_for_tts": "ЗК14 В том году…",
+          "text_for_tts": "СНХ В том году…",
           "original_label": "",
           "source": "llm",
           "confidence": 1.0
@@ -280,7 +280,7 @@
         {
           "uid": "fx-1",
           "order": 1,
-          "original_text": "ЗК14 В том году…",
+          "original_text": "СНХ В том году…",
           "normalized_text": "В том году…",
           "type": "voiceover",
           "text_for_tts": "В том году…",

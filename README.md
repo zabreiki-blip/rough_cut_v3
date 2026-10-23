@@ -465,6 +465,9 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 | POST | `/stage1/normalization/confirm` | `stage1_normalization_confirm` |
 | POST | `/stage1/normalization/confirm/preview` | `stage1_normalization_learning_preview` |
 | POST | `/stage1/normalization/generate` | `stage1_normalization_generate` |
+| GET | `/stage1/normalization/history` | `stage1_normalization_history` |
+| GET | `/stage1/normalization/history/<name>/diff` | `stage1_normalization_history_diff` |
+| POST | `/stage1/normalization/history/<name>/restore` | `stage1_normalization_history_restore` |
 | GET, POST | `/stage1/normalization/memory` | `stage1_normalization_memory_create`, `stage1_normalization_memory_get` |
 | DELETE, PATCH | `/stage1/normalization/memory/<int:rule_id>` | `stage1_normalization_memory_delete`, `stage1_normalization_memory_update` |
 | POST | `/stage1/normalization/reset` | `stage1_normalization_reset` |

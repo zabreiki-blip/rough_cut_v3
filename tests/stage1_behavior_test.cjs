@@ -1393,9 +1393,463 @@ function testNormalizationWarningLocations({ state, normalization }) {
   }
 }
 
+async function testNormalizationWarningReview({ state, normalization }) {
+  const { appState, ids } = state;
+  const h = normalizationRaceHarness({ state });
+  const originalFetch = globalThis.fetch;
+  const originalPath = ids.normalization_input_path.value;
+  try {
+    const headingWarning = "all-caps section heading treated as technical (not spoken): check manually";
+    const transitionWarning = "leading '+' splice continues previous block: check manually";
+    h.reset("original", 8);
+    appState.normalization.blocks = [
+      { uid: "a", order: 1, type: "technical", original_text: "ЛИНИЯ НИКИТЫ", warnings: [headingWarning, transitionWarning] },
+      { uid: "b", order: 2, type: "unknown", warnings: ["LLM returned an unknown type"] },
+    ];
+    normalization.renderNormalization();
+    const clickReview = (index, warningIndex) => {
+      const card = { dataset: { index: String(index) } };
+      const button = { dataset: { action: "review-warning", warningIndex: String(warningIndex) }, closest: () => card };
+      ids.normalization_blocks.dispatch("click", { target: { closest: () => button } });
+    };
+    clickReview(0, 0);
+    assert.deepStrictEqual(appState.normalization.blocks[0].warnings, [transitionWarning], "review acknowledges only the selected warning");
+    assert.strictEqual(appState.normalization.blocks[0].original_text, "ЛИНИЯ НИКИТЫ");
+    assert.strictEqual(appState.normalizationDirty, true);
+    clickReview(1, 0);
+    assert.strictEqual(appState.normalization.blocks[1].warnings.length, 1, "unknown type still needs a decision");
+    clickReview(0, 0);
+    assert.ok(!ids.normalization_warnings.innerHTML.includes("ЛИНИЯ"));
+    assert.ok(ids.norm_issue_position.textContent.includes("1 из 1"), "reviewed block leaves the review queue, unknown block stays");
+
+    const calls = [];
+    ids.normalization_input_path.value = "/app/scenario.txt";
+    globalThis.fetch = async (url, options = {}) => {
+      calls.push({ url: String(url), method: options.method, body: JSON.parse(options.body || "{}") });
+      if (options.method === "PUT") return h.jsonResponse({ ok: true, result: { ...appState.normalization, revision: 9 } });
+      return h.jsonResponse({ ok: true, result: { id: "job", status: "completed", result: { ...appState.normalization, revision: 10 } } });
+    };
+    await normalization.generateNormalization();
+    assert.strictEqual(calls[0].method, "PUT", "save review decisions before regenerating");
+    assert.deepStrictEqual(calls[0].body.blocks[0].warnings, []);
+    assert.ok(calls[1].url.endsWith("/normalization-jobs/start"));
+    assert.strictEqual(appState.normalization.revision, 10);
+    assert.strictEqual(appState.normalizationDirty, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    ids.normalization_input_path.value = originalPath;
+    h.restore();
+  }
+}
+
+async function testNormalizationEditDuringGenerate({ state, normalization }) {
+  const h = normalizationRaceHarness({ state });
+  const originalPath = state.ids.normalization_input_path.value;
+  try {
+    h.reset("original", 8);
+    state.ids.normalization_input_path.value = "/app/scenario.txt";
+    const response = h.deferred();
+    globalThis.fetch = async () => response.promise;
+    const done = normalization.generateNormalization();
+    await h.settle();
+    state.appState.normalization.blocks[0].text_for_tts = "new text during generation";
+    normalization.markNormalizationDirty();
+    response.resolve(h.jsonResponse({ ok: true, result: { id: "job", status: "completed", result: h.doc("original", 9) } }));
+    await done;
+    assert.strictEqual(state.appState.normalization.revision, 9);
+    assert.strictEqual(state.appState.normalization.blocks[0].text_for_tts, "new text during generation");
+    assert.strictEqual(state.appState.normalizationDirty, true);
+  } finally {
+    state.ids.normalization_input_path.value = originalPath;
+    h.restore();
+  }
+}
+
+function testTypeDecisionKeepsUnrelatedWarnings({ state, normalization }) {
+  const h = normalizationRaceHarness({ state });
+  try {
+    h.reset("original", 1);
+    const timeWarning = "Ambiguous timecode '00:30.00' read as 00:30:00: check manually";
+    state.appState.normalization.blocks = [{
+      uid: "a", order: 1, type: "unknown", normalized_text: "Рассказ героя.",
+      warnings: ["Ambiguous label combination 'ЗК СНХ': check the block type manually", timeWarning],
+    }];
+    const card = { dataset: { index: "0" }, querySelector: () => null };
+    normalization.updateBlockFromControl({ dataset: { field: "type" }, value: "sync", closest: () => card });
+    assert.strictEqual(state.appState.normalization.blocks[0].type, "sync");
+    assert.deepStrictEqual(state.appState.normalization.blocks[0].warnings, [timeWarning], "choosing a type does not confirm a timecode");
+  } finally {
+    h.restore();
+  }
+}
+
+const cyrillic = /[а-яё]/i;
+const cardsOf = (ids) => ids.normalization_blocks.children.filter((item) => item.dataset && item.dataset.uid !== undefined);
+const cardFor = (ids, uid) => cardsOf(ids).filter((item) => item.dataset.uid === uid).pop();
+const issueOf = (code, order, message, severity = "error", uid = "a") => ({ code, uid, order, message, severity });
+
+// Plan section 6: preview summary before confirm, blocking issues never reach /confirm.
+async function testConfirmPreviewSummaryAndBlocking({ state, normalization }) {
+  const { ids, appState } = state;
+  const h = normalizationRaceHarness({ state });
+  globalThis.requestAnimationFrame = globalThis.requestAnimationFrame || ((fn) => fn());
+  try {
+    const calls = [];
+    let validation = [
+      issueOf("service_label_in_tts", 1, "Block 1 has a service label 'ЗК № 3' in its TTS text"),
+      issueOf("scene_opener_changed", 2, "scene opener changed: check reply type", "warning", "b"),
+    ];
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/normalization/confirm/preview")) {
+        return h.jsonResponse({ ok: true, result: { candidates: [], validation, tts_preview: [{ uid: "a", order: 1, text_for_tts: "x" }] } });
+      }
+      if (target.includes("/normalization/confirm")) return h.jsonResponse({ ok: true, result: h.doc("ok", 6, "confirmed") });
+      if (target.includes("/normalization/memory")) return h.jsonResponse({ ok: true, result: [] });
+      return h.jsonResponse({ ok: true, result: { normalization_confirmed: true, normalization_status: "confirmed" } });
+    };
+    h.reset("original", 5);
+    appState.normalization.blocks = [
+      { uid: "a", order: 1, type: "voiceover", normalized_text: "ЗК № 3 текст", text_for_tts: "ЗК № 3 текст" },
+      { uid: "b", order: 2, type: "life", normalized_text: "Лайф" },
+    ];
+    ids.normalization_blocks.children = [];
+    await assert.rejects(normalization.confirmNormalization(), /Подтверждение не отправлено/);
+    assert.ok(!calls.some((url) => url.endsWith("/normalization/confirm")), "blocking issue must not send confirm");
+    const html = ids.normalization_confirm_summary.innerHTML;
+    assert.strictEqual(ids.normalization_confirm_summary.hidden, false);
+    assert.strictEqual(ids.normalization_confirm_summary.dataset.state, "blocked");
+    assert.ok(html.includes("В озвучку пойдёт блоков: <b>1</b>"), html);
+    assert.ok(html.includes("Блокирующих ошибок: <b>1</b>"), html);
+    assert.ok(html.includes("служебная метка"), "reason must be in Russian");
+    assert.ok(html.includes('data-goto-uid="a"') && html.includes("Предупреждения (1)"), html);
+    assert.ok(html.includes("Начало сцены изменилось"), html);
+    assert.ok(ids.norm_issue_position.textContent.includes("из"), "blocked block joins the review queue");
+
+    // Navigation to the reason's block highlights it like the issue navigation does.
+    ids.normalization_blocks.children = [];
+    ids.normalization_confirm_summary.dispatch("click", { target: { closest: () => ({ dataset: { gotoUid: "b" } }) } });
+    assert.ok(cardFor(ids, "b").className.includes("is-active-issue"), "goto highlights the block");
+    assert.ok(!cardFor(ids, "a").className.includes("is-active-issue"));
+
+    // Only warnings: summary is shown and confirm proceeds.
+    validation = [issueOf("scene_opener_changed", 2, "scene opener changed: check reply type", "warning", "b")];
+    h.reset("original", 5);
+    calls.length = 0;
+    await normalization.confirmNormalization();
+    assert.ok(calls.some((url) => url.endsWith("/normalization/confirm")), "no blocking issues: confirm is sent");
+    assert.strictEqual(ids.normalization_confirm_summary.dataset.state, "ok");
+    assert.strictEqual(appState.normalization.status, "confirmed");
+  } finally {
+    h.restore();
+  }
+}
+
+// A rejected confirm (422) shows structured reasons; new codes never fall back to raw text.
+async function testConfirmRejectedShowsRussianReasons({ state, normalization }) {
+  const { ids, appState } = state;
+  const h = normalizationRaceHarness({ state });
+  try {
+    const messages = [
+      ["service_label_in_tts", "Block 1 has a service label 'ЗК № 3' in its TTS text"],
+      ["timecode_in_role", "Block 1 has a timecode fragment in role: 'Герой (00:1'"],
+      ["timecode_remnant_in_text", "Block 1 normalized_text starts with a timecode remnant: ') слово'"],
+      ["false_hero_from_cue", "Block 1 speaker 'Титры' is a technical cue, not a person"],
+      ["lost_splice", "Block 1 lost the explicit '+' splice: no fragment starts at 00:10:05"],
+      ["unmatched_speech", "Block 1 lost 5 of 9 spoken words (e.g. 'слово')"],
+      ["unknown_type", "Block 1 has unknown type"],
+      ["sync_no_speaker", "Sync block 1 has no speaker"],
+    ];
+    const issues = messages.map(([code, message]) => issueOf(code, 1, message));
+    for (const issue of issues) {
+      const text = normalization.describeIssue(issue);
+      assert.notStrictEqual(text, issue.message, `${issue.code}: raw fallback`);
+      assert.ok(cyrillic.test(text) && !/Block \d/.test(text), `${issue.code}: ${text}`);
+    }
+    assert.ok(normalization.describeIssue(issues[1]).includes("Роль / должность"));
+    assert.ok(normalization.describeIssue(issues[4]).includes("00:10:05"));
+    assert.ok(normalization.describeIssue(issues[5]).includes("5 из 9"));
+
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      if (target.includes("/normalization/confirm/preview")) return h.jsonResponse({ ok: true, result: { candidates: [] } });
+      if (target.includes("/normalization/confirm")) {
+        return { ok: false, status: 422, text: async () => JSON.stringify({
+          ok: false, error: "normalization_validation_failed", message: "Block 1 has a service label", issues, codes: [] }) };
+      }
+      throw new Error(`unexpected fetch ${target}`);
+    };
+    h.reset("original", 5);
+    appState.normalization.blocks[0].uid = "a";
+    await assert.rejects(normalization.confirmNormalization(), /Сервер отклонил подтверждение: ошибок 8/);
+    const html = ids.normalization_confirm_summary.innerHTML;
+    assert.ok(html.includes("сервер отклонил подтверждение") && html.includes('data-goto-uid="a"'), html);
+    assert.ok(html.includes("служебная метка") && html.includes("Потерян фрагмент склейки"), html);
+    assert.ok(!html.includes("has a service label"), "server English message must not be shown");
+    assert.strictEqual(appState.normalization.status, "draft", "rejected confirm leaves the draft unconfirmed");
+
+    // Warnings without a dedicated hint are still translated (no `return raw` fallback).
+    appState.normalization.blocks = [{ uid: "w", order: 1, type: "life", warnings: [
+      "scene opener changed: check reply type",
+      "long dash paragraph joined to the LIFE scene as a reply: check manually",
+      "reply joined to the previous SYNC scene; speaker is not stated: check manually",
+      "leading '+' splice has no previous LIFE/SYNC block to continue: check manually",
+    ] }];
+    normalization.renderNormalization();
+    const warningHtml = ids.normalization_warnings.innerHTML;
+    assert.ok(warningHtml.includes("Начало сцены изменилось") && warningHtml.includes("Длинный абзац с тире"), warningHtml);
+    assert.ok(warningHtml.includes("говорящий не указан") && warningHtml.includes("склейку «+»"), warningHtml);
+    assert.ok(!/check manually|check reply type/.test(warningHtml), warningHtml);
+  } finally {
+    h.restore();
+  }
+}
+
+function testSyncFragmentEditing({ state, normalization }) {
+  const { ids, appState } = state;
+  const h = normalizationRaceHarness({ state });
+  try {
+    h.reset("original", 1);
+    appState.normalization.blocks = [
+      { uid: "op", order: 1, type: "sync", speaker: "Орлов", normalized_text: "Один два три", timecode_start: "00:00:10", timecode_end: "00:00:20",
+        sync_fragments: [{ text: "Один два три", timecode_start: "00:00:10", timecode_end: "00:00:20" }], warnings: [] },
+      { uid: "re", order: 2, type: "life", scene_uid: "op", normalized_text: "Реплика" },
+    ];
+    ids.normalization_blocks.children = [];
+    normalization.renderNormalization();
+    assert.ok(cardFor(ids, "op").innerHTML.includes('data-action="add-fragment"'), "sync block offers adding a fragment");
+    const replyHtml = cardFor(ids, "re").innerHTML;
+    assert.ok(replyHtml.includes("Сцена: блок #1 (") && replyHtml.includes("Орлов"), replyHtml);
+    assert.ok(replyHtml.includes('data-action="goto-scene"') && replyHtml.includes('data-goto-uid="op"'), replyHtml);
+    assert.ok(!cardFor(ids, "op").innerHTML.includes("Сцена:"), "scene opener has no scene label");
+
+    const block = () => appState.normalization.blocks[0];
+    const click = (action, { fragment, cursor } = {}) => {
+      const card = { dataset: { index: "0" } };
+      const row = fragment == null ? null : {
+        dataset: { fragmentIndex: String(fragment) },
+        querySelector: () => ({ selectionStart: cursor }),
+      };
+      const button = { dataset: { action }, closest: (selector) => (selector === ".normalization-block" ? card : row) };
+      ids.normalization_blocks.dispatch("click", { target: { closest: () => button } });
+    };
+    appState.normalizationDirty = false;
+    click("add-fragment");
+    assert.strictEqual(block().sync_fragments.length, 2);
+    assert.deepStrictEqual(block().sync_fragments[1], { text: "", timecode_start: "", timecode_end: "" });
+    assert.strictEqual(appState.normalizationDirty, true, "adding a fragment marks the draft changed");
+
+    block().sync_fragments[1].text = "Четыре";
+    appState.normalizationDirty = false;
+    click("split-fragment", { fragment: 0, cursor: 4 });
+    assert.deepStrictEqual(block().sync_fragments.map((f) => f.text), ["Один", "два три", "Четыре"]);
+    assert.strictEqual(block().sync_fragments[0].timecode_start, "00:00:10");
+    assert.strictEqual(block().sync_fragments[1].timecode_start, "", "tail awaits its own timecode");
+    assert.strictEqual(block().normalized_text, "Один два три Четыре");
+    assert.strictEqual(appState.normalizationDirty, true);
+
+    appState.normalizationDirty = false;
+    click("split-fragment", { fragment: 0, cursor: 0 });
+    click("split-fragment", { fragment: 0, cursor: 4 });
+    assert.strictEqual(block().sync_fragments.length, 3, "cursor at an edge does not split");
+    assert.strictEqual(appState.normalizationDirty, false);
+
+    click("delete-fragment", { fragment: 1 });
+    assert.deepStrictEqual(block().sync_fragments.map((f) => f.text), ["Один", "Четыре"]);
+    click("delete-fragment", { fragment: 1 });
+    assert.strictEqual(block().sync_fragments.length, 1);
+    click("delete-fragment", { fragment: 0 });
+    assert.strictEqual(block().sync_fragments.length, 1, "the last fragment cannot be deleted");
+    assert.strictEqual(block().normalized_text, "Один");
+    assert.ok(cardFor(ids, "op").innerHTML.includes('data-action="add-fragment"'));
+
+    // Scene jump from the reply card.
+    const jump = { dataset: { action: "goto-scene", gotoUid: "op" }, closest: () => ({ dataset: { index: "1" } }) };
+    ids.normalization_blocks.children = [];
+    ids.normalization_blocks.dispatch("click", { target: { closest: () => jump } });
+    assert.ok(cardFor(ids, "op").className.includes("is-active-issue"));
+  } finally {
+    h.restore();
+  }
+}
+
+function testGroupReviewOnlySelectedBlocks({ state, normalization }) {
+  const { ids, appState } = state;
+  const h = normalizationRaceHarness({ state });
+  try {
+    h.reset("original", 1);
+    const warn = () => ["leading '+' splice continues previous block: check manually"];
+    appState.normalization.blocks = [
+      { uid: "a", order: 1, type: "life", warnings: warn() },
+      { uid: "b", order: 2, type: "life", warnings: warn() },
+      { uid: "c", order: 3, type: "unknown", warnings: ["LLM returned an unknown type"] },
+    ];
+    normalization.renderNormalization();
+    assert.strictEqual(ids.btn_norm_group_review.disabled, true, "no selection: group action unavailable");
+    appState.normalizationDirty = false;
+    ids.btn_norm_group_review.dispatch("click");
+    assert.strictEqual(appState.normalization.blocks[0].warnings.length, 1, "nothing selected: nothing changes");
+    assert.strictEqual(appState.normalizationDirty, false);
+
+    const tick = (uid, checked) => ids.normalization_blocks.dispatch("change", {
+      target: { dataset: { selectBlock: "" }, checked, closest: () => ({ dataset: { uid } }) },
+    });
+    tick("a", true);
+    tick("c", true);
+    assert.strictEqual(ids.norm_selected_count.textContent, "2");
+    assert.strictEqual(ids.btn_norm_group_review.disabled, false);
+    tick("c", false);
+    tick("c", true);
+    ids.btn_norm_group_review.dispatch("click");
+    const [a, b, c] = appState.normalization.blocks;
+    assert.deepStrictEqual(a.warnings, [], "selected block is reviewed");
+    assert.strictEqual(b.warnings.length, 1, "unselected block is untouched");
+    assert.strictEqual(c.warnings.length, 1, "unknown type still needs a decision");
+    assert.strictEqual(appState.normalizationDirty, true);
+    assert.strictEqual(ids.norm_selected_count.textContent, "0", "selection is cleared after the action");
+    assert.strictEqual(ids.btn_norm_group_review.disabled, true);
+  } finally {
+    h.restore();
+  }
+}
+
+async function testNormalizationHistoryDiffRestore({ state, normalization }) {
+  const h = normalizationRaceHarness({ state });
+  const { ids, appState } = state;
+  const name = "20260101T120000000000Z_rev3.json";
+  const calls = [];
+  const confirmNow = () => ids.btn_confirm_dialog_accept.onclick();
+  const install = ({ restoreGate = null } = {}) => {
+    calls.length = 0;
+    globalThis.fetch = async (url, options = {}) => {
+      const target = String(url);
+      const method = options.method || "GET";
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ method, target, body });
+      if (target.includes("/normalization/history/") && target.includes("/diff")) {
+        return h.jsonResponse({
+          ok: true,
+          result: {
+            summary: { unchanged: 1, edited: 1 },
+            snapshot: { revision: 3, status: "confirmed", blocks: 2 },
+            current: { revision: 5, status: "draft", blocks: 2 },
+            changes: [
+              { status: "unchanged", old_index: 0, new_index: 0, old_type: "voiceover", new_type: "voiceover", old_speaker: "", new_speaker: "", old_text: "same", new_text: "same" },
+              { status: "edited", old_index: 1, new_index: 1, old_type: "sync", new_type: "sync", old_speaker: "", new_speaker: "", old_text: "<b>старый</b>", new_text: "новый" },
+            ],
+          },
+        });
+      }
+      if (target.includes("/normalization/history/") && target.includes("/restore")) {
+        if (restoreGate) await restoreGate.promise;
+        return h.jsonResponse({ ok: true, result: h.doc("restored", body.expected_revision + 1) });
+      }
+      if (target.includes("/normalization/history")) {
+        return h.jsonResponse({
+          ok: true,
+          history: [{ name, revision: 3, status: "confirmed", created_at: "2026-01-01T10:00:00+00:00", confirmed_at: "", blocks: 2 }],
+        });
+      }
+      if (method === "PUT" && target.includes("/stage1/normalization")) {
+        return h.jsonResponse({ ok: true, result: h.doc("saved edit", body.revision + 1) });
+      }
+      if (target.includes("/stage1/normalization?")) {
+        return h.jsonResponse({ ok: true, result: h.doc("restored", 6) });
+      }
+      if (target.includes("/stage1/status")) {
+        return h.jsonResponse({ ok: true, result: { normalization_confirmed: false, normalization_status: "draft" } });
+      }
+      throw new Error(`testNormalizationHistoryDiffRestore: unexpected fetch ${method} ${target}`);
+    };
+  };
+  try {
+    // List -> diff, with HTML in block text escaped.
+    h.reset("original", 5);
+    install();
+    ids.normalization_history_panel.hidden = true;
+    await normalization.toggleNormalizationHistory();
+    assert.strictEqual(ids.normalization_history_panel.hidden, false);
+    assert.ok(calls[0].target.includes("/stage1/normalization/history?project="));
+    const listHtml = ids.normalization_history_list.innerHTML;
+    assert.ok(listHtml.includes(name) && listHtml.includes("Ревизия 3") && listHtml.includes("подтверждён"));
+    assert.ok(listHtml.includes("01.01.2026 12:00") && listHtml.includes("блоков: 2"));
+    assert.ok(!listHtml.includes("path"), "filesystem paths are never shown");
+    const item = { dataset: { name } };
+    const button = { dataset: { historyAction: "diff" }, closest: () => item };
+    ids.normalization_history_list.dispatch("click", { target: { closest: () => button } });
+    await h.settle();
+    const diffHtml = ids.normalization_history_diff.innerHTML;
+    assert.strictEqual(ids.normalization_history_diff.hidden, false);
+    assert.ok(diffHtml.includes("Блок 2") && diffHtml.includes("изменён текст"));
+    assert.ok(diffHtml.includes("&lt;b&gt;старый&lt;/b&gt;") && !diffHtml.includes("<b>старый"));
+    assert.ok(!diffHtml.includes("Блок 1"), "unchanged blocks are not listed");
+
+    // Declined confirmation: nothing is sent.
+    install();
+    let done = normalization.restoreNormalizationSnapshot(name);
+    ids.btn_confirm_dialog_cancel.onclick();
+    await done;
+    assert.strictEqual(calls.length, 0);
+    assert.strictEqual(appState.normalization.revision, 5);
+
+    // Clean restore: sent with the current revision, draft reloaded, never eligible.
+    install();
+    appState.normalizationEligible = true;
+    done = normalization.restoreNormalizationSnapshot(name);
+    confirmNow();
+    await done;
+    const restoreCall = calls.find((call) => call.target.includes("/restore"));
+    assert.strictEqual(restoreCall.method, "POST");
+    assert.deepStrictEqual(restoreCall.body, { project: state.project, expected_revision: 5 });
+    assert.ok(!calls.some((call) => call.method === "PUT"), "no save without unsaved edits");
+    assert.ok(calls.some((call) => call.method === "GET" && call.target.includes("/stage1/normalization?")));
+    assert.strictEqual(appState.normalization.revision, 6);
+    assert.strictEqual(appState.normalization.status, "draft");
+    assert.strictEqual(appState.normalizationDirty, false);
+    assert.strictEqual(appState.normalizationEligible, false);
+    assert.strictEqual(ids.normalization_history_diff.hidden, true, "stale diff is cleared");
+
+    // Unsaved edits are saved first, and the restore uses the saved revision.
+    h.reset("original", 5);
+    appState.normalization.blocks[0].text_for_tts = "unsaved";
+    normalization.markNormalizationDirty();
+    install();
+    done = normalization.restoreNormalizationSnapshot(name);
+    confirmNow();
+    await done;
+    const methods = calls.map((call) => `${call.method} ${call.target.includes("/restore") ? "restore" : "other"}`);
+    assert.ok(methods.indexOf("PUT other") !== -1 && methods.indexOf("PUT other") < methods.indexOf("POST restore"));
+    assert.strictEqual(calls.find((call) => call.target.includes("/restore")).body.expected_revision, 6);
+    assert.strictEqual(appState.normalizationDirty, false);
+
+    // An edit made while the restore request is in flight is kept, not overwritten.
+    h.reset("original", 5);
+    const gate = h.deferred();
+    install({ restoreGate: gate });
+    done = normalization.restoreNormalizationSnapshot(name);
+    confirmNow();
+    await h.settle();
+    appState.normalization.blocks[0].text_for_tts = "typed during restore";
+    normalization.markNormalizationDirty();
+    gate.resolve();
+    await done;
+    assert.strictEqual(appState.normalization.blocks[0].text_for_tts, "typed during restore");
+    assert.strictEqual(appState.normalization.revision, 6);
+    assert.strictEqual(appState.normalizationDirty, true);
+    assert.strictEqual(appState.normalizationEligible, false);
+    assert.ok(!calls.some((call) => call.method === "GET" && call.target.includes("/stage1/normalization?")));
+  } finally {
+    h.restore();
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
+    ["testNormalizationWarningReview", () => testNormalizationWarningReview(modules)],
+    ["testNormalizationEditDuringGenerate", () => testNormalizationEditDuringGenerate(modules)],
+    ["testTypeDecisionKeepsUnrelatedWarnings", () => testTypeDecisionKeepsUnrelatedWarnings(modules)],
     ["testNormalizationWarningLocations", () => testNormalizationWarningLocations(modules)],
     ["testComputeEtaSeconds", () => testComputeEtaSeconds(modules)],
     ["testRenderEtaCells", () => testRenderEtaCells(modules)],
@@ -1418,6 +1872,11 @@ async function main() {
     ["testNormalizationEditDuringConfirm", () => testNormalizationEditDuringConfirm(modules)],
     ["testNormalizationSaveAcceptsRevisionAfterEdit", () => testNormalizationSaveAcceptsRevisionAfterEdit(modules)],
     ["testApplyStatusSyncsTimelineReady", () => testApplyStatusSyncsTimelineReady(modules)],
+    ["testConfirmPreviewSummaryAndBlocking", () => testConfirmPreviewSummaryAndBlocking(modules)],
+    ["testConfirmRejectedShowsRussianReasons", () => testConfirmRejectedShowsRussianReasons(modules)],
+    ["testSyncFragmentEditing", () => testSyncFragmentEditing(modules)],
+    ["testGroupReviewOnlySelectedBlocks", () => testGroupReviewOnlySelectedBlocks(modules)],
+    ["testNormalizationHistoryDiffRestore", () => testNormalizationHistoryDiffRestore(modules)],
   ];
 
   let passed = 0;

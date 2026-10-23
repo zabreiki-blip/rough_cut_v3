@@ -20,6 +20,10 @@ from typing import Any
 
 from .scenario_structure import find_timecodes
 
+# Bump whenever scene/dialogue/continuation context (and the neighbour context
+# sent to the LLM) changes behaviour; part of the LLM cache fingerprint.
+SCENE_CONTEXT_VERSION = 1
+
 SCENE_TYPES = frozenset({"life", "sync", "host"})
 _SPLICE_TYPES = frozenset({"life", "sync"})
 

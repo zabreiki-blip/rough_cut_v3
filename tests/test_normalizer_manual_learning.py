@@ -12,6 +12,7 @@ from stage1.normalizer import (
     _VIDEO_CUE_KEYWORDS,
     confirm_normalization,
     generate_normalization,
+    preview_learning_candidates,
     save_normalization,
 )
 
@@ -21,14 +22,17 @@ def _builtin_video_cue_markers() -> set[str]:
 
 
 class ManualCorrectionLearningTests(unittest.TestCase):
-    """A manual correction of an *unlabelled* block must teach the learnable
+    """A manual correction of an *unlabelled* block may teach the learnable
     video-cue lexicon (scope='video_cue'), the same lexicon
-    `_seed_video_cue_rules`/`_video_cue_keyword_pattern` already read from,
-    so the same unrecognized text is auto-classified next time -- without
-    ever growing the lexicon from ordinary narration.
+    `_seed_video_cue_rules`/`_video_cue_keyword_pattern` already read from --
+    but only when the user explicitly accepts the proposed keyword at
+    confirmation (``learning_decisions`` action ``remember``), and never from
+    ordinary narration.
     """
 
-    def _confirm_manual_technical(self, root: Path, text: str) -> Path:
+    def _confirm_manual_technical(
+        self, root: Path, text: str, action: str | None = "remember"
+    ) -> Path:
         source = root / "scenario.txt"
         normalized = root / "normalized.json"
         prepared = root / "prepared.json"
@@ -44,14 +48,118 @@ class ManualCorrectionLearningTests(unittest.TestCase):
         saved = save_normalization(normalized, draft, expected_revision=1)
         self.assertEqual(saved["blocks"][0]["source"], "manual")
 
+        decisions = None
+        if action is not None:
+            candidates = preview_learning_candidates(
+                normalized, memory_path=memory_path, expected_revision=saved["revision"]
+            )
+            decisions = [{"candidate_id": item["id"], "action": action} for item in candidates]
         confirm_normalization(
             normalized,
             prepared,
             raw,
             memory_path=memory_path,
             expected_revision=saved["revision"],
+            learning_decisions=decisions,
         )
         return memory_path
+
+    def _video_cue_markers(self, memory_path: Path) -> set[str]:
+        with NormalizationMemory(memory_path) as memory:
+            return {rule["normalized_marker"] for rule in memory.list_rules(scope="video_cue")}
+
+    def test_manual_reclassification_is_not_learned_without_a_decision(self) -> None:
+        for action in (None, "this_time", "never"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                memory_path = self._confirm_manual_technical(root, "Сольные номера", action)
+                self.assertEqual(self._video_cue_markers(memory_path), _builtin_video_cue_markers())
+
+    def test_video_cue_candidates_are_previewed_per_keyword(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            normalized = root / "normalized.json"
+            memory_path = root / "memory.sqlite3"
+            source.write_text("Сольные номера\n", encoding="utf-8")
+            draft = generate_normalization(
+                source, normalized, memory_path=memory_path, use_llm=False
+            )
+            draft["blocks"][0]["type"] = "technical"
+            saved = save_normalization(normalized, draft, expected_revision=1)
+
+            first = preview_learning_candidates(normalized, memory_path=memory_path)
+            second = preview_learning_candidates(normalized, memory_path=memory_path)
+
+            self.assertEqual(first, second)  # deterministic ids between preview and confirm
+            self.assertEqual({item["marker"] for item in first}, {"сольные", "номера"})
+            for item in first:
+                self.assertEqual(item["scope"], "video_cue")
+                self.assertEqual(item["reason"], "manual_video_cue")
+                self.assertEqual(item["target_type"], "technical")
+                self.assertEqual(item["block_uids"], [saved["blocks"][0]["uid"]])
+                self.assertEqual(item["status"], "new")
+            self.assertEqual(self._video_cue_markers(memory_path), _builtin_video_cue_markers())
+
+    def test_decision_for_one_keyword_does_not_teach_the_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            normalized = root / "normalized.json"
+            memory_path = root / "memory.sqlite3"
+            source.write_text("Сольные номера\n", encoding="utf-8")
+            draft = generate_normalization(
+                source, normalized, memory_path=memory_path, use_llm=False
+            )
+            draft["blocks"][0]["type"] = "technical"
+            saved = save_normalization(normalized, draft, expected_revision=1)
+            candidates = preview_learning_candidates(normalized, memory_path=memory_path)
+            keep = next(item for item in candidates if item["marker"] == "сольные")
+
+            confirm_normalization(
+                normalized,
+                root / "prepared.json",
+                root / "raw.txt",
+                memory_path=memory_path,
+                expected_revision=saved["revision"],
+                learning_decisions=[{"candidate_id": keep["id"], "action": "remember"}],
+            )
+
+            learned = self._video_cue_markers(memory_path) - _builtin_video_cue_markers()
+            self.assertEqual(learned, {"сольные"})
+
+    def test_hero_and_scene_corrections_never_become_global_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            normalized = root / "normalized.json"
+            memory_path = root / "memory.sqlite3"
+            source.write_text(
+                "СНХ Мария Иванова (00:30.00) Рассказ героя.\nЗК Продолжение истории о реке.\n",
+                encoding="utf-8",
+            )
+            draft = generate_normalization(
+                source, normalized, memory_path=memory_path, use_llm=False
+            )
+            with NormalizationMemory(memory_path) as memory:
+                before = [(r["normalized_marker"], r["scope"]) for r in memory.list_rules()]
+            draft["blocks"][0]["speaker"] = "Другой Герой"
+            draft["blocks"][0]["role"] = "рыбак"
+            draft["blocks"][1]["scene_uid"] = draft["blocks"][0]["uid"]
+            saved = save_normalization(normalized, draft, expected_revision=1)
+            candidates = preview_learning_candidates(normalized, memory_path=memory_path)
+            self.assertEqual(candidates, [])
+            confirm_normalization(
+                normalized,
+                root / "prepared.json",
+                root / "raw.txt",
+                memory_path=memory_path,
+                expected_revision=saved["revision"],
+                learning_decisions=[],
+            )
+            with NormalizationMemory(memory_path) as memory:
+                after = [(r["normalized_marker"], r["scope"]) for r in memory.list_rules()]
+            self.assertEqual(before, after)
 
     def test_manual_reclassification_learns_keyword_and_is_reused_without_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

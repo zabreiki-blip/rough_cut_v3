@@ -223,7 +223,7 @@ def test_native_confirm_is_replaced_with_custom_confirm_dialog() -> None:
     assert 'acceptBtn.classList.toggle("danger", Boolean(danger));' in STAGE1_JS
     assert "if (acceptBtn.disabled) return;" in STAGE1_JS
     assert "acceptBtn.disabled = true;" in STAGE1_JS
-    assert STAGE1_JS.count("await confirmDialog({") == 8
+    assert STAGE1_JS.count("await confirmDialog({") == 9
 
 
 def test_asr_metrics_panel_reports_engine_cost_and_timestamp_precision() -> None:
@@ -297,3 +297,40 @@ def test_scroll_jump_logic_in_node_runtime() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_normalization_manual_review_controls_are_wired() -> None:
+    for element_id in (
+        "normalization_confirm_summary",
+        "normalization_group_bar",
+        "norm_selected_count",
+        "btn_norm_group_review",
+        "btn_norm_group_clear",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+        assert f'el("{element_id}")' in STAGE1_JS
+    assert '"/stage1/normalization/confirm/preview"' in STAGE1_JS
+    assert "preview.validation" in STAGE1_JS
+    assert "err?.payload?.issues" in STAGE1_JS
+    for action in ("add-fragment", "delete-fragment", "split-fragment", "goto-scene"):
+        assert f'data-action="{action}"' in STAGE1_JS
+    assert ".normalization-confirm-summary" in STAGE1_CSS
+    assert ".normalization-group-bar" in STAGE1_CSS
+
+
+def test_normalization_history_controls_are_wired() -> None:
+    for element_id in (
+        "btn_normalization_history",
+        "btn_normalization_history_close",
+        "normalization_history_panel",
+        "normalization_history_list",
+        "normalization_history_diff",
+    ):
+        assert f'id="{element_id}"' in PROJECT_HTML
+        assert f'el("{element_id}")' in STAGE1_JS
+    assert "История разбора" in PROJECT_HTML
+    assert "/stage1/normalization/history" in STAGE1_JS
+    assert "/restore" in STAGE1_JS and "/diff" in STAGE1_JS
+    # Rollback is confirmed in the app dialog, never with native browser popups.
+    assert "restoreNormalizationSnapshot" in STAGE1_JS
+    assert "window.confirm" not in STAGE1_JS and "alert(" not in STAGE1_JS

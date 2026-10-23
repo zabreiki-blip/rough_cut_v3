@@ -492,3 +492,28 @@ def test_rerun_keeps_uids_of_repeated_number_blocks(tmp_path: Path) -> None:
     before = generate_normalization(source, out, **kwargs)["blocks"]
     after = generate_normalization(source, out, **kwargs)["blocks"]
     assert [b["uid"] for b in before] == [b["uid"] for b in after]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "ЗК: Текст сюжета",
+        "ЗК Текст сюжета",
+        "ЗК14: Текст сюжета",
+        "З.К.: Текст сюжета",
+        "зк: Текст сюжета",
+    ],
+)
+def test_zk_label_variants_never_reach_tts_text(tmp_path: Path, line: str) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(line + "\n", encoding="utf-8")
+    result = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )
+    (block,) = result["blocks"]
+    assert block["type"] == "voiceover"
+    assert block["text_for_tts"] == "Текст сюжета"
+    assert block["normalized_text"] == "Текст сюжета"

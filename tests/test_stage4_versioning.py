@@ -1011,3 +1011,48 @@ def test_resumed_activation_rejects_working_projection_at_a_third_revision(
         activate_revision("rev_0002", paths, _resume=True)
 
     assert paths["normalized"].read_bytes() == before
+
+
+def _baseline_with_status(tmp_path: Path, blocks: list[dict]) -> dict:
+    paths = ensure_project("demo", tmp_path / "projects")
+    source = paths["input"] / "v1.docx"
+    source.write_bytes(b"v1")
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": blocks,
+        },
+    )
+    ensure_baseline("demo", paths)
+    return paths
+
+
+def test_restoring_confirmed_revision_failing_current_checks_warns_and_keeps_status(
+    tmp_path: Path,
+) -> None:
+    bad = {**_block("one", "СНХ1 Первая", "voiceover", ""), "order": 1}
+    bad["text_for_tts"] = "СНХ1 Первая"
+    bad["source"] = "builtin_rule"
+    paths = _baseline_with_status(tmp_path, [bad])
+
+    result = activate_revision("rev_0001", paths)
+
+    message = "restored confirmed revision fails current checks: service_label_in_tts"
+    assert result["warnings"] == [message]
+    restored = json.loads(paths["normalized"].read_text(encoding="utf-8"))
+    assert restored["status"] == "confirmed"
+    assert message in restored["warnings"]
+
+
+def test_restoring_confirmed_revision_passing_checks_adds_no_warning(tmp_path: Path) -> None:
+    good = {**_block("one", "Первая", "voiceover", ""), "order": 1, "source": "builtin_rule"}
+    paths = _baseline_with_status(tmp_path, [good])
+
+    result = activate_revision("rev_0001", paths)
+
+    assert "warnings" not in result
+    restored = json.loads(paths["normalized"].read_text(encoding="utf-8"))
+    assert restored["status"] == "confirmed" and not restored.get("warnings")

@@ -36,6 +36,7 @@ from .normalization_models import (
 )
 from .scenario_context import (
     AMBIGUOUS_CAPS_WARNING,
+    SCENE_CONTEXT_VERSION,
     SCENE_OPENER_CHANGED_WARNING,
     SCENE_TYPES,
     SECTION_HEADING_WARNING,
@@ -51,12 +52,14 @@ from .presenter_cues import parse_presenter_parts
 from .scenario_structure import (
     LEAD_IN_WARNING,
     STANDUP_WARNING,
+    STRUCTURE_PARSER_VERSION,
     ParagraphStructure,
     canonicalize_timecodes,
     find_repeated_author_numbers,
     parse_paragraph,
     parse_timecode,
     split_timed_parts,
+    strip_leading_zk_label,
     timecode_warnings,
 )
 
@@ -65,6 +68,29 @@ logger = logging.getLogger(__name__)
 
 LLMClassifier = Callable[[list[dict[str, Any]], str], list[dict[str, Any]]]
 LLM_PRESETS = {"standard", "fast"}
+_REVIEWED_BLOCK_FIELDS = (
+    "type",
+    "original_label",
+    "label_confirmed",
+    "normalized_text",
+    "text_for_tts",
+    "speaker",
+    "role",
+    "source_description",
+    "timecode_start",
+    "timecode_end",
+    "sync_fragments",
+    "notes",
+    "continuation_of_type",
+    "absorbed_by_uid",
+    "scene_uid",
+)
+_REVIEW_WARNING_PINNED_FIELDS = (
+    ("Ambiguous timecode", ("timecode_start", "timecode_end", "sync_fragments")),
+    (SECTION_HEADING_WARNING, ("type",)),
+    ("Ambiguous label combination", ("type", "original_label", "label_confirmed")),
+    (SCENE_OPENER_CHANGED_WARNING, ("type",)),
+)
 
 
 def normalize_llm_preset(value: str | None) -> str:
@@ -265,9 +291,28 @@ _TTS_EDITORIAL_PARENTHESES = re.compile(
 )
 
 
-def clean_voiceover_tts_text(text: str) -> str:
-    """Remove speech-direction labels and on-screen cues from spoken text."""
-    value = _TTS_VOICE_CREDIT.sub("", text.strip())
+ZK_LABEL_REMOVED_WARNING = "ЗК label removed from TTS text"
+ABSORBED_LINK_LOST_WARNING = "Absorbed-by link dropped: target block was not found after re-parse"
+
+
+def strip_zk_label(text: str) -> str:
+    """Drop a leading ``ЗК`` voiceover label (``ЗК:``, ``ЗК14``, ``З.К.``); rest unchanged."""
+    return strip_leading_zk_label(text)
+
+
+def clean_voiceover_tts_text(text: str, *, strip_zk: bool = True) -> str:
+    """Remove speech-direction labels and on-screen cues from spoken text.
+
+    The leading ``ЗК`` label marks a voiceover block and is not speech.  It is
+    removed at most once (``strip_zk``) and only from the very start, so the
+    result is stable: ``ЗК: ЗК РФ запрещает`` -> ``ЗК РФ запрещает``.  Callers
+    that receive text whose label was already split off (rule/LLM parsing,
+    saved drafts) pass ``strip_zk=False``.
+    """
+    value = text.strip()
+    if strip_zk:
+        value = strip_zk_label(value).strip()
+    value = _TTS_VOICE_CREDIT.sub("", value)
     value = _TTS_EDITORIAL_PARENTHESES.sub("", value)
     return value.replace("<…>", "…").strip()
 
@@ -706,7 +751,10 @@ def _generate_normalization_unlocked(
 
     for block in blocks:
         if block.type == BlockType.VOICEOVER.value:
-            block.text_for_tts = clean_voiceover_tts_text(block.text_for_tts)
+            # The label was split off once when the block was parsed
+            # (``_split_label`` / LLM boundary); never strip a second time, or
+            # speech such as ``ЗК РФ запрещает это.`` loses its first word.
+            block.text_for_tts = clean_voiceover_tts_text(block.text_for_tts, strip_zk=False)
     _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
         source=str(input_path),
@@ -732,10 +780,50 @@ def _generate_normalization_unlocked(
             uid_map[block.uid] = old.uid
             block.uid = old.uid
             block.versioning = dict(old.versioning)
+            reviewed = set(old.reviewed_warnings)
+            block.reviewed_warnings = list(old.reviewed_warnings)
+            block.manually_edited = old.manually_edited
+            block.manual_fields = list(old.manual_fields)
+            block.warnings = [warning for warning in block.warnings if warning not in reviewed]
+            legacy_manual = old.source == DecisionSource.MANUAL.value and not old.manual_fields
+            fields_to_restore = set(old.manual_fields)
+            if legacy_manual:
+                fields_to_restore = set(_REVIEWED_BLOCK_FIELDS)
+            for field_name in fields_to_restore:
+                if field_name in _REVIEWED_BLOCK_FIELDS:
+                    setattr(block, field_name, getattr(old, field_name))
+            classification_pinned = legacy_manual or bool(
+                fields_to_restore & {"type", "original_label", "label_confirmed"}
+            )
+            if classification_pinned:
+                block.proposed_type = old.proposed_type
+                block.proposed_label = old.proposed_label
+                block.proposed_label_confirmed = old.proposed_label_confirmed
+                block.proposed_source = old.proposed_source
+                block.proposed_memory_rule_id = old.proposed_memory_rule_id
+                block.source = old.source
+                block.confidence = old.confidence
+                block.memory_rule_id = old.memory_rule_id
         for block in scenario.blocks:
             if block.scene_uid:
                 block.scene_uid = uid_map.get(block.scene_uid, block.scene_uid)
+        valid_uids = {block.uid for block in scenario.blocks}
+        for block in scenario.blocks:
+            if not block.absorbed_by_uid:
+                continue
+            target = uid_map.get(block.absorbed_by_uid, block.absorbed_by_uid)
+            if target in valid_uids and target != block.uid:
+                block.absorbed_by_uid = target
+                continue
+            block.absorbed_by_uid = ""
+            if ABSORBED_LINK_LOST_WARNING not in block.warnings:
+                block.warnings.append(ABSORBED_LINK_LOST_WARNING)
+        _flag_changed_scene_openers(scenario.blocks)
     scenario_payload = scenario.to_dict()
+    if previous is not None:
+        # The re-parse is a comparable draft: the replaced revision (often a
+        # confirmed one) stays on disk and can be diffed against / restored.
+        _snapshot_normalization_file(output_path, previous)
     _atomic_write_json(Path(output_path), scenario_payload)
     logger.info("Normalization draft written source=%s blocks=%d", input_path, len(blocks))
     return scenario_payload
@@ -755,6 +843,167 @@ def _warn_repeated_author_numbers(blocks: list[NormalizedBlock]) -> None:
                 f"Repeated author number {label}{number} ({len(indexes)} occurrences, "
                 f"first in block {blocks[indexes[0]].order}): check numbering"
             )
+
+
+NORMALIZATION_HISTORY_DIRNAME = "normalization_history"
+_HISTORY_NAME_RE = re.compile(r"\d{8}T\d{12}Z_rev\d+(?:-\d+)?\.json")
+MAX_NORMALIZATION_HISTORY = 30
+
+
+def normalization_history_dir(normalized_path: Path) -> Path:
+    """Where replaced normalization revisions are kept (next to the draft)."""
+    return Path(normalized_path).parent / NORMALIZATION_HISTORY_DIRNAME
+
+
+def _snapshot_normalization_file(
+    normalized_path: Path, scenario: NormalizedScenario
+) -> Path | None:
+    """Copy the on-disk normalization to ``normalization_history`` before it is replaced."""
+    normalized_path = Path(normalized_path)
+    try:
+        data = normalized_path.read_bytes()
+    except OSError:
+        return None
+    directory = normalization_history_dir(normalized_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target = directory / f"{stamp}_rev{scenario.revision}.json"
+    counter = 1
+    while target.exists():
+        target = directory / f"{stamp}_rev{scenario.revision}-{counter}.json"
+        counter += 1
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_bytes(data)
+    temporary.replace(target)
+    _prune_normalization_history(directory)
+    return target
+
+
+def _prune_normalization_history(directory: Path) -> None:
+    """Keep the newest ``MAX_NORMALIZATION_HISTORY`` snapshots, drop the older ones."""
+    names = sorted(
+        path.name for path in directory.iterdir() if _HISTORY_NAME_RE.fullmatch(path.name)
+    )
+    for name in names[: max(0, len(names) - MAX_NORMALIZATION_HISTORY)]:
+        try:
+            (directory / name).unlink()
+        except OSError:
+            logger.warning("Cannot remove old normalization snapshot %s", name)
+
+
+def list_normalization_history(normalized_path: Path) -> list[dict[str, Any]]:
+    """Snapshots of replaced revisions, newest first.
+
+    Each item: ``{name, path, revision, status, created_at, confirmed_at, blocks}``.
+    ``name`` is the identifier accepted by :func:`diff_normalization_snapshot`
+    and :func:`restore_normalization_snapshot`.
+    """
+    directory = normalization_history_dir(normalized_path)
+    if not directory.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in sorted(directory.iterdir(), reverse=True):
+        if not _HISTORY_NAME_RE.fullmatch(path.name):
+            continue
+        try:
+            payload = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        items.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "revision": payload.get("revision"),
+                "status": payload.get("status", ""),
+                "created_at": payload.get("created_at", ""),
+                "confirmed_at": payload.get("confirmed_at", ""),
+                "blocks": len(payload.get("blocks") or []),
+            }
+        )
+    return items
+
+
+def _load_history_snapshot(normalized_path: Path, name: str) -> dict[str, Any]:
+    if not isinstance(name, str) or not _HISTORY_NAME_RE.fullmatch(name):
+        raise ValueError(f"Invalid normalization snapshot name: {name!r}")
+    path = normalization_history_dir(normalized_path) / name
+    if not path.is_file():
+        raise FileNotFoundError(f"Normalization snapshot not found: {name}")
+    return NormalizedScenario.from_dict(read_json(path)).to_dict()
+
+
+def diff_normalization_payloads(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """Pure block diff between two normalization payloads (stage4 ``compare_blocks``).
+
+    Returns ``{summary, changes, snapshot, current}`` where ``snapshot`` and
+    ``current`` describe the compared sides (``revision``, ``status``, ``blocks``).
+    """
+    from stage4.versioning import compare_blocks
+
+    old_blocks = [b for b in old.get("blocks") or [] if isinstance(b, dict)]
+    new_blocks = [b for b in new.get("blocks") or [] if isinstance(b, dict)]
+    result = compare_blocks(old_blocks, new_blocks)
+    result["snapshot"] = {
+        "revision": old.get("revision"),
+        "status": old.get("status", ""),
+        "blocks": len(old_blocks),
+    }
+    result["current"] = {
+        "revision": new.get("revision"),
+        "status": new.get("status", ""),
+        "blocks": len(new_blocks),
+    }
+    return result
+
+
+def diff_normalization_snapshot(normalized_path: Path, snapshot: str) -> dict[str, Any]:
+    """Diff a history snapshot (``name`` from the list) against the current draft."""
+    with _path_lock(normalized_path):
+        old = _load_history_snapshot(normalized_path, snapshot)
+        current = NormalizedScenario.from_dict(read_json(Path(normalized_path))).to_dict()
+    return diff_normalization_payloads(old, current)
+
+
+def restore_normalization_snapshot(
+    normalized_path: Path,
+    snapshot: str,
+    *,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Roll the draft back to a history snapshot, as a new *draft* revision.
+
+    The currently stored revision is snapshotted first, so a restore is itself
+    reversible.  The restored scenario is never ``confirmed``: it must be
+    confirmed again, and ``scenario_prepared.json`` is not touched here.
+    """
+    normalized_path = Path(normalized_path)
+    with _path_lock(normalized_path):
+        old = NormalizedScenario.from_dict(_load_history_snapshot(normalized_path, snapshot))
+        current: NormalizedScenario | None = None
+        if normalized_path.is_file():
+            current = NormalizedScenario.from_dict(read_json(normalized_path))
+            if expected_revision is not None and current.revision != expected_revision:
+                raise RevisionConflictError(
+                    f"Expected revision {expected_revision}, current revision is {current.revision}"
+                )
+        source_path = Path((current or old).source)
+        if not source_path.exists() or _file_hash(source_path) != old.source_hash:
+            raise SourceChangedError("Source scenario changed after this snapshot was taken")
+        if current is not None:
+            _snapshot_normalization_file(normalized_path, current)
+            old.revision = current.revision + 1
+            old.created_at = current.created_at or old.created_at
+            old.source = current.source
+        else:
+            old.revision += 1
+        old.status = NormalizationStatus.DRAFT.value
+        old.confirmed_at = ""
+        old.updated_at = _utcnow()
+        result = old.to_dict()
+        _atomic_write_json(normalized_path, result)
+        return result
 
 
 def load_normalization(path: Path) -> dict[str, Any]:
@@ -829,6 +1078,7 @@ def _save_normalization_unlocked(
         previous = {block.uid: block for block in current.blocks}
         for block in incoming.blocks:
             old = previous.get(block.uid)
+            _sanitize_saved_voiceover(block, old)
             if old is not None:
                 block.proposed_type = old.proposed_type
                 block.proposed_label = old.proposed_label
@@ -850,6 +1100,44 @@ def _save_normalization_unlocked(
                 block.source = DecisionSource.MANUAL.value
                 block.confidence = 1.0
             if old is not None:
+                changed_names = {
+                    field_name
+                    for field_name in _REVIEWED_BLOCK_FIELDS
+                    if getattr(block, field_name) != getattr(old, field_name)
+                }
+                reviewed = set(old.reviewed_warnings)
+                removed_warnings = [w for w in old.warnings if w not in block.warnings]
+                reviewed.update(removed_warnings)
+                reviewed.difference_update(block.warnings)
+                block.reviewed_warnings = sorted(reviewed)
+                # The automatic ZK-removal warning is not a reviewer decision.
+                warnings_changed = set(block.warnings) - {ZK_LABEL_REMOVED_WARNING} != set(
+                    old.warnings
+                ) - {ZK_LABEL_REMOVED_WARNING}
+                acknowledged_fields = {
+                    field_name
+                    for warning in removed_warnings
+                    for prefix, pinned_fields in _REVIEW_WARNING_PINNED_FIELDS
+                    if warning.startswith(prefix)
+                    for field_name in pinned_fields
+                }
+                block.manual_fields = sorted(
+                    (
+                        set(_REVIEWED_BLOCK_FIELDS)
+                        if old.source == DecisionSource.MANUAL.value and not old.manual_fields
+                        else set(old.manual_fields)
+                    )
+                    | changed_names
+                    | acknowledged_fields
+                )
+                block.manually_edited = (
+                    old.manually_edited or bool(changed_names) or warnings_changed
+                )
+            else:
+                block.reviewed_warnings = []
+                block.manual_fields = []
+                block.manually_edited = False
+            if old is not None:
                 block.original_text = old.original_text
             block.warnings = list(dict.fromkeys(block.warnings))
         incoming.created_at = current.created_at
@@ -857,6 +1145,11 @@ def _save_normalization_unlocked(
     else:
         incoming.revision = max(1, incoming.revision)
         incoming.created_at = incoming.created_at or _utcnow()
+        for block in incoming.blocks:
+            _sanitize_saved_voiceover(block)
+            block.reviewed_warnings = []
+            block.manually_edited = False
+            block.manual_fields = []
     _flag_changed_scene_openers(incoming.blocks)
     incoming.status = NormalizationStatus.DRAFT.value
     incoming.confirmed_at = ""
@@ -865,6 +1158,31 @@ def _save_normalization_unlocked(
     result = incoming.to_dict()
     _atomic_write_json(path, result)
     return result
+
+
+def _sanitize_saved_voiceover(block: NormalizedBlock, old: NormalizedBlock | None = None) -> None:
+    """Remove a leading ``ЗК`` label a user typed into a voiced block; warn, never block.
+
+    Only a field the user changed against the stored block can carry a typed
+    label: stored text was already sanitized once when it was written, so an
+    unchanged ``ЗК РФ запрещает это.`` is speech and must stay intact.
+    """
+    if block.type != BlockType.VOICEOVER.value or block.absorbed_by_uid:
+        return
+    tts_typed = old is None or block.text_for_tts != old.text_for_tts
+    normalized_typed = old is None or block.normalized_text != old.normalized_text
+    text = block.text_for_tts
+    if tts_typed and text.strip():
+        text = strip_zk_label(text)
+    normalized = (
+        strip_zk_label(block.normalized_text) if normalized_typed else block.normalized_text
+    )
+    if text == block.text_for_tts and normalized == block.normalized_text:
+        return
+    block.text_for_tts = text
+    block.normalized_text = normalized
+    if ZK_LABEL_REMOVED_WARNING not in block.warnings:
+        block.warnings.append(ZK_LABEL_REMOVED_WARNING)
 
 
 def _flag_changed_scene_openers(blocks: list[NormalizedBlock]) -> None:
@@ -879,7 +1197,10 @@ def _flag_changed_scene_openers(blocks: list[NormalizedBlock]) -> None:
             continue
         opener = by_uid.get(block.scene_uid)
         if opener is None or opener.type not in SCENE_TYPES:
-            if SCENE_OPENER_CHANGED_WARNING not in block.warnings:
+            if (
+                SCENE_OPENER_CHANGED_WARNING not in block.reviewed_warnings
+                and SCENE_OPENER_CHANGED_WARNING not in block.warnings
+            ):
                 block.warnings.append(SCENE_OPENER_CHANGED_WARNING)
         elif SCENE_OPENER_CHANGED_WARNING in block.warnings:
             block.warnings.remove(SCENE_OPENER_CHANGED_WARNING)
@@ -999,6 +1320,7 @@ _WARNING_CODES: tuple[tuple[str, str], ...] = (
     ("Ambiguous timecode", "ambiguous_timecode"),
     ("Ambiguous label combination", "ambiguous_label_combination"),
     ("Sync credit has no source media file", "sync_credit_no_media"),
+    (ZK_LABEL_REMOVED_WARNING, "zk_label_removed"),
     ("LLM", "low_confidence_llm"),
     ("Possible learned alias", "learned_alias_suggestion"),
     ("leading '+' splice", "leading_splice"),
@@ -1077,7 +1399,8 @@ def validate_for_confirmation_detailed(
             add("empty_tts", block, f"Voiceover block {block.order} has empty TTS text")
         if (
             block.type == BlockType.VOICEOVER.value
-            and clean_voiceover_tts_text(block.text_for_tts) != block.text_for_tts.strip()
+            and clean_voiceover_tts_text(block.text_for_tts, strip_zk=False)
+            != block.text_for_tts.strip()
         ):
             add(
                 "speech_direction_in_tts",
@@ -1139,8 +1462,8 @@ def validate_for_confirmation_detailed(
                             block,
                             f"Sync block {block.order} has invalid timecode {timecode}",
                         )
-        for code, message in structural_checks(block, _paragraph_structure):
-            add(code, block, message)
+        for code, message, severity in structural_checks(block, _paragraph_structure):
+            add(code, block, message, severity)
         for message in block.warnings:
             add(_warning_code(message), block, message, "warning")
         if (
@@ -1977,6 +2300,63 @@ def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
     }
 
 
+_UNLABELED_CREDIT = re.compile(
+    r"^\s*(?P<credit>(?:(?!ИСХ(?:ОДНИК)?\.?\s)[А-ЯЁ][А-ЯЁ\-]+\s+){0,4}"
+    r"(?!ИСХ(?:ОДНИК)?\.?\s)[А-ЯЁ][А-ЯЁ\-]+(?:\s*\([А-ЯЁ\-\s]{2,40}\))?)"
+    r"\s+(?P<tail>\S.*)$",
+    re.DOTALL,
+)
+
+
+def _parse_unlabeled_sync_credit(text: str) -> dict[str, str] | None:
+    """Parse a sync paragraph whose all-caps credit has no ``СНХ`` label.
+
+    ``ИГУМЕН ИМЯ (ФАМИЛИЯ) ИСХ АВТОР ИМЯ 00.35:30 речь`` -> the whole credit before
+    ``ИСХ`` is the speaker, the words up to the timecode are the source (parsed by
+    the ``СНХ`` credit logic).  Without ``ИСХ`` only a credit with a bracketed
+    surname directly followed by a timecode qualifies; a plain all-caps name before
+    a timecode is already handled by the generic label logic.
+    """
+    view = _structural_text(text)
+    match = _UNLABELED_CREDIT.match(view)
+    if not match:
+        return None
+    structure = _paragraph_structure(view)
+    if structure.has_label or structure.is_technical_cue:
+        return None
+    credit, tail = match.group("credit"), match.group("tail")
+    if normalize_marker(credit) in set(_BUILTIN_MARKERS) | _TECH_MARKERS:
+        return None
+    if _CREDIT_SOURCE_MARK.match(f" {tail}"):
+        parsed = _parse_snh_timed_credit(f"СНХ {view}")
+        if (
+            not parsed
+            or parsed["header_only"]
+            or not parsed["source"]
+            or not parsed["content"]
+            or parsed["speaker"] != credit
+            or any(word[:1].islower() for word in parsed["source"].split())
+        ):
+            return None
+        return {**parsed, "marker": ""}
+    if "(" not in credit or not _starts_with_unambiguous_timecode(tail):
+        return None
+    if not _is_credit_name(credit) or not _looks_like_plausible_sync_credit(credit):
+        return None
+    content = tail.strip()
+    if not _TIMECODE.sub("", content, count=1).strip(" \t[]()–—-.:"):
+        return None
+    return {
+        "marker": "",
+        "speaker": credit,
+        "role": "",
+        "source": "",
+        "content": content,
+        "header_only": "",
+        "dashed": "",
+    }
+
+
 def _merge_snh_credit_headers(paragraphs: list[str]) -> list[str]:
     """Join a header-only ``СНХ Имя — файл`` paragraph with the next timecoded one."""
     merged: list[str] = []
@@ -2014,6 +2394,9 @@ def _split_label(text: str) -> tuple[str, str]:
     dash_credit = _parse_snh_dash_credit(text)
     if dash_credit:
         return dash_credit["marker"], dash_credit["content"]
+    unlabeled_credit = _parse_unlabeled_sync_credit(text)
+    if unlabeled_credit:
+        return unlabeled_credit["speaker"], unlabeled_credit["content"]
     # Service labels (ЗК/З.К./СНХ/ЛАЙФ/ЛАЙФЫ/СТЕНДАП/technical markers) and
     # montage cues are recognised by the shared structural parser BEFORE any
     # "capitalised words are a hero" heuristic below. The author's block
@@ -2208,6 +2591,8 @@ def _classify_by_rules(
         or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
     ) and _TIMECODE.match(sync_content):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif _parse_unlabeled_sync_credit(block.original_text):
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
     elif _starts_with_unambiguous_timecode(stripped) or re.match(r"^\s*\((?:…|\.\.\.)\)", stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _EDITORIAL_TIMECODE_PREFIX.match(stripped):
@@ -2334,6 +2719,7 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
     match = _SYNC_METADATA.match(normalized_view)
     dash_credit = _parse_snh_dash_credit(block.original_text)
+    unlabeled_credit = _parse_unlabeled_sync_credit(block.original_text)
     unnamed_label = _paragraph_structure(block.original_text).metadata.get("service_label")
     if unnamed_label:
         presenter_parts = parse_presenter_parts(block.original_text)
@@ -2380,6 +2766,14 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
             # none (Stage 2 binds media).
             block.warnings.append("Sync credit has no source media file")
         fragment_source = dash_credit["content"]
+        has_sync_metadata = True
+    elif unlabeled_credit and normalize_marker(block.original_label) == normalize_marker(
+        unlabeled_credit["speaker"]
+    ):
+        block.speaker = unlabeled_credit["speaker"]
+        block.source_description = unlabeled_credit["source"]
+        block.warnings.append("sync credit without СНХ label: check manually")
+        fragment_source = unlabeled_credit["content"]
         has_sync_metadata = True
     elif explicit_label:
         block.speaker = explicit_label.group(1).strip(" \t,;:")
@@ -2713,6 +3107,9 @@ def _apply_llm_results(
                 block.text_for_tts = block.normalized_text
             else:
                 proposed = str(item.get("text_for_tts", "")).strip()
+                if proposed != block.normalized_text.strip():
+                    # The LLM boundary: drop a label the model echoed (once).
+                    proposed = strip_zk_label(proposed).strip()
                 # TTS preparation (numbers to words, dropped cues) is allowed;
                 # a text that no longer resembles the source is not.
                 if proposed and not _llm_text_close_to_source(proposed, block.normalized_text):
@@ -2941,6 +3338,8 @@ def _llm_cache_fingerprint(
 ) -> str:
     material = {
         "version": _LLM_CACHE_VERSION,
+        "structure_parser_version": STRUCTURE_PARSER_VERSION,
+        "scene_context_version": SCENE_CONTEXT_VERSION,
         "input": _stable_llm_input(payload),
         "hint": hint.strip(),
         "classifier": _classifier_identity(classifier, llm_preset=llm_preset),
@@ -3227,8 +3626,10 @@ def _prepared_projection(scenario: NormalizedScenario) -> dict[str, Any]:
             {
                 "id": f"zk{index}",
                 "block_uid": block.uid,
+                # Stored text is sanitized exactly once on write (parse/save);
+                # the projection never strips again.
                 "text_original": block.normalized_text,
-                "text_for_tts": block.text_for_tts,
+                "text_for_tts": block.text_for_tts.strip(),
                 "pause_ms": 300,
                 "notes": block.notes,
             }
@@ -3326,6 +3727,58 @@ def _infer_learning_candidates(
         if existing:
             item["status"] = existing["status"]
             item["confirmations"] = int(existing["confirmations"])
+    result = list(candidates.values())
+    result.extend(_infer_video_cue_candidates(scenario, memory))
+    return result
+
+
+def _infer_video_cue_candidates(
+    scenario: NormalizedScenario, memory: NormalizationMemory
+) -> list[dict[str, Any]]:
+    """Propose video-cue keywords from unlabelled blocks the user reclassified.
+
+    The memory is global, so nothing here is learned implicitly: each keyword is
+    a separate candidate that is written only when the user answers
+    ``remember`` for it (see :func:`_learn_from_confirmation`).  Speaker, role
+    and scene corrections never produce candidates.
+    """
+    known = {normalize_marker(word) for word in _VIDEO_CUE_KEYWORDS}
+    known.update(str(rule["normalized_marker"]) for rule in memory.list_rules(scope="video_cue"))
+    candidates: dict[str, dict[str, Any]] = {}
+    for block in scenario.blocks:
+        if (
+            block.original_label
+            or block.source != DecisionSource.MANUAL.value
+            or block.type != BlockType.TECHNICAL.value
+            or not block.proposed_type
+            or block.proposed_type == block.type
+            or block.absorbed_by_uid
+        ):
+            continue
+        for keyword in _extract_manual_video_cue_keywords(block.normalized_text, set(known)):
+            normalized = normalize_marker(keyword)
+            candidate_id = sha256(f"video-cue-v1\n{normalized}".encode("utf-8")).hexdigest()[:20]
+            item = candidates.setdefault(
+                candidate_id,
+                {
+                    "id": candidate_id,
+                    "marker": keyword,
+                    "normalized_marker": normalized,
+                    "from_type": block.proposed_type,
+                    "target_type": BlockType.TECHNICAL.value,
+                    "reason": "manual_video_cue",
+                    "scope": "video_cue",
+                    "block_uids": [],
+                    "orders": [],
+                    "snippets": [],
+                    "status": "new",
+                    "confirmations": 0,
+                    "required_confirmations": 1,
+                },
+            )
+            item["block_uids"].append(block.uid)
+            item["orders"].append(block.order)
+            item["snippets"].append(block.normalized_text.strip()[:160])
     return list(candidates.values())
 
 
@@ -3407,16 +3860,24 @@ def _learn_from_confirmation(
     decisions: dict[str, str],
 ) -> None:
     with NormalizationMemory(memory_path) as memory:
+        learned_video_cue_keyword = False
         for candidate in candidates:
             action = decisions.get(candidate["id"], "this_time")
+            if candidate.get("scope") == "video_cue":
+                # Explicit decisions only: ``this_time``/``never`` leave the
+                # global video-cue lexicon untouched.
+                if action == "remember":
+                    memory.record_manual(
+                        candidate["marker"], candidate["target_type"], scope="video_cue"
+                    )
+                    learned_video_cue_keyword = True
+                continue
             if action == "remember":
                 memory.record_correction_confirmation(
                     candidate["marker"], candidate["target_type"], scenario.source_hash
                 )
             elif action == "never":
                 memory.suppress_marker(candidate["marker"])
-        known_video_cue_markers: set[str] | None = None
-        learned_video_cue_keyword = False
         for block in scenario.blocks:
             if (
                 not block.original_label
@@ -3427,24 +3888,6 @@ def _learn_from_confirmation(
                     BlockType.OTHER.value,
                 }
             ):
-                if (
-                    not block.original_label
-                    and block.source == DecisionSource.MANUAL.value
-                    and block.type == BlockType.TECHNICAL.value
-                ):
-                    if known_video_cue_markers is None:
-                        known_video_cue_markers = {
-                            normalize_marker(word) for word in _VIDEO_CUE_KEYWORDS
-                        }
-                        known_video_cue_markers.update(
-                            str(rule["normalized_marker"])
-                            for rule in memory.list_rules(scope="video_cue")
-                        )
-                    for keyword in _extract_manual_video_cue_keywords(
-                        block.normalized_text, known_video_cue_markers
-                    ):
-                        memory.record_manual(keyword, BlockType.TECHNICAL.value, scope="video_cue")
-                        learned_video_cue_keyword = True
                 continue
             if block.source == DecisionSource.MANUAL.value:
                 if block.memory_rule_id:
@@ -3460,11 +3903,8 @@ def _learn_from_confirmation(
             # A newly learned keyword was just written to this db's
             # scope='video_cue' rules, but `_seed_video_cue_rules` may
             # already have this db marked as "seeded" from an earlier
-            # normalization run in this process. Without invalidating that
-            # process-local cache, a later `_seed_video_cue_rules` call for
-            # the same db path stays a no-op, so nothing here forces a
-            # fresh look; keep the cache honest so it never masks what
-            # memory now actually contains.
+            # normalization run in this process; keep the process-local cache
+            # honest so it never masks what memory now actually contains.
             invalidate_video_cue_seed_cache(memory.path)
 
 

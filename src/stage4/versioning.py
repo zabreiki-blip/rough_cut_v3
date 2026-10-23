@@ -1044,6 +1044,27 @@ def _activation_matches(
     return result, kept
 
 
+def _restored_confirmation_warnings(normalized: dict[str, Any]) -> list[str]:
+    """Warn when a restored ``confirmed`` revision fails today's confirmation checks.
+
+    Restoring copies the confirmed status without re-running the validator, so
+    revisions confirmed under older, weaker checks are grandfathered.  The status
+    is kept (not silently downgraded); the failing codes are surfaced instead.
+    """
+    if normalized.get("status") != "confirmed":
+        return []
+    from stage1.normalizer import validate_for_confirmation_detailed
+
+    try:
+        issues = validate_for_confirmation_detailed(normalized)
+    except (ValueError, TypeError, KeyError):
+        return []
+    codes = sorted({i["code"] for i in issues if i["severity"] == "error"})
+    if not codes:
+        return []
+    return [f"restored confirmed revision fails current checks: {', '.join(codes)}"]
+
+
 @_locked_project_paths(1)
 def activate_revision(
     revision_id: str,
@@ -1096,6 +1117,11 @@ def activate_revision(
     source_snapshot = storage["scenarios"] / str(manifest.get("source_snapshot") or "")
     normalized["source"] = str(source_snapshot.resolve())
     validate_revision_assets(revision_id, manifest, normalized, project_paths)
+    restore_warnings = _restored_confirmation_warnings(normalized)
+    if restore_warnings:
+        normalized["warnings"] = list(
+            dict.fromkeys([*normalized.get("warnings", []), *restore_warnings])
+        )
 
     # Validate the remaining projections before snapshotting or changing any
     # outgoing state.  After this point activation only performs staged/atomic
@@ -1153,7 +1179,10 @@ def activate_revision(
         {"revision_id": revision_id, "activated_at": _utcnow()},
     )
     clear_activation_intent(project_paths)
-    return {"revision": manifest, "reused_sync_matches": len(kept)}
+    result: dict[str, Any] = {"revision": manifest, "reused_sync_matches": len(kept)}
+    if restore_warnings:
+        result["warnings"] = restore_warnings
+    return result
 
 
 @_locked_project_paths(1)
