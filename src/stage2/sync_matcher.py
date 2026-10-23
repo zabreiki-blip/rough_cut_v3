@@ -23,6 +23,8 @@ from .sync_models import (
     WordIndex,
     WordTimestamp,
 )
+from stage1.confirmation_checks import _SERVICE_WORDS
+
 from .text_normalization import fold_russian_text
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
@@ -157,6 +159,101 @@ def normalize_text(text: str) -> list[str]:
         for token in _TOKEN_RE.findall(unicodedata.normalize("NFKC", text).replace("ё", "е"))
         if (normalized := normalize_token(token))
     ]
+
+
+# Service labels that precede a speaker name in a scenario or source label
+# ("СИНХ Максимова", "СНХ", "sync"); they are never part of a person's name.
+_SPEAKER_LABEL_WORDS = frozenset({*_SERVICE_WORDS, "синх", "синхр"})
+# Case/gender endings of Russian surnames and given names. Possessive suffixes
+# (-ов, -ев, -ин) are deliberately not listed: they belong to the surname, so
+# Максимов / Максимова / Максимовым share one stem while Максимович and
+# Максим stay distinct.
+_NAME_ENDINGS = tuple(
+    sorted(
+        {
+            "ого",
+            "ому",
+            "ыми",
+            "ими",
+            "ами",
+            "ями",
+            "ым",
+            "им",
+            "ом",
+            "ем",
+            "ой",
+            "ей",
+            "ою",
+            "ею",
+            "ую",
+            "юю",
+            "ая",
+            "яя",
+            "ое",
+            "ее",
+            "ий",
+            "ый",
+            "ых",
+            "их",
+            "а",
+            "у",
+            "е",
+            "ы",
+            "и",
+            "ю",
+            "я",
+            "о",
+            "ь",
+            "й",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_MIN_NAME_STEM = 3
+
+
+def _name_stem(token: str) -> str:
+    """Strip case/gender endings until stable so all forms share one stem."""
+
+    if not any("а" <= char <= "я" for char in token):
+        return token
+    while True:
+        for ending in _NAME_ENDINGS:
+            if token.endswith(ending) and len(token) - len(ending) >= _MIN_NAME_STEM:
+                token = token[: -len(ending)]
+                break
+        else:
+            return token
+
+
+def speaker_name_tokens(name: str) -> list[str]:
+    """Comparable tokens of a speaker/source name (not for quote text).
+
+    Drops service labels and numeric tokens/prefixes (dates, clip numbers) and
+    reduces each word to an inflection-tolerant stem.
+    """
+
+    result: list[str] = []
+    for raw in _TOKEN_RE.findall(fold_russian_text(name)):
+        word = raw.lstrip("0123456789")
+        if not word or word in _SPEAKER_LABEL_WORDS:
+            continue
+        stem = _name_stem(word)
+        if stem:
+            result.append(stem)
+    return result
+
+
+# Setting/kinship words in source labels ("Сторожева дача", "Мать"), in stem form.
+_SETTING_WORDS = frozenset(
+    stem for word in ("дача", "дом", "интервью") for stem in speaker_name_tokens(word)
+)
+_KINSHIP_WORDS = frozenset(
+    stem
+    for word in ("отец", "мать", "мама", "папа", "брат", "сестра")
+    for stem in speaker_name_tokens(word)
+)
 
 
 _NEGATION_MARKERS = {
@@ -1422,7 +1519,9 @@ class SyncMatcher:
             source_id: _timed_tokens(index) for source_id, index in self.indexes.items()
         }
         self.speaker_tokens = {
-            source_id: [tokens for name in source.speaker_names if (tokens := normalize_text(name))]
+            source_id: [
+                tokens for name in source.speaker_names if (tokens := speaker_name_tokens(name))
+            ]
             for source_id, source in self.sources.items()
         }
         self.config = config or MatcherConfig()
@@ -1457,11 +1556,15 @@ class SyncMatcher:
             )
         available = [source for source in self.sources.values() if source.id in self.indexes]
         # Role descriptions after a comma are not part of a person's name.
-        speaker_tokens = [
-            token
-            for token in normalize_text(request.speaker.split(",", 1)[0])
-            if not token.isdigit()
-        ]
+        # A leading service label ("СНХ, Максимова") falls through to the next part.
+        speaker_tokens = next(
+            (
+                tokens
+                for part in request.speaker.split(",")
+                if (tokens := speaker_name_tokens(part))
+            ),
+            [],
+        )
         if not speaker_tokens:
             return available, []
         universal = [source for source in available if source.all_speakers]
@@ -1492,9 +1595,7 @@ class SyncMatcher:
                     return False
                 # Source labels may contain a date prefix or a setting after
                 # the surname ("40726 Стычкин", "Сторожева дача").
-                words = [token for token in tokens if not token.isdigit()]
-                if not words:
-                    return False
+                words = tokens
                 if words[-1] == surname:
                     return (
                         len(speaker_tokens) == 1 or len(words) == 1 or words[0] == speaker_tokens[0]
@@ -1502,10 +1603,7 @@ class SyncMatcher:
                 return (
                     words[0] == surname
                     and len(words) == 2
-                    and (
-                        words[1] in {"дач", "дом", "интервью"}
-                        or surname in {"отец", "мать", "мам", "пап", "брат", "сестр"}
-                    )
+                    and (words[1] in _SETTING_WORDS or surname in _KINSHIP_WORDS)
                 )
 
             surname_matches = [
@@ -1523,15 +1621,16 @@ class SyncMatcher:
                     for source in available
                     if len(speaker_tokens) > 1
                     and any(
-                        normalize_text(alias) == speaker_tokens[:1] for alias in source.speakers
+                        speaker_name_tokens(alias) == speaker_tokens[:1]
+                        for alias in source.speakers
                     )
                 ]
-                query_words = normalize_text(request.speaker)
+                query_words = speaker_name_tokens(request.speaker)
                 titled_sources = [
                     source
                     for source in available
                     if any(
-                        len(alias_tokens := normalize_text(alias)) > 1
+                        len(alias_tokens := speaker_name_tokens(alias)) > 1
                         and any(
                             query_words[index : index + len(alias_tokens)] == alias_tokens
                             for index in range(len(query_words) - len(alias_tokens) + 1)
