@@ -133,7 +133,10 @@ function renderStage3Job(value) {
   if (ids.stage3_job_message) ids.stage3_job_message.textContent = job.message || "Stage 3";
   if (ids.stage3_job_numbers) ids.stage3_job_numbers.textContent = `${Math.round(progress)}%`;
   if (ids.stage3_progress_bar) ids.stage3_progress_bar.style.width = `${progress}%`;
-  if (job.error) ids.stage3_media_message.textContent = job.error;
+  if (job.error) {
+    ids.stage3_media_message.textContent = job.error_code === "assembly_incomplete"
+      ? (job.message || job.error) : job.error;
+  }
   renderEtaCells(
     ids.stage3_job_elapsed, ids.stage3_job_eta,
     stage3JobClientStartedAt, Math.max(0, Math.min(1, progress / 100)), status,
@@ -162,6 +165,45 @@ const STAGE3_PLACEHOLDER_REASON_LABELS = {
   unmapped_source: "Источник не подключён",
   life_unassigned: "LIFE: материал не назначен",
 };
+
+// Extra blocker reasons produced by the "assembly without gaps" validation.
+const STAGE3_BLOCKER_REASON_LABELS = {
+  ...STAGE3_PLACEHOLDER_REASON_LABELS,
+  speech_overlap: "Речь пересекается с соседним клипом",
+  source_missing: "Файл просмотровки не найден",
+  invalid_edit_range: "Некорректный диапазон In/Out",
+  edit_beyond_source: "Диапазон выходит за длину источника",
+  speech_outside_edit: "Речь вне диапазона клипа",
+  open_task: "Есть незакрытая задача",
+};
+
+export function stage3PrepareMode() {
+  const value = ids.stage3_prepare_mode ? String(ids.stage3_prepare_mode.value || "") : "";
+  return value === "complete" ? "complete" : "draft";
+}
+
+export function describeStage3Blocker(blocker) {
+  const reason = String(blocker && blocker.reason || "");
+  const label = STAGE3_BLOCKER_REASON_LABELS[reason] || reason || "Причина не указана";
+  const type = String(blocker && blocker.type || "").toUpperCase() || "—";
+  const segmentId = String(blocker && (blocker.segment_id || blocker.uid) || "—");
+  return `${type} · ${segmentId} — ${label}`;
+}
+
+export function renderStage3Blockers(blockers) {
+  const items = Array.isArray(blockers) ? blockers : [];
+  appState.stage3Blockers = items;
+  if (!ids.stage3_blockers) return items;
+  ids.stage3_blockers.hidden = items.length === 0;
+  ids.stage3_blockers.innerHTML = items.length === 0 ? "" : (
+    `<strong>Сборка без пропусков невозможна: блокеров ${items.length}</strong><ul>`
+    + items.map((item) =>
+      `<li title="${escaped(item.detail || "")}">${escaped(describeStage3Blocker(item))}</li>`
+    ).join("")
+    + "</ul>"
+  );
+  return items;
+}
 
 export function describeStage3Placeholders(result) {
   const total = Number(result.placeholder_segments || 0);
@@ -193,6 +235,7 @@ async function applyCompletedStage3Job(job, download) {
     return;
   }
   renderStage3SourceMapping(result.source_mapping || []);
+  renderStage3Blockers([]);
   ids.stage3_media_message.textContent =
     `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
     + `${describeStage3Placeholders(result)}.`;
@@ -218,7 +261,12 @@ async function pollStage3Job(statusUrl, downloadOnComplete) {
     }
     if (["failed", "interrupted"].includes(status)) {
       finishStage3Job();
-      const message = job.error || job.message || "Stage 3 завершился с ошибкой";
+      if (job.error_code === "assembly_incomplete") {
+        renderStage3Blockers(job.blockers);
+      }
+      const message = job.error_code === "assembly_incomplete"
+        ? (job.message || "Сборка без пропусков невозможна")
+        : (job.error || job.message || "Stage 3 завершился с ошибкой");
       ids.stage3_media_message.textContent = message;
       toast(message, status === "failed" ? "error" : "warn");
       appendLog(`Stage 3 ${job.kind || "job"}: ${message}`, "error");
@@ -252,7 +300,9 @@ async function startStage3Job(kind) {
   if (kind === "prepare") ids.btn_export_xml.textContent = "Подготовка XML…";
   updateActionAvailability();
   try {
-    const started = await postJSON(`/stage3/jobs/${kind}/start`, { project });
+    if (kind === "prepare") renderStage3Blockers([]);
+    const body = kind === "prepare" ? { project, mode: stage3PrepareMode() } : { project };
+    const started = await postJSON(`/stage3/jobs/${kind}/start`, body);
     const jobId = String(started.job_id || started.id || "");
     if (!jobId) throw new Error("Backend не вернул идентификатор Stage 3 job");
     currentStage3JobId = jobId;
@@ -284,6 +334,9 @@ async function restoreStage3Job() {
     return true;
   }
   if (status === "completed") await applyCompletedStage3Job(job, false);
+  if (status === "failed" && job.error_code === "assembly_incomplete") {
+    renderStage3Blockers(job.blockers);
+  }
   finishStage3Job();
   return false;
 }
@@ -352,7 +405,9 @@ async function confirmExportSummary() {
 
 export async function exportTimelineXml() {
   if (appState.stage3JobRunning || stage3MediaScanning) return undefined;
-  if (!(await confirmExportSummary())) return undefined;
+  // "Assembly without gaps" never exports placeholders, so the draft confirmation is moot:
+  // the backend refuses to publish while blockers remain.
+  if (stage3PrepareMode() !== "complete" && !(await confirmExportSummary())) return undefined;
   return startStage3Job("prepare");
 }
 

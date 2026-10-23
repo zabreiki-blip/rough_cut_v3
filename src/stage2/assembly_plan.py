@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+import os
+from typing import Any, Callable, Mapping
 
 from stage_common import placeholder_reason
 
@@ -176,3 +177,113 @@ def plan_to_report(plan: dict) -> dict[str, Any]:
         ),
         "plan_summary": summary,
     }
+
+
+_RANGE_EPS = 1e-6
+
+
+def _catalog_value(entry: object, *names: str) -> object:
+    if not isinstance(entry, Mapping):
+        return None
+    for name in names:
+        value = entry.get(name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def validate_plan_complete(
+    plan: dict,
+    *,
+    catalog: Mapping[str, object] | None = None,
+    path_exists: Callable[[str], bool] = os.path.exists,
+) -> list[dict[str, Any]]:
+    """Blockers that prevent a gap-free ("complete") assembly; empty list means complete.
+
+    ``catalog`` maps source ids to media entries (``path``/``container_path`` and
+    ``duration``/``duration_sec``); when None, source file and duration checks are skipped.
+    Order is deterministic: by plan ``order``, then by check order within an item.
+    """
+    items = [item for item in (plan.get("items") or []) if isinstance(item, dict)]
+    blockers: list[dict[str, Any]] = []
+    for item in sorted(items, key=lambda entry: int(entry.get("order") or 0)):
+        found: list[tuple[str, str]] = []
+        item_type = str(item.get("type") or "")
+        if item.get("required") and item.get("status") != "ready":
+            reason = str(item.get("reason") or item.get("status") or "not_ready")
+            found.append((reason, f"status={item.get('status')}"))
+        elif item.get("status") == "ready":
+            found.extend(_ready_item_problems(item, item_type, catalog, path_exists))
+        if item.get("status") == "ready":
+            # A not-ready item is already blocked by its own reason; its tasks only restate it.
+            for task in item.get("tasks") or []:
+                if isinstance(task, dict) and task.get("open"):
+                    reason = str(task.get("reason") or task.get("kind") or "open_task")
+                    found.append((reason, f"open task: {task.get('kind')}"))
+        seen: set[str] = set()
+        for reason, detail in found:
+            if reason in seen:
+                continue
+            seen.add(reason)
+            blockers.append(
+                {
+                    "uid": str(item.get("uid") or ""),
+                    "segment_id": str(item.get("segment_id") or ""),
+                    "type": item_type,
+                    "reason": reason,
+                    "detail": detail,
+                }
+            )
+    return blockers
+
+
+def _ready_item_problems(
+    item: dict,
+    item_type: str,
+    catalog: Mapping[str, object] | None,
+    path_exists: Callable[[str], bool],
+) -> list[tuple[str, str]]:
+    problems: list[tuple[str, str]] = []
+    if item_type == "zk":
+        wav = item.get("wav") if isinstance(item.get("wav"), dict) else {}
+        wav_path = str(wav.get("path") or "")
+        if not wav_path or _num(wav.get("duration_sec")) <= 0:
+            problems.append(("missing_wav", "wav path or duration is empty"))
+        elif not path_exists(wav_path):
+            problems.append(("missing_wav", f"wav file not found: {wav_path}"))
+        return problems
+    if item_type not in {"snh", "host"}:
+        return problems
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    source_id = str(source.get("source_id") or "")
+    media_status = str(source.get("media_status") or "unchecked")
+    if media_status not in {"mapped", "unchecked"}:
+        problems.append(("unmapped_source", f"media_status={media_status}"))
+    entry = catalog.get(source_id) if catalog is not None and source_id else None
+    duration = _num(_catalog_value(entry, "duration", "duration_sec"))
+    media_path = _catalog_value(entry, "path", "container_path", "media_path")
+    if media_path is not None and not path_exists(str(media_path)):
+        problems.append(("source_missing", f"source file not found: {media_path}"))
+    edit = item.get("edit_range") if isinstance(item.get("edit_range"), dict) else {}
+    edit_in, edit_out = edit.get("in_sec"), edit.get("out_sec")
+    if edit_in is None or edit_out is None or not 0 <= edit_in < edit_out:
+        problems.append(("invalid_edit_range", f"edit_range={edit_in}..{edit_out}"))
+        return problems
+    if duration > 0 and edit_out > duration + _RANGE_EPS:
+        problems.append(
+            ("edit_beyond_source", f"edit out {edit_out} exceeds source duration {duration}")
+        )
+    speech = item.get("speech_range") if isinstance(item.get("speech_range"), dict) else {}
+    speech_in, speech_out = speech.get("in_sec"), speech.get("out_sec")
+    if (
+        speech_in is not None
+        and speech_out is not None
+        and (speech_in < edit_in - _RANGE_EPS or speech_out > edit_out + _RANGE_EPS)
+    ):
+        problems.append(
+            (
+                "speech_outside_edit",
+                f"speech {speech_in}..{speech_out} outside edit {edit_in}..{edit_out}",
+            )
+        )
+    return problems

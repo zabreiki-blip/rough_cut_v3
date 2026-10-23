@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from stage2.assembly_plan import build_assembly_plan, plan_to_report
+from stage2.assembly_plan import build_assembly_plan, plan_to_report, validate_plan_complete
 from stage2.models import FullTimeline, TimelineSegment
 from stage_common import placeholder_reason
 
@@ -303,3 +303,119 @@ def test_plan_speech_overlap_adds_single_review_task() -> None:
     assert ready["tasks"] == [{"kind": "review_match", "open": True, "reason": "speech_overlap"}]
     assert review["tasks"] == [{"kind": "review_match", "open": True}]  # no duplicate
     assert plan["summary"]["open_tasks"] == 2
+
+
+def _complete_plan(segments: list[dict], mapped: set[str] | None = None) -> dict:
+    return build_assembly_plan(
+        {"segments": segments}, media_mapping={"ivan_01"} if mapped is None else mapped
+    )
+
+
+def _reasons(blockers: list[dict]) -> list[tuple[str, str]]:
+    return [(item["uid"], item["reason"]) for item in blockers]
+
+
+def test_validate_complete_ready_plan_has_no_blockers() -> None:
+    plan = _complete_plan(
+        [
+            {"id": "zk1", "type": "zk", "duration_sec": 3.0, "wav_path": "/z.wav",
+             "block_uid": "uid-zk1"},
+            _matched("snh1"),
+            {"id": "tech1", "type": "tech", "duration_sec": 0.0},
+        ]
+    )
+    catalog = {"ivan_01": {"path": "/media/ivan.mp4", "duration": 100.0}}
+
+    assert validate_plan_complete(plan, catalog=catalog, path_exists=lambda _p: True) == []
+    assert validate_plan_complete(plan, path_exists=lambda _p: True) == []
+
+
+def test_validate_complete_reports_each_placeholder_reason_in_order() -> None:
+    plan = _complete_plan(
+        [
+            _snh("a"),
+            {"id": "z", "type": "zk", "duration_sec": 2.0, "wav_path": "", "block_uid": "uid-z"},
+            _snh("r", match_status="needs_review"),
+            {"id": "l", "type": "life", "duration_sec": 3.0, "block_uid": "uid-l"},
+            _matched("u", source_id="other"),
+        ]
+    )
+
+    blockers = validate_plan_complete(plan, path_exists=lambda _p: True)
+
+    assert _reasons(blockers) == [
+        ("uid-a", "not_found"),
+        ("uid-z", "missing_wav"),
+        ("uid-r", "needs_review"),
+        ("uid-l", "life_unassigned"),
+        ("uid-u", "unmapped_source"),
+    ]
+    assert blockers[0] == {
+        "uid": "uid-a", "segment_id": "a", "type": "snh", "reason": "not_found",
+        "detail": "status=placeholder",
+    }
+    assert validate_plan_complete(plan, path_exists=lambda _p: True) == blockers
+
+
+def test_validate_complete_checks_files_and_source_duration() -> None:
+    plan = _complete_plan(
+        [
+            {"id": "z", "type": "zk", "duration_sec": 2.0, "wav_path": "/gone.wav",
+             "block_uid": "uid-z"},
+            _matched("snh1"),
+        ]
+    )
+    catalog = {"ivan_01": {"container_path": "/media/ivan.mp4", "duration_sec": 5.0}}
+
+    blockers = validate_plan_complete(
+        plan, catalog=catalog, path_exists=lambda path: path == "/media/ivan.mp4"
+    )
+    assert _reasons(blockers) == [("uid-z", "missing_wav"), ("uid-snh1", "edit_beyond_source")]
+
+    blockers = validate_plan_complete(plan, catalog=catalog, path_exists=lambda _p: False)
+    assert _reasons(blockers) == [
+        ("uid-z", "missing_wav"),
+        ("uid-snh1", "source_missing"),
+        ("uid-snh1", "edit_beyond_source"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"source_in_sec": -1.0}, "invalid_edit_range"),
+        ({"speech_in_sec": 0.5}, "speech_outside_edit"),
+        ({"speech_out_sec": 11.5}, "speech_outside_edit"),
+    ],
+)
+def test_validate_complete_edit_and_speech_ranges(overrides: dict, reason: str) -> None:
+    plan = _complete_plan([_matched("snh1", **overrides)])
+
+    blockers = validate_plan_complete(plan, path_exists=lambda _p: True)
+
+    assert _reasons(blockers) == [("uid-snh1", reason)]
+
+
+def test_validate_complete_zero_length_edit_range_is_invalid() -> None:
+    plan = _complete_plan([_matched("snh1")])
+    plan["items"][0]["edit_range"] = {"in_sec": 2.0, "out_sec": 2.0}
+
+    assert _reasons(validate_plan_complete(plan)) == [("uid-snh1", "invalid_edit_range")]
+
+
+def test_validate_complete_open_speech_overlap_task_blocks_ready_item() -> None:
+    plan = _complete_plan(
+        [_matched("snh1", trim={"speech_overlap": True, "trimmed_head_sec": 0.0})]
+    )
+    assert plan["items"][0]["status"] == "ready"
+
+    blockers = validate_plan_complete(plan, path_exists=lambda _p: True)
+
+    assert _reasons(blockers) == [("uid-snh1", "speech_overlap")]
+
+
+def test_validate_complete_unmapped_media_status_on_ready_item() -> None:
+    plan = _complete_plan([_matched("snh1")])
+    plan["items"][0]["source"]["media_status"] = "unmapped"
+
+    assert _reasons(validate_plan_complete(plan)) == [("uid-snh1", "unmapped_source")]

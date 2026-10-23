@@ -1172,6 +1172,59 @@ function testStage3PlaceholderDescription({ stage3 }) {
   }
 }
 
+// Stage 3 result modes: the mode switch is sent with the prepare job and an
+// assembly_incomplete failure renders the blocker list with Russian reasons.
+async function testStage3ModesAndBlockers({ state, stage3 }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalRunning = appState.stage3JobRunning;
+  const originalMode = ids.stage3_prepare_mode.value;
+  const bodies = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("/stage3/jobs/prepare/start")) {
+      bodies.push(JSON.parse(options.body));
+    }
+    return { ok: false, status: 500, json: async () => ({ ok: false, error: "stop-after-start" }) };
+  };
+  try {
+    ids.stage3_prepare_mode.value = "";
+    assert.strictEqual(stage3.stage3PrepareMode(), "draft");
+    ids.stage3_prepare_mode.value = "bogus";
+    assert.strictEqual(stage3.stage3PrepareMode(), "draft");
+    ids.stage3_prepare_mode.value = "complete";
+    assert.strictEqual(stage3.stage3PrepareMode(), "complete");
+
+    appState.stage3JobRunning = false;
+    await stage3.exportTimelineXml().catch((err) => err);
+    assert.strictEqual(bodies.length, 1, "complete mode skips the draft confirmation dialog");
+    assert.strictEqual(bodies[0].mode, "complete");
+    appState.stage3JobRunning = false;
+
+    const blockers = [
+      { uid: "u1", segment_id: "r1", type: "snh", reason: "needs_review", detail: "x" },
+      { uid: "u2", segment_id: "z1", type: "zk", reason: "missing_wav", detail: "<b>" },
+      { uid: "u3", segment_id: "o1", type: "snh", reason: "speech_overlap", detail: "" },
+      { uid: "u4", segment_id: "q1", type: "host", reason: "brand_new_reason", detail: "" },
+    ];
+    assert.strictEqual(stage3.describeStage3Blocker(blockers[0]), "SNH · r1 — Нужна проверка");
+    assert.strictEqual(stage3.describeStage3Blocker(blockers[1]), "ZK · z1 — Нет WAV");
+    assert.ok(stage3.describeStage3Blocker(blockers[2]).includes("Речь пересекается"));
+    assert.ok(stage3.describeStage3Blocker(blockers[3]).endsWith("brand_new_reason"));
+    stage3.renderStage3Blockers(blockers);
+    assert.strictEqual(ids.stage3_blockers.hidden, false);
+    assert.ok(ids.stage3_blockers.innerHTML.includes("блокеров 4"), ids.stage3_blockers.innerHTML);
+    assert.ok(ids.stage3_blockers.innerHTML.includes("Нужна проверка"));
+    assert.ok(!ids.stage3_blockers.innerHTML.includes("<b>"), "details are HTML-escaped");
+    stage3.renderStage3Blockers([]);
+    assert.strictEqual(ids.stage3_blockers.hidden, true);
+    assert.strictEqual(ids.stage3_blockers.innerHTML, "");
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.stage3JobRunning = originalRunning;
+    ids.stage3_prepare_mode.value = originalMode;
+  }
+}
+
 // Audit item 4: the editor sees fragment counts and build warnings BEFORE export;
 // unresolved fragments need an explicit confirmation, cancel aborts the export.
 async function testExportXmlPreExportSummary({ state, stage3 }) {
@@ -1961,6 +2014,7 @@ async function main() {
     ["testSyncJobIncompleteAndAsrFailedLabel", () => testSyncJobIncompleteAndAsrFailedLabel(modules)],
     ["testStage3PlaceholderDescription", () => testStage3PlaceholderDescription(modules)],
     ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
+    ["testStage3ModesAndBlockers", () => testStage3ModesAndBlockers(modules)],
     ["testNormalizationEditDuringConfirm", () => testNormalizationEditDuringConfirm(modules)],
     ["testNormalizationSaveAcceptsRevisionAfterEdit", () => testNormalizationSaveAcceptsRevisionAfterEdit(modules)],
     ["testApplyStatusSyncsTimelineReady", () => testApplyStatusSyncsTimelineReady(modules)],

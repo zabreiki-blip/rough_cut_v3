@@ -545,6 +545,7 @@
               <span>Осталось примерно: <strong id="stage3_job_eta">рассчитывается</strong></span>
             </div>
           </div>
+          <div id="stage3_blockers" class="stage3-blockers" hidden aria-live="polite"></div>
           <div id="stage3_media_list" class="stage3-media-list" aria-live="polite">
             <div class="empty-state compact">Просмотровки ещё не найдены.</div>
           </div>
@@ -682,6 +683,13 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="4" rx="1"/><rect x="3" y="10" width="11" height="4" rx="1"/><rect x="3" y="17" width="15" height="4" rx="1"/></svg>
             Build Timeline
           </button>
+          <label class="stage3-mode-switch" for="stage3_prepare_mode" title="Черновик допускает заглушки; «Сборка без пропусков» не публикует XML, пока есть блокеры">
+            <span>Режим XML</span>
+            <select id="stage3_prepare_mode">
+              <option value="draft" selected>Черновик</option>
+              <option value="complete">Сборка без пропусков</option>
+            </select>
+          </label>
           <button id="btn_export_xml" class="btn btn-ghost" type="button" disabled title="Экспорт готового таймлайна в XML для Premiere">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             Export XML

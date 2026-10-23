@@ -1335,3 +1335,300 @@ def test_stage3_download_is_refused_when_timeline_file_changes_without_fingerpri
     stale = http.get("/stage3/export/xml?project=BRIK")
     assert stale.status_code == 409
     assert "stale" in stale.get_json()["error"]
+
+
+# --- result modes: draft / complete -------------------------------------------------------
+
+
+def _complete_setup(client, *, wav: bool = True, source: bool = True, extra=(), duration=100.0):
+    """Nested project with one ZK + one matched SNH; media files exist unless disabled."""
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    root = services._ensure_project("BRIK")["root"]
+    media = root / "media" / "v1.mp4"
+    wav_file = root / "work" / "zk.wav"
+    media.parent.mkdir(parents=True, exist_ok=True)
+    wav_file.parent.mkdir(parents=True, exist_ok=True)
+    if source:
+        media.write_bytes(b"x")
+    if wav:
+        wav_file.write_bytes(b"x")
+    segments = [
+        _segment("z1", "zk", 0.0, 2.0, wav_path=str(wav_file)),
+        _segment(
+            "m1", "snh", 2.0, 2.0,
+            match_status="confirmed", source_id="v1", source_in_sec=1.0, source_out_sec=3.0,
+            speech_in_sec=1.2, speech_out_sec=2.8,
+        ),
+        *extra,
+    ]
+    http, paths = _nested_prepare_setup(client, segments)
+    video = {"source_id": "v1", "path": str(media), "duration": duration, "media_kind": "video"}
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "map_catalog_to_timeline",
+        lambda *_a: SimpleNamespace(
+            catalog={"v1": video}, details={}, unmapped_source_ids=[], to_dict=lambda: {}
+        ),
+    )
+    return http, paths
+
+
+def _published(paths) -> list[str]:
+    work = paths["work"]
+    return sorted(
+        item.name
+        for item in work.iterdir()
+        if item.suffix == ".xml" or item.name in {"assembly_plan.json", "stage3_source_mapping.json"}
+    )
+
+
+def test_prepare_mode_defaults_to_draft_with_placeholders(client) -> None:
+    http, paths = _nested_prepare_setup(
+        client,
+        [
+            _segment("r1", "snh", 0.0, 3.0, match_status="needs_review"),
+            _segment("l1", "life", 3.0, 2.0),
+        ],
+    )
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    assert result["mode"] == "draft"
+    assert result["complete"] is False
+    assert result["blocker_count"] == 2
+    assert result["placeholder_segments"] == 2
+    assert "assembly_plan.json" in _published(paths)
+
+
+@pytest.mark.parametrize("mode", ["strict", "", 3, ["complete"]])
+def test_prepare_rejects_unknown_mode(client, mode) -> None:
+    http, paths = _complete_setup(client)
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": mode})
+
+    assert response.status_code == 400
+    assert "mode" in response.get_json()["error"]
+    assert _published(paths) == []
+
+
+def test_prepare_job_rejects_unknown_mode(client) -> None:
+    http, _paths = _complete_setup(client)
+
+    response = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "x"})
+
+    assert response.status_code == 400
+    assert "mode" in response.get_json()["error"]
+
+
+def test_prepare_complete_on_full_project_publishes(client) -> None:
+    http, paths = _complete_setup(client)
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    assert result["mode"] == "complete"
+    assert result["complete"] is True
+    assert result["blocker_count"] == 0
+    assert result["placeholder_segments"] == 0
+    assert "assembly_plan.json" in _published(paths)
+    assert (paths["work"] / result["filename"]).is_file()
+
+
+def test_prepare_draft_on_full_project_reports_complete(client) -> None:
+    http, _paths = _complete_setup(client)
+
+    result = http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).get_json()["result"]
+
+    assert result["mode"] == "draft"
+    assert result["complete"] is True
+
+
+def test_prepare_complete_with_placeholders_returns_409_and_publishes_nothing(client) -> None:
+    http, paths = _complete_setup(
+        client,
+        extra=[
+            _segment("r1", "snh", 4.0, 3.0, match_status="needs_review", block_uid="uid-r1"),
+            _segment("n1", "host", 7.0, 2.0, match_status="not_found", block_uid="uid-n1"),
+            _segment("l1", "life", 9.0, 2.0, block_uid="uid-l1"),
+            _segment(
+                "u1", "snh", 11.0, 2.0, block_uid="uid-u1",
+                match_status="auto_matched", source_id="v2", source_in_sec=1.0, source_out_sec=3.0,
+            ),
+        ],
+    )
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["ok"] is False
+    assert body["error"] == "assembly_incomplete"
+    assert [(b["uid"], b["segment_id"], b["type"], b["reason"]) for b in body["blockers"]] == [
+        ("uid-r1", "r1", "snh", "needs_review"),
+        ("uid-n1", "n1", "host", "not_found"),
+        ("uid-l1", "l1", "life", "life_unassigned"),
+        ("uid-u1", "u1", "snh", "unmapped_source"),
+    ]
+    assert body["summary"]["placeholders"]["segments"] == 4
+    assert _published(paths) == []
+
+
+def test_prepare_complete_blocks_on_missing_wav_file(client) -> None:
+    http, paths = _complete_setup(client, wav=False)
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert response.status_code == 409
+    blockers = response.get_json()["blockers"]
+    assert [(b["uid"], b["reason"]) for b in blockers] == [("z1", "missing_wav")]
+    assert _published(paths) == []
+
+
+def test_prepare_complete_blocks_on_deleted_source_file(client) -> None:
+    http, paths = _complete_setup(client, source=False)
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert response.status_code == 409
+    blockers = response.get_json()["blockers"]
+    assert [(b["uid"], b["reason"]) for b in blockers] == [("m1", "source_missing")]
+    assert _published(paths) == []
+    # The same project still prepares as a draft.
+    assert http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).status_code == 200
+
+
+def test_prepare_complete_blocks_when_edit_exceeds_source_duration(client) -> None:
+    http, _paths = _complete_setup(client, duration=2.5)
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert response.status_code == 409
+    assert [b["reason"] for b in response.get_json()["blockers"]] == ["edit_beyond_source"]
+
+
+def test_prepare_complete_blocks_on_open_speech_overlap(client) -> None:
+    http, _paths = _complete_setup(
+        client,
+        extra=[
+            _segment(
+                "o1", "snh", 4.0, 2.0, block_uid="uid-o1",
+                match_status="confirmed", source_id="v1", source_in_sec=10.0, source_out_sec=12.0,
+                speech_in_sec=10.2, speech_out_sec=11.8,
+                trim={"speech_overlap": True},
+            )
+        ],
+    )
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert response.status_code == 409
+    assert [(b["uid"], b["reason"]) for b in response.get_json()["blockers"]] == [
+        ("uid-o1", "speech_overlap")
+    ]
+
+
+def test_prepare_complete_without_viewings_is_blocked(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "normalization_revision": "norm-1",
+                "segments": [
+                    _segment(
+                        "m1", "snh", 0.0, 2.0, match_status="confirmed", source_id="v1",
+                        source_in_sec=1.0, source_out_sec=3.0,
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {"sources": []}
+    )
+
+    draft = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+    complete = http.post("/stage3/timeline/prepare", json={"project": "BRIK", "mode": "complete"})
+
+    assert draft.status_code == 200
+    assert draft.get_json()["result"]["complete"] is False
+    assert complete.status_code == 409
+    assert [b["reason"] for b in complete.get_json()["blockers"]] == ["unmapped_source"]
+
+
+def test_prepare_job_complete_fails_with_blockers(client) -> None:
+    http, paths = _complete_setup(
+        client, extra=[_segment("r1", "snh", 4.0, 3.0, match_status="needs_review")]
+    )
+    client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+
+    started = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "complete"})
+    assert started.status_code == 200
+    job = http.get(started.get_json()["result"]["status_url"]).get_json()["result"]
+
+    assert job["status"] == "failed"
+    assert job["error"] == "assembly_incomplete"
+    assert job["error_code"] == "assembly_incomplete"
+    assert job["http_status"] == 409
+    assert job["error_status"] == 409
+    assert [(b["segment_id"], b["reason"]) for b in job["blockers"]] == [("r1", "needs_review")]
+    assert job["summary"]["placeholders"]["segments"] == 1
+    assert _published(paths) == []
+
+
+def test_prepare_job_defaults_to_draft_and_complete_succeeds(client) -> None:
+    http, paths = _complete_setup(client)
+    client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+
+    draft = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"}).get_json()["result"]
+    job = http.get(draft["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["result"]["mode"] == "draft"
+
+    done = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "complete"})
+    job = http.get(done.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["status"] == "completed"
+    assert job["result"]["mode"] == "complete"
+    assert job["result"]["complete"] is True
+
+
+def test_stage3_plan_endpoint_reports_blockers_without_writing(client) -> None:
+    http, paths = _complete_setup(
+        client, extra=[_segment("r1", "snh", 4.0, 3.0, match_status="needs_review")]
+    )
+    before = sorted(path.name for path in paths["work"].iterdir())
+
+    response = http.get("/stage3/plan?project=BRIK")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["result"]["complete_ready"] is False
+    assert body["complete_ready"] is False
+    assert [(b["segment_id"], b["reason"]) for b in body["blockers"]] == [("r1", "needs_review")]
+    assert body["summary"]["items"] == 3
+    assert sorted(path.name for path in paths["work"].iterdir()) == before
+
+
+def test_stage3_plan_endpoint_complete_ready_and_gates(client) -> None:
+    http, _paths = _complete_setup(client)
+
+    body = http.get("/stage3/plan?project=BRIK").get_json()
+
+    assert body["complete_ready"] is True
+    assert body["blockers"] == []
+
+
+def test_stage3_plan_endpoint_requires_timeline(client) -> None:
+    http, _app, _monkeypatch = client
+
+    response = http.get("/stage3/plan?project=BRIK")
+
+    assert response.status_code == 404

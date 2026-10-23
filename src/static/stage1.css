@@ -477,6 +477,16 @@ nav { display: grid; gap: 4px; }
 }
 .stage3-media-summary strong { color: var(--blue); font-family: "JetBrains Mono", monospace; }
 .stage3-media-list { display: grid; gap: 7px; max-height: 360px; overflow-y: auto; }
+.stage3-mode-switch { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.stage3-mode-switch select { font-size: 12px; }
+.stage3-blockers {
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.stage3-blockers ul { margin: 6px 0 0; padding-left: 18px; max-height: 240px; overflow-y: auto; }
 .stage3-media-item {
   display: grid;
   grid-template-columns: minmax(180px, 1fr) minmax(340px, .9fr);

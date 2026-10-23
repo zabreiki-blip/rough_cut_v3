@@ -18,7 +18,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from atomic_io import atomic_write_json, atomic_write_text
 from export_naming import xml_export_filename
 from job_runtime import trim_terminal_jobs
-from stage2.assembly_plan import build_assembly_plan, plan_to_report
+from stage2.assembly_plan import build_assembly_plan, plan_to_report, validate_plan_complete
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
@@ -35,12 +35,36 @@ _STAGE3_JOB_KINDS = ("scan", "prepare")
 _STAGE3_JOBS_MAX = 200
 _STAGE3_JOBS_TTL_SECONDS = 24 * 60 * 60
 _STAGE3_TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
+_STAGE3_PREPARE_MODES = ("draft", "complete")
+_ASSEMBLY_INCOMPLETE = "assembly_incomplete"
 
 
 class Stage3OperationError(RuntimeError):
     def __init__(self, message: str, status_code: int = 400) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class AssemblyIncompleteError(Stage3OperationError):
+    """``mode=complete`` was requested but the assembly plan still has blockers."""
+
+    error_code = _ASSEMBLY_INCOMPLETE
+
+    def __init__(self, blockers: list[dict], summary: dict) -> None:
+        super().__init__(_ASSEMBLY_INCOMPLETE, 409)
+        self.blockers = blockers
+        self.summary = summary
+
+    def payload(self) -> dict:
+        return {"error": self.error_code, "blockers": self.blockers, "summary": self.summary}
+
+
+def _parse_prepare_mode(value: object) -> str:
+    if value is None:
+        return "draft"
+    if not isinstance(value, str) or value not in _STAGE3_PREPARE_MODES:
+        raise MediaCatalogError("mode must be 'draft' or 'complete'")
+    return value
 
 
 def _host_path(path: str, *, project: str, project_root: Path) -> str:
@@ -419,13 +443,12 @@ def _perform_scan(
     return {"project": project, **catalog}
 
 
-def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> dict:
-    paths = services._ensure_project(project)
+def _load_current_timeline(project: str, services: ModuleType, paths: dict) -> tuple[bytes, dict]:
+    """Read full_timeline.json and refuse it when normalization or sync matches moved on."""
+
     timeline_path = paths["work"] / "full_timeline.json"
     if not timeline_path.is_file():
         raise Stage3OperationError("full_timeline.json not found — run Build Timeline first", 404)
-    if progress:
-        progress(10, "Проверка собранного таймлайна")
     timeline_bytes = timeline_path.read_bytes()
     timeline_data = json.loads(timeline_bytes.decode("utf-8"))
     confirmed, _reason = services._confirmed_normalization(project)
@@ -437,6 +460,33 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     _source_store, match_store = services._sync_stores(paths)
     if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
         raise Stage3OperationError(TIMELINE_MATCHES_CHANGED_ERROR, 409)
+    return timeline_bytes, timeline_data
+
+
+def _plan_with_mapping(
+    project: str, services: ModuleType, paths: dict, timeline_data: dict, logical_catalog: dict
+):
+    """Map viewings to the timeline and build the assembly plan (writes nothing)."""
+
+    source_store, _match_store = services._sync_stores(paths)
+    sync_sources = [source.to_dict() for source in source_store.list()]
+    host_catalog = _host_catalog(logical_catalog, project=project, project_root=paths["root"])
+    mapping = map_catalog_to_timeline(timeline_data, {"sources": sync_sources}, host_catalog)
+    _annotate_media_kinds(mapping, host_catalog)
+    host_timeline = _host_timeline_paths(timeline_data, project=project, project_root=paths["root"])
+    plan = build_assembly_plan(host_timeline, media_mapping=set(mapping.catalog))
+    return mapping, host_catalog, host_timeline, plan
+
+
+def _perform_prepare(
+    project: str, services: ModuleType, *, progress=None, mode: str = "draft"
+) -> dict:
+    paths = services._ensure_project(project)
+    if not (paths["work"] / "full_timeline.json").is_file():
+        raise Stage3OperationError("full_timeline.json not found — run Build Timeline first", 404)
+    if progress:
+        progress(10, "Проверка собранного таймлайна")
+    timeline_bytes, timeline_data = _load_current_timeline(project, services, paths)
     if progress:
         progress(25, "Проверка доступных просмотровок")
     sync_summary = timeline_sync_summary(timeline_data)
@@ -451,9 +501,21 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     catalog = _scan_project_media(project, paths, services)
     logical_catalog = _timeline_catalog(catalog)
     if not logical_catalog.get("sources"):
+        # No viewings: nothing can be mapped, so every sync segment is "unmapped_source"
+        # for the completeness check, while the draft report keeps its legacy shape.
+        host_timeline = _host_timeline_paths(
+            timeline_data, project=project, project_root=paths["root"]
+        )
+        unmapped_plan = build_assembly_plan(host_timeline, media_mapping=set())
+        blockers = validate_plan_complete(unmapped_plan)
+        if mode == "complete" and blockers:
+            raise AssemblyIncompleteError(blockers, unmapped_plan["summary"])
         return {
             "project": project,
             "format": "legacy",
+            "mode": mode,
+            "complete": not blockers,
+            "blocker_count": len(blockers),
             "filename": xml_export_filename(project, timeline_data.get("scenario_revision_id")),
             "download_url": f"/stage2/export/xml?project={project}",
             "media_count": 0,
@@ -473,14 +535,15 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         width=int(timeline_data.get("width") or 1920),
         height=int(timeline_data.get("height") or 1080),
     )
-    source_store, _match_store = services._sync_stores(paths)
-    sync_sources = [source.to_dict() for source in source_store.list()]
-    host_catalog = _host_catalog(logical_catalog, project=project, project_root=paths["root"])
-    mapping = map_catalog_to_timeline(timeline_data, {"sources": sync_sources}, host_catalog)
-    _annotate_media_kinds(mapping, host_catalog)
-    mapped_timeline_source_ids = set(mapping.catalog)
-    host_timeline = _host_timeline_paths(timeline_data, project=project, project_root=paths["root"])
-    plan = build_assembly_plan(host_timeline, media_mapping=mapped_timeline_source_ids)
+    mapping, host_catalog, host_timeline, plan = _plan_with_mapping(
+        project, services, paths, timeline_data, logical_catalog
+    )
+    blockers = validate_plan_complete(plan, catalog=mapping.catalog)
+    if mode == "complete" and blockers:
+        # Fail closed before anything is published: no XML, no mapping and no assembly_plan.json,
+        # so the files on disk keep describing the last successful prepare.  The rejected plan is
+        # available without side effects through GET /stage3/plan.
+        raise AssemblyIncompleteError(blockers, plan["summary"])
     placeholder_report = plan_to_report(plan)
     export_catalog: dict[str, object] = {
         str(source["source_id"]): source
@@ -521,6 +584,9 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     return {
         "project": project,
         "format": "nested",
+        "mode": mode,
+        "complete": not blockers,
+        "blocker_count": len(blockers),
         "filename": filename,
         "download_url": f"/stage3/export/xml?project={project}",
         "media_count": len(host_catalog.get("sources", [])),
@@ -534,6 +600,35 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         **placeholder_report,
         "source_mapping": _mapping_summary(mapping),
         "sync_summary": sync_summary,
+    }
+
+
+def _perform_plan_check(project: str, services: ModuleType) -> dict:
+    """Read-only completeness check of the current timeline (no XML, no plan file).
+
+    It reuses the prepare mapping on the cached ffprobe catalog and skips only the audio
+    placeholder cards, which are PNG side effects that do not influence the mapping.
+    """
+
+    paths = services._ensure_project(project)
+    _timeline_bytes, timeline_data = _load_current_timeline(project, services, paths)
+    logical_catalog = _timeline_catalog(_scan_project_media(project, paths, services))
+    if logical_catalog.get("sources"):
+        mapping, _host_catalog_, _host_timeline, plan = _plan_with_mapping(
+            project, services, paths, timeline_data, logical_catalog
+        )
+        blockers = validate_plan_complete(plan, catalog=mapping.catalog)
+    else:
+        host_timeline = _host_timeline_paths(
+            timeline_data, project=project, project_root=paths["root"]
+        )
+        plan = build_assembly_plan(host_timeline, media_mapping=set())
+        blockers = validate_plan_complete(plan)
+    return {
+        "project": project,
+        "summary": plan["summary"],
+        "complete_ready": not blockers,
+        "blockers": blockers,
     }
 
 
@@ -635,6 +730,7 @@ def _run_job(
     jobs_lock,
     active_projects: set[str],
     services: ModuleType,
+    mode: str = "draft",
 ) -> None:
     def progress(value: int, message: str) -> None:
         _update_job(job_id, jobs, jobs_lock, services, progress=value, message=message)
@@ -652,7 +748,7 @@ def _run_job(
         result = (
             _perform_scan(project, services, recursive=recursive, progress=progress)
             if kind == "scan"
-            else _perform_prepare(project, services, progress=progress)
+            else _perform_prepare(project, services, progress=progress, mode=mode)
         )
         _update_job(
             job_id,
@@ -663,6 +759,23 @@ def _run_job(
             progress=100,
             message=("Просмотровки обновлены" if kind == "scan" else "XML готов"),
             result=result,
+            finished_at=_now_iso(),
+        )
+    except AssemblyIncompleteError as exc:
+        _update_job(
+            job_id,
+            jobs,
+            jobs_lock,
+            services,
+            status="failed",
+            error=exc.error_code,
+            error_code=exc.error_code,
+            error_status=exc.status_code,
+            http_status=exc.status_code,
+            message=f"Сборка без пропусков невозможна: блокеров {len(exc.blockers)}",
+            blockers=exc.blockers,
+            summary=exc.summary,
+            mode=mode,
             finished_at=_now_iso(),
         )
     except Stage3OperationError as exc:
@@ -722,6 +835,7 @@ def _start_job(
         recursive = payload.get("recursive", False)
         if not isinstance(recursive, bool):
             raise MediaCatalogError("recursive must be a boolean")
+        mode = _parse_prepare_mode(payload.get("mode")) if kind == "prepare" else "draft"
     except (MediaCatalogError, ValueError) as exc:
         return services._json_error(str(exc), 400)
     if kind == "prepare":
@@ -742,7 +856,10 @@ def _start_job(
         job = _create_job(project, kind, jobs, jobs_lock, services)
         worker = threading.Thread(
             target=_run_job,
-            args=(job["id"], project, kind, recursive, jobs, jobs_lock, active_projects, services),
+            args=(
+                job["id"], project, kind, recursive, jobs, jobs_lock, active_projects,
+                services, mode,
+            ),
             daemon=True,
         )
         worker.start()
@@ -870,11 +987,14 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error("JSON object is required", 400)
         try:
             project = services._resolve_project_name(payload.get("project"))
+            mode = _parse_prepare_mode(payload.get("mode"))
             gate = services._normalization_required(project)
             if gate:
                 return gate
             with _project_transition(project, services):
-                result = _perform_prepare(project, services)
+                result = _perform_prepare(project, services, mode=mode)
+        except AssemblyIncompleteError as exc:
+            return jsonify({"ok": False, **exc.payload()}), exc.status_code
         except Stage3OperationError as exc:
             return services._json_error(str(exc), exc.status_code)
         except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -882,6 +1002,24 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         except Exception as exc:
             return services._internal_error(exc)
         return jsonify({"ok": True, "result": result})
+
+    @app.get("/stage3/plan")
+    def stage3_plan_check():
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+            gate = services._normalization_required(project)
+            if gate:
+                return gate
+            result = _perform_plan_check(project, services)
+        except Stage3OperationError as exc:
+            return services._json_error(str(exc), exc.status_code)
+        except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return services._json_error(str(exc), 400)
+        except Exception as exc:
+            return services._internal_error(exc)
+        # Same {ok, result} envelope as the other Stage 3 routes; the fields are mirrored at the
+        # top level for clients that read {summary, complete_ready, blockers} directly.
+        return jsonify({"ok": True, "result": result, **result})
 
     @app.get("/stage3/export/xml")
     def stage3_export_xml():

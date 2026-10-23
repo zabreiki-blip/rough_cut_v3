@@ -154,6 +154,8 @@ export const ids = {
   stage3_media_count: el("stage3_media_count"),
   stage3_media_message: el("stage3_media_message"),
   stage3_media_list: el("stage3_media_list"),
+  stage3_prepare_mode: el("stage3_prepare_mode"),
+  stage3_blockers: el("stage3_blockers"),
   stage3_source_mapping: el("stage3_source_mapping"),
   stage3_job_progress: el("stage3_job_progress"),
   stage3_job_message: el("stage3_job_message"),
