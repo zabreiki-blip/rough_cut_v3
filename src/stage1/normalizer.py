@@ -48,7 +48,12 @@ from .scenario_context import (
     neighbour_context,
     plan_scene_context,
 )
-from .confirmation_checks import ConfirmationIssue, structural_checks
+from .confirmation_checks import (
+    ConfirmationIssue,
+    has_speaker_name,
+    looks_like_caps_source_note,
+    structural_checks,
+)
 from .presenter_cues import parse_presenter_parts
 from .scenario_structure import (
     LEAD_IN_WARNING,
@@ -268,6 +273,8 @@ _DOT_CREDIT_MAX_WORDS = 4
 # quote. Recognized independently of the generic marker machinery below,
 # which requires an exact alias match and cannot absorb a trailing name.
 _SYNC_LABEL_ONLY_MARKER = SYNC_LABEL_ONLY_RE
+# A bare sync service word standing where a speaker name could be (``СИНХ``, ``СНХ``).
+_SYNC_SERVICE_LABEL = re.compile(r"^(?:синх|снх|синхрон|sync)[.:]?$", re.IGNORECASE)
 _SYNC_CONTINUATION_NOTE = re.compile(r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE)
 _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"^\s*\((?:[^)\n]{{1,240}}\)\s*:?\s*|[^:\n]{{1,240}}:\s*)"
@@ -1470,7 +1477,18 @@ def validate_for_confirmation_detailed(
                     f"Voiceover block {block.order} contains an editorial cue",
                 )
         if block.type == BlockType.SYNC.value:
-            if not block.speaker.strip():
+            if (
+                block.speaker.strip()
+                and not has_speaker_name(block.speaker)
+                and "speaker" not in block.manual_fields
+            ):
+                add(
+                    "sync_no_speaker",
+                    block,
+                    f"Sync block {block.order} has no recognizable speaker name "
+                    f"('{block.speaker.strip()}' is a service label)",
+                )
+            elif not block.speaker.strip():
                 # A sync typed only by scene context (splice) is not an
                 # explicit label: the author may mean the same speaker.
                 opener = blocks_by_uid.get(block.scene_uid)
@@ -1872,6 +1890,26 @@ def _annotate_continuation_context(
                 DecisionSource.BUILTIN_RULE.value,
                 0.9,
             )
+            if NARRATION_RECOVERED_WARNING in previous.warnings:
+                # Still inside the text read after a cue: same review note.
+                block.warnings.append(NARRATION_RECOVERED_WARNING)
+                block.text_for_tts = block.normalized_text
+        elif (
+            previous is not None
+            and _is_voice_reading_cue(previous)
+            and _continues_voice_reading_cue(block, video_cue_re)
+        ):
+            # ``Голос «Маяковского»:`` hands the next paragraph to a role's voice:
+            # it is narration (voiceover), never the previous synchron's speech.
+            block.continuation_of_type = BlockType.VOICEOVER.value
+            if not block.suggested_type:
+                block.suggested_type = BlockType.VOICEOVER.value
+            _apply_type(block, BlockType.VOICEOVER.value, DecisionSource.BUILTIN_RULE.value, 0.8)
+            block.speaker = ""
+            block.role = ""
+            block.text_for_tts = block.normalized_text
+            if NARRATION_RECOVERED_WARNING not in block.warnings:
+                block.warnings.append(NARRATION_RECOVERED_WARNING)
         # A bare timecoded quote can inherit the interviewee only from the
         # immediately preceding sync. A cue or narration in between makes
         # that attribution uncertain and requires an explicit speaker.
@@ -2790,6 +2828,15 @@ def _classify_by_rules(
                         block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0
                     )
                     return
+            if _SYNC_SERVICE_LABEL.match(block.original_label.strip()):
+                _label, marked_content = _split_label(block.original_text)
+                if looks_like_caps_source_note(marked_content):
+                    # ``СИНХ ЭРНСТА – ИЗ ФАЙЛОВ, КОТОРЫЙ ДАЛ ПЕРВЫЙ КАНАЛ – ...``: a
+                    # remark about the material's source, not a quote.
+                    _apply_type(
+                        block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9
+                    )
+                    return
             _apply_type(block, _BUILTIN_MARKERS[marker], DecisionSource.BUILTIN_RULE.value, 1.0)
             return
         if marker in _TECH_MARKERS:
@@ -2868,6 +2915,13 @@ def _classify_by_rules(
     elif _looks_like_section_heading(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif (
+        _SYNC_SERVICE_LABEL.match(block.original_label.strip())
+        and looks_like_caps_source_note(content)
+    ):
+        # ``СИНХ ЭРНСТА – ИЗ ФАЙЛОВ, КОТОРЫЙ ДАЛ ПЕРВЫЙ КАНАЛ – ...``: the label is a
+        # sync service word, not a name, and the rest is a remark about the source.
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+    elif (
         (_BARE_SPEAKER_PREFIX.match(stripped) or _CLEAR_SPEAKER_CREDIT.match(stripped))
         and block.original_label
         and len(content) >= 35
@@ -2916,6 +2970,13 @@ def _assign_first_timecodes(block: NormalizedBlock) -> None:
 
 
 def _extract_block_metadata(block: NormalizedBlock) -> None:
+    _extract_block_metadata_fields(block)
+    if block.type == BlockType.SYNC.value and block.speaker and not has_speaker_name(block.speaker):
+        # A lone service label (``СИНХ``, ``ЗК``) is never a speaker.
+        block.speaker = ""
+
+
+def _extract_block_metadata_fields(block: NormalizedBlock) -> None:
     if block.type == BlockType.LIFE.value:
         life = _LIFE_PREFIX.match(_structural_text(block.original_text))
         block.speaker = ""
@@ -3361,6 +3422,29 @@ def _llm_pinned_non_voiceover(block: NormalizedBlock) -> bool:
         any("contradicts the preceding LIFE scene" in warning for warning in block.warnings)
         or bool(block.scene_uid)
         or block.suggested_type not in ("", BlockType.VOICEOVER.value)
+    )
+
+
+def _continues_voice_reading_cue(
+    block: NormalizedBlock, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
+) -> bool:
+    """An unresolved plain paragraph right after a reading cue is the cued text."""
+    return (
+        block.type == BlockType.UNKNOWN.value
+        and not block.original_label
+        and AMBIGUOUS_CAPS_WARNING not in block.warnings
+        and TIMECODE_NOTE_WARNING not in block.warnings
+        and not block.scene_uid
+        and not _paragraph_structure(block.original_text).has_label_conflict
+        and not _TIMECODE.search(block.original_text)
+        and not is_plus_splice(block.original_text)
+        and not is_dialogue_reply(block.original_text)
+        and _technical_heuristic_confidence(block.original_text, video_cue_re) is None
+        and not _looks_like_video_cue(block.original_text, video_cue_re)
+        and not _LINK_RE.search(block.original_text)
+        and not _FOOTAGE_REMARK_START_RE.match(block.original_text.strip())
+        and bool(re.search(r"[^\W\d_]", block.original_text))
+        and not _looks_like_credit_line(block.original_text)
     )
 
 

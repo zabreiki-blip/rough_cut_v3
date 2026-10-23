@@ -31,6 +31,7 @@ FALSE_HERO_FROM_CUE = "false_hero_from_cue"
 LOST_SPLICE = "lost_splice"
 UNMATCHED_SPEECH = "unmatched_speech"
 MONTAGE_NOTE_IN_TTS = "montage_note_in_tts"
+SYNC_SOURCE_NOTE = "sync_source_note"
 
 
 @dataclass(frozen=True)
@@ -90,8 +91,19 @@ _SERVICE_WORDS = frozenset(
         "фотография",
         "скл",
         "склейка",
+        # Source/provenance remarks written in capitals
+        # (``ИЗ ФАЙЛОВ, КОТОРЫЙ ДАЛ ПЕРВЫЙ КАНАЛ``, ``АРХИВ``, ``СЪЕМКИ``).
+        "файл",
+        "файлов",
+        "файлы",
+        "архив",
+        "съемка",
+        "съемки",
+        "канал",
     }
 )
+# Service labels that may stand in a speaker field but never name a person.
+_SPEAKER_SERVICE_WORDS = _SERVICE_WORDS | {"синх", "синхр"}
 _TIMECODE_FRAGMENT = re.compile(
     r"\(\s*[\d:.]*\s*$|(?<![\d:.])\d{1,2}[:.][0-5]\d[:.][0-5]\d(?![\d:.])"
 )
@@ -184,6 +196,66 @@ def _from_zk_label(block: Any) -> bool:
         words = str(getattr(block, "original_text", "") or "").split()
         label = words[0].rstrip(".:") if words else ""
     return bool(label) and is_zk_label(label)
+
+
+def has_speaker_name(speaker: str) -> bool:
+    """True if ``speaker`` holds at least one name token.
+
+    A lone service label (``СИНХ``, ``СНХ``, ``ЗК``), a number or an empty
+    string names nobody.
+    """
+    for token in re.findall(r"[^\W\d_]+", str(speaker or "")):
+        if _fold(token) not in _SPEAKER_SERVICE_WORDS:
+            return True
+    return False
+
+
+_SOURCE_NOTE_MIN_CAPS_WORDS = 3
+_SOURCE_NOTE_MIN_CAPS_SHARE = 0.5
+
+
+def looks_like_caps_source_note(text: str) -> bool:
+    """Text without a timecode that is mostly capitals and names a montage/source word.
+
+    ``ЭРНСТА – ИЗ ФАЙЛОВ, КОТОРЫЙ ДАЛ ПЕРВЫЙ КАНАЛ – съемки в центр`` is a note
+    about where the material came from, not a quote.
+    """
+    if find_structural_timecodes(text) or re.search(r"\d{1,2}[:.][0-5]\d", text):
+        return False
+    words = [w for w in re.findall(r"[^\W\d_]+", text) if len(w) >= 2]
+    caps = [w for w in words if w.isupper()]
+    return (
+        len(caps) >= _SOURCE_NOTE_MIN_CAPS_WORDS
+        and len(caps) / len(words) >= _SOURCE_NOTE_MIN_CAPS_SHARE
+        and _has_montage_word(text)
+    )
+
+
+def check_sync_source_note(block: Any, structure_of: StructureOf) -> list[tuple[str, str, str]]:
+    """A sync block whose text (after its label) is a capitals source remark."""
+    if block.type != "sync" or block.absorbed_by_uid or getattr(block, "label_only", False):
+        return []
+    # Judge the text that will actually be voiced: the original line may carry
+    # capitals captions (``СТЕНДАП МАРИЯ У РЕКИ ...``) already moved out of it.
+    spoken = str(getattr(block, "normalized_text", "") or "")
+    if spoken.strip():
+        content = spoken
+    else:
+        original = str(block.original_text or "")
+        structure = structure_of(original)
+        content = structure.speech if structure.has_label else original
+    if not looks_like_caps_source_note(content):
+        return []
+    fields = set(getattr(block, "manual_fields", None) or [])
+    manual = "type" in fields or block.source == "manual"
+    return [
+        (
+            SYNC_SOURCE_NOTE,
+            f"Block {block.order} sync text looks like a source note in capitals: "
+            f"'{content.strip()[:40]}'",
+            WARNING if manual else ERROR,
+        )
+    ]
 
 
 def check_montage_note_in_tts(block: Any) -> list[tuple[str, str, str]]:
@@ -366,5 +438,6 @@ def structural_checks(block: Any, structure_of: StructureOf) -> list[tuple[str, 
         *check_service_label_in_tts(block, structure_of),
         *((code, message, ERROR) for code, message in plain),
         *check_montage_note_in_tts(block),
+        *check_sync_source_note(block, structure_of),
         *check_unmatched_speech(block, structure_of),
     ]
