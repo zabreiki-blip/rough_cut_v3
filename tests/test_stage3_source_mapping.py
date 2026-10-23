@@ -141,6 +141,36 @@ def test_named_media_is_rejected_when_used_range_exceeds_duration() -> None:
     assert result.details["smekhov"]["max_source_out_sec"] == 101
 
 
+def test_assigned_life_range_counts_and_its_label_is_not_a_speaker_alias() -> None:
+    timeline = FullTimeline(
+        project="BRIK",
+        fps=25,
+        segments=[
+            TimelineSegment(
+                id="life1",
+                type="life",
+                text="Лайф",
+                duration_sec=2,
+                speaker="ЛАЙФ",
+                source_id="smekhov",
+                source_in_sec=99,
+                source_out_sec=101,
+                match_status="confirmed",
+            )
+        ],
+    )
+    source = _source("smekhov", "Смехов")
+
+    result = map_catalog_to_timeline(
+        timeline, [source], [_media("media", "080626_Смехов.mp4", duration=100)]
+    )
+
+    assert result.catalog == {}
+    assert result.details["smekhov"]["reason"] == "media_too_short"
+    assert result.details["smekhov"]["max_source_out_sec"] == 101
+    assert "лайф" not in {alias.lower() for alias in result.details["smekhov"]["speaker_aliases"]}
+
+
 def test_one_frame_duration_tolerance_is_allowed() -> None:
     timeline = _brik_timeline(["barton"])
     timeline.segments[0].source_in_sec = 98.02

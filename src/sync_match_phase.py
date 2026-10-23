@@ -24,6 +24,7 @@ from stage2.sync_offset_clusters import (
     is_promotion_candidate,
 )
 from stage2.sync_storage import SyncMatchStore
+from stage_common import classify_sync_matches, is_life_match
 from sync_cost_tracker import ProgressPersistGate, SyncCostTracker
 
 
@@ -251,7 +252,11 @@ def _retime_confirmed_matches(
     retimed: list[str] = []
     review: list[str] = []
     for source_id in sorted(
-        {str(getattr(m, "source_id", "")) for m in existing.values() if m.status == "confirmed"}
+        {
+            str(getattr(m, "source_id", ""))
+            for m in existing.values()
+            if m.status == "confirmed" and not is_life_match(m)
+        }
     ):
         index, source = indexes_by_id.get(source_id), sources_by_id.get(source_id)
         if index is None or source is None:
@@ -268,6 +273,8 @@ def _retime_confirmed_matches(
         for segment_id, match in existing.items():
             if match.source_id != source_id or match.status != "confirmed":
                 continue
+            if is_life_match(match):
+                continue  # manual LIFE range has no speech bounds to retime
             try:
                 outcome = apply_retime_to_match(
                     match,
@@ -535,6 +542,12 @@ def run_match_phase(
         llm_limit=review.limit,
         scenario_revision_id=scenario_revision_id,
     )
+    # Manually assigned LIFE matches are never matched here, but they are part of the
+    # summary the live endpoint reports, so the job's own counters must include them.
+    life_matches, _stale, _stale_life = classify_sync_matches(
+        [item for item in existing.values() if is_life_match(item)], normalization
+    )
+    summary_ids = current_ids | {item.segment_id for item in life_matches}
     total_segments = len(current_ids)
     _update_sync_job(
         job_id,
@@ -603,7 +616,7 @@ def run_match_phase(
             )
         ):
             processed += 1
-            current = [item for key, item in existing.items() if key in current_ids]
+            current = [item for key, item in existing.items() if key in summary_ids]
             _update_sync_job(
                 job_id,
                 persist=should_persist_progress(),
@@ -656,7 +669,7 @@ def run_match_phase(
         processed += 1
         if processed % 10 == 0:
             checkpoint_matches()
-        current = [item for key, item in existing.items() if key in current_ids]
+        current = [item for key, item in existing.items() if key in summary_ids]
         _update_sync_job(
             job_id,
             persist=should_persist_progress(force=(processed % 10 == 0)),
@@ -721,7 +734,7 @@ def run_match_phase(
         except Exception as exc:
             # Keep the unreviewed match (no fingerprint: the next run retries it).
             segment_failures.append({"segment_id": segment_id, "error": str(exc)})
-        current = [item for key, item in existing.items() if key in current_ids]
+        current = [item for key, item in existing.items() if key in summary_ids]
         _update_sync_job(
             job_id,
             persist=should_persist_progress(),
@@ -734,7 +747,7 @@ def run_match_phase(
         )
     checkpoint_matches()
     return SyncMatchResult(
-        matches=[item for key, item in existing.items() if key in current_ids],
+        matches=[item for key, item in existing.items() if key in summary_ids],
         llm_reviewed=review.reviewed,
         llm_review_failures=review.failures,
         segment_failures=segment_failures,

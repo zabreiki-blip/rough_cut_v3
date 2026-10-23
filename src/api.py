@@ -112,6 +112,7 @@ from stage2.timeline_parser import (
 )
 from stage2.placeholder import generate_placeholder, generate_versioned_placeholder
 from stage2.sync_llm_review import SemanticCandidate, review_candidates_with_llm
+from stage2.sync_quote import _sync_prefix_end, _sync_quote, life_unit_fragments  # noqa: F401
 from stage2.sync_matcher import MatcherConfig, SyncMatcher, normalize_text
 from stage2.sync_models import (
     AlignmentRequest,
@@ -130,6 +131,7 @@ from stage2.assembly_manifest import (
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 from stage_common import (
     _timeline_matches_are_current,
+    classify_sync_matches,
     placeholder_reason,
     timeline_sync_summary,
 )
@@ -1368,78 +1370,6 @@ def _cleanup_stale_uploads(directory: Path, *, max_age_seconds: int = 24 * 60 * 
     return removed
 
 
-def _sync_prefix_end(text: str, timecode: str, timecode_end: str) -> int | None:
-    """End offset of the leading timecode prefix of ``text``, or ``None``.
-
-    Stored timecodes are normalized (``01:02:03``) while the text keeps the
-    author's spelling (``01.02.03``, ``(00:42:32)``, ``[29:41.93 - 30:42.20]``),
-    so the match is structural and compares normalized values.  Older projects
-    stored the spot spelling; both forms normalize alike.  Only a timestamp in
-    the scenario prefix is structural: one mentioned later in the quote stays
-    part of the quote.
-    """
-    wanted = normalize_timecode_value(timecode)
-    wanted_end = normalize_timecode_value(timecode_end)
-    spans = find_timecodes(text, header_zone=True)
-    for index, span in enumerate(spans):
-        if span.start > 180:
-            break
-        if span.first.stored != wanted:
-            continue
-        end = span.end
-        if span.last is None and wanted_end and index + 1 < len(spans):
-            following = spans[index + 1]
-            between = text[end : following.start]
-            if (
-                following.start - end <= 32
-                and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", between)
-                and following.first.stored == wanted_end
-            ):
-                end = following.end
-        return end
-    # Spelling that is not a structural timecode (e.g. a legacy ``MM.SS``).
-    position = text.find(timecode)
-    if 0 <= position <= 180:
-        end = position + len(timecode)
-        if timecode_end:
-            end_position = text.find(timecode_end, end, end + 32)
-            if end_position >= 0 and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", text[end:end_position]):
-                end = end_position + len(timecode_end)
-        return end
-    return None
-
-
-def _sync_quote(block: dict) -> str:
-    """Remove a scenario speaker/role/timecode prefix before fuzzy matching."""
-    text = str(block.get("normalized_text") or block.get("original_text") or "").strip()
-    if not text:
-        return ""
-
-    timecode = str(block.get("timecode_start") or "").strip()
-    timecode_end = str(block.get("timecode_end") or "").strip()
-    if timecode:
-        end = _sync_prefix_end(text, timecode, timecode_end)
-        if end is not None:
-            quote = text[end:].lstrip(" \t\r\n:;,.…—–-")
-            if quote:
-                return quote
-
-    speaker = str(block.get("speaker") or "").strip()
-    role = str(block.get("role") or "").strip()
-    if speaker and text.casefold().startswith(speaker.casefold()):
-        remainder = text[len(speaker) :].lstrip(" \t,")
-        # A malformed legacy label can put the start of the quote into the
-        # role field (``Лукьянова: начало реплики``). Its name prefix is
-        # structural, while the rest must remain searchable text.
-        role_prefix = role.split(":", 1)[0].strip() if ":" in role else role
-        if role_prefix and remainder.casefold().startswith(role_prefix.casefold()):
-            remainder = remainder[len(role_prefix) :]
-        quote = remainder.lstrip(" \t\r\n:;,.…—–-")
-        if quote:
-            return quote
-    return text
-
-
 _EDITORIAL_SPEAKER_MARKERS = frozenset({"снх", "синхрон", "sync", "лайф", "life"})
 
 
@@ -1513,14 +1443,7 @@ def _sync_alignment_units(
         else:
             # A LIFE ``+`` splice is stored as several independent inserts; a
             # block without them (or with a single one) stays one unit.
-            fragments = life_parts(block) if block_type == "life" else []
-            fragments = fragments or [
-                {
-                    "text": _sync_quote(block),
-                    "timecode_start": str(block.get("timecode_start") or "").strip(),
-                    "timecode_end": str(block.get("timecode_end") or "").strip(),
-                }
-            ]
+            fragments = life_unit_fragments(block, life_only=block_type == "life")
         for index, fragment in enumerate(fragments):
             units.append(
                 {
@@ -1538,6 +1461,10 @@ def _sync_alignment_units(
 
 
 def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
+    # LIFE matches are assigned by hand and never auto-matched: they must not look like
+    # not_found/unmatched quotes, so they get their own counter.
+    life_assigned = sum(item.metadata.get("block_type") == "life" for item in matches)
+    matches = [item for item in matches if item.metadata.get("block_type") != "life"]
     # A confirmed match flagged ``retime_pending_review`` (word times were retimed, the
     # kept manual range awaits re-confirmation) counts as needing review, not as ready.
     pending = [bool(item.metadata.get("retime_pending_review")) for item in matches]
@@ -1586,6 +1513,7 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
         "no_speaker": no_speaker,
         "no_file": no_file,
         "asr_failed": asr_failed,
+        "life_assigned": life_assigned,
     }
 
 
@@ -1611,18 +1539,7 @@ def _sync_job_with_live_summary(job: dict) -> dict:
         return snapshot
     confirmed, _reason = _confirmed_normalization(project)
     if confirmed is not None:
-        normalization_revision = confirmed.get("revision")
-        scenario_revision_id = str(confirmed.get("scenario_revision_id") or "")
-        matches = [
-            item
-            for item in matches
-            if item.metadata.get("normalization_revision") in (None, "", normalization_revision)
-            and (
-                not str(item.metadata.get("scenario_revision_id") or "")
-                or not scenario_revision_id
-                or str(item.metadata.get("scenario_revision_id") or "") == scenario_revision_id
-            )
-        ]
+        matches, _stale, _stale_life = classify_sync_matches(matches, confirmed)
         confirmed_uids = {item.segment_id for item in matches if item.status == "confirmed"}
         valid_ids = {
             str(unit.get("segment_id") or "")
@@ -1630,7 +1547,7 @@ def _sync_job_with_live_summary(job: dict) -> dict:
                 [
                     block
                     for block in confirmed.get("blocks", [])
-                    if str(block.get("type") or "").lower() in {"sync", "host"}
+                    if str(block.get("type") or "").lower() in {"sync", "host", "life"}
                 ],
                 preserve_whole_uids=confirmed_uids,
             )

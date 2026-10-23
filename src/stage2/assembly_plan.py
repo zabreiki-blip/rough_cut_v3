@@ -50,7 +50,7 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
     else:
         status = "ready"
 
-    is_sync = seg_type in {"snh", "host"}
+    is_sync = seg_type in {"snh", "host", "life"}
     source_id = str(segment.get("source_id") or "")
     if source_id and media_mapping is not None:
         media_status = "mapped" if source_id in media_mapping else "unmapped"
@@ -252,7 +252,7 @@ def _ready_item_problems(
         elif not path_exists(wav_path):
             problems.append(("missing_wav", f"wav file not found: {wav_path}"))
         return problems
-    if item_type not in {"snh", "host"}:
+    if item_type not in {"snh", "host", "life"}:
         return problems
     source = item.get("source") if isinstance(item.get("source"), dict) else {}
     source_id = str(source.get("source_id") or "")

@@ -976,6 +976,31 @@ def test_confirmed_match_of_retimed_source_is_shifted_and_persisted(tmp_path: Pa
     assert fields["retime_retimed_matches"] == 1
 
 
+def api_sync_summary(matches: list[Any]) -> dict[str, int]:
+    import api
+
+    return api._sync_summary(matches)
+
+
+def test_manual_life_match_is_skipped_by_retime(tmp_path: Path) -> None:
+    h = _Harness([])
+    life = _rt_confirmed("life-a", source_in=8.5)
+    life.metadata["block_type"] = "life"
+    before = _match_signature(life)
+    h.store.items = [life]
+
+    result = _RetimeSetup(tmp_path).run(h)
+
+    saved = h.store.items[0]
+    assert "retime_pending_review" not in saved.metadata
+    assert "retimed_from" not in saved.metadata
+    assert _match_signature(saved) == before
+    fields = {k: v for _a, kw in h.updates for k, v in kw.items()}
+    assert "retime_review_segment_ids" not in fields
+    assert result.matches == [saved]  # counted in the job summary like the live one
+    assert api_sync_summary(result.matches)["life_assigned"] == 1
+
+
 def test_manual_boundary_edit_is_kept_and_flagged_for_review(tmp_path: Path) -> None:
     h = _Harness(["a"])
     h.store.items = [_rt_confirmed(source_in=8.5)]

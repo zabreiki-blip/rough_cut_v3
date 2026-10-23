@@ -161,6 +161,40 @@ def test_life_block_is_exported_as_graphic_placeholder_without_audio() -> None:
     assert life.findtext("end") == "500"
 
 
+def test_assigned_life_is_exported_as_nested_source_clip() -> None:
+    timeline = _timeline()
+    timeline.segments.append(
+        TimelineSegment(
+            id="life1",
+            type="life",
+            text="А на море белый песок",
+            duration_sec=4,
+            start_sec=10,
+            block_uid="life-block",
+            speaker="ЛАЙФ",
+            source_id="свиблова",
+            source_in_sec=20,
+            source_out_sec=24,
+            speech_in_sec=20,
+            speech_out_sec=24,
+            match_status="confirmed",
+            placeholder_path="/tmp/life-card.png",
+        )
+    )
+
+    root = _root(build_nested_xml(timeline, _catalog()))
+    source = root.find("./project/children/bin/children/sequence")
+    final = root.find("./project/children/sequence")
+    assert source is not None and final is not None
+    life = final.findall("./media/video/track/clipitem")[-1]
+    assert life.find("sequence").get("id") == source.get("id")
+    assert life.findtext("start") == "250"
+    assert life.findtext("end") == "350"
+    assert life.findtext("in") == "500"
+    assert life.findtext("out") == "600"
+    assert len(final.findall("./media/audio/track/clipitem/sequence")) == 2
+
+
 def test_same_media_path_creates_only_one_source_sequence() -> None:
     timeline = _timeline()
     second = TimelineSegment(
@@ -347,7 +381,9 @@ def _all_reasons_timeline() -> FullTimeline:
                 start_sec=14,
                 placeholder_path="/tmp/life.png",
             ),
-            TimelineSegment(id="zk_ok", type="zk", text="zk", duration_sec=2, start_sec=17, wav_path="/a.wav"),
+            TimelineSegment(
+                id="zk_ok", type="zk", text="zk", duration_sec=2, start_sec=17, wav_path="/a.wav"
+            ),
             TimelineSegment(id="zk_missing", type="zk", text="zk", duration_sec=2, start_sec=19),
         ],
     )

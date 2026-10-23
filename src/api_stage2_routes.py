@@ -32,7 +32,9 @@ from stage_common import (
     _scenario_revision_matches,
     _timeline_is_current,
     _timeline_matches_are_current,
+    classify_sync_matches,
     current_sync_matches,
+    life_text_sha256,
     sync_matches_fingerprint,
 )
 
@@ -641,13 +643,15 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
     try:
         if request.method == "GET":
             matches = match_store.list()
+            stale_life_ids: list[str] = []
             confirmed, _reason = services._confirmed_normalization(project)
             normalization_document = confirmed or services._read_json_safe(paths["normalized"])
             if isinstance(normalization_document.get("blocks"), list):
+                # LIFE units are storable (manual assignment) but never auto-matched.
                 confirmed_blocks = [
                     block
                     for block in normalization_document.get("blocks", [])
-                    if str(block.get("type") or "").lower() in {"sync", "host"}
+                    if str(block.get("type") or "").lower() in {"sync", "host", "life"}
                 ]
                 revision = normalization_document.get("revision")
                 scenario_revision_id = normalization_document.get("scenario_revision_id")
@@ -661,22 +665,19 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                     )
                     if str(unit.get("segment_id") or "")
                 }
-                matches = [
-                    item
-                    for item in matches
-                    if item.segment_id in valid_ids
-                    and item.metadata.get("normalization_revision") in (None, "", revision)
-                    and _scenario_revision_matches(
-                        item.metadata.get("scenario_revision_id"),
-                        scenario_revision_id,
-                    )
-                ]
+                # One shared decision (revision filter + LIFE carry-over by text hash).
+                matches, _stale, stale_life_ids = classify_sync_matches(
+                    matches, normalization_document
+                )
+                matches = [item for item in matches if item.segment_id in valid_ids]
             return jsonify(
                 {
                     "ok": True,
                     "result": {
                         "project": project,
                         "matches": [services._match_api_dict(item) for item in matches],
+                        # LIFE assignments dropped because the LIFE text changed.
+                        "stale_life_assignments": stale_life_ids,
                         **services._sync_summary(matches),
                     },
                 }
@@ -699,7 +700,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
         confirmed_blocks = [
             block
             for block in confirmed.get("blocks", [])
-            if str(block.get("type") or "").lower() in {"sync", "host"}
+            if str(block.get("type") or "").lower() in {"sync", "host", "life"}
         ]
         stored_matches = match_store.list()
         valid_units = {
@@ -731,7 +732,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                     raise ValueError("block_uid (segment_id) is required")
                 if segment_id not in valid_units:
                     raise ValueError(
-                        f"segment_id is not a confirmed sync/host fragment: {segment_id}"
+                        f"segment_id is not a confirmed sync/host/life fragment: {segment_id}"
                     )
                 supplied_segment_id = str(values.get("segment_id") or segment_id).strip()
                 if supplied_segment_id != segment_id:
@@ -752,6 +753,12 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 metadata["normalization_revision"] = revision
                 metadata["scenario_revision_id"] = scenario_revision_id
                 unit = valid_units[segment_id]
+                is_life_unit = str(unit["block"].get("type") or "").lower() == "life"
+                # The server owns block_type: it follows the unit, never the client.
+                metadata.pop("block_type", None)
+                metadata.pop("life_text_sha256", None)
+                if is_life_unit:
+                    metadata["block_type"] = "life"
                 metadata["parent_block_uid"] = str(unit.get("parent_block_uid") or segment_id)
                 metadata["fragment_index"] = int(unit.get("fragment_index") or 0)
                 metadata["fragment_count"] = int(unit.get("fragment_count") or 1)
@@ -760,10 +767,33 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 for key in ("retime_pending_review", "retime_review_for", "retime_review_at"):
                     metadata.pop(key, None)
                 merged["metadata"] = metadata
+                unassign_life = is_life_unit and str(merged.get("status") or "") == "not_found"
+                if unassign_life:
+                    # "Снять материал": the assignment is dropped, the segment is a stub again.
+                    merged.update(source_id="", source_in_sec=None, source_out_sec=None)
                 source_id = str(merged.get("source_id") or "")
                 if source_id and source_id not in source_ids:
                     raise ValueError(f"unknown sync source: {source_id}")
                 match = services.SyncMatch.from_dict(merged)
+                if unassign_life:
+                    stored_by_id.pop(segment_id, None)
+                    saved.append(match)
+                    continue
+                if is_life_unit:
+                    # LIFE is assigned by hand only: confirmed, a source and a real range.
+                    if (
+                        match.status != "confirmed"
+                        or not match.source_id
+                        or match.source_in_sec is None
+                        or match.source_out_sec is None
+                        or not 0 <= match.source_in_sec < match.source_out_sec
+                    ):
+                        raise ValueError(
+                            "life requires status=confirmed, source_id and "
+                            "source_in_sec < source_out_sec"
+                        )
+                    # Survives a revision bump only while the LIFE text stays the same.
+                    match.metadata["life_text_sha256"] = life_text_sha256(unit.get("text"))
                 source = sources_by_id.get(match.source_id)
                 if (
                     source

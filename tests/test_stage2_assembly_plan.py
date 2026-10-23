@@ -40,6 +40,16 @@ def _matched(seg_id: str = "snh1", **overrides) -> dict:
     return _snh(seg_id, **fields)
 
 
+_LIFE_ASSIGNED = {
+    "type": "life",
+    "duration_sec": 4.0,
+    "match_status": "confirmed",
+    "source_id": "ivan_01",
+    "source_in_sec": 1.0,
+    "source_out_sec": 5.0,
+}
+
+
 @pytest.mark.parametrize(
     ("segment", "mapped", "expected"),
     [
@@ -63,6 +73,12 @@ def _matched(seg_id: str = "snh1", **overrides) -> dict:
         (_matched(), None, None),
         ({"type": "host", "match_status": "not_found", "duration_sec": 5.0}, None, "not_found"),
         ({"type": "life", "duration_sec": 10.0}, None, "life_unassigned"),
+        (_LIFE_ASSIGNED, None, None),
+        (_LIFE_ASSIGNED, {"ivan_01"}, None),
+        (_LIFE_ASSIGNED, set(), "unmapped_source"),
+        ({**_LIFE_ASSIGNED, "match_status": "auto_matched"}, None, "life_unassigned"),
+        ({**_LIFE_ASSIGNED, "source_out_sec": 1.0}, None, "life_unassigned"),
+        ({**_LIFE_ASSIGNED, "source_id": ""}, None, "life_unassigned"),
         ({"type": "tech", "duration_sec": 0.0}, None, None),
     ],
 )
@@ -318,8 +334,13 @@ def _reasons(blockers: list[dict]) -> list[tuple[str, str]]:
 def test_validate_complete_ready_plan_has_no_blockers() -> None:
     plan = _complete_plan(
         [
-            {"id": "zk1", "type": "zk", "duration_sec": 3.0, "wav_path": "/z.wav",
-             "block_uid": "uid-zk1"},
+            {
+                "id": "zk1",
+                "type": "zk",
+                "duration_sec": 3.0,
+                "wav_path": "/z.wav",
+                "block_uid": "uid-zk1",
+            },
             _matched("snh1"),
             {"id": "tech1", "type": "tech", "duration_sec": 0.0},
         ]
@@ -351,7 +372,10 @@ def test_validate_complete_reports_each_placeholder_reason_in_order() -> None:
         ("uid-u", "unmapped_source"),
     ]
     assert blockers[0] == {
-        "uid": "uid-a", "segment_id": "a", "type": "snh", "reason": "not_found",
+        "uid": "uid-a",
+        "segment_id": "a",
+        "type": "snh",
+        "reason": "not_found",
         "detail": "status=placeholder",
     }
     assert validate_plan_complete(plan, path_exists=lambda _p: True) == blockers
@@ -360,8 +384,13 @@ def test_validate_complete_reports_each_placeholder_reason_in_order() -> None:
 def test_validate_complete_checks_files_and_source_duration() -> None:
     plan = _complete_plan(
         [
-            {"id": "z", "type": "zk", "duration_sec": 2.0, "wav_path": "/gone.wav",
-             "block_uid": "uid-z"},
+            {
+                "id": "z",
+                "type": "zk",
+                "duration_sec": 2.0,
+                "wav_path": "/gone.wav",
+                "block_uid": "uid-z",
+            },
             _matched("snh1"),
         ]
     )
@@ -412,3 +441,57 @@ def test_validate_complete_open_speech_overlap_task_blocks_ready_item() -> None:
     blockers = validate_plan_complete(plan, path_exists=lambda _p: True)
 
     assert _reasons(blockers) == [("uid-snh1", "speech_overlap")]
+
+
+def test_assigned_life_is_ready_with_edit_range_and_no_task() -> None:
+    timeline = {
+        "segments": [
+            {
+                **_LIFE_ASSIGNED,
+                "id": "life1",
+                "speech_in_sec": 1.0,
+                "speech_out_sec": 5.0,
+            }
+        ]
+    }
+
+    (item,) = build_assembly_plan(timeline, media_mapping={"ivan_01"})["items"]
+
+    assert item["status"] == "ready"
+    assert item["reason"] is None
+    assert item["tasks"] == []
+    assert item["required"] is True
+    assert item["edit_range"] == {"in_sec": 1.0, "out_sec": 5.0}
+    assert item["padding"]["head_sec"] == 0.0
+    assert item["padding"]["tail_sec"] == 0.0
+
+
+def test_complete_blocks_assigned_life_with_missing_file_or_range_beyond_source() -> None:
+    plan = _complete_plan([{**_LIFE_ASSIGNED, "id": "l1", "block_uid": "uid-l1"}])
+
+    missing = validate_plan_complete(
+        plan,
+        catalog={"ivan_01": {"path": "/media/ivan.mp4", "duration": 100.0}},
+        path_exists=lambda _p: False,
+    )
+    short = validate_plan_complete(
+        plan,
+        catalog={"ivan_01": {"path": "/media/ivan.mp4", "duration": 3.0}},
+        path_exists=lambda _p: True,
+    )
+    fine = validate_plan_complete(
+        plan,
+        catalog={"ivan_01": {"path": "/media/ivan.mp4", "duration": 100.0}},
+        path_exists=lambda _p: True,
+    )
+
+    assert _reasons(missing) == [("uid-l1", "source_missing")]
+    assert _reasons(short) == [("uid-l1", "edit_beyond_source")]
+    assert fine == []  # speech == edit for a LIFE: no speech_outside_edit false positive
+
+
+def test_complete_life_without_speech_range_has_no_speech_blockers() -> None:
+    plan = _complete_plan([{**_LIFE_ASSIGNED, "id": "l1", "block_uid": "uid-l1"}])
+    catalog = {"ivan_01": {"path": "/m.mp4", "duration": 100.0}}
+
+    assert validate_plan_complete(plan, catalog=catalog, path_exists=lambda _p: True) == []

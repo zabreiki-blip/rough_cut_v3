@@ -316,10 +316,10 @@ def map_catalog_to_timeline(
         speakers = timeline_speakers.setdefault(segment.source_id, set())
         if segment.sequence_name:
             sequences.add(segment.sequence_name)
-        if segment.speaker:
+        if segment.speaker and segment.type != "life":  # "ЛАЙФ" is a label, not a person
             speakers.add(segment.speaker)
         if (
-            segment.type in {"snh", "host"}
+            segment.type in {"snh", "host", "life"}
             and segment.match_status in _MATCHED_STATUSES
             and segment.source_out_sec > segment.source_in_sec
         ):

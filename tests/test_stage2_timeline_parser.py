@@ -569,6 +569,101 @@ class NormalizedTimelineTest(unittest.TestCase):
             self.assertEqual(segment.spoken_text, "")
 
 
+class LifeAssignmentTest(unittest.TestCase):
+    @staticmethod
+    def _document() -> dict:
+        return {
+            "status": "confirmed",
+            "blocks": [
+                {"uid": "life-a", "order": 1, "type": "life", "normalized_text": "Лайф А"},
+                {
+                    "uid": "life-b",
+                    "order": 2,
+                    "type": "life",
+                    "normalized_text": "Один Два",
+                    "sync_fragments": [
+                        {"timecode_start": "00:10", "text": "Один"},
+                        {"timecode_start": "00:20", "text": "Два"},
+                    ],
+                },
+            ],
+        }
+
+    def _parse(self, matches: dict) -> list[TimelineSegment]:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            return parse_normalized_timeline(
+                self._document(),
+                base,
+                base,
+                "TEST",
+                sync_matches=matches,
+                sync_sources={"src1": {"premiere_sequence": "SEQ", "sequence_id": "seq-1"}},
+            ).segments
+
+    def test_confirmed_manual_match_makes_life_a_real_clip(self) -> None:
+        match = {
+            "status": "confirmed",
+            "source_id": "src1",
+            "source_in_sec": 3.0,
+            "source_out_sec": 8.5,
+            "metadata": {"manual_updated_at": "2026-01-01T00:00:00+00:00"},
+        }
+        a, b1, b2 = self._parse({"life-a": match, "life-b::fragment:2": dict(match)})
+
+        self.assertEqual(
+            (a.type, a.source_id, a.sequence_name, a.sequence_id), ("life", "src1", "SEQ", "seq-1")
+        )
+        self.assertEqual((a.source_in_sec, a.source_out_sec), (3.0, 8.5))
+        self.assertEqual((a.speech_in_sec, a.speech_out_sec), (3.0, 8.5))
+        self.assertEqual(a.duration_sec, 5.5)
+        self.assertEqual(a.match_status, "confirmed")
+        self.assertTrue(a.manual_range)
+        # Splice parts are matched by their own fragment ids; the unassigned one stays a stub.
+        self.assertEqual(
+            (b1.block_uid, b1.source_id, b1.duration_sec), ("life-b::fragment:1", "", 10.0)
+        )
+        self.assertEqual(
+            (b2.block_uid, b2.source_id, b2.duration_sec), ("life-b::fragment:2", "src1", 5.5)
+        )
+
+    def test_unassigned_or_unconfirmed_life_stays_a_stub(self) -> None:
+        auto = {
+            "status": "auto_matched",
+            "source_id": "src1",
+            "source_in_sec": 1.0,
+            "source_out_sec": 2.0,
+        }
+        empty = {
+            "status": "confirmed",
+            "source_id": "src1",
+            "source_in_sec": 4.0,
+            "source_out_sec": 4.0,
+        }
+        for matches in ({}, {"life-a": auto}, {"life-a": empty}):
+            first = self._parse(matches)[0]
+            self.assertEqual(
+                (first.duration_sec, first.source_id, first.match_status), (10.0, "", "")
+            )
+
+    def test_trim_never_touches_adjacent_assigned_life(self) -> None:
+        match = {
+            "status": "confirmed",
+            "source_id": "src1",
+            "source_in_sec": 3.0,
+            "source_out_sec": 8.0,
+        }
+        overlapping = {**match, "source_in_sec": 7.0, "source_out_sec": 12.0}
+        _, first, second = self._parse(
+            {"life-b::fragment:1": match, "life-b::fragment:2": overlapping}
+        )
+
+        self.assertEqual((first.source_in_sec, first.source_out_sec), (3.0, 8.0))
+        self.assertEqual((second.source_in_sec, second.source_out_sec), (7.0, 12.0))
+        self.assertIsNone(first.trim)
+        self.assertIsNone(second.trim)
+
+
 def _sync(seg_id: str, s_in: float, s_out: float, sp_in: float, sp_out: float, **kw):
     fields = dict(
         id=seg_id,

@@ -1124,6 +1124,175 @@ async function testSyncMatchVerificationReasons({ state, sync }) {
   }
 }
 
+// LIFE rows: never matched automatically, so they come from the normalization and offer
+// a manual "Назначить материал" editor that PATCHes the same sync-matches endpoint.
+async function testSyncLifeManualAssignment({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+  const originalNormalization = appState.normalization;
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  let matches = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url);
+    calls.push({ target, method: options.method || "GET", body: options.body });
+    if (target.includes("/sync-sources")) {
+      return ok({ ok: true, result: { items: [{ id: "media_a1", premiere_sequence: "SYNC_A1" }] } });
+    }
+    if (target.includes("/sync-matches")) return ok({ ok: true, result: { items: matches } });
+    if (target.includes("/sync-jobs/status")) return { ok: false, status: 404, text: async () => "" };
+    throw new Error(`testSyncLifeManualAssignment: unexpected fetch ${target}`);
+  };
+  appState.normalization = {
+    blocks: [
+      { uid: "life-a", type: "life", normalized_text: "Лайф <A>", timecode_start: "01.10" },
+      {
+        uid: "life-b", type: "life", normalized_text: "Один Два",
+        sync_fragments: [{ text: "Один" }, { text: "Два" }],
+      },
+      { uid: "sync-1", type: "sync", normalized_text: "Не лайф" },
+    ],
+  };
+  try {
+    assert.deepStrictEqual(sync.lifeUnits().map((unit) => unit.id), [
+      "life-a", "life-b::fragment:1", "life-b::fragment:2",
+    ]);
+    await sync.loadSyncWorkspace(true);
+    let html = ids.sync_review_list.innerHTML;
+    assert.strictEqual((html.match(/Назначить материал/g) || []).length, 3, html);
+    assert.match(html, /data-life-id="life-b::fragment:2"/);
+    assert.match(html, /assign-life-material/);
+    assert.ok(html.includes("Лайф &lt;A&gt;"), "LIFE text must be escaped");
+    assert.ok(!html.includes("Не лайф"), "only LIFE blocks get assignment rows");
+    assert.ok(html.includes("SYNC_A1"), "registered sources are selectable");
+
+    // An assigned LIFE shows its range and offers to change it.
+    matches = [{
+      segment_id: "life-a", status: "confirmed", source_id: "media_a1",
+      source_in_sec: 5, source_out_sec: 9.5, metadata: { block_type: "life" },
+    }];
+    await sync.loadSyncWorkspace(true);
+    html = ids.sync_review_list.innerHTML;
+    assert.match(html, /data-sync-in[^>]*value="5\.000"/);
+    assert.match(html, /data-sync-out[^>]*value="9\.500"/);
+    assert.ok(html.includes("Изменить материал"), html);
+    assert.strictEqual((html.match(/Назначить материал/g) || []).length, 2, html);
+
+    // The editor PATCHes the sync-matches endpoint with a confirmed range.
+    const inputs = {
+      "[data-life-source]": { value: "media_a1" },
+      "[data-sync-in]": { value: "2.5" },
+      "[data-sync-out]": { value: "6" },
+    };
+    const card = { querySelector: (selector) => inputs[selector] };
+    calls.length = 0;
+    await sync.assignLifeMaterial("life-b::fragment:2", card);
+    const patch = calls.find((call) => call.method === "PATCH");
+    assert.ok(patch, "assignment must send a PATCH");
+    assert.ok(patch.target.includes(encodeURIComponent("life-b::fragment:2")), patch.target);
+    const { project: _project, expected_revision: _revision, ...patchBody } = JSON.parse(patch.body);
+    assert.deepStrictEqual(patchBody, {
+      status: "confirmed", source_id: "media_a1", source_in_sec: 2.5, source_out_sec: 6,
+    });
+
+    // Out <= in or no source is rejected before any request.
+    calls.length = 0;
+    inputs["[data-sync-out]"].value = "2";
+    await assert.rejects(() => sync.assignLifeMaterial("life-a", card), /Source in\/out/);
+    inputs["[data-life-source]"].value = "";
+    inputs["[data-sync-out]"].value = "6";
+    await assert.rejects(() => sync.assignLifeMaterial("life-a", card), /Source in\/out/);
+    assert.ok(!calls.some((call) => call.method === "PATCH"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+    appState.normalization = originalNormalization;
+  }
+}
+
+// LIFE card extras: no preview player (change handler must not throw), "Снять материал"
+// sends status=not_found without a range, a stale assignment explains why it vanished.
+async function testSyncLifeCardUnassignAndStale({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+  const originalNormalization = appState.normalization;
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  let matchesResult = {};
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url);
+    calls.push({ target, method: options.method || "GET", body: options.body });
+    if (target.includes("/sync-sources")) {
+      return ok({ ok: true, result: { items: [{ id: "media_a1", premiere_sequence: "SYNC_A1" }] } });
+    }
+    if (target.includes("/sync-matches")) return ok({ ok: true, result: matchesResult });
+    if (target.includes("/sync-jobs/status")) return { ok: false, status: 404, text: async () => "" };
+    throw new Error(`testSyncLifeCardUnassignAndStale: unexpected fetch ${target}`);
+  };
+  appState.normalization = {
+    blocks: [{ uid: "life-a", type: "life", normalized_text: "Лайф А" }],
+  };
+  try {
+    // Assigned: the remove button is offered.
+    matchesResult = {
+      items: [{
+        segment_id: "life-a", status: "confirmed", source_id: "media_a1",
+        source_in_sec: 5, source_out_sec: 9.5, metadata: { block_type: "life" },
+      }],
+    };
+    await sync.loadSyncWorkspace(true);
+    let html = ids.sync_review_list.innerHTML;
+    assert.match(html, /unassign-life-material/);
+    assert.ok(html.includes("Снять материал"), html);
+    assert.ok(!html.includes("data-life-stale"), "a live assignment is not stale");
+
+    // The change handler tolerates a LIFE card without a preview player.
+    const inputs = { "[data-sync-in]": { value: "1" }, "[data-sync-out]": { value: "2" } };
+    const lifeCard = { dataset: { matchId: "life-a" }, querySelector: (sel) => inputs[sel] || null };
+    assert.doesNotThrow(() => ids.sync_review_list.dispatch("change", {
+      target: {
+        closest: (sel) => (sel === ".sync-match-card" ? lifeCard : null),
+        matches: () => true,
+      },
+    }));
+
+    // "Снять материал" PATCHes status=not_found with no source or range.
+    calls.length = 0;
+    await sync.unassignLifeMaterial("life-a");
+    const patch = calls.find((call) => call.method === "PATCH");
+    assert.ok(patch, "unassign must send a PATCH");
+    assert.ok(patch.target.includes(encodeURIComponent("life-a")), patch.target);
+    const { project: _project, expected_revision: _revision, ...body } = JSON.parse(patch.body);
+    assert.deepStrictEqual(body, { status: "not_found" });
+
+    // The click on the button goes through the delegated handler.
+    calls.length = 0;
+    const button = { dataset: { matchId: "life-a" } };
+    ids.sync_review_list.dispatch("click", {
+      target: { closest: (sel) => (sel.includes("unassign-life-material") ? button : null) },
+    });
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(calls.some((call) => call.method === "PATCH"), "click must send the PATCH");
+
+    // Unassigned + server reports the old assignment as stale: the card says why.
+    matchesResult = { items: [], stale_life_assignments: ["life-a"] };
+    await sync.loadSyncWorkspace(true);
+    html = ids.sync_review_list.innerHTML;
+    assert.ok(html.includes("назначение устарело: текст LIFE изменился"), html);
+    assert.ok(!html.includes("Снять материал"), "nothing to remove when unassigned");
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+    appState.normalization = originalNormalization;
+  }
+}
+
 // Sync ASR failure reporting: a completed job with complete === false reads as
 // "готово с ошибками" (not plain "готово"), and an asr_failed match is labelled as a
 // recognition failure, not as "no recording".
@@ -2079,6 +2248,8 @@ async function main() {
     ["testConfirmPreviewSummaryAndBlocking", () => testConfirmPreviewSummaryAndBlocking(modules)],
     ["testConfirmRejectedShowsRussianReasons", () => testConfirmRejectedShowsRussianReasons(modules)],
     ["testSyncFragmentEditing", () => testSyncFragmentEditing(modules)],
+    ["testSyncLifeManualAssignment", () => testSyncLifeManualAssignment(modules)],
+    ["testSyncLifeCardUnassignAndStale", () => testSyncLifeCardUnassignAndStale(modules)],
     ["testGroupReviewOnlySelectedBlocks", () => testGroupReviewOnlySelectedBlocks(modules)],
     ["testNormalizationHistoryDiffRestore", () => testNormalizationHistoryDiffRestore(modules)],
   ];

@@ -198,6 +198,8 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
             "no_speaker": 0,
             "no_file": 0,
             "asr_failed": 0,
+            "life_assigned": 0,
+            "stale_life_assignments": [],
         },
     }
 

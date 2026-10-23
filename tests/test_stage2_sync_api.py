@@ -3859,3 +3859,143 @@ def test_sync_cloud_preflight_keeps_wave_path_for_real_wav(sync_api, monkeypatch
     probe.assert_not_called()
     job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
     assert job["estimated_cost_usd"] == "0.06"
+
+
+def _write_life_normalization(projects: Path) -> None:
+    path = _write_confirmed_normalization(projects)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["blocks"].append(
+        {
+            "uid": "life-uid",
+            "order": 3,
+            "type": "life",
+            "original_text": "ЛАЙФ: Подойду к тебе",
+            "normalized_text": "Подойду к тебе",
+            "source_description": "концерт",
+        }
+    )
+    document["blocks"].append(
+        {
+            "uid": "life-multi",
+            "order": 4,
+            "type": "life",
+            "original_text": "ЛАЙФ: Первый лайф + Второй лайф",
+            "normalized_text": "Первый лайф Второй лайф",
+            "sync_fragments": [
+                {"timecode_start": "01:00", "text": "Первый лайф"},
+                {"timecode_start": "02:00", "text": "Второй лайф"},
+            ],
+        }
+    )
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+
+def _life_patch(**overrides) -> dict:
+    body = {
+        "project": "demo",
+        "status": "confirmed",
+        "source_id": "vasilieva_01",
+        "source_in_sec": 5.0,
+        "source_out_sec": 9.5,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_life_unit_accepts_manual_confirmed_range_only(sync_api) -> None:
+    client, projects = sync_api
+    _write_life_normalization(projects)
+    assert _post_source(client).status_code == 201
+
+    ok = client.patch("/stage2/sync-matches/life-uid", json=_life_patch())
+    assert ok.status_code == 200, ok.get_json()
+    saved = ok.get_json()["result"]["matches"][0]
+    assert saved["status"] == "confirmed"
+    assert saved["metadata"]["block_type"] == "life"
+    # A LIFE splice part has its own stable fragment id.
+    part = client.patch("/stage2/sync-matches/life-multi::fragment:2", json=_life_patch())
+    assert part.status_code == 200, part.get_json()
+
+    for bad in (
+        {"project": "demo", "status": "confirmed"},
+        _life_patch(source_id=""),
+        _life_patch(source_in_sec=9.5, source_out_sec=5.0),
+        _life_patch(source_in_sec=None, source_out_sec=None),
+        _life_patch(status="auto_matched"),
+        _life_patch(status="needs_review"),
+    ):
+        # Fragment 1 was never assigned: nothing stored to merge the bad values into.
+        response = client.patch("/stage2/sync-matches/life-multi::fragment:1", json=bad)
+        assert response.status_code == 400, (bad, response.get_json())
+    unknown = client.patch("/stage2/sync-matches/not-a-block", json=_life_patch())
+    assert unknown.status_code == 400
+
+
+def test_sync_worker_never_auto_matches_life_and_keeps_manual_life_match(sync_api) -> None:
+    client, projects = sync_api
+    _write_life_normalization(projects)
+    assert _post_source(client).status_code == 201
+    _seed_words(client)
+    assert client.patch("/stage2/sync-matches/life-uid", json=_life_patch()).status_code == 200
+
+    for rematch in (False, True):
+        with patch.object(api.threading, "Thread", _ImmediateThread):
+            response = client.post(
+                "/stage2/sync-jobs/start",
+                json={"project": "demo", "rematch_confirmed": rematch},
+            )
+        assert response.status_code == 200, response.get_json()
+        job_id = response.get_json()["result"]["job_id"]
+        job = client.get(f"/stage2/sync-jobs/{job_id}").get_json()["result"]
+        assert job["status"] == "completed"
+        # LIFE units are not matching units: only sync + host are counted.
+        assert job["total_segments"] == 2
+
+        result = client.get("/stage2/sync-matches?project=demo").get_json()["result"]
+        by_uid = {item["block_uid"]: item for item in result["matches"]}
+        # No automatic LIFE match was created for the unassigned parts.
+        assert "life-multi::fragment:1" not in by_uid
+        assert "life-multi::fragment:2" not in by_uid
+        kept = by_uid["life-uid"]
+        assert kept["status"] == "confirmed"
+        assert (kept["source_in_sec"], kept["source_out_sec"]) == (5.0, 9.5)
+        # The assigned LIFE is not an unmatched quote.
+        assert result["life_assigned"] == 1
+        assert result["not_found"] == 1  # only the host quote has no recording
+        live = client.get(f"/stage2/sync-jobs/{job_id}").get_json()["result"]
+        assert live["life_assigned"] == 1
+        assert live["not_found"] == 1
+
+    stored = api.SyncMatchStore(projects / "demo" / "work" / "sync_matches.json").list()
+    assert {item.segment_id for item in stored} >= {"life-uid", "stable-sync-uid"}
+    assert all(not item.segment_id.startswith("life-multi") for item in stored)
+
+
+def test_life_assignment_flows_into_timeline_plan_and_fingerprint(sync_api) -> None:
+    client, projects = sync_api
+    _write_life_normalization(projects)
+    assert _post_source(client).status_code == 201
+
+    with patch.object(api, "generate_placeholder", return_value=None):
+        assert client.post("/stage2/build", json={"project": "demo"}).status_code == 200
+    timeline = client.get("/stage2/timeline?project=demo").get_json()["result"]
+    life = next(item for item in timeline["segments"] if item["block_uid"] == "life-uid")
+    assert (life["duration_sec"], life["source_id"], life["match_status"]) == (10.0, "", "")
+    before = timeline["sync_matches_fingerprint"]
+
+    assert client.patch("/stage2/sync-matches/life-uid", json=_life_patch()).status_code == 200
+    # Stage 3 must rebuild: the stored timeline no longer matches the stored matches.
+    assert client.get("/stage2/timeline?project=demo").status_code == 409
+
+    with patch.object(api, "generate_placeholder", return_value=None):
+        assert client.post("/stage2/build", json={"project": "demo"}).status_code == 200
+    timeline = client.get("/stage2/timeline?project=demo").get_json()["result"]
+    assert timeline["sync_matches_fingerprint"] != before
+    life = next(item for item in timeline["segments"] if item["block_uid"] == "life-uid")
+    assert life["type"] == "life"
+    assert life["source_id"] == "vasilieva_01"
+    assert life["sequence_name"] == "SYNC_VASILIEVA_01"
+    assert (life["source_in_sec"], life["source_out_sec"]) == (5.0, 9.5)
+    assert (life["speech_in_sec"], life["speech_out_sec"]) == (5.0, 9.5)
+    assert life["duration_sec"] == 4.5
+    assert life["match_status"] == "confirmed"

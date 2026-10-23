@@ -9,6 +9,7 @@ import {
 
 let syncMatches = [];
 let syncMatchesRevision = 0;
+let staleLifeIds = new Set();
 let currentSyncJobId = "";
 let syncPollTimer = null;
 let syncPollFailures = 0;
@@ -285,6 +286,93 @@ const MATCH_REVIEW_REASON_LABELS = {
   local_text_mismatch: "На этом месте локальная расшифровка содержит другой текст",
 };
 
+// LIFE inserts are never matched automatically: the editor assigns a source range by
+// hand (PATCH /stage2/sync-matches/<unit id>, same endpoint as a manual СНХ confirm).
+// Unit ids mirror the backend: ``uid`` for a plain block, ``uid::fragment:N`` per ``+`` part.
+export function lifeUnits() {
+  const blocks = appState.normalization?.blocks;
+  if (!Array.isArray(blocks)) return [];
+  const units = [];
+  for (const block of blocks) {
+    const uid = String(block.uid || "");
+    if (String(block.type || "").toLowerCase() !== "life" || !uid) continue;
+    const parts = (Array.isArray(block.sync_fragments) ? block.sync_fragments : [])
+      .filter((part) => part && String(part.text || "").trim());
+    if (parts.length > 1) {
+      parts.forEach((part, index) => units.push({
+        id: `${uid}::fragment:${index + 1}`,
+        text: String(part.text),
+        timecode: String(part.timecode_start || ""),
+        description: String(block.source_description || ""),
+      }));
+    } else {
+      units.push({
+        id: uid,
+        text: String(block.normalized_text || block.original_text || ""),
+        timecode: String(block.timecode_start || ""),
+        description: String(block.source_description || ""),
+      });
+    }
+  }
+  return units;
+}
+
+function renderLifeCards() {
+  const units = lifeUnits();
+  if (!units.length) return "";
+  const sources = Array.isArray(appState.syncSources) ? appState.syncSources : [];
+  const cards = units.map((unit) => {
+    const match = syncMatches.find((item) => String(item.segment_id || "") === unit.id);
+    const assigned = Boolean(match) && normalizedMatchStatus(match.status) === "confirmed"
+      && Boolean(match.source_id);
+    const selectedId = assigned ? String(match.source_id) : "";
+    const options = sources.map((source) => {
+      const sourceId = sourceEditableId(source);
+      const name = source.premiere_sequence || source.sequence_name || sourceId;
+      return `<option value="${escaped(sourceId)}"${sourceId === selectedId ? " selected" : ""}>${escaped(name)}</option>`;
+    }).join("");
+    const sourceIn = assigned ? Number(match.source_in_sec) : NaN;
+    const sourceOut = assigned ? Number(match.source_out_sec) : NaN;
+    const stale = !assigned && staleLifeIds.has(unit.id);
+    return `
+      <article class="sync-match-card sync-life-card" data-status="${assigned ? "confirmed" : "unmatched"}"
+        data-life-id="${escaped(unit.id)}" data-match-id="${escaped(unit.id)}">
+        <div class="sync-match-head">
+          <div class="sync-match-title">ЛАЙФ${unit.timecode ? ` · ${escaped(unit.timecode)}` : ""}${
+            unit.description ? ` · ${escaped(unit.description)}` : ""}</div>
+          <span class="sync-match-status">${assigned ? "материал назначен" : "материал не назначен"}</span>
+        </div>
+        ${stale ? '<div class="sync-match-note" data-life-stale>назначение устарело: текст LIFE изменился</div>' : ""}
+        <p class="sync-match-text">${escaped(unit.text || "Текст сценария отсутствует")}</p>
+        <div class="sync-review-controls">
+          <label class="sync-match-field">
+            <span>Источник</span>
+            <select data-life-source>${options}</select>
+          </label>
+          <label class="sync-match-field">
+            <span>Source in, сек</span>
+            <input data-sync-in type="number" min="0" step="0.04" value="${
+              Number.isFinite(sourceIn) ? escaped(sourceIn.toFixed(3)) : ""}">
+          </label>
+          <label class="sync-match-field">
+            <span>Source out, сек</span>
+            <input data-sync-out type="number" min="0" step="0.04" value="${
+              Number.isFinite(sourceOut) ? escaped(sourceOut.toFixed(3)) : ""}">
+          </label>
+        </div>
+        <div class="sync-match-actions">
+          <button class="btn btn-sm btn-accent" type="button" data-action="assign-life-material"
+            data-match-id="${escaped(unit.id)}"${sources.length ? "" : " disabled"}>
+            ${assigned ? "Изменить материал" : "Назначить материал"}
+          </button>${assigned ? `
+          <button class="btn btn-sm" type="button" data-action="unassign-life-material"
+            data-match-id="${escaped(unit.id)}">Снять материал</button>` : ""}
+        </div>
+      </article>`;
+  }).join("");
+  return `<div class="sync-match-text sync-life-title">ЛАЙФ: материал назначается вручную</div>${cards}`;
+}
+
 function renderSyncMatches(document) {
   if (!ids.sync_review_list) return;
   const counts = syncCounts(document || {});
@@ -303,6 +391,7 @@ function renderSyncMatches(document) {
     if (stat) stat.hidden = !(value > 0);
   }
 
+  const lifeHtml = renderLifeCards();
   const reviewItems = syncMatches.filter((match) => {
     const status = normalizedMatchStatus(match.status);
     return status === "needs_review" || status === "unmatched" || retimePendingReview(match);
@@ -315,13 +404,13 @@ function renderSyncMatches(document) {
     return;
   }
   if (reviewItems.length === 0) {
-    ids.sync_review_list.innerHTML = syncMatches.length > 0
+    ids.sync_review_list.innerHTML = (syncMatches.length > 0
       ? '<div class="empty-state compact">Все найденные фрагменты готовы к сборке.</div>'
-      : '<div class="empty-state compact">Результатов сопоставления пока нет.</div>';
+      : '<div class="empty-state compact">Результатов сопоставления пока нет.</div>') + lifeHtml;
     return;
   }
 
-  ids.sync_review_list.innerHTML = reviewItems.map((match) => {
+  const reviewHtml = reviewItems.map((match) => {
     const status = normalizedMatchStatus(match.status);
     const candidate = matchCandidate(match);
     const candidates = candidateChoices(match);
@@ -476,6 +565,7 @@ function renderSyncMatches(document) {
         <div class="sync-match-actions">${action}</div>
       </article>`;
   }).join("");
+  ids.sync_review_list.innerHTML = reviewHtml + lifeHtml;
   updateActionAvailability();
 }
 
@@ -492,6 +582,10 @@ export async function loadSyncWorkspace(quiet) {
   appState.syncSources = syncCollection(sourcesDocument, ["items", "sources"]);
   syncMatches = syncCollection(matchesDocument, ["items", "matches"]);
   syncMatchesRevision = Number(matchesDocument.revision || 0);
+  staleLifeIds = new Set(
+    (Array.isArray(matchesDocument.stale_life_assignments) ? matchesDocument.stale_life_assignments : [])
+      .map(String),
+  );
   renderSyncSources();
   renderSyncMatches(matchesDocument);
   if (jobResponse.available && jobResponse.result) {
@@ -817,6 +911,54 @@ async function confirmSyncMatch(matchId, card) {
   await loadSyncWorkspace(true);
 }
 
+export async function assignLifeMaterial(unitId, card) {
+  const sourceId = String(card?.querySelector("[data-life-source]")?.value || "");
+  const inValue = card?.querySelector("[data-sync-in]")?.value;
+  const outValue = card?.querySelector("[data-sync-out]")?.value;
+  const sourceIn = inValue === "" || inValue == null ? NaN : Number(inValue);
+  const sourceOut = outValue === "" || outValue == null ? NaN : Number(outValue);
+  if (!sourceId || !Number.isFinite(sourceIn) || !Number.isFinite(sourceOut)
+    || sourceIn < 0 || sourceOut <= sourceIn) {
+    throw new Error("Выберите источник и границы Source in/out (out должен быть больше in)");
+  }
+  const response = await optionalRequestJSON(
+    `/stage2/sync-matches/${encodeURIComponent(unitId)}`,
+    "PATCH",
+    {
+      project,
+      expected_revision: syncMatchesRevision,
+      status: "confirmed",
+      source_id: sourceId,
+      source_in_sec: sourceIn,
+      source_out_sec: sourceOut,
+    },
+  );
+  if (!response.available) {
+    appendLog("Назначение ЛАЙФ недоступно в текущей версии backend.", "warn");
+    return;
+  }
+  toast("Материал ЛАЙФ назначен", "success");
+  appendLog(`Stage 2 sync: ЛАЙФ ${unitId} назначен.`);
+  await loadSyncWorkspace(true);
+}
+
+// "Снять материал": not_found without a range drops the assignment; the segment is a
+// life_unassigned stub again.
+export async function unassignLifeMaterial(unitId) {
+  const response = await optionalRequestJSON(
+    `/stage2/sync-matches/${encodeURIComponent(unitId)}`,
+    "PATCH",
+    { project, expected_revision: syncMatchesRevision, status: "not_found" },
+  );
+  if (!response.available) {
+    appendLog("Снятие материала ЛАЙФ недоступно в текущей версии backend.", "warn");
+    return;
+  }
+  toast("Материал ЛАЙФ снят", "success");
+  appendLog(`Stage 2 sync: ЛАЙФ ${unitId} снят.`);
+  await loadSyncWorkspace(true);
+}
+
 ids.btn_sync_align.addEventListener("click", () => safely(startSyncAlignment));
 if (ids.btn_sync_cancel) ids.btn_sync_cancel.addEventListener("click", cancelSyncJob);
 if (ids.sync_asr_engine) {
@@ -841,6 +983,18 @@ if (ids.sync_sources_list) {
   });
 }
 ids.sync_review_list.addEventListener("click", (event) => {
+  const unassignButton = event.target.closest("[data-action='unassign-life-material']");
+  if (unassignButton) {
+    const unitId = String(unassignButton.dataset.matchId || "");
+    if (unitId) safely(() => unassignLifeMaterial(unitId));
+    return;
+  }
+  const lifeButton = event.target.closest("[data-action='assign-life-material']");
+  if (lifeButton) {
+    const unitId = String(lifeButton.dataset.matchId || "");
+    if (unitId) safely(() => assignLifeMaterial(unitId, lifeButton.closest(".sync-life-card")));
+    return;
+  }
   const button = event.target.closest("[data-action='confirm-sync-match']");
   if (!button) return;
   const matchId = String(button.dataset.matchId || "");
@@ -868,15 +1022,20 @@ ids.sync_review_list.addEventListener("change", (event) => {
       `${sourceName} · ${formatSourceSecond(candidate.source_in_sec)}–${formatSourceSecond(candidate.source_out_sec)}`
       + ` · уверенность ${Number.isFinite(confidence) ? Math.round(confidence * (confidence <= 1 ? 100 : 1)) + "%" : "—"}`;
     const audio = card.querySelector("[data-sync-audio]");
-    audio.src = syncAudioUrl(candidate.source_id);
-    audio.dataset.rangeIn = candidate.source_in_sec;
-    audio.dataset.rangeOut = candidate.source_out_sec;
-    audio.load();
+    if (audio) {
+      audio.src = syncAudioUrl(candidate.source_id);
+      audio.dataset.rangeIn = candidate.source_in_sec;
+      audio.dataset.rangeOut = candidate.source_out_sec;
+      audio.load();
+    }
   }
   if (card && event.target.matches("[data-sync-in], [data-sync-out]")) {
+    // A LIFE card has no preview player.
     const audio = card.querySelector("[data-sync-audio]");
-    audio.dataset.rangeIn = card.querySelector("[data-sync-in]").value;
-    audio.dataset.rangeOut = card.querySelector("[data-sync-out]").value;
+    if (audio) {
+      audio.dataset.rangeIn = card.querySelector("[data-sync-in]").value;
+      audio.dataset.rangeOut = card.querySelector("[data-sync-out]").value;
+    }
   }
 });
 ids.sync_review_list.addEventListener("play", (event) => {

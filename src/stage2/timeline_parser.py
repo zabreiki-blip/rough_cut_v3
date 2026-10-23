@@ -156,7 +156,8 @@ def _trim_adjacent_padding(segments: list[TimelineSegment], fps: int = 25) -> No
     """
 
     def exportable(seg: TimelineSegment) -> bool:
-        return is_exportable_match(
+        # LIFE has no padding (speech == edit range): it never takes part in trimming.
+        return seg.type in {"snh", "host"} and is_exportable_match(
             seg.type, seg.match_status, seg.source_id, seg.source_in_sec, seg.source_out_sec
         )
 
@@ -226,9 +227,8 @@ def _trim_adjacent_padding(segments: list[TimelineSegment], fps: int = 25) -> No
             late.duration_sec = late.source_out_sec - late.source_in_sec
             info_late["trimmed_head_sec"] = round(info_late["trimmed_head_sec"] + head, 6)
         if (
-            (early.manual_range or late.manual_range)
-            and early.source_out_sec > late.source_in_sec + 1e-9
-        ):
+            early.manual_range or late.manual_range
+        ) and early.source_out_sec > late.source_in_sec + 1e-9:
             info_early["overlap_kept_manual"] = info_late["overlap_kept_manual"] = True
 
 
@@ -772,23 +772,62 @@ def parse_normalized_timeline(
             ):
                 counters["life"] += 1
                 seg_id = f"life{counters['life']}"
+                life_uid = (
+                    sync_fragment_id(block_uid, part_index, len(parts)) if parts else block_uid
+                )
+                # Manual assignment only: a confirmed match with a source range turns the
+                # placeholder into a real clip (speech == edit range, no padding).
+                match = matches.get(life_uid)
+                match_metadata = field(match, "metadata", {})
+                if not isinstance(match_metadata, dict):
+                    match_metadata = {}
+                source_id = str(field(match, "source_id", "") or "")
+                source = sources.get(source_id)
+                source_in = float(field(match, "source_in_sec", 0.0) or 0.0)
+                source_out = float(field(match, "source_out_sec", 0.0) or 0.0)
+                assigned = (
+                    str(field(match, "status", "") or "") == "confirmed"
+                    and bool(source_id)
+                    and source_out > source_in >= 0
+                )
                 segments.append(
                     TimelineSegment(
                         id=seg_id,
                         type="life",
                         text=part["text"],
-                        duration_sec=SNH_PLACEHOLDER_DURATION,
-                        block_uid=(
-                            sync_fragment_id(block_uid, part_index, len(parts))
-                            if parts
-                            else block_uid
-                        ),
+                        duration_sec=source_out - source_in
+                        if assigned
+                        else SNH_PLACEHOLDER_DURATION,
+                        block_uid=life_uid,
                         parent_block_uid=block_uid if parts else "",
                         revision_status=revision_status,
                         speaker="ЛАЙФ",
                         role=str(block.get("source_description") or "ОРИГИНАЛЬНЫЙ ЗВУК").strip(),
                         timecode=part["timecode_start"],
                         timecode_end=part["timecode_end"],
+                        source_id=source_id if assigned else "",
+                        sequence_name=(
+                            str(
+                                field(
+                                    source,
+                                    "premiere_sequence",
+                                    field(source, "sequence_name", ""),
+                                )
+                                or ""
+                            )
+                            if assigned
+                            else ""
+                        ),
+                        sequence_id=str(field(source, "sequence_id", "") or "") if assigned else "",
+                        source_in_sec=source_in if assigned else 0.0,
+                        source_out_sec=source_out if assigned else 0.0,
+                        speech_in_sec=source_in if assigned else 0.0,
+                        speech_out_sec=source_out if assigned else 0.0,
+                        match_status="confirmed" if assigned else "",
+                        match_confidence=float(field(match, "confidence", 0.0) or 0.0)
+                        if assigned
+                        else 0.0,
+                        manual_range=bool(assigned and match_metadata.get("manual_updated_at")),
                         placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
                         spoken_text="",
                     )

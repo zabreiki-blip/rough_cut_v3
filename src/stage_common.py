@@ -37,21 +37,78 @@ def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
     )
 
 
-def current_sync_matches(matches: list, normalization: dict) -> tuple[list, list[str]]:
-    """Split stored sync matches into those valid for the normalization and stale ids."""
+def life_text_sha256(text: object) -> str:
+    """Hash of a LIFE unit text (whitespace-normalized): identifies what was assigned."""
+    return hashlib.sha256(" ".join(str(text or "").split()).encode("utf-8")).hexdigest()
+
+
+def is_life_match(match: Any) -> bool:
+    return str((match.metadata or {}).get("block_type") or "") == "life"
+
+
+def life_unit_texts(normalization: dict) -> dict[str, str]:
+    """``{unit id: text}`` of every LIFE unit of the normalization.
+
+    Built from the same fragments as the sync alignment units, so the hash stored at
+    PATCH time and the one compared at read time come from one source.
+    """
+    from stage2.sync_quote import life_unit_fragments
+    from stage2.timeline_parser import sync_fragment_id
+
+    texts: dict[str, str] = {}
+    for block in normalization.get("blocks") or []:
+        if not isinstance(block, dict) or str(block.get("type") or "").lower() != "life":
+            continue
+        uid = str(block.get("uid") or "").strip()
+        if not uid:
+            continue
+        fragments = life_unit_fragments(block)
+        for index, fragment in enumerate(fragments):
+            texts[sync_fragment_id(uid, index, len(fragments))] = str(fragment["text"])
+    return texts
+
+
+def classify_sync_matches(
+    matches: list, normalization: dict
+) -> tuple[list, list[str], list[str]]:
+    """Split stored matches into current ones, stale ids and stale LIFE assignment ids.
+
+    The single place that decides whether a match belongs to the current normalization.
+    A manual LIFE assignment survives a revision change when its unit still exists and
+    the LIFE text is unchanged (``life_text_sha256``); a changed text makes it stale and
+    reports the uid in the third list so the UI can say why the assignment disappeared.
+    """
     revision = normalization.get("revision")
     scenario_revision_id = normalization.get("scenario_revision_id")
+    life_texts: dict[str, str] | None = None
     current: list = []
     stale_ids: list[str] = []
+    stale_life_ids: list[str] = []
     for match in matches:
         metadata = match.metadata
-        match_revision = metadata.get("normalization_revision")
-        if match_revision not in (None, "", revision) or not _scenario_revision_matches(
-            metadata.get("scenario_revision_id"), scenario_revision_id
-        ):
-            stale_ids.append(match.segment_id)
+        if metadata.get("normalization_revision") in (
+            None,
+            "",
+            revision,
+        ) and _scenario_revision_matches(metadata.get("scenario_revision_id"), scenario_revision_id):
+            current.append(match)
             continue
-        current.append(match)
+        if is_life_match(match):
+            if life_texts is None:
+                life_texts = life_unit_texts(normalization)
+            text = life_texts.get(match.segment_id)
+            if text is not None:
+                if metadata.get("life_text_sha256") == life_text_sha256(text):
+                    current.append(match)
+                    continue
+                stale_life_ids.append(match.segment_id)
+        stale_ids.append(match.segment_id)
+    return current, stale_ids, stale_life_ids
+
+
+def current_sync_matches(matches: list, normalization: dict) -> tuple[list, list[str]]:
+    """Split stored sync matches into those valid for the normalization and stale ids."""
+    current, stale_ids, _stale_life = classify_sync_matches(matches, normalization)
     return current, stale_ids
 
 
@@ -116,7 +173,7 @@ def is_exportable_match(
     """True when the Stage 3 export cuts this fragment from a source (not a placeholder).
 
     Single predicate shared by the exporter and the pre-export summary so they cannot
-    drift: an SNH/host fragment with a matched status (legacy empty status included),
+    drift: an SNH/host/LIFE fragment with a matched status (legacy empty status included),
     a source id and a non-empty source range.
     """
     try:
@@ -124,7 +181,7 @@ def is_exportable_match(
     except (TypeError, ValueError):
         has_range = False
     return bool(
-        segment_type in {"snh", "host"}
+        segment_type in {"snh", "host", "life"}
         and str(match_status or "") in MATCHED_STATUSES
         and source_id
         and has_range
@@ -194,12 +251,22 @@ def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str 
         except (TypeError, ValueError):
             duration = 0.0
         return None if segment.get("wav_path") and duration > 0 else "missing_wav"
-    if segment_type == "life":
-        return "life_unassigned"
-    if segment_type not in {"snh", "host"}:
+    if segment_type not in {"snh", "host", "life"}:
         return None
 
     status = str(segment.get("match_status") or "")
+    if segment_type == "life":
+        # LIFE is assigned by hand only: a confirmed match with a range, or the placeholder.
+        source_id = str(segment.get("source_id") or "")
+        if status == "confirmed" and is_exportable_match(
+            segment_type,
+            status,
+            source_id,
+            segment.get("source_in_sec"),
+            segment.get("source_out_sec"),
+        ):
+            return "unmapped_source" if mapped is not None and source_id not in mapped else None
+        return "life_unassigned"
     if status == "needs_review" or (status == "confirmed" and segment.get("retime_pending_review")):
         return "needs_review"
     source_id = str(segment.get("source_id") or "")

@@ -640,7 +640,7 @@ def build_nested_xml(
         if status == "skipped" or segment.type == "tech" or segment.duration_sec <= 0:
             continue
         entry = sequence_by_source.get(segment.source_id)
-        if status == "ready" and segment.type in {"snh", "host"}:
+        if status == "ready" and segment.type in {"snh", "host", "life"}:
             if entry is None:
                 raise ValueError(
                     f"segment {segment.id} is ready but source {segment.source_id!r} "
