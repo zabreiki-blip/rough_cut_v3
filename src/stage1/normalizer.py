@@ -181,6 +181,15 @@ def _paragraph_structure(text: str) -> ParagraphStructure:
     return parse_paragraph(text, _MARKER_TYPES)
 
 
+_SYNC_INLINE_LABEL_MARKERS = frozenset({"снх", "синх", "синхр", "синхрон", "sync"})
+
+
+def _is_unlabeled_or_sync_label(original_label: str) -> bool:
+    """No label, or a plain sync marker (``СНХ``/``Синх``/``Синхрон``): the only
+    labels after which a glued ``<Имя><цитата>`` may be split off."""
+    return not original_label or normalize_marker(original_label) in _SYNC_INLINE_LABEL_MARKERS
+
+
 def _structural_text(text: str) -> str:
     """Parsing view of a paragraph with its timecodes in the stored colon form.
 
@@ -1520,6 +1529,7 @@ def validate_for_confirmation_detailed(
                 block.original_label
                 and _SYNC_NAME_ONLY_LABEL.fullmatch(block.original_label.strip())
                 and normalize_marker(block.original_label) not in _BUILTIN_MARKERS
+                and normalize_marker(block.original_label) not in _SYNC_INLINE_LABEL_MARKERS
                 and block.speaker
                 and normalize_marker(block.original_label) != normalize_marker(block.speaker)
             ):
@@ -2771,7 +2781,11 @@ def _classify_by_rules(
         # the header into a quote of its own.
         block.label_only = True
         return
-    inline_sync = None if block.original_label else split_inline_sync_label(stripped)
+    inline_sync = (
+        split_inline_sync_label(stripped)
+        if _is_unlabeled_or_sync_label(block.original_label)
+        else None
+    )
     if inline_sync:
         # ``Синх СторожевойТо, что...``: the label is glued to the quote (or
         # followed by a splice marker). The unambiguous border makes it a sync
@@ -3034,7 +3048,15 @@ def _extract_block_metadata_fields(block: NormalizedBlock) -> None:
     fragment_source = _SYNC_CONTINUATION_NOTE.sub("", normalized_view)
     has_sync_metadata = False
     explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
-    inline_sync = None if block.original_label else split_inline_sync_label(normalized_view)
+    # The label is already stripped from ``normalized_view`` (``СНХ СторожевойТо...``
+    # -> ``СторожевойТо...``): put the canonical marker back for the splitter.
+    inline_sync = (
+        split_inline_sync_label(
+            f"СНХ {normalized_view}" if block.original_label else normalized_view
+        )
+        if _is_unlabeled_or_sync_label(block.original_label)
+        else None
+    )
     match = _SYNC_METADATA.match(normalized_view)
     dash_credit = _parse_snh_dash_credit(block.original_text)
     unlabeled_credit = _parse_unlabeled_sync_credit(block.original_text)

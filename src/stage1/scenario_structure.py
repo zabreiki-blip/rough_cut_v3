@@ -74,6 +74,7 @@ DEFAULT_MARKER_TYPES: Mapping[str, str] = {
     "з к": "voiceover",
     "з": "voiceover",
     "снх": "sync",
+    "синх": "sync",
     "синхр": "sync",
     "синхрон": "sync",
     "sync": "sync",
@@ -92,6 +93,7 @@ _CANONICAL_LABELS: Mapping[str, str] = {
     "з к": "ЗК",
     "з": "ЗК",
     "снх": "СНХ",
+    "синх": "СНХ",
     "синхр": "СНХ",
     "синхрон": "СНХ",
     "sync": "СНХ",
@@ -423,24 +425,41 @@ def detect_technical_cue(text: str) -> str:
     return ""
 
 
+# Splice markers that are not in the label tables but are never a person's name.
+_SPLICE_WORDS = ("скл", "склейка", "тк")
+# Service words (labels, splice markers) written as one Cyrillic word: they can
+# never be part of an interviewee's name, whatever their letter case.
+_SERVICE_NAME_WORDS = tuple(
+    sorted(
+        {
+            marker
+            for marker in (*DEFAULT_MARKER_TYPES, *_SPLICE_WORDS)
+            if len(marker) >= 2 and re.fullmatch(r"[а-яё]+", marker)
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_NOT_SERVICE_WORD = rf"(?!(?i:{'|'.join(_SERVICE_NAME_WORDS)})(?![А-ЯЁа-яёA-Za-z\-]))"
+_SYNC_NAME_WORD = rf"{_NOT_SERVICE_WORD}[А-ЯЁ][а-яёА-ЯЁ\-]+"
 # A paragraph that is *only* a sync label with an interviewee name and no quote:
 # ``Синх Сторожевой``.  It announces the speaker for the paragraph(s) that follow.
+# The marker is case-insensitive, the name is capitalised (or all-caps) words
+# that are not service labels.
 SYNC_LABEL_ONLY_RE = re.compile(
-    r"^\s*(?:Синх|СНХ|Синхрон)\s+"
-    r"([А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)*)\s*$",
-    re.IGNORECASE,
+    rf"^\s*(?i:Синх|СНХ|Синхрон)\s+({_SYNC_NAME_WORD}(?:\s+{_SYNC_NAME_WORD})*)\s*$",
 )
 _SYNC_WORD = r"(?i:Синх|СНХ|Синхрон)"
 # ``Синх СторожевойТо, что...``: the name and the quote are glued; the border is
 # the lower->upper case change inside the word.
 _SYNC_GLUED_RE = re.compile(
-    rf"^\s*{_SYNC_WORD}\s+(?P<name>[А-ЯЁ][а-яё\-]{{2,}}?)(?P<rest>[А-ЯЁ](?![А-ЯЁ]{{2}}).*)$",
+    rf"^\s*{_SYNC_WORD}\s+(?P<name>{_NOT_SERVICE_WORD}[А-ЯЁ][а-яё\-]{{2,}}?)(?P<rest>[А-ЯЁ](?![А-ЯЁ]{{2}}).*)$",
     re.DOTALL,
 )
 # ``Синх Сторожева СКЛ Эльза...`` / ``Синх Сторожева и тогда...``: one capitalised
 # word, then a splice marker or a lower-case word, so the name cannot go further.
 _SYNC_SPACED_RE = re.compile(
-    rf"^\s*{_SYNC_WORD}\s+(?P<name>[А-ЯЁ][а-яё\-]{{2,}})[ \t]+"
+    rf"^\s*{_SYNC_WORD}\s+(?P<name>{_NOT_SERVICE_WORD}[А-ЯЁ][а-яё\-]{{2,}})[ \t]+"
     r"(?P<rest>(?:СКЛ(?:ЕЙКА)?\b|[а-яё]).*)$",
     re.DOTALL,
 )

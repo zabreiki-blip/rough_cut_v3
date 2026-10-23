@@ -10,6 +10,11 @@ import pytest
 
 from stage1.normalization_models import NormalizedBlock
 from stage1.normalizer import generate_normalization, validate_for_confirmation_detailed
+from stage1.scenario_structure import (
+    DEFAULT_MARKER_TYPES,
+    SYNC_LABEL_ONLY_RE,
+    parse_paragraph as parse_paragraph_structure,
+)
 from stage2.timeline_parser import parse_normalized_timeline
 
 
@@ -266,3 +271,103 @@ def test_sync_speaker_that_is_a_person_is_not_flagged(speaker: str) -> None:
         text_for_tts="",
     )
     assert "false_hero_from_cue" not in _error_codes(block)
+
+
+# --- D: label-only name must not swallow service labels; glued form after СНХ ----------
+
+
+@pytest.mark.parametrize(
+    ("header", "speaker"),
+    [
+        ("СИНХ МАКСИМОВА", "МАКСИМОВА"),
+        ("Синх Смольникова", "Смольникова"),
+        ("СНХ Татьяна Васильева", "Татьяна Васильева"),
+        ("Синхрон Ёлкина", "Ёлкина"),
+    ],
+)
+def test_label_only_header_with_name(tmp_path: Path, header: str, speaker: str) -> None:
+    block = _normalize(tmp_path, "ЗК. Вводная фраза для контекста.", header)["blocks"][1]
+    assert block["type"] == "sync"
+    assert block["label_only"] is True
+    assert block["speaker"] == speaker
+
+
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "Синх Сторожева СКЛ Эльза",
+        "Синх Сторожева СКЛЕЙКА Эльза",
+        "СНХ Сторожева ЗК Эльза",
+        "Синх Сторожева и тогда мы пошли",
+    ],
+)
+def test_service_label_or_lowercase_word_is_not_part_of_label_only_name(paragraph: str) -> None:
+    assert SYNC_LABEL_ONLY_RE.match(paragraph) is None
+
+
+def test_label_only_regex_keeps_name_without_service_words() -> None:
+    match = SYNC_LABEL_ONLY_RE.match("СНХ Татьяна Васильева")
+    assert match and match.group(1) == "Татьяна Васильева"
+    assert SYNC_LABEL_ONLY_RE.match("синх Смольникова")  # marker is case-insensitive
+
+
+def test_spaced_label_with_cyrillic_splice_in_name_position(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "ЗК. Фильм о Лиле Брик вышел в этом году.",
+        "Синх Сторожева СКЛ Эльза привела Маяковского СКЛ к Лиле домой.",
+    )
+    block = result["blocks"][1]
+    assert block["type"] == "sync"
+    assert block["label_only"] is False
+    assert block["speaker"] == "Сторожева"
+    assert all("СКЛ" not in f["text"] and "Синх" not in f["text"] for f in block["sync_fragments"])
+    assert "СКЛ" not in block["speaker"]
+
+
+def test_spaced_label_with_lowercase_word_is_not_label_only(tmp_path: Path) -> None:
+    block = _normalize(
+        tmp_path,
+        "ЗК. Фильм о Лиле Брик вышел в этом году.",
+        "Синх Сторожева и тогда мы пошли",
+    )["blocks"][1]
+    assert block["label_only"] is False
+
+
+@pytest.mark.parametrize("label", ["Синх", "СНХ", "синх", "СИНХ"])
+def test_glued_name_after_sync_marker_variants(tmp_path: Path, label: str) -> None:
+    result = _normalize(
+        tmp_path,
+        "ЗК. Фильм о Лиле Брик вышел в этом году.",
+        f"{label} СторожевойТо, что получилось у нас, это живая история. СКЛ это живые люди.",
+    )
+    block = result["blocks"][1]
+    assert block["type"] == "sync"
+    assert block["speaker"] == "Сторожевой"
+    assert block["text_for_tts"] == ""
+    assert block["label_only"] is False
+    assert block["normalized_text"].startswith("То, что")
+    texts = [fragment["text"] for fragment in block["sync_fragments"]]
+    assert texts and texts[0].startswith("То, что")
+    assert all(
+        "Синх" not in t and "СНХ" not in t and "Сторожевой" not in t and "СКЛ" not in t
+        for t in texts
+    )
+    assert validate_for_confirmation_detailed(result) == []
+
+
+def test_synh_is_a_canonical_sync_marker() -> None:
+    structure = parse_paragraph_structure("Синх Иванов: 00:00:10 - Реплика героя.")
+    assert structure.label == "СНХ"
+    assert DEFAULT_MARKER_TYPES["синх"] == "sync"
+
+
+@pytest.mark.parametrize("tts", ["СИНХРОН Иванов сказал это в кадре.", "Синхрон Иванов сказал это."])
+def test_synhron_name_in_voiceover_tts_blocks(tts: str) -> None:
+    block = _block(original_text=tts, normalized_text=tts, text_for_tts=tts)
+    assert "service_label_in_tts" in _error_codes(block)
+
+
+def test_yolkina_is_recognised_as_a_name_in_label_only_regex() -> None:
+    match = SYNC_LABEL_ONLY_RE.match("Синх Ёлкина")
+    assert match and match.group(1) == "Ёлкина"
