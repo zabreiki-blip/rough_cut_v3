@@ -206,6 +206,8 @@ def _trim_adjacent_padding(segments: list[TimelineSegment], fps: int = 25) -> No
             continue
         lo = max(late.source_in_sec, early.speech_out_sec)
         hi = min(early.source_out_sec, late.speech_in_sec)
+        if lo > hi:
+            continue  # speech lies outside an edit range (corrupted data): never cut
         if early.manual_range:
             cut = hi
         elif late.manual_range:

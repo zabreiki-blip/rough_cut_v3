@@ -38,6 +38,7 @@ _STAGE3_JOBS_TTL_SECONDS = 24 * 60 * 60
 _STAGE3_TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
 _STAGE3_PREPARE_MODES = ("draft", "complete")
 _ASSEMBLY_INCOMPLETE = "assembly_incomplete"
+_BUILD_NOT_DETERMINISTIC = "build_not_deterministic"
 
 
 class Stage3OperationError(RuntimeError):
@@ -565,8 +566,10 @@ def _perform_prepare(
         timeline_data=timeline_data,
         timeline_sha256=timeline_sha256,
         plan=plan,
-        mapping_catalog=mapping.catalog,
+        export_catalog=export_catalog,
         unmapped_source_ids=mapping.unmapped_source_ids,
+        project_root=paths["root"],
+        progress=progress,
     )
     build_id = stage3_builds.compute_build_id(inputs, mode)
     filename = _nested_timeline_filename(project, timeline_data.get("scenario_revision_id"))
@@ -601,6 +604,7 @@ def _perform_prepare(
             project, timeline_data.get("scenario_revision_id"), build_id=build_id
         ),
         mapping_payload=mapping_payload,
+        project_root=str(paths["root"]),
     )
     atomic_write_text(output_path, xml_text)
     atomic_write_json(paths["work"] / "assembly_plan.json", plan)
@@ -808,6 +812,21 @@ def _run_job(
             blockers=exc.blockers,
             summary=exc.summary,
             mode=mode,
+            finished_at=_now_iso(),
+        )
+    except stage3_builds.BuildInvariantError as exc:
+        _logger.error("Stage 3 prepare job for %s: %s", project, exc)
+        _update_job(
+            job_id,
+            jobs,
+            jobs_lock,
+            services,
+            status="failed",
+            error=str(exc),
+            error_code=_BUILD_NOT_DETERMINISTIC,
+            error_status=500,
+            http_status=500,
+            message=str(exc),
             finished_at=_now_iso(),
         )
     except Stage3OperationError as exc:
@@ -1070,6 +1089,12 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                 result = _perform_prepare(project, services, mode=mode)
         except AssemblyIncompleteError as exc:
             return jsonify({"ok": False, **exc.payload()}), exc.status_code
+        except stage3_builds.BuildInvariantError as exc:
+            _logger.error("Stage 3 prepare for %s: %s", project, exc)
+            return (
+                jsonify({"ok": False, "error": str(exc), "error_code": _BUILD_NOT_DETERMINISTIC}),
+                500,
+            )
         except Stage3OperationError as exc:
             return services._json_error(str(exc), exc.status_code)
         except (MediaCatalogError, TypeError, ValueError, json.JSONDecodeError) as exc:

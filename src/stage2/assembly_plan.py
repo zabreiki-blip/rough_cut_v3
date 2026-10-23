@@ -256,9 +256,6 @@ def _ready_item_problems(
         return problems
     source = item.get("source") if isinstance(item.get("source"), dict) else {}
     source_id = str(source.get("source_id") or "")
-    media_status = str(source.get("media_status") or "unchecked")
-    if media_status not in {"mapped", "unchecked"}:
-        problems.append(("unmapped_source", f"media_status={media_status}"))
     entry = catalog.get(source_id) if catalog is not None and source_id else None
     duration = _num(_catalog_value(entry, "duration", "duration_sec"))
     media_path = _catalog_value(entry, "path", "container_path", "media_path")

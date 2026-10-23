@@ -640,7 +640,12 @@ def build_nested_xml(
         if status == "skipped" or segment.type == "tech" or segment.duration_sec <= 0:
             continue
         entry = sequence_by_source.get(segment.source_id)
-        if status == "ready" and segment.type in {"snh", "host"} and entry is not None:
+        if status == "ready" and segment.type in {"snh", "host"}:
+            if entry is None:
+                raise ValueError(
+                    f"segment {segment.id} is ready but source {segment.source_id!r} "
+                    "is not in the media catalog"
+                )
             source, sequence_id, _, sequence_name = entry
             clip_number += 1
             _nested_clip(
@@ -663,11 +668,11 @@ def build_nested_xml(
                 media_type="audio",
                 timeline_fps=full_timeline.fps,
             )
-        elif (
-            status == "placeholder"
-            and segment.type in {"snh", "host", "life"}
-            and segment.placeholder_path
-        ):
+        elif status == "placeholder" and segment.type in {"snh", "host", "life"}:
+            if not segment.placeholder_path:
+                raise ValueError(
+                    f"segment {segment.id} is a placeholder but has no placeholder_path"
+                )
             clip_number += 1
             _placeholder_clip(
                 video_track,

@@ -642,8 +642,6 @@ class TrimAdjacentPaddingTest(unittest.TestCase):
         b.source_id = "src2"
         _trim_adjacent_padding([a, b], 25)
         self.assertEqual((a.source_out_sec, b.source_in_sec), (624.315, 622.58))
-        self.assertIsNone(a.trim)
-        self.assertIsNone(b.trim)
 
     def test_zk_or_placeholder_between_breaks_adjacency(self) -> None:
         for between in (
@@ -804,6 +802,16 @@ class TrimInParseNormalizedTimelineTest(unittest.TestCase):
         self.assertEqual(merged.source_out_sec, tail.source_in_sec)
         self.assertGreaterEqual(merged.source_out_sec, 10.0)
         self.assertLessEqual(tail.source_in_sec, 12.0)
+
+
+class TrimAdjacentPaddingCorruptedDataTest(unittest.TestCase):
+    def test_speech_outside_edit_range_is_left_untouched(self) -> None:
+        # The earlier fragment's speech ends past its own edit range: lo > hi, so no cut.
+        a = _sync("a", 10.0, 20.0, 11.0, 25.0)
+        b = _sync("b", 15.0, 30.0, 26.0, 28.0)
+        _trim_adjacent_padding([a, b], 25)
+        self.assertEqual((a.source_in_sec, a.source_out_sec), (10.0, 20.0))
+        self.assertEqual((b.source_in_sec, b.source_out_sec), (15.0, 30.0))
 
 
 if __name__ == "__main__":

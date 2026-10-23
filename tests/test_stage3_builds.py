@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
+import time
 
 import pytest
 
@@ -111,7 +113,7 @@ def test_build_id_depends_on_matches_fingerprint_and_sources(tmp_path: Path) -> 
             timeline_data=data,
             timeline_sha256="t",
             plan=plan,
-            mapping_catalog={"v1": {"path": str(media)}},
+            export_catalog={"v1": {"path": str(media)}},
             unmapped_source_ids=[],
         )
 
@@ -322,3 +324,266 @@ def test_builds_history_is_newest_first_with_latest_pointer(client) -> None:
     assert newest["mode"] == "complete"
     assert newest["summary"]["items"] >= 2
     assert api_stage3_routes.stage3_builds is stage3_builds
+
+
+def _extra_viewing(tmp_path: Path, duration: float = 10.0) -> dict:
+    media = tmp_path / "extra_v2.mp4"
+    media.write_bytes(b"v2")
+    return {
+        "source_id": "v2",
+        "container_path": str(media),
+        "duration": duration,
+        "fps": 25,
+        "media_kind": "video",
+    }
+
+
+def test_unmapped_viewing_change_gives_new_build_id_and_both_prepares_succeed(
+    client, tmp_path
+) -> None:
+    http, paths = _complete_setup(client)
+    extra = _extra_viewing(tmp_path)
+    video = {"source_id": "v1", "path": "/media/v1.mp4", "duration": 100.0, "media_kind": "video"}
+    client[2].setattr(
+        api_stage3_routes,
+        "_host_catalog",
+        lambda *_a, **_k: {"sources": [video, extra]},
+    )
+
+    first = _prepare(http)
+    extra["duration"] = 20.0  # an unrelated, unmapped viewing changes the RC_VIEWINGS bin
+    second = _prepare(http)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.get_json()["result"]["build_id"] != second.get_json()["result"]["build_id"]
+
+
+def test_collect_inputs_covers_every_export_catalog_entry(tmp_path: Path) -> None:
+    media = tmp_path / "a.mp4"
+    media.write_bytes(b"a")
+    plan = {"items": [], "summary": {}}
+
+    def inputs(duration: float) -> dict:
+        return stage3_builds.collect_inputs(
+            timeline_data={"fps": 25},
+            timeline_sha256="t",
+            plan=plan,
+            export_catalog={"a": {"path": str(media), "duration": duration}},
+            unmapped_source_ids=[],
+        )
+
+    assert [item["source_id"] for item in inputs(5.0)["sources"]] == ["a"]
+    assert inputs(5.0)["sources"] != inputs(6.0)["sources"]
+
+
+def _publish_kwargs(xml_text: str = "<a/>", **extra) -> dict:
+    return {
+        "mode": "draft",
+        "complete": True,
+        "inputs": {"timeline_sha256": "t"},
+        "plan": {"items": [], "summary": {}},
+        "xml_text": xml_text,
+        "xml_filename": "a.xml",
+        "mapping_payload": {},
+        **extra,
+    }
+
+
+@pytest.mark.parametrize("damage", ["missing_xml", "missing_build_json", "bad_json", "bad_xml"])
+def test_broken_existing_build_is_republished(tmp_path: Path, damage: str) -> None:
+    root = tmp_path / "builds"
+    first = stage3_builds.publish_build(root, **_publish_kwargs())
+    target = root / first["build_id"]
+    if damage == "missing_xml":
+        (target / "timeline.xml").unlink()
+    elif damage == "missing_build_json":
+        (target / "build.json").unlink()
+    elif damage == "bad_json":
+        (target / "build.json").write_text("{not json", encoding="utf-8")
+    else:
+        (target / "timeline.xml").write_text("<tampered/>", encoding="utf-8")
+
+    again = stage3_builds.publish_build(root, **_publish_kwargs())
+
+    assert again["build_id"] == first["build_id"]
+    assert [p.name for p in root.iterdir()] == [first["build_id"]]
+    assert (target / "timeline.xml").read_text(encoding="utf-8") == "<a/>"
+    assert json.loads((target / "build.json").read_text())["build_id"] == first["build_id"]
+
+
+def test_intact_build_with_different_xml_is_an_invariant_error_with_clear_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "builds"
+    stage3_builds.publish_build(root, **_publish_kwargs())
+
+    with pytest.raises(stage3_builds.BuildInvariantError, match="not deterministic"):
+        stage3_builds.publish_build(root, **_publish_kwargs("<b/>"))
+
+
+def test_existing_build_from_other_project_root_is_replaced(tmp_path: Path) -> None:
+    root = tmp_path / "builds"
+    stage3_builds.publish_build(root, **_publish_kwargs(project_root="/old/root"))
+
+    again = stage3_builds.publish_build(root, **_publish_kwargs("<b/>", project_root="/new/root"))
+
+    assert again["project_root"] == "/new/root"
+    assert (root / again["build_id"] / "timeline.xml").read_text(encoding="utf-8") == "<b/>"
+
+
+def test_prepare_route_reports_build_not_deterministic(client) -> None:
+    http, paths = _complete_setup(client)
+    assert _prepare(http).status_code == 200
+    client[2].setattr(api_stage3_routes, "build_nested_xml", lambda *_a, **_k: "<different/>")
+
+    response = _prepare(http)
+
+    assert response.status_code == 500
+    body = response.get_json()
+    assert body["error_code"] == "build_not_deterministic"
+    assert "not deterministic" in body["error"]
+
+
+def test_prepare_job_reports_build_not_deterministic(client) -> None:
+    from test_stage3_api import _ImmediateThread
+
+    http, paths = _complete_setup(client)
+    assert _prepare(http).status_code == 200
+    client[2].setattr(api_stage3_routes, "build_nested_xml", lambda *_a, **_k: "<different/>")
+    client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+
+    started = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"})
+    job = http.get(started.get_json()["result"]["status_url"]).get_json()["result"]
+
+    assert job["status"] == "failed"
+    assert job["error_code"] == "build_not_deterministic"
+    assert job["error_status"] == 500
+
+
+def _age(path: Path, seconds: float) -> None:
+    stamp = time.time() - seconds
+    os.utime(path, (stamp, stamp))
+
+
+def test_stale_tmp_and_broken_directories_are_cleaned_up(tmp_path: Path) -> None:
+    root = tmp_path / "builds"
+    kept = stage3_builds.publish_build(root, **_publish_kwargs())
+    stale_tmp = root / ".tmp-old"
+    stale_broken = root / ".broken-old"
+    fresh_tmp = root / ".tmp-fresh"
+    for directory in (stale_tmp, stale_broken, fresh_tmp):
+        directory.mkdir()
+    _age(stale_tmp, 3 * 3600)
+    _age(stale_broken, 3 * 3600)
+
+    stage3_builds.safe_rotate(root)
+
+    assert not stale_tmp.exists()
+    assert not stale_broken.exists()
+    assert fresh_tmp.exists()
+    assert (root / kept["build_id"]).is_dir()
+
+
+def test_publish_also_cleans_stale_directories(tmp_path: Path) -> None:
+    root = tmp_path / "builds"
+    root.mkdir()
+    stale = root / ".tmp-crashed"
+    stale.mkdir()
+    _age(stale, 3 * 3600)
+
+    stage3_builds.publish_build(root, **_publish_kwargs())
+
+    assert not stale.exists()
+
+
+def test_published_build_directory_is_world_readable(tmp_path: Path) -> None:
+    root = tmp_path / "builds"
+    build = stage3_builds.publish_build(root, **_publish_kwargs())
+
+    assert (root / build["build_id"]).stat().st_mode & 0o777 == 0o755
+
+
+def test_build_id_ignores_where_the_project_lives(tmp_path: Path) -> None:
+    def make(base: Path) -> Path:
+        project = base / "BRIK"
+        (project / "work").mkdir(parents=True)
+        (project / "media").mkdir()
+        (project / "work" / "zk.wav").write_bytes(b"wav")
+        (project / "media" / "v1.mp4").write_bytes(b"mp4")
+        return project
+
+    first_root = make(tmp_path / "one")
+    second_root = tmp_path / "two" / "BRIK"
+    shutil.copytree(first_root, second_root)
+
+    def inputs(project: Path) -> dict:
+        plan = {
+            "items": [{"uid": "u1", "wav": {"path": str(project / "work" / "zk.wav")}}],
+            "summary": {},
+        }
+        return stage3_builds.collect_inputs(
+            timeline_data={"fps": 25},
+            timeline_sha256="t",
+            plan=plan,
+            export_catalog={"v1": {"path": str(project / "media" / "v1.mp4"), "duration": 9}},
+            unmapped_source_ids=[],
+            project_root=project,
+        )
+
+    one, two = inputs(first_root), inputs(second_root)
+    assert one == two
+    assert one["wav"][0]["path"] == "work/zk.wav"
+    assert stage3_builds.compute_build_id(one, "draft") == stage3_builds.compute_build_id(
+        two, "draft"
+    )
+
+
+def test_paths_outside_the_project_stay_absolute(tmp_path: Path) -> None:
+    outside = tmp_path / "elsewhere" / "v1.mp4"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x")
+    inputs = stage3_builds.collect_inputs(
+        timeline_data={"fps": 25},
+        timeline_sha256="t",
+        plan={"items": [], "summary": {}},
+        export_catalog={"v1": {"path": str(outside)}},
+        unmapped_source_ids=[],
+        project_root=tmp_path / "BRIK",
+    )
+    assert inputs["sources"][0]["path"] == str(outside)
+
+
+def test_collect_inputs_reports_wav_hashing_progress(tmp_path: Path) -> None:
+    items = []
+    for index in range(25):
+        wav = tmp_path / f"w{index}.wav"
+        wav.write_bytes(bytes([index]))
+        items.append({"uid": f"u{index}", "wav": {"path": str(wav)}})
+    calls: list[tuple[int, str]] = []
+
+    stage3_builds.collect_inputs(
+        timeline_data={"fps": 25},
+        timeline_sha256="t",
+        plan={"items": items, "summary": {}},
+        export_catalog={},
+        unmapped_source_ids=[],
+        progress=lambda percent, message: calls.append((percent, message)),
+    )
+
+    assert len(calls) == 2  # after 10 and after 20 files
+    assert "10" in calls[0][1] and "25" in calls[0][1]
+    assert calls[0][0] <= calls[1][0]
+
+
+def test_prepare_with_segment_missing_placeholder_path_returns_400_with_segment_id(
+    client,
+) -> None:
+    http, paths = _complete_setup(
+        client, extra=[_segment("l7", "life", 4.0, 2.0, placeholder_path="")]
+    )
+
+    response = _prepare(http)
+
+    assert response.status_code == 400
+    assert "l7" in response.get_json()["error"]

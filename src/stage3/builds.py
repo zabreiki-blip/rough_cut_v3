@@ -12,6 +12,7 @@ fully written temporary directory and is never modified afterwards.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -22,10 +23,13 @@ import re
 import shutil
 import tempfile
 import threading
-from typing import Any, Iterable
+import time
+from typing import Any, Callable, Iterable
+import uuid
 
 from atomic_io import atomic_write_json
 from stage2.assembly_manifest import sha256_file
+from stage3.nested_xml import MediaSource
 from stage_common import _scenario_revision_matches
 
 BUILD_SCHEMA_VERSION = 1
@@ -38,6 +42,9 @@ PLAN_FILENAME = "assembly_plan.json"
 XML_FILENAME = "timeline.xml"
 MAPPING_FILENAME = "source_mapping.json"
 _TMP_PREFIX = ".tmp-"
+_BROKEN_PREFIX = ".broken-"
+STALE_DIR_MINUTES = 60
+WAV_PROGRESS_EVERY = 10
 
 _logger = logging.getLogger(__name__)
 _wav_hash_cache: dict[tuple[str, int, int], str] = {}
@@ -83,15 +90,33 @@ def _cached_wav_sha256(path: str, size: int, mtime_ns: int) -> str | None:
     return digest
 
 
-def wav_inputs(plan: dict) -> list[dict]:
+def _portable_path(path: str, project_root: Path | None) -> str:
+    """Path relative to the project root when inside it, otherwise unchanged (absolute)."""
+
+    if not path or project_root is None:
+        return path
+    try:
+        return Path(path).relative_to(project_root).as_posix()
+    except ValueError:
+        return path
+
+
+def wav_inputs(
+    plan: dict,
+    *,
+    project_root: Path | None = None,
+    progress: Callable[[int, str], None] | None = None,
+) -> list[dict]:
     """Full-content identity of every WAV the plan references (missing files get nulls)."""
 
+    wav_items = [
+        (item, str(item["wav"].get("path") or ""))
+        for item in plan.get("items") or []
+        if isinstance(item, dict) and isinstance(item.get("wav"), dict)
+    ]
+    wav_items = [(item, path) for item, path in wav_items if path]
     result: list[dict] = []
-    for item in plan.get("items") or []:
-        wav = item.get("wav") if isinstance(item, dict) else None
-        path = str(wav.get("path") or "") if isinstance(wav, dict) else ""
-        if not path:
-            continue
+    for index, (item, path) in enumerate(wav_items, start=1):
         size, mtime_ns = _stat(path)
         digest = (
             _cached_wav_sha256(path, size, mtime_ns)
@@ -101,11 +126,16 @@ def wav_inputs(plan: dict) -> list[dict]:
         result.append(
             {
                 "uid": str(item.get("uid") or ""),
-                "path": path,
+                "path": _portable_path(path, project_root),
                 "size": size,
                 "sha256": digest,
             }
         )
+        if progress is not None and index % WAV_PROGRESS_EVERY == 0:
+            progress(
+                85 + 10 * index // len(wav_items),
+                f"Хэширование WAV: {index} из {len(wav_items)}",
+            )
     return result
 
 
@@ -117,15 +147,31 @@ def _entry_value(entry: object, *keys: str) -> object:
     return None
 
 
-def source_inputs(catalog: dict) -> list[dict]:
-    """Cheap identity (size + mtime) of every mapped source video."""
+def _xml_fields_sha256(source_id: str, entry: object, project_root: Path | None) -> str:
+    """Hash of every catalog field the XML exporter reads (paths made portable)."""
+
+    fields = asdict(MediaSource.from_value(source_id, entry))
+    for key in ("path", "placeholder_path"):
+        fields[key] = _portable_path(str(fields.get(key) or ""), project_root)
+    return sha256_text(canonical_json(fields))
+
+
+def source_inputs(catalog: dict, *, project_root: Path | None = None) -> list[dict]:
+    """Identity of every catalog source that reaches the XML (size + mtime + XML fields)."""
 
     result: list[dict] = []
     for source_id in sorted(catalog):
-        path = str(_entry_value(catalog[source_id], "path", "container_path", "media_path") or "")
+        entry = catalog[source_id]
+        path = str(_entry_value(entry, "path", "container_path", "media_path") or "")
         size, mtime_ns = _stat(path) if path else (None, None)
         result.append(
-            {"source_id": str(source_id), "path": path, "size": size, "mtime_ns": mtime_ns}
+            {
+                "source_id": str(source_id),
+                "path": _portable_path(path, project_root),
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "xml_fields_sha256": _xml_fields_sha256(str(source_id), entry, project_root),
+            }
         )
     return result
 
@@ -135,10 +181,14 @@ def collect_inputs(
     timeline_data: dict,
     timeline_sha256: str,
     plan: dict,
-    mapping_catalog: dict,
+    export_catalog: dict,
     unmapped_source_ids: Iterable[str],
+    project_root: Path | None = None,
+    progress: Callable[[int, str], None] | None = None,
 ) -> dict:
-    sources = source_inputs(mapping_catalog)
+    """Build inputs; ``export_catalog`` is the exact catalog the XML is generated from."""
+
+    sources = source_inputs(export_catalog, project_root=project_root)
     settings = {
         "fps": timeline_data.get("fps"),
         "width": timeline_data.get("width"),
@@ -156,7 +206,7 @@ def collect_inputs(
         "timeline_sha256": timeline_sha256,
         "sync_matches_fingerprint": str(timeline_data.get("sync_matches_fingerprint") or ""),
         "settings_sha256": sha256_text(canonical_json(settings)),
-        "wav": wav_inputs(plan),
+        "wav": wav_inputs(plan, project_root=project_root, progress=progress),
         "sources": sources,
         "media_mapping_sha256": sha256_text(canonical_json(media_mapping)),
     }
@@ -168,12 +218,6 @@ def _read_json(path: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
-
-
-def build_dir(builds_dir: Path, build_id: str) -> Path:
-    if not BUILD_ID_RE.fullmatch(build_id):
-        raise ValueError(f"invalid build id: {build_id!r}")
-    return builds_dir / build_id
 
 
 def load_build(builds_dir: Path, build_id: str) -> dict | None:
@@ -268,10 +312,6 @@ def rotate_builds(builds_dir: Path, *, keep: int = BUILDS_KEEP) -> list[str]:
     return removed
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    atomic_write_json(path, payload)
-
-
 def publish_build(
     builds_dir: Path,
     *,
@@ -282,11 +322,13 @@ def publish_build(
     xml_text: str,
     xml_filename: str,
     mapping_payload: dict,
+    project_root: str = "",
 ) -> dict:
     """Write and atomically publish a build directory; returns its build.json.
 
     latest.json is NOT touched here (see :func:`set_latest`), so a failure leaves the previous
-    pointer intact.  An identical existing build is reused as is.
+    pointer intact.  An identical existing build is reused as is; a broken one (missing or
+    corrupted files, or an XML built under another project root) is replaced.
     """
 
     build_id = compute_build_id(inputs, mode)
@@ -298,6 +340,7 @@ def publish_build(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "complete": complete,
+        "project_root": project_root,
         "inputs": inputs,
         "outputs": {
             "plan_sha256": plan_sha256,
@@ -307,48 +350,88 @@ def publish_build(
         "summary": plan.get("summary"),
     }
     builds_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_dirs(builds_dir)
     target = builds_dir / build_id
-    existing = _reuse_existing(builds_dir, build_id, xml_sha256)
+    existing, replace = _inspect_existing(builds_dir, build_id, xml_sha256, project_root)
     if existing is not None:
         return existing
 
     tmp = Path(tempfile.mkdtemp(prefix=_TMP_PREFIX, dir=builds_dir))
+    broken: Path | None = None
     try:
         (tmp / XML_FILENAME).write_text(xml_text, encoding="utf-8")
-        _write_json(tmp / PLAN_FILENAME, plan)
-        _write_json(tmp / MAPPING_FILENAME, mapping_payload)
-        _write_json(tmp / BUILD_FILENAME, build)
+        atomic_write_json(tmp / PLAN_FILENAME, plan)
+        atomic_write_json(tmp / MAPPING_FILENAME, mapping_payload)
+        atomic_write_json(tmp / BUILD_FILENAME, build)
         if sha256_file(tmp / XML_FILENAME) != xml_sha256:
             raise OSError("build XML hash changed while it was being written")
+        os.chmod(tmp, 0o755)  # mkdtemp creates 0o700; published builds are shared read-only
+        if replace:
+            broken = builds_dir / f"{_BROKEN_PREFIX}{build_id}-{uuid.uuid4().hex[:8]}"
+            os.rename(target, broken)
         try:
             os.rename(tmp, target)
         except OSError:
+            if broken is not None and not target.exists():
+                os.rename(broken, target)  # put the previous directory back
+                broken = None
             # A concurrent publisher may have created the same build meanwhile.
-            existing = _reuse_existing(builds_dir, build_id, xml_sha256)
+            existing, _ = _inspect_existing(builds_dir, build_id, xml_sha256, project_root)
             if existing is None:
                 raise
             return existing
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if broken is not None:
+            shutil.rmtree(broken, ignore_errors=True)
     return build
 
 
-def _reuse_existing(builds_dir: Path, build_id: str, xml_sha256: str) -> dict | None:
+def _inspect_existing(
+    builds_dir: Path, build_id: str, xml_sha256: str, project_root: str
+) -> tuple[dict | None, bool]:
+    """Return ``(reusable build, False)``, ``(None, True)`` to replace a broken/foreign build,
+    or ``(None, False)`` when there is no build.  Raises BuildInvariantError when an intact
+    build of the same project holds a different XML.
+    """
+
     target = builds_dir / build_id
     if not target.exists():
-        return None
+        return None, False
     existing = _read_json(target / BUILD_FILENAME)
     try:
         actual = sha256_file(target / XML_FILENAME)
     except OSError:
-        actual = ""
-    if existing is None or actual != xml_sha256:
-        raise BuildInvariantError(
-            f"build {build_id} already exists with a different XML: "
-            "the XML export is not deterministic for identical inputs "
-            f"(stored {actual[:12] or 'unreadable'}, new {xml_sha256[:12]})"
-        )
-    return existing
+        return None, True
+    recorded = str(((existing or {}).get("outputs") or {}).get("xml_sha256") or "")
+    if existing is None or existing.get("build_id") != build_id or actual != recorded:
+        return None, True  # unreadable build.json or the stored XML was damaged
+    if actual == xml_sha256:
+        return existing, False
+    stored_root = str(existing.get("project_root") or "")
+    if project_root and stored_root != project_root:
+        return None, True  # same inputs, but the XML embeds paths of another project location
+    raise BuildInvariantError(
+        f"build {build_id} already exists with a different XML: "
+        "the XML export is not deterministic for identical inputs "
+        f"(stored {actual[:12]}, new {xml_sha256[:12]})"
+    )
+
+
+def cleanup_stale_dirs(builds_dir: Path, *, max_age_minutes: int = STALE_DIR_MINUTES) -> None:
+    """Remove abandoned ``.tmp-*`` / ``.broken-*`` directories older than ``max_age_minutes``."""
+
+    if not builds_dir.is_dir():
+        return
+    cutoff = time.time() - max_age_minutes * 60
+    for entry in builds_dir.iterdir():
+        if not entry.name.startswith((_TMP_PREFIX, _BROKEN_PREFIX)) or not entry.is_dir():
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def set_latest(builds_dir: Path, build_id: str) -> None:
@@ -360,6 +443,7 @@ def set_latest(builds_dir: Path, build_id: str) -> None:
 
 def safe_rotate(builds_dir: Path, *, keep: int | None = None) -> None:
     try:
+        cleanup_stale_dirs(builds_dir)
         rotate_builds(builds_dir, keep=BUILDS_KEEP if keep is None else keep)
     except OSError:
         _logger.warning("Stage 3 build rotation failed in %s", builds_dir, exc_info=True)

@@ -399,3 +399,25 @@ def test_nested_xml_without_plan_builds_it_from_timeline() -> None:
     assert final is not None
     clips = final.findall("./media/video/track/clipitem")
     assert len([c for c in clips if c.get("id", "").endswith("-placeholder")]) == 6
+
+
+def test_placeholder_without_placeholder_path_is_rejected_with_segment_id() -> None:
+    timeline = _timeline()
+    timeline.segments[2].placeholder_path = ""
+
+    with pytest.raises(ValueError, match="snh2.*placeholder_path"):
+        build_nested_xml(timeline, _catalog())
+
+
+def test_ready_item_without_catalog_entry_is_rejected_with_segment_id() -> None:
+    timeline = _timeline()
+    plan = {
+        "items": [
+            {"order": 0, "segment_id": "snh1", "status": "ready"},
+            {"order": 1, "segment_id": "zk1", "status": "ready"},
+            {"order": 2, "segment_id": "snh2", "status": "ready"},
+        ]
+    }
+
+    with pytest.raises(ValueError, match="snh2.*catalog"):
+        build_nested_xml(timeline, _catalog(), plan=plan)

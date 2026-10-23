@@ -412,10 +412,3 @@ def test_validate_complete_open_speech_overlap_task_blocks_ready_item() -> None:
     blockers = validate_plan_complete(plan, path_exists=lambda _p: True)
 
     assert _reasons(blockers) == [("uid-snh1", "speech_overlap")]
-
-
-def test_validate_complete_unmapped_media_status_on_ready_item() -> None:
-    plan = _complete_plan([_matched("snh1")])
-    plan["items"][0]["source"]["media_status"] = "unmapped"
-
-    assert _reasons(validate_plan_complete(plan)) == [("uid-snh1", "unmapped_source")]
