@@ -44,6 +44,21 @@ def _frames(seconds: float, fps: int) -> int:
     return math.ceil(seconds * fps)
 
 
+def _source_frames(seconds: float, fps: int) -> int:
+    """Frames of an absolute source position; float noise (10.04 * 25) must not add a frame."""
+    return math.ceil(round(seconds * fps, 6))
+
+
+def _recorded_range(seg: TimelineSegment, fps: int) -> tuple[int, int, int]:
+    """(in, out, full media duration) in frames of a recorded ZK range of the shared recording."""
+    if not seg.source_out_sec > seg.source_in_sec >= 0:
+        raise ValueError(f"{seg.id} has no valid recorded voiceover range for XML export")
+    in_f = _source_frames(seg.source_in_sec, fps)
+    out_f = max(_source_frames(seg.source_out_sec, fps), in_f + 1)
+    full_f = _source_frames(max(seg.audio_source_duration_sec, seg.source_out_sec), fps)
+    return in_f, out_f, full_f
+
+
 def _placeholder_identity(seg: TimelineSegment) -> str:
     return f"RC_BLOCK {seg.block_uid} | {seg.speaker} [{seg.timecode}]"
 
@@ -67,13 +82,24 @@ def _revision_label(parent: ET.Element, seg: TimelineSegment) -> None:
         _sub(labels, "label2", "Rose")
 
 
-def _audio_file_el(parent: ET.Element, seg: TimelineSegment, fps: int) -> None:
+def _audio_file_el(
+    parent: ET.Element,
+    seg: TimelineSegment,
+    fps: int,
+    *,
+    file_id: str | None = None,
+    duration_frames: int | None = None,
+) -> None:
     file_el = ET.SubElement(parent, "file")
-    file_el.set("id", f"file-{seg.id}")
+    file_el.set("id", file_id or f"file-{seg.id}")
     _sub(file_el, "name", Path(seg.wav_path).name)
     _sub(file_el, "pathurl", _path_to_url(seg.wav_path))
     _rate_el(file_el, fps)
-    _sub(file_el, "duration", str(_frames(seg.duration_sec, fps)))
+    _sub(
+        file_el,
+        "duration",
+        str(_frames(seg.duration_sec, fps) if duration_frames is None else duration_frames),
+    )
     sample_rate, bit_depth, channels = _wav_audio_params(seg.wav_path)
     media = _sub(file_el, "media")
     audio = _sub(media, "audio")
@@ -143,6 +169,10 @@ def build_xml(timeline: FullTimeline) -> str:
     atrack = _sub(audio, "track")
 
     clip_idx = 1
+    # One <file> per shared recording path: the first clip carries the full element,
+    # later clips reference it by id (FCP7 XML: define a file once, then <file id=.../>).
+    recorded_files: dict[str, str] = {}
+    used_file_ids = {f"file-{s.id}" for s in timeline.segments}
     for seg in timeline.segments:
         if seg.type == "tech":
             continue
@@ -163,8 +193,14 @@ def build_xml(timeline: FullTimeline) -> str:
             _rate_el(ci, fps)
             _sub(ci, "start", str(start_f))
             _sub(ci, "end", str(end_f))
-            _sub(ci, "in", "0")
-            _sub(ci, "out", str(dur_f))
+            recorded = seg.voiceover_kind == "recorded"
+            if recorded:
+                in_f, out_f, full_f = _recorded_range(seg, fps)
+                _sub(ci, "in", str(in_f))
+                _sub(ci, "out", str(out_f))
+            else:
+                _sub(ci, "in", "0")
+                _sub(ci, "out", str(dur_f))
             # Marker with text
             marker = _sub(ci, "marker")
             _sub(marker, "name", seg.id)
@@ -172,7 +208,21 @@ def build_xml(timeline: FullTimeline) -> str:
             _sub(marker, "in", "0")
             _sub(marker, "out", "-1")
             _revision_label(ci, seg)
-            _audio_file_el(ci, seg, fps)
+            if not recorded:
+                _audio_file_el(ci, seg, fps)
+            else:
+                path_key = str(Path(seg.wav_path).resolve())
+                known_id = recorded_files.get(path_key)
+                if known_id is not None:
+                    ET.SubElement(ci, "file").set("id", known_id)
+                else:
+                    n = len(recorded_files) + 1
+                    while f"file-voiceover-{n}" in used_file_ids:
+                        n += 1
+                    known_id = f"file-voiceover-{n}"
+                    used_file_ids.add(known_id)
+                    recorded_files[path_key] = known_id
+                    _audio_file_el(ci, seg, fps, file_id=known_id, duration_frames=full_f)
             st = _sub(ci, "sourcetrack")
             _sub(st, "mediatype", "audio")
             _sub(st, "trackindex", "1")

@@ -457,3 +457,77 @@ def test_ready_item_without_catalog_entry_is_rejected_with_segment_id() -> None:
 
     with pytest.raises(ValueError, match="snh2.*catalog"):
         build_nested_xml(timeline, _catalog(), plan=plan)
+
+
+def _rec(seg_id: str, start: float, dur: float, s_in: float, s_out: float) -> TimelineSegment:
+    return TimelineSegment(
+        id=seg_id,
+        type="zk",
+        text=f"text {seg_id}",
+        duration_sec=dur,
+        start_sec=start,
+        voiceover_kind="recorded",
+        wav_path="/rec/Закадр.wav",
+        source_id="rec1",
+        source_in_sec=s_in,
+        source_out_sec=s_out,
+        audio_source_duration_sec=120.0,
+        audio_source_sha256="abc",
+    )
+
+
+def _tts(seg_id: str, start: float, dur: float) -> TimelineSegment:
+    return TimelineSegment(
+        id=seg_id,
+        type="zk",
+        text="t",
+        duration_sec=dur,
+        start_sec=start,
+        wav_path=f"/tmp/{seg_id}.wav",
+    )
+
+
+def _vo_clips(segments: list[TimelineSegment]) -> tuple[ET.Element, list[ET.Element]]:
+    xml = build_nested_xml(FullTimeline(project="P", fps=25, segments=segments), {})
+    root = _root(xml)
+    final = root.find("./project/children/sequence")
+    assert final is not None
+    return root, final.findall("./media/audio/track[2]/clipitem")
+
+
+def test_recorded_voiceover_shares_one_full_file_and_uses_source_range() -> None:
+    root, (first, second) = _vo_clips([_rec("zk1", 0, 5, 10, 15), _rec("zk2", 5, 7, 40, 47)])
+    assert [first.findtext("start"), first.findtext("end")] == ["0", "125"]
+    assert [second.findtext("start"), second.findtext("end")] == ["125", "300"]
+    assert [first.findtext("in"), first.findtext("out")] == ["250", "375"]
+    assert [second.findtext("in"), second.findtext("out")] == ["1000", "1175"]
+    assert first.get("id") != second.get("id")
+    full = first.find("file")
+    assert full.findtext("duration") == "3000"
+    assert full.findtext("pathurl") == "file:///rec/%D0%97%D0%B0%D0%BA%D0%B0%D0%B4%D1%80.wav"
+    ref = second.find("file")
+    assert ref.get("id") == full.get("id")
+    assert list(ref) == []
+    ids = [e.get("id") for e in root.iter() if e.get("id")]
+    assert len(ids) - len(set(ids)) == 1  # only the shared file id repeats (a reference)
+
+
+def test_mixed_recorded_and_tts_voiceover_on_one_track() -> None:
+    root, (one, two, three) = _vo_clips(
+        [_rec("zk1", 0, 5, 10, 15), _tts("zk2", 5, 2), _rec("zk3", 7, 7, 40, 47)]
+    )
+    assert (two.findtext("in"), two.findtext("out")) == ("0", "50")
+    assert two.findtext("file/duration") == "50"
+    assert two.find("file").get("id") != one.find("file").get("id")
+    assert three.find("file").get("id") == one.find("file").get("id")
+    assert len({c.get("id") for c in (one, two, three)}) == 3
+
+
+def test_tts_voiceover_keeps_legacy_ids_and_ranges() -> None:
+    _, clips = _vo_clips([_tts("zk1", 0, 2), _tts("zk2", 2, 3)])
+    assert [c.get("id") for c in clips] == ["clip-final-1-zk", "clip-final-2-zk"]
+    assert [c.find("file").get("id") for c in clips] == [
+        "file-clip-final-1-zk",
+        "file-clip-final-2-zk",
+    ]
+    assert [(c.findtext("in"), c.findtext("out")) for c in clips] == [("0", "50"), ("0", "75")]

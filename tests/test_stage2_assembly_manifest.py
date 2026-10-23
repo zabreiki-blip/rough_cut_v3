@@ -388,9 +388,18 @@ def test_manifest_contains_recorded_voiceover_ranges(tmp_path: Path) -> None:
         project="FRISKE_001",
         segments=[
             TimelineSegment(
-                "zk1", "zk", "z", 5.0, block_uid="uid-zk1", voiceover_kind="recorded",
-                wav_path="/w/montage.wav", source_id="rec1", source_in_sec=10.0,
-                source_out_sec=15.0, speech_in_sec=10.5, speech_out_sec=14.5,
+                "zk1",
+                "zk",
+                "z",
+                5.0,
+                block_uid="uid-zk1",
+                voiceover_kind="recorded",
+                wav_path="/w/montage.wav",
+                source_id="rec1",
+                source_in_sec=10.0,
+                source_out_sec=15.0,
+                speech_in_sec=10.5,
+                speech_out_sec=14.5,
                 audio_source_duration_sec=120.0,
             ),
             TimelineSegment(
@@ -402,7 +411,60 @@ def test_manifest_contains_recorded_voiceover_ranges(tmp_path: Path) -> None:
     first, second = manifest["blocks"]
     assert first["plan_status"] == "ready"
     assert first["expected_source"]["source_id"] == "rec1"
-    assert (first["expected_source"]["source_in_sec"], first["expected_source"]["source_out_sec"]) == (10.0, 15.0)
+    assert (
+        first["expected_source"]["source_in_sec"],
+        first["expected_source"]["source_out_sec"],
+    ) == (10.0, 15.0)
     assert first["voiceover_kind"] == "recorded"
     assert second["voiceover_kind"] == "tts"
     assert second["expected_source"]["source_in_sec"] is None
+
+
+def test_manifest_recorded_ranges_use_shared_source_with_full_duration(tmp_path: Path) -> None:
+    def rec(seg_id: str, start: float, dur: float, lo: float, hi: float) -> TimelineSegment:
+        return TimelineSegment(
+            seg_id,
+            "zk",
+            "z",
+            dur,
+            start_sec=start,
+            block_uid=f"uid-{seg_id}",
+            voiceover_kind="recorded",
+            wav_path="/w/rec.wav",
+            source_id="rec1",
+            source_in_sec=lo,
+            source_out_sec=hi,
+            speech_in_sec=lo + 0.2,
+            speech_out_sec=hi - 0.2,
+            audio_source_duration_sec=120.0,
+            audio_source_sha256="abc",
+        )
+
+    timeline = FullTimeline(
+        project="FRISKE_001",
+        segments=[
+            rec("zk1", 0.0, 5.0, 10.0, 15.0),
+            TimelineSegment(
+                "zk2", "zk", "z", 2.0, start_sec=5.0, block_uid="uid-zk2", wav_path="/w/zk2.wav"
+            ),
+            rec("zk3", 7.0, 7.0, 40.0, 47.0),
+        ],
+    )
+    manifest = _manifest_for(tmp_path, timeline)
+    one, tts, three = manifest["blocks"]
+    assert (one["expected_source"]["source_in_sec"], one["expected_source"]["source_out_sec"]) == (
+        10.0,
+        15.0,
+    )
+    assert (
+        three["expected_source"]["source_in_sec"],
+        three["expected_source"]["source_out_sec"],
+    ) == (40.0, 47.0)
+    assert (one["timeline_in_sec"], one["timeline_out_sec"]) == (0.0, 5.0)
+    assert (three["timeline_in_sec"], three["timeline_out_sec"]) == (7.0, 14.0)
+    assert tts["voiceover_kind"] == "tts" and tts["expected_source"]["source_in_sec"] is None
+    plan = build_assembly_plan(timeline)
+    wavs = [item["wav"] for item in plan["items"]]
+    assert wavs[0]["path"] == wavs[2]["path"] == "/w/rec.wav"
+    assert wavs[0]["source_duration_sec"] == wavs[2]["source_duration_sec"] == 120.0
+    assert wavs[1]["kind"] == "tts" and wavs[1]["source_duration_sec"] is None

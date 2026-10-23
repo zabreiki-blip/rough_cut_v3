@@ -127,6 +127,11 @@ def _frames(seconds: float, fps: int) -> int:
     return math.ceil(seconds * fps)
 
 
+def _source_frames(seconds: float, fps: int) -> int:
+    """Frames of an absolute source position; float noise (10.04 * 25) must not add a frame."""
+    return math.ceil(round(seconds * fps, 6))
+
+
 def _path_url(path: str) -> str:
     return "file://" + pathname2url(str(Path(path).expanduser().resolve()))
 
@@ -504,32 +509,59 @@ def _voiceover_clip(
     *,
     clip_id: str,
     fps: int,
+    recorded_files: dict[str, str] | None = None,
 ) -> None:
     start = _frames(segment.start_sec, fps)
     end = max(_frames(segment.end_sec, fps), start + 1)
     duration = end - start
+    recorded = segment.voiceover_kind == "recorded"
+    in_frame, out_frame, file_duration = 0, duration, duration
+    if recorded:
+        if not segment.source_out_sec > segment.source_in_sec >= 0:
+            raise ValueError(
+                f"segment {segment.id} has no valid recorded voiceover range for XML export"
+            )
+        # in/out come from absolute source seconds, start/end from the timeline: rounding
+        # of one never feeds into the other, so a long recording does not drift.
+        in_frame = _source_frames(segment.source_in_sec, fps)
+        out_frame = max(_source_frames(segment.source_out_sec, fps), in_frame + 1)
+        file_duration = _source_frames(
+            max(segment.audio_source_duration_sec, segment.source_out_sec), fps
+        )
     clip = ET.SubElement(track, "clipitem", {"id": clip_id})
     _sub(clip, "name", segment.id)
-    _sub(clip, "duration", duration)
+    _sub(clip, "duration", file_duration if recorded else duration)
     _rate(clip, fps)
     _sub(clip, "start", start)
     _sub(clip, "end", end)
-    _sub(clip, "in", 0)
-    _sub(clip, "out", duration)
+    _sub(clip, "in", in_frame)
+    _sub(clip, "out", out_frame)
     _marker(clip, segment, segment.id)
     _revision_label(clip, segment)
-    file_element = ET.SubElement(clip, "file", {"id": f"file-{clip_id}"})
-    _sub(file_element, "name", Path(segment.wav_path).name)
-    _sub(file_element, "pathurl", _path_url(segment.wav_path))
-    _rate(file_element, fps)
-    _sub(file_element, "duration", duration)
-    sample_rate, depth, channels = _wav_params(segment.wav_path)
-    media = _sub(file_element, "media")
-    audio = _sub(media, "audio")
-    characteristics = _sub(audio, "samplecharacteristics")
-    _sub(characteristics, "depth", depth)
-    _sub(characteristics, "samplerate", sample_rate)
-    _sub(audio, "channelcount", channels)
+    file_id = f"file-{clip_id}"
+    if recorded and recorded_files is not None:
+        # One full <file> per shared recording path; later clips only reference its id.
+        path_key = str(Path(segment.wav_path).expanduser().resolve())
+        known_id = recorded_files.get(path_key)
+        if known_id is not None:
+            ET.SubElement(clip, "file", {"id": known_id})
+            file_id = ""
+        else:
+            file_id = f"file-voiceover-{len(recorded_files) + 1}"
+            recorded_files[path_key] = file_id
+    if file_id:
+        file_element = ET.SubElement(clip, "file", {"id": file_id})
+        _sub(file_element, "name", Path(segment.wav_path).name)
+        _sub(file_element, "pathurl", _path_url(segment.wav_path))
+        _rate(file_element, fps)
+        _sub(file_element, "duration", file_duration)
+        sample_rate, depth, channels = _wav_params(segment.wav_path)
+        media = _sub(file_element, "media")
+        audio = _sub(media, "audio")
+        characteristics = _sub(audio, "samplecharacteristics")
+        _sub(characteristics, "depth", depth)
+        _sub(characteristics, "samplerate", sample_rate)
+        _sub(audio, "channelcount", channels)
     source_track = _sub(clip, "sourcetrack")
     _sub(source_track, "mediatype", "audio")
     _sub(source_track, "trackindex", 1)
@@ -635,6 +667,7 @@ def build_nested_xml(
     voiceover_track = _sub(audio, "track")
 
     clip_number = 0
+    recorded_files: dict[str, str] = {}
     for index, segment in enumerate(full_timeline.segments):
         status = items[index].get("status")
         if status == "skipped" or segment.type == "tech" or segment.duration_sec <= 0:
@@ -687,6 +720,7 @@ def build_nested_xml(
                 segment,
                 clip_id=f"clip-final-{clip_number}-zk",
                 fps=full_timeline.fps,
+                recorded_files=recorded_files,
             )
 
     ET.indent(root, space="  ")

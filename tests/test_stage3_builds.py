@@ -587,3 +587,125 @@ def test_prepare_with_segment_missing_placeholder_path_returns_400_with_segment_
 
     assert response.status_code == 400
     assert "l7" in response.get_json()["error"]
+
+
+def _recorded_plan(wav: Path, ranges: dict[str, tuple[float, float]], sha: str = "src-sha") -> dict:
+    return {
+        "items": [
+            {
+                "uid": uid,
+                "wav": {
+                    "path": str(wav),
+                    "kind": "recorded",
+                    "source_sha256": sha,
+                    "source_duration_sec": 120.0,
+                },
+                "edit_range": {"in_sec": lo, "out_sec": hi},
+            }
+            for uid, (lo, hi) in ranges.items()
+        ],
+        "summary": {},
+    }
+
+
+def _recorded_build_id(plan: dict, timeline: dict | None = None) -> tuple[str, dict]:
+    data = timeline or {"fps": 25}
+    inputs = stage3_builds.collect_inputs(
+        timeline_data=data,
+        timeline_sha256="same-timeline-hash",
+        plan=plan,
+        export_catalog={},
+        unmapped_source_ids=[],
+    )
+    return stage3_builds.compute_build_id(inputs, "draft"), inputs
+
+
+def test_build_id_follows_recorded_ranges_and_source_file(tmp_path: Path) -> None:
+    wav = tmp_path / "rec.wav"
+    wav.write_bytes(b"a" * 100)
+    base_id, base_inputs = _recorded_build_id(
+        _recorded_plan(wav, {"u1": (10.0, 15.0), "u2": (40.0, 47.0)})
+    )
+    assert _recorded_build_id(_recorded_plan(wav, {"u1": (10.0, 15.0), "u2": (40.0, 47.0)}))[0] == (
+        base_id
+    )
+    assert base_inputs["wav"][0]["kind"] == "recorded"
+    assert base_inputs["wav"][0]["source_sha256"] == "src-sha"
+
+    moved = _recorded_build_id(_recorded_plan(wav, {"u1": (10.0, 15.0), "u2": (41.0, 47.0)}))[0]
+    assert moved != base_id
+
+    other_source_sha = _recorded_build_id(
+        _recorded_plan(wav, {"u1": (10.0, 15.0), "u2": (40.0, 47.0)}, sha="other")
+    )[0]
+    assert other_source_sha != base_id
+
+    # Replacing the shared recording at the same path (same size) changes the content hash.
+    wav.write_bytes(b"b" * 100)
+    os.utime(wav, ns=(2_000_000_000, 2_000_000_000))
+    replaced = _recorded_build_id(_recorded_plan(wav, {"u1": (10.0, 15.0), "u2": (40.0, 47.0)}))[0]
+    assert replaced != base_id
+
+
+def test_build_id_follows_recorded_voiceover_map_fingerprint(tmp_path: Path) -> None:
+    plan = {"items": [], "summary": {}}
+    one, inputs = _recorded_build_id(plan, {"fps": 25, "recorded_voiceover_sha256": "map-1"})
+    two, _ = _recorded_build_id(plan, {"fps": 25, "recorded_voiceover_sha256": "map-2"})
+    assert inputs["recorded_voiceover_sha256"] == "map-1"
+    assert one != two
+
+
+def test_tts_only_build_inputs_are_unchanged(tmp_path: Path) -> None:
+    wav = tmp_path / "zk1.wav"
+    wav.write_bytes(b"x")
+    plan = {
+        "items": [{"uid": "u1", "wav": {"path": str(wav), "kind": "tts", "duration_sec": 2.0}}],
+        "summary": {},
+    }
+    _, inputs = _recorded_build_id(plan)
+    assert set(inputs["wav"][0]) == {"uid", "path", "size", "sha256"}
+    assert "recorded_voiceover_sha256" not in inputs
+
+
+def test_build_id_from_real_plan_changes_with_range_and_replaced_recording(tmp_path: Path) -> None:
+    from stage2.assembly_plan import build_assembly_plan
+    from stage2.models import FullTimeline, TimelineSegment
+
+    wav = tmp_path / "rec.wav"
+    wav.write_bytes(b"a" * 64)
+
+    def build_id(second_in: float) -> str:
+        segments = [
+            TimelineSegment(
+                f"zk{i}",
+                "zk",
+                "z",
+                hi - lo,
+                start_sec=0.0 if i == 1 else 5.0,
+                block_uid=f"uid-{i}",
+                voiceover_kind="recorded",
+                wav_path=str(wav),
+                source_id="rec1",
+                source_in_sec=lo,
+                source_out_sec=hi,
+                audio_source_duration_sec=120.0,
+                audio_source_sha256="s",
+            )
+            for i, (lo, hi) in enumerate([(10.0, 15.0), (second_in, 47.0)], start=1)
+        ]
+        timeline = FullTimeline(project="P", segments=segments)
+        inputs = stage3_builds.collect_inputs(
+            timeline_data=timeline.to_dict(),
+            timeline_sha256="fixed",
+            plan=build_assembly_plan(timeline),
+            export_catalog={},
+            unmapped_source_ids=[],
+        )
+        return stage3_builds.compute_build_id(inputs, "draft")
+
+    base = build_id(40.0)
+    assert build_id(40.0) == base
+    assert build_id(41.0) != base
+    wav.write_bytes(b"b" * 64)
+    os.utime(wav, ns=(3_000_000_000, 3_000_000_000))
+    assert build_id(40.0) != base

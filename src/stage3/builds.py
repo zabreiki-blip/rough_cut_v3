@@ -123,14 +123,26 @@ def wav_inputs(
             if size is not None and mtime_ns is not None
             else None
         )
-        result.append(
-            {
-                "uid": str(item.get("uid") or ""),
-                "path": _portable_path(path, project_root),
-                "size": size,
-                "sha256": digest,
-            }
-        )
+        entry = {
+            "uid": str(item.get("uid") or ""),
+            "path": _portable_path(path, project_root),
+            "size": size,
+            "sha256": digest,
+        }
+        if item["wav"].get("kind") == "recorded":
+            # A range of a shared recording: the block's voice source, the immutable source
+            # identity and the range itself belong to the build (TTS entries stay as before).
+            edit_range = item.get("edit_range") if isinstance(item.get("edit_range"), dict) else {}
+            entry.update(
+                {
+                    "kind": "recorded",
+                    "source_sha256": str(item["wav"].get("source_sha256") or ""),
+                    "source_duration_sec": item["wav"].get("source_duration_sec"),
+                    "source_in_sec": edit_range.get("in_sec"),
+                    "source_out_sec": edit_range.get("out_sec"),
+                }
+            )
+        result.append(entry)
         if progress is not None and index % WAV_PROGRESS_EVERY == 0:
             progress(
                 85 + 10 * index // len(wav_items),
@@ -200,7 +212,7 @@ def collect_inputs(
         "mapped": {item["source_id"]: item["path"] for item in sources},
         "unmapped": sorted(str(item) for item in unmapped_source_ids),
     }
-    return {
+    inputs = {
         "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
         "normalization_revision": timeline_data.get("normalization_revision"),
         "timeline_sha256": timeline_sha256,
@@ -210,6 +222,11 @@ def collect_inputs(
         "sources": sources,
         "media_mapping_sha256": sha256_text(canonical_json(media_mapping)),
     }
+    recorded_map = str(timeline_data.get("recorded_voiceover_sha256") or "")
+    if recorded_map:
+        # Fingerprint of the published map of ranges and voice_source per block.
+        inputs["recorded_voiceover_sha256"] = recorded_map
+    return inputs
 
 
 def _read_json(path: Path) -> dict | None:

@@ -192,3 +192,112 @@ def test_loaded_edited_revision_reaches_premiere_xml(tmp_path) -> None:
     root = ET.fromstring(build_xml(timeline).split("\n", 2)[2])
 
     assert root.findtext("./sequence/media/video/track/clipitem/labels/label2") == "Rose"
+
+
+def _recorded_seg(seg_id: str, start: float, dur: float, s_in: float, s_out: float, **kw):
+    return TimelineSegment(
+        id=seg_id,
+        type="zk",
+        text=f"text {seg_id}",
+        duration_sec=dur,
+        start_sec=start,
+        block_uid=f"uid-{seg_id}",
+        voiceover_kind="recorded",
+        wav_path="/rec/Закадр.wav",
+        source_id="rec1",
+        source_in_sec=s_in,
+        source_out_sec=s_out,
+        audio_source_duration_sec=120.0,
+        audio_source_sha256="abc",
+        **kw,
+    )
+
+
+def _tts_seg(seg_id: str, start: float, dur: float):
+    return TimelineSegment(
+        id=seg_id,
+        type="zk",
+        text="tts",
+        duration_sec=dur,
+        start_sec=start,
+        wav_path=f"/tmp/{seg_id}.wav",
+    )
+
+
+def _audio_clips(xml: str) -> list[ET.Element]:
+    root = ET.fromstring(xml.split("\n", 2)[2])
+    return root.findall("./sequence/media/audio/track/clipitem")
+
+
+def test_recorded_zk_clips_share_one_full_file_and_use_source_range() -> None:
+    timeline = FullTimeline(
+        project="P",
+        fps=25,
+        segments=[
+            _recorded_seg("zk1", 0.0, 5.0, 10.0, 15.0),
+            _recorded_seg("zk2", 5.0, 7.0, 40.0, 47.0),
+        ],
+    )
+    xml = build_xml(timeline)
+    first, second = _audio_clips(xml)
+
+    assert [first.findtext("start"), first.findtext("end")] == ["0", "125"]
+    assert [second.findtext("start"), second.findtext("end")] == ["125", "300"]
+    assert [first.findtext("in"), first.findtext("out")] == ["250", "375"]
+    assert [second.findtext("in"), second.findtext("out")] == ["1000", "1175"]
+    assert first.get("id") != second.get("id")
+    full = [c for c in (first, second) if c.find("file/pathurl") is not None]
+    assert len(full) == 1
+    file_el = first.find("file")
+    assert file_el.findtext("duration") == "3000"
+    assert file_el.findtext("pathurl") == "file:///rec/%D0%97%D0%B0%D0%BA%D0%B0%D0%B4%D1%80.wav"
+    ref = second.find("file")
+    assert ref.get("id") == file_el.get("id")
+    assert list(ref) == []
+    ids = [
+        e.get("id")
+        for e in ET.fromstring(xml.split("\n", 2)[2]).iter()
+        if e.get("id") and not (e.tag == "file" and len(e) == 0)
+    ]
+    assert len(ids) == len(set(ids))
+
+
+def test_mixed_recorded_and_tts_zk_on_one_audio_track() -> None:
+    timeline = FullTimeline(
+        project="P",
+        fps=25,
+        segments=[
+            _recorded_seg("zk1", 0.0, 5.0, 10.0, 15.0),
+            _tts_seg("zk2", 5.0, 2.0),
+            _recorded_seg("zk3", 7.0, 7.0, 40.0, 47.0),
+        ],
+    )
+    xml = build_xml(timeline)
+    root = ET.fromstring(xml.split("\n", 2)[2])
+    assert len(root.findall("./sequence/media/audio/track")) == 1
+    one, two, three = _audio_clips(xml)
+    assert (two.findtext("in"), two.findtext("out")) == ("0", "50")
+    assert two.find("file").get("id") == "file-zk2"
+    assert two.findtext("file/duration") == "50"
+    assert (one.findtext("in"), three.findtext("in")) == ("250", "1000")
+    assert three.find("file").get("id") == one.find("file").get("id")
+    assert len({c.get("id") for c in (one, two, three)}) == 3
+    ids = [e.get("id") for e in root.iter() if e.get("id")]
+    assert len(ids) == len(set(ids)) + 1  # the shared file id is referenced twice
+
+
+def test_recorded_zk_without_valid_range_is_rejected() -> None:
+    timeline = FullTimeline(project="P", segments=[_recorded_seg("zk1", 0.0, 5.0, 15.0, 15.0)])
+    with pytest.raises(ValueError, match="zk1"):
+        build_xml(timeline)
+
+
+def test_tts_only_xml_keeps_legacy_shape() -> None:
+    timeline = FullTimeline(
+        project="P", fps=25, segments=[_tts_seg("zk1", 0.0, 2.0), _tts_seg("zk2", 2.0, 3.0)]
+    )
+    clips = _audio_clips(build_xml(timeline))
+    assert [c.findtext("in") for c in clips] == ["0", "0"]
+    assert [c.findtext("out") for c in clips] == ["50", "75"]
+    assert [c.find("file").get("id") for c in clips] == ["file-zk1", "file-zk2"]
+    assert [c.findtext("file/duration") for c in clips] == ["50", "75"]
