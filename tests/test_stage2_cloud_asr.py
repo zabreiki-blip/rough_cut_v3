@@ -603,6 +603,7 @@ def test_call_model_payload_requests_cost_usage(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_transcribe_words_preserves_cost_on_parse_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_PARSE_RETRIES", "0")  # проверяем учёт стоимости, не повтор
     """Если последний из нескольких чанков не удалось распарсить, стоимость
     уже успешно распознанных предыдущих чанков не должна теряться, а сама
     ошибка должна быть CloudAudioAsrError (а не TranscriptParseError/иное
@@ -925,6 +926,7 @@ def test_budget_initial_spend_prevents_first_http_attempt(monkeypatch) -> None:
 
 
 def test_budget_asr_error_preserves_settled_and_unknown_cost(monkeypatch) -> None:
+    monkeypatch.setenv("SYNC_CLOUD_ASR_PARSE_RETRIES", "0")  # проверяем учёт стоимости, не повтор
     calls = []
     monkeypatch.setattr(CloudAudioAsrAdapter, "_probe_duration", lambda *_: 120.0)
 

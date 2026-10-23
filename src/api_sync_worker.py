@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from api_service_contracts import SyncWorkerServices
+from sync_asr_failures import mark_asr_failed_matches
 from sync_asr_phase import SyncAsrContext, run_asr_phase
 from sync_match_phase import (
     SyncMatchCheckpoint,
@@ -222,11 +223,64 @@ def run_sync_job(
             checkpoint=match_checkpoint,
         )
         ensure_not_cancelled()
+        # Real ASR failures (transcription was attempted) vs. sources that
+        # could not be read at all (guide file missing/unreadable): the second
+        # group is "no recording", not "ASR failed".
+        degraded_sources = [
+            str(source_id) for source_id in asr_result.asr_failed_source_ids if source_id
+        ]
+        unavailable_sources = [
+            str(item["source_id"])
+            for item in source_failures
+            if item.get("source_id") and str(item["source_id"]) not in set(degraded_sources)
+        ]
+        if asr_result.asr_failed_source_ids:
+            # A failed ASR must not look like "no recording": relabel segments a
+            # failed source could have served, in memory and in the store.
+            # A source whose guide file is missing keeps ``no_eligible_source``.
+            failed_ids = set(asr_result.asr_failed_source_ids)
+            changed = set(
+                mark_asr_failed_matches(
+                    match_result.matches, sources, failed_ids, normalize_text
+                )
+            )
+            if changed:
+                with _SYNC_DATA_LOCK:
+                    stored = match_store.list()
+                    relabelled = mark_asr_failed_matches(
+                        [item for item in stored if item.segment_id in changed],
+                        sources,
+                        failed_ids,
+                        normalize_text,
+                    )
+                    if relabelled:
+                        match_store.replace_all(stored)
         summary = _sync_summary(match_result.matches)
+        # ``status`` stays "completed" (terminal for polling and the UI); an
+        # incomplete result is expressed by ``complete`` / ``degraded_sources``.
         _update_sync_job(
             job_id,
             status="completed",
-            message="Completed",
+            message=(
+                "Completed with errors: "
+                + "; ".join(
+                    part
+                    for part in (
+                        f"ASR failed for {len(degraded_sources)} source(s)"
+                        if degraded_sources
+                        else "",
+                        f"guide file unavailable for {len(unavailable_sources)} source(s)"
+                        if unavailable_sources
+                        else "",
+                    )
+                    if part
+                )
+                if degraded_sources or unavailable_sources
+                else "Completed"
+            ),
+            complete=not (degraded_sources or unavailable_sources),
+            degraded_sources=degraded_sources,
+            unavailable_sources=unavailable_sources,
             finished_at=_utc_now_iso(),
             current_segment_id="",
             source_failures=source_failures,

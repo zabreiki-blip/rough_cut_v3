@@ -55,12 +55,15 @@ import asyncio
 import base64
 import contextlib
 import difflib
+import hashlib
+import json
 import logging
 import math
 import os
 import random
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import replace
@@ -117,6 +120,11 @@ DEFAULT_HOLE_MIN_SEC = 30.0
 DEFAULT_HOLE_MAX_WPM = 40.0
 # Сколько раз повторно распознавать одну дыру (SYNC_CLOUD_ASR_HOLE_RETRIES).
 DEFAULT_HOLE_RETRIES = 1
+# Сколько раз повторно спросить модель, если ответ части не разобрался (пустой,
+# None, не тот формат). Каждый повтор платный, поэтому предел небольшой.
+DEFAULT_PARSE_RETRIES = 1
+# Верхняя граница SYNC_CLOUD_ASR_PARSE_RETRIES: каждый повтор - платный запрос.
+MAX_PARSE_RETRIES = 3
 # Поле вокруг дыры при повторной нарезке аудио, секунды.
 _HOLE_PAD_SEC = 3.0
 # Длинная дыра повторяется кусками не длиннее этого (SYNC_CLOUD_ASR_HOLE_SPLIT_SEC):
@@ -420,6 +428,92 @@ def parse_transcript(text: str, *, offset_sec: float = 0.0) -> list[AsrSegment]:
     return segments
 
 
+_JSON_TIME_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?$")
+_JSON_SPLIT_KEYS = ("splits", "segments", "utterances")
+
+
+def _format_json_time(value: Any) -> str | None:
+    """Время из JSON-ответа -> `ММ:СС.д`; `None`, если не распознать."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    elif isinstance(value, str) and _JSON_TIME_RE.match(value.strip()):
+        return value.strip()
+    elif isinstance(value, str):
+        try:
+            seconds = float(value.strip().replace(",", "."))
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    minutes, rest = divmod(seconds, 60.0)
+    return f"{int(minutes):02d}:{rest:04.1f}"
+
+
+def _load_json_payload(text: str) -> Any:
+    """Достаёт JSON-значение из ответа (с markdown-обёрткой или хвостом)."""
+    body = "\n".join(
+        line for line in text.strip().splitlines() if not _FENCE_RE.match(line.strip())
+    ).strip()
+    if not body or body[0] not in "{[":
+        return None
+    try:
+        value, _end = json.JSONDecoder().raw_decode(body)
+    except ValueError:
+        return None
+    return value
+
+
+def adapt_json_splits(text: str) -> str | None:
+    """Явный адаптер JSON-ответа `{"splits": [{start, end, speaker, text}]}`.
+
+    Модель иногда отвечает JSON вместо построчного формата
+    `[ММ:СС — ММ:СС] ГОЛОС N: текст`. Возвращает текст в построчном формате
+    (его дальше разбирает обычный парсер) или `None`, если ответ - не такой
+    JSON либо в нём нет ни одной пригодной реплики.
+    """
+    payload = _load_json_payload(text)
+    items: Any = payload
+    if isinstance(payload, dict):
+        items = next(
+            (payload[key] for key in _JSON_SPLIT_KEYS if isinstance(payload.get(key), list)),
+            None,
+        )
+    if not isinstance(items, list):
+        return None
+    lines: list[str] = []
+    skipped = 0
+    for item in items:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        start = _format_json_time(item.get("start"))
+        content = " ".join(str(item.get("text") or "").split())
+        if start is None or not content:
+            skipped += 1
+            continue
+        end = _format_json_time(item.get("end"))
+        speaker = item.get("speaker")
+        if isinstance(speaker, (int, float)) and not isinstance(speaker, bool):
+            speaker = f"ГОЛОС {int(speaker)}"
+        label = " ".join(str(speaker or "").split()) or "ГОЛОС 1"
+        span = f"{start} — {end}" if end is not None else start
+        lines.append(f"[{span}] {label}: {content}")
+    if skipped and lines:
+        # Не молча: пропущенные реплики оставляют во времени разрыв, который
+        # find_coverage_holes затем находит и (при включённых повторах) чинит.
+        logger.warning(
+            "Облачный ASR: в JSON-ответе пропущено %d из %d элементов без start/text; "
+            "образовавшийся разрыв проверит поиск дыр покрытия",
+            skipped,
+            len(items),
+        )
+    return "\n".join(lines) if lines else None
+
+
 def _parse_transcript_with_own_end(
     text: str, *, offset_sec: float = 0.0
 ) -> tuple[list[AsrSegment], list[bool]]:
@@ -434,6 +528,11 @@ def _parse_transcript_with_own_end(
     одной части. `parse_transcript` — тонкая обёртка над этой функцией для
     вызывающего кода, которому флаги не нужны.
     """
+    if text is None or not text.strip() or text.strip() == "None":
+        raise TranscriptParseError("Облачная модель вернула пустой ответ (нет текста расшифровки)")
+    adapted = adapt_json_splits(text)
+    if adapted is not None:
+        text = adapted
     entries: list[tuple[float, str | None, str, float | None]] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -1119,6 +1218,17 @@ def _resolve_hole_retries() -> int:
     return value if value >= 0 else DEFAULT_HOLE_RETRIES
 
 
+def _resolve_parse_retries() -> int:
+    raw = os.getenv("SYNC_CLOUD_ASR_PARSE_RETRIES", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_PARSE_RETRIES
+    except ValueError:
+        return DEFAULT_PARSE_RETRIES
+    if value < 0:
+        return DEFAULT_PARSE_RETRIES
+    return min(value, MAX_PARSE_RETRIES)
+
+
 def split_hole(hole: tuple[float, float], max_sec: float) -> list[tuple[float, float]]:
     """Делит дыру на равные куски не длиннее `max_sec` (для повторов)."""
     start, end = hole
@@ -1264,6 +1374,116 @@ def _resolve_max_output_tokens() -> int:
     return value if value > 0 else DEFAULT_MAX_OUTPUT_TOKENS
 
 
+class _ChunkCache:
+    """Сохранённые ответы успешно разобранных частей одной записи.
+
+    Длинная запись режется на платные запросы-части; если часть N падает,
+    части 1..N-1 уже оплачены. Их ответы лежат в каталоге кэша и при повторном
+    запуске берутся оттуда, так что повторяются (и оплачиваются) только
+    неудавшиеся части.
+
+    Каталог: параметр ``cache_dir`` (проектный кэш, например ``work/transcripts/
+    asr-chunks``, его передаёт sync-фаза через ``cloud_options``), иначе
+    переменная ``SYNC_CLOUD_ASR_CHUNK_CACHE_DIR``, иначе системный temp-каталог.
+    Рядом с исходным медиа ничего не создаётся.
+
+    Ключ файла - sha256 от содержимого аудио, модели, языка, нарезки (части,
+    длина, нахлёст) и прочих параметров; ответ части дополнительно привязан к
+    её границам и хэшу промпта. Любое изменение - кэш не применяется. Запись
+    атомарна (tmp + os.replace). После полного успеха файл удаляется. Сбои
+    чтения/записи отключают кэш, распознавание от этого не ломается.
+    """
+
+    def __init__(
+        self,
+        audio_path: Path,
+        key_parts: list[Any],
+        cache_dir: Path | str | None = None,
+    ) -> None:
+        self.path: Path | None = None
+        self._chunks: dict[str, dict[str, Any]] = {}
+        self._key = ""
+        if os.getenv("SYNC_CLOUD_ASR_CHUNK_CACHE", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return
+        audio_digest = hashlib.sha256()
+        try:
+            with audio_path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    audio_digest.update(block)
+        except OSError:
+            return  # нет файла на диске (например, мок в тестах) - нечего привязывать
+        self._key = hashlib.sha256(
+            json.dumps([audio_digest.hexdigest(), *key_parts], ensure_ascii=False).encode()
+        ).hexdigest()
+        directory = cache_dir or os.getenv("SYNC_CLOUD_ASR_CHUNK_CACHE_DIR", "").strip()
+        base = Path(directory) if directory else Path(tempfile.gettempdir()) / "rough_cut_asr_chunks"
+        self.path = base / f"{self._key[:32]}.json"
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(data, dict) and data.get("key") == self._key:
+            chunks = data.get("chunks")
+            if isinstance(chunks, dict):
+                self._chunks = {str(k): v for k, v in chunks.items() if isinstance(v, dict)}
+
+    @staticmethod
+    def _prompt_hash(prompt: str) -> str:
+        return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+    @property
+    def stored(self) -> int:
+        return len(self._chunks)
+
+    def get(self, idx: int, part_start: float, part_end: float, prompt: str) -> str | None:
+        item = self._chunks.get(str(idx))
+        if (
+            item is None
+            or item.get("start") != part_start
+            or item.get("end") != part_end
+            or item.get("prompt") != self._prompt_hash(prompt)
+            or not isinstance(item.get("content"), str)
+        ):
+            return None
+        return item["content"]
+
+    def drop(self, idx: int) -> None:
+        if self._chunks.pop(str(idx), None) is not None:
+            self._write()
+
+    def store(self, idx: int, part_start: float, part_end: float, prompt: str, content: str) -> None:
+        self._chunks[str(idx)] = {
+            "start": part_start,
+            "end": part_end,
+            "prompt": self._prompt_hash(prompt),
+            "content": content,
+        }
+        self._write()
+
+    def clear(self) -> None:
+        self._chunks = {}
+        if self.path is not None:
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+
+    def _write(self) -> None:
+        if self.path is None:
+            return
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(
+                json.dumps({"key": self._key, "chunks": self._chunks}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.path)
+        except OSError:
+            logger.warning("Облачный ASR: не удалось сохранить кэш частей", exc_info=True)
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            self.path = None
+
+
 class CloudAudioAsrAdapter:
     """ASR-адаптер поверх облачной модели с аудио-входом.
 
@@ -1291,8 +1511,11 @@ class CloudAudioAsrAdapter:
         ffmpeg: str = "ffmpeg",
         ffprobe: str = "ffprobe",
         max_retries: int | None = None,
+        chunk_cache_dir: Path | str | None = None,
     ) -> None:
         self.model = model
+        # Каталог кэша успешных частей (см. _ChunkCache); None - env/temp.
+        self._chunk_cache_dir = chunk_cache_dir
         self.language = language
         resolved_base_url = (
             base_url
@@ -1635,6 +1858,9 @@ class CloudAudioAsrAdapter:
             # Некоторые провайдеры возвращают content частями (list of parts).
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
 
+        if content is None:
+            # Провайдер вернул `content: null` - это пустой ответ, а не "None".
+            content = ""
         return str(content), cost, data
 
     # -- низкоуровневый прогон -------------------------------------------------
@@ -2005,6 +2231,7 @@ class CloudAudioAsrAdapter:
         budget_callback: Callable[[dict[str, float]], None] | None = None,
         deadline_monotonic: float | None = None,
         duration_sec: float | None = None,
+        chunk_cache_dir: Path | str | None = None,
     ) -> AsrRunResult:
         self._require_available()
         on_progress = _monotonic_progress(on_progress)
@@ -2024,6 +2251,22 @@ class CloudAudioAsrAdapter:
                 raise ValueError("duration_sec must be a finite positive number")
         parts = self._plan_chunks(duration_sec)
         chunk_len = self.chunk_minutes * 60
+        # Кэш успешных частей: ключ - hash аудио, модель, язык, нарезка и
+        # параметры запроса (промпт каждой части проверяется отдельно).
+        chunk_cache = await asyncio.to_thread(
+            _ChunkCache,
+            audio_path,
+            [
+                self.model,
+                language or self.language,
+                [list(part) for part in parts],
+                self.chunk_minutes,
+                self.overlap_sec,
+                self._max_output_tokens,
+                self._reasoning_effort,
+            ],
+            chunk_cache_dir if chunk_cache_dir is not None else self._chunk_cache_dir,
+        )
 
         client = self._http_client
         own_client = False
@@ -2063,85 +2306,114 @@ class CloudAudioAsrAdapter:
                 if cancel is not None and cancel.is_set():
                     raise asyncio.CancelledError("Распознавание отменено пользователем")
 
-                mp3_bytes = await self._extract_chunk_mp3(
-                    audio_path, part_start, part_end - part_start
-                )
-                audio_b64 = base64.b64encode(mp3_bytes).decode("ascii")
-
                 prompt = _build_prompt(
                     speaker_descriptions if idx > 0 else None,
                     next_number=next_speaker_number,
                 )
-                try:
-                    content, cost, raw = await self._call_model(
-                        client,
-                        audio_b64,
-                        prompt=prompt,
-                        cancel=cancel,
-                        budget=budget,
-                        duration_sec=part_end - part_start,
-                        budget_callback=budget_callback,
-                        deadline_monotonic=deadline_monotonic,
+                part_segments: list[AsrSegment] | None = None
+                part_own_end: list[bool] = []
+                legend_text: str | None = None
+                cached_content = chunk_cache.get(idx, part_start, part_end, prompt)
+                if cached_content is not None:
+                    # Часть уже оплачена прошлым запуском: запрос не нужен.
+                    try:
+                        transcript_text, legend_text = split_transcript_and_legend(cached_content)
+                        part_segments, part_own_end = _parse_transcript_with_own_end(
+                            transcript_text, offset_sec=part_start
+                        )
+                    except Exception:
+                        chunk_cache.drop(idx)
+                        part_segments = None
+                if part_segments is None:
+                    mp3_bytes = await self._extract_chunk_mp3(
+                        audio_path, part_start, part_end - part_start
                     )
-                except CloudAudioAsrError as exc:
-                    # Ретраи внутри _call_model уже исчерпаны для ЭТОГО чанка —
-                    # запрос окончательно не удался. Если предыдущие чанки уже
-                    # были успешно оплачены (cost_found), эта стоимость не
-                    # должна пропасть молча вместе с исключением: приложим её
-                    # к ошибке (см. CloudAudioAsrError.cost_usd), чтобы
-                    # вызывающий код и логи не потеряли информацию об уже
-                    # потраченных деньгах.
-                    if cost_found:
-                        raise CloudAudioAsrError(
-                            f"{exc} (уже потрачено ~{total_cost:.4f} USD на {idx} из "
-                            f"{len(parts)} успешно распознанных частях записи — эта работа "
-                            "оплачена и не потеряна, но текущий запуск придётся повторить)",
-                            cost_usd=total_cost,
-                        ) from exc
-                    raise
-                raw_responses.append(raw)
-                if cost is not None:
-                    total_cost += cost
-                    cost_found = True
-                if finish_reason(raw) == "length":
-                    # Ответ обрезан лимитом токенов: повтор заплатил бы за тот
-                    # же обрезанный результат, а принять неполный транскрипт
-                    # нельзя — останавливаемся с понятной подсказкой.
-                    raise CloudAudioAsrError(
-                        f"Ответ облачной ASR-модели для части {idx + 1} из {len(parts)} "
-                        f"обрезан лимитом max_tokens={self._max_output_tokens} "
-                        "(finish_reason=length); повтор не выполнялся, чтобы не платить "
-                        "за тот же результат. Увеличьте SYNC_CLOUD_ASR_MAX_TOKENS "
-                        "и запустите заново.",
-                        cost_usd=total_cost if cost_found else None,
-                    )
-
-                try:
-                    transcript_text, legend_text = split_transcript_and_legend(content)
-                    part_segments, part_own_end = _parse_transcript_with_own_end(
-                        transcript_text, offset_sec=part_start
-                    )
-                except Exception as exc:
-                    # Запрос к модели уже оплачен (см. total_cost выше) —
-                    # если разбор её ответа не удался (например, модель
-                    # вернула текст без ожидаемой разметки таймкодов), эта
-                    # уже потраченная сумма не должна пропасть молча вместе
-                    # с TranscriptParseError/иным исключением парсера,
-                    # которое вызывающий код (ловит только
-                    # CloudAudioAsrError) не перехватит.
-                    raise CloudAudioAsrError(
-                        f"Не удалось разобрать ответ облачной ASR-модели для части "
-                        f"{idx + 1} из {len(parts)}: {exc}"
-                        + (
-                            f" (уже потрачено ~{total_cost:.4f} USD на {idx} из "
-                            f"{len(parts)} успешно распознанных частях записи — эта "
-                            "работа оплачена и не потеряна, но текущий запуск придётся "
-                            "повторить)"
-                            if cost_found
-                            else ""
-                        ),
-                        cost_usd=total_cost if cost_found else None,
-                    ) from exc
+                    audio_b64 = base64.b64encode(mp3_bytes).decode("ascii")
+                    # Ограниченный повтор ТОЛЬКО этой части, если ответ пустой /
+                    # не разобрался. Каждый повтор идёт через _call_model, то есть
+                    # через budget/budget_callback и deadline_monotonic.
+                    max_attempts = 1 + _resolve_parse_retries()
+                    attempt = 0
+                    while True:
+                        attempt += 1
+                        try:
+                            content, cost, raw = await self._call_model(
+                                client,
+                                audio_b64,
+                                prompt=prompt,
+                                cancel=cancel,
+                                budget=budget,
+                                duration_sec=part_end - part_start,
+                                budget_callback=budget_callback,
+                                deadline_monotonic=deadline_monotonic,
+                            )
+                        except CloudAudioAsrError as exc:
+                            # Ретраи внутри _call_model уже исчерпаны для ЭТОГО
+                            # чанка (или исчерпан бюджет). Уже потраченная
+                            # стоимость не должна пропасть молча (см.
+                            # CloudAudioAsrError.cost_usd).
+                            if cost_found:
+                                raise CloudAudioAsrError(
+                                    f"{exc} (уже потрачено ~{total_cost:.4f} USD; успешно "
+                                    f"распознано и сохранено частей: {chunk_cache.stored} из "
+                                    f"{len(parts)} - эта работа оплачена и не потеряна, но "
+                                    "текущий запуск придётся повторить)",
+                                    cost_usd=total_cost,
+                                ) from exc
+                            raise
+                        raw_responses.append(raw)
+                        if cost is not None:
+                            total_cost += cost
+                            cost_found = True
+                        if finish_reason(raw) == "length":
+                            # Ответ обрезан лимитом токенов: повтор заплатил бы за
+                            # тот же обрезанный результат, а принять неполный
+                            # транскрипт нельзя.
+                            raise CloudAudioAsrError(
+                                f"Ответ облачной ASR-модели для части {idx + 1} из {len(parts)} "
+                                f"обрезан лимитом max_tokens={self._max_output_tokens} "
+                                "(finish_reason=length); повтор не выполнялся, чтобы не платить "
+                                "за тот же результат. Увеличьте SYNC_CLOUD_ASR_MAX_TOKENS "
+                                "и запустите заново.",
+                                cost_usd=total_cost if cost_found else None,
+                            )
+                        try:
+                            transcript_text, legend_text = split_transcript_and_legend(content)
+                            part_segments, part_own_end = _parse_transcript_with_own_end(
+                                transcript_text, offset_sec=part_start
+                            )
+                            break
+                        except Exception as exc:
+                            if attempt < max_attempts:
+                                logger.warning(
+                                    "Облачный ASR: ответ части %d из %d не разобран "
+                                    "(попытка %d/%d): %s - повторяем только эту часть",
+                                    idx + 1,
+                                    len(parts),
+                                    attempt,
+                                    max_attempts,
+                                    exc,
+                                )
+                                continue
+                            kind = (
+                                "пустой ответ"
+                                if not content.strip() or content.strip() == "None"
+                                else f"текст без разметки таймкодов, {len(content)} симв."
+                            )
+                            # Запрос уже оплачен: стоимость и сохранённые части
+                            # не должны пропасть вместе с исключением парсера
+                            # (вызывающий код ловит только CloudAudioAsrError).
+                            raise CloudAudioAsrError(
+                                f"Не удалось разобрать ответ облачной ASR-модели для части "
+                                f"{idx + 1} из {len(parts)} после {attempt} попыток "
+                                f"(тип ответа: {kind}): {exc}. Эта часть не распознана; "
+                                f"успешно распознано и сохранено в кэше частей: "
+                                f"{chunk_cache.stored} из {len(parts)}, при повторном запуске "
+                                "они не будут запрошены заново"
+                                + (f" (уже потрачено ~{total_cost:.4f} USD)" if cost_found else ""),
+                                cost_usd=total_cost if cost_found else None,
+                            ) from exc
+                    chunk_cache.store(idx, part_start, part_end, prompt, content)
                 # Дыры только запоминаем: повторы делаются вторым проходом,
                 # после всех основных частей, — иначе повтор дыры съел бы
                 # бюджет, зарезервированный под ещё не распознанные части.
@@ -2319,6 +2591,9 @@ class CloudAudioAsrAdapter:
             hole_vad=hole_vad_report,
         )
 
+        # Полный успех: сохранённые ответы частей больше не нужны.
+        chunk_cache.clear()
+
         return AsrRunResult(
             words=[],
             segments=final_segments,
@@ -2381,6 +2656,7 @@ def transcribe_cloud(
     timeout_sec: float | None = None,
     budget_callback: Callable[[dict[str, float]], None] | None = None,
     duration_sec: float | None = None,
+    chunk_cache_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Синхронный публичный вход в облачный ASR-адаптер (этап 1: только сам
     адаптер, без интеграции в whisper_runner/UI — см. docstring модуля).
@@ -2429,6 +2705,7 @@ def transcribe_cloud(
                 budget_callback=budget_callback,
                 deadline_monotonic=deadline_monotonic,
                 duration_sec=duration_sec,
+                chunk_cache_dir=chunk_cache_dir,
             ),
             timeout=timeout_sec,
         )

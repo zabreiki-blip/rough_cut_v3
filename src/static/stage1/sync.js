@@ -372,6 +372,7 @@ function renderSyncMatches(document) {
     const unmatchedReasons = {
       query_too_short: "Фраза слишком короткая для поиска по записи.",
       no_eligible_source: "Нет записи: для этого спикера ещё нет источника — реплика будет найдена после загрузки.",
+      asr_failed: "Распознавание записи спикера не удалось — повторите запуск сопоставления.",
       no_candidate: "В доступной расшифровке подходящая фраза не найдена.",
       below_review_threshold: "Есть только слабые совпадения; проверьте запись вручную.",
     };
@@ -547,7 +548,7 @@ function renderSyncJob(value) {
   const segmentFailures = Array.isArray(job.segment_failures) ? job.segment_failures : [];
   const sourceWarnings = Array.isArray(job.source_warnings) ? job.source_warnings : [];
   ids.sync_job_status.textContent = status === "completed"
-    ? (segmentFailures.length ? "готово с ошибками" : "готово")
+    ? (segmentFailures.length || job.complete === false ? "готово с ошибками" : "готово")
     : status === "failed" ? "ошибка"
     : status === "interrupted" ? "прервано"
     : status === "cancelled" ? "прервано"

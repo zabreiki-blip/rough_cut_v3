@@ -78,6 +78,9 @@ class SyncAsrResult:
     # Non-fatal per-source notes, e.g. cloud ASR coverage holes it could not
     # recover: {"source_id": ..., "warning": ...}.
     source_warnings: list[dict[str, str]] = field(default_factory=list)
+    # Failed sources whose transcription was actually attempted (as opposed to a
+    # missing/unreadable guide file): their segments are "asr_failed".
+    asr_failed_source_ids: list[str] = field(default_factory=list)
 
 
 def _coverage_warning(source_id: str, metadata: Mapping[str, Any]) -> dict[str, str] | None:
@@ -507,6 +510,7 @@ def run_asr_phase(
     indexes: list[Any] = []
     source_failures: list[dict[str, str]] = []
     source_warnings: list[dict[str, str]] = []
+    asr_failed_source_ids: list[str] = []
     transcribed = 0
     reused = 0
 
@@ -519,6 +523,7 @@ def run_asr_phase(
         audio_path = None
         initial_exposure = Decimal("0")
         cloud_dispatch = False
+        asr_attempted = False
         usage_recorded = False
         pending_usage_recorded = False
 
@@ -759,6 +764,10 @@ def run_asr_phase(
                     for start, end in chunks:
                         budget.reserve_attempt(end - start)
                     options["initial_cost_usd"] = canonical_decimal_string(initial_exposure)
+                    # Paid cloud chunks that already succeeded are kept in the
+                    # project cache (work/transcripts/asr-chunks), not beside
+                    # the source media, so a rerun only repays failed chunks.
+                    options["chunk_cache_dir"] = str(index_path.parent / "asr-chunks")
 
                     def report_budget(snapshot: dict[str, Any]) -> None:
                         cost_tracker.account_cloud_source(
@@ -784,6 +793,7 @@ def run_asr_phase(
                     # cancelled while queued for a slot dispatched nothing,
                     # so it must not be accounted as cloud spend.
                     cloud_dispatch = cloud_source_options is not None
+                    asr_attempted = True
                     result = transcribe_audio(
                         audio_path,
                         backend=config["backend"],
@@ -893,6 +903,8 @@ def run_asr_phase(
                 indexes.append(cached_index)
                 reused += 1
             source_failures.append({"source_id": source.id, "error": str(exc)})
+            if asr_attempted:
+                asr_failed_source_ids.append(source.id)
         _update_sync_job(
             job_id,
             transcribed=transcribed,
@@ -906,4 +918,5 @@ def run_asr_phase(
         transcribed=transcribed,
         reused=reused,
         source_warnings=source_warnings,
+        asr_failed_source_ids=asr_failed_source_ids,
     )

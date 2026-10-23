@@ -1082,6 +1082,79 @@ async function testSyncMatchVerificationReasons({ state, sync }) {
   }
 }
 
+// Sync ASR failure reporting: a completed job with complete === false reads as
+// "готово с ошибками" (not plain "готово"), and an asr_failed match is labelled as a
+// recognition failure, not as "no recording".
+async function testSyncJobIncompleteAndAsrFailedLabel({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+  const load = async (job, matchMetadata) => {
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      let body = { items: [] };
+      if (target.includes("/sync-matches")) {
+        body = { items: [{
+          segment_id: "asr1", status: "not_found", speaker: "ИВАН",
+          metadata: matchMetadata || {},
+        }] };
+      } else if (target.includes("/sync-jobs/status")) {
+        body = job;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: body }) };
+    };
+    await sync.loadSyncWorkspace(true);
+  };
+  try {
+    await load({ id: "j1", status: "completed", complete: true, message: "Completed" });
+    assert.strictEqual(ids.sync_job_status.textContent, "готово");
+    await load({
+      id: "j1", status: "completed", complete: false, degraded_sources: ["a"],
+      message: "Completed with errors: ASR failed for 1 source(s)",
+    });
+    assert.strictEqual(ids.sync_job_status.textContent, "готово с ошибками");
+    assert.ok(ids.sync_job_message.textContent.includes("ASR failed for 1 source(s)"), ids.sync_job_message.textContent);
+
+    await load(
+      { id: "j2", status: "completed", complete: true, message: "Completed" },
+      { unmatched_reason: "asr_failed", asr_failed_source_ids: ["a"] },
+    );
+    const html = ids.sync_review_list.innerHTML;
+    assert.ok(html.includes("Распознавание записи спикера не удалось"), html);
+    assert.ok(!html.includes("Нет записи"), html);
+    await load(
+      { id: "j2", status: "completed", complete: true, message: "Completed" },
+      { unmatched_reason: "no_eligible_source" },
+    );
+    assert.ok(ids.sync_review_list.innerHTML.includes("Нет записи"), ids.sync_review_list.innerHTML);
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+  }
+}
+
+// Stage 3 prepare result: the UI shows the total placeholder count, duration and reasons,
+// not just the narrow unmapped-source swap counter.
+function testStage3PlaceholderDescription({ stage3 }) {
+  assert.strictEqual(stage3.describeStage3Placeholders({}), "плейсхолдеров: 0");
+  const text = stage3.describeStage3Placeholders({
+    placeholder_segments: 84,
+    placeholder_duration_sec: 312.46,
+    placeholder_breakdown: {
+      sync_needs_review: { segments: 50, duration_sec: 200 },
+      sync_not_found: { segments: 26, duration_sec: 100 },
+      life: { segments: 8, duration_sec: 12.46 },
+    },
+    unmapped_source_placeholders: 0,
+  });
+  assert.ok(text.startsWith("плейсхолдеров: 84 (312.5 с)"), text);
+  assert.ok(text.includes("синхрон: проверить: 50 / 200.0 с"), text);
+  assert.ok(text.includes("синхрон: не найден: 26"), text);
+  assert.ok(text.includes("LIFE: 8 / 12.5 с"), text);
+}
+
 // Audit item 4: the editor sees fragment counts and build warnings BEFORE export;
 // unresolved fragments need an explicit confirmation, cancel aborts the export.
 async function testExportXmlPreExportSummary({ state, stage3 }) {
@@ -1868,6 +1941,8 @@ async function main() {
     ["testRevisionImportTimeout", () => testRevisionImportTimeout(modules)],
     ["testBuildTimelineSurfacesWarnings", () => testBuildTimelineSurfacesWarnings(modules)],
     ["testSyncMatchVerificationReasons", () => testSyncMatchVerificationReasons(modules)],
+    ["testSyncJobIncompleteAndAsrFailedLabel", () => testSyncJobIncompleteAndAsrFailedLabel(modules)],
+    ["testStage3PlaceholderDescription", () => testStage3PlaceholderDescription(modules)],
     ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
     ["testNormalizationEditDuringConfirm", () => testNormalizationEditDuringConfirm(modules)],
     ["testNormalizationSaveAcceptsRevisionAfterEdit", () => testNormalizationSaveAcceptsRevisionAfterEdit(modules)],
