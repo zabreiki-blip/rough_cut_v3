@@ -63,7 +63,7 @@ from .normalization_memory import normalize_marker
 # Bump whenever the structural parse (labels, author numbers, timecodes,
 # technical cues) changes behaviour.  It is part of the LLM cache fingerprint,
 # so a cached answer produced for an older, wrong parse is never reused.
-STRUCTURE_PARSER_VERSION = 1
+STRUCTURE_PARSER_VERSION = 2
 
 # Core label -> block type candidates.  ``normalizer`` passes its own, wider
 # table (``_BUILTIN_MARKERS`` + ``_TECH_MARKERS``); this one covers the
@@ -145,9 +145,16 @@ _SPEECH_AFTER_NUMBER = rf"\s+(?:\d{{3}}(?!\d)|{_MONTH}(?![А-Яа-яЁё]))"
 # A dash after a number separates it only when a capital letter or a quote
 # follows (``ЗК 12 - Текст``); ``ЗК 5 - это много`` keeps the number.
 _NOT_SEPARATOR_DASH = r"\s*[-–—]\s*(?![А-ЯЁA-Z«])"
+_AFTER_GLUED_NUMBER = r"$|\s|[,;\-–—]|:(?!\d)|\.(?!\d)"
 _GLUED_NUMBER = re.compile(
     rf"[-.]?(?P<n>{_NUM})(?!{_SPEECH_AFTER_NUMBER}|\s+[-–—]\s+(?![А-ЯЁA-Z«]))"
-    r"(?=$|\s|[,;\-–—]|:(?!\d)|\.(?!\d))"
+    rf"(?={_AFTER_GLUED_NUMBER})"
+)
+# A compound number (``1.4``, ``0.1``, ``1.10``) is never a plain quantity: a
+# month or a digit group after it does not make it speech (``ЗК1.4 Март 2005``).
+_GLUED_COMPOUND_NUMBER = re.compile(
+    r"[-.]?(?P<n>\d{1,3}(?:\.\d{1,3})+[A-Za-zА-Яа-яЁё]?)"
+    rf"(?!\s+[-–—]\s+(?![А-ЯЁA-Z«]))(?={_AFTER_GLUED_NUMBER})"
 )
 _SPACED_NUMBER = re.compile(
     rf"\s+(?P<n>{_NUM})(?=\s*:(?!\d)|\.(?=\s|$)|\s*[-–—]\s*(?=[А-ЯЁA-Z«])|\s*$)"
@@ -224,7 +231,7 @@ def match_author_number(text: str, pos: int) -> tuple[str, int] | None:
     See the module docstring for the rule.  ``end`` is the offset right after the
     number; a separator (if any) is not consumed.
     """
-    glued = _GLUED_NUMBER.match(text, pos)
+    glued = _GLUED_NUMBER.match(text, pos) or _GLUED_COMPOUND_NUMBER.match(text, pos)
     if glued:
         return glued.group("n"), glued.end("n")
     spaced = _SPACED_NUMBER.match(text, pos)
@@ -274,6 +281,10 @@ def parse_paragraph(text: str, marker_types: Mapping[str, str] | None = None) ->
         sep = _SEPARATOR.match(text, label_raw_end)
         if sep:
             speech_start = sep.end()
+        elif text[label_raw_end : label_raw_end + 1] == "…" and is_zk_label(label_raw):
+            # ``ЗК.… Текст`` / ``ЗК… Текст``: the ellipsis is the author's
+            # trailing-off of the speech itself, not a separator -- keep it.
+            speech_start = label_raw_end
         elif glue_allowed or text[label_raw_end : label_raw_end + 1].isdigit():
             # ``З.КВ 1915`` (marker glued to the first word) or a digit run that
             # is not an author number (``ЗК1915 год``): the text is speech.

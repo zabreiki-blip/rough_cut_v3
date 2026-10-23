@@ -42,6 +42,7 @@ from .scenario_context import (
     SECTION_HEADING_WARNING,
     SceneLink,
     classify_section_headings,
+    is_dialogue_reply,
     is_plus_splice,
     is_section_heading,
     neighbour_context,
@@ -188,8 +189,12 @@ _LIFE_PREFIX = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _EXPLICIT_SYNC_CREDIT = re.compile(
-    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s*,\s*"
-    r"(?P<speaker>[^:\n]{1,80}?)\s*:\s*[,;]?\s*(?P<content>.+)$",
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s*(?P<sep>[,.])\s*"
+    # The credit ends at a label colon (never the colon of a timecode, i.e. one
+    # right after a digit) or right before a timecode: ``СНХ. Иванов 00:10:00 ...``.
+    r"(?P<speaker>[^:\n]{1,80}?)"
+    r"(?:(?<!\d)\s*:\s*[,;]?\s*|\s+(?=[(\[]?\d{1,2}[:.]\d{2}))"
+    r"(?P<content>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
 # ``СНХ Имя, роль — файл.wav 00:05:42 — реплика``: the marker is followed by
@@ -239,9 +244,22 @@ _SYNC_LABEL_METADATA = re.compile(
     # (e.g. "То, что получилось у нас, это живая история...").
     r"^([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\s\-]{1,60}),\s*([^.…!?\n]{2,160})$"
 )
-_SYNC_NAME_ONLY_LABEL = re.compile(
-    r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*$"
+# Root words that make a bracket after a name a footage/source description.
+_SOURCE_WORD = (
+    r"(?i:фильм|сериал|кино|передач|архив|хроник|интервью|запис|видео|программ|эфир|фото)"
 )
+_SYNC_NAME_ONLY_LABEL = re.compile(
+    # An optional bracketed *source* follows the name: ``Имя (фильм): 38:38 ...``.
+    # A bracket without a source word (``Имя (эксперт)``) is a role, not a source.
+    r"^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*"
+    rf"(?:\s*\((?=[^()\n]*{_SOURCE_WORD})[^()\n]{{2,60}}\))?$"
+)
+_SYNC_NAME_SOURCE_SPLIT = re.compile(r"^(?P<name>[^()]+?)\s*\((?P<source>[^()]+)\)$")
+# ``Голос «Маяковского»: текст`` -- a named voice reading text aloud.
+_NAMED_VOICE_LABEL = re.compile(r"^Голос\s+[«\"“][^«»\"“”\n]{1,60}[»\"”]$", re.IGNORECASE)
+# ``СНХ. Отец: речь`` -- the dot after the marker may be a separator, but then the
+# credit must be a short name, never the first words of a sentence.
+_DOT_CREDIT_MAX_WORDS = 4
 # A paragraph that is *only* a sync label, with no colon and no quote --
 # e.g. "Синх Сторожевой" -- names the interviewee in the genitive case ahead
 # of a separate paragraph carrying the actual (often mid-sentence-timecoded)
@@ -258,6 +276,14 @@ _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"{_TIMECODE_TOKEN}",
     re.DOTALL,
 )
+# ``ПОДВОДКА № 6`` / ``СТЕНДАП 3`` / ``ПОДВОДКА``: a numbered heading with no
+# speech after it.
+_PRESENTER_HEADING_ONLY = re.compile(
+    r"^\s*(?:СНХ\s+)?(?:СТЕНДАП|(?-i:ПОДВОДКА))\s*(?:№|N|#|No\.?)?\s*\d*\s*[.:]?\s*$",
+    re.IGNORECASE,
+)
+TIMECODE_NOTE_WARNING = "timecode note without label: check manually"
+_TIMECODE_NOTE_MAX_WORDS = 4
 _PLAYBACK_LIFE_CUE = re.compile(
     r"(?:\bзвучит\s+песня\b|\bпереход\s+на\s+клип\b|\bклип\b.{0,60}\bна\s+припев\b)",
     re.IGNORECASE | re.DOTALL,
@@ -276,6 +302,11 @@ _CLEAR_SPEAKER_CREDIT = re.compile(
 )
 _EDITORIAL_VOICEOVER_CUE = re.compile(
     r"^(?:ЗТМ\.?|НА КАДРАХ\b.+|ФРАГМЕНТ СЕРИАЛА\b.+|"
+    # ``ФР СЕРИАЛА, ГДЕ ... – ЕСТЬ`` / ``ФРАГМЕНТ ИЗ ФИЛЬМА – ...``: a note about
+    # footage to insert.  The prefix must be written in capitals (``(?-i:..)``);
+    # narration such as ``Фрагмент фильма показывает ...`` stays speech.
+    r"(?-i:ФР(?:АГМЕНТ)?)\b\.?\s+(?:(?-i:ИЗ)\s+)?"
+    r"(?:сериал|фильм|кино|передач|ролик|интервью|эфир|видео|хроник|материал)\w*\b.*|"
     r"ЗДЕСЬ\s+(?:БЫ\s+НУЖЕН|НАДО(?:\s+БЫ)?\s+(?:ДАТЬ|ПОСТАВИТЬ|ВСТАВИТЬ))\s+ФРАГМЕНТ\b.+|"
     r"\([^)]*(?:фото|кадр|план)[^)]*\))$",
     re.IGNORECASE | re.DOTALL,
@@ -509,7 +540,12 @@ _OPENROUTER_INSTRUCTIONS = (
     "speaker or technical cue. "
     "An item may carry a context object with truncated neighbouring "
     "paragraphs (before/after). It is for reference only: classify the item "
-    "itself, never the neighbours, and never copy their text. "
+    "itself, never the neighbours, and never copy their text. A neighbour "
+    'with type "unresolved" has not been classified yet and says nothing '
+    "about the item. An unlabelled plain sentence or line of verse that "
+    "nothing marks as an interview, life sound or editorial cue is narration: "
+    "type=voiceover. Leave speaker, role and timecodes empty when the text "
+    "does not state them (never write the word unknown). "
 )
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -594,13 +630,28 @@ def _generate_normalization_unlocked(
                 text_for_tts="",
                 original_label=label,
             )
-            _classify_by_rules(block, memory, video_cue_re)
+            # Inside an open LIFE/SYNC scene a short timecoded line is a quote
+            # of that scene, not an editor's note.
+            in_scene = bool(blocks) and blocks[-1].type in (
+                BlockType.LIFE.value,
+                BlockType.SYNC.value,
+            )
+            _classify_by_rules(block, memory, video_cue_re, in_scene)
             for warning in (
                 *_paragraph_structure(original).warnings,
                 *timecode_warnings(original),
             ):
+                # A numbered presenter heading has no speaker to identify.
+                if (
+                    warning in {STANDUP_WARNING, LEAD_IN_WARNING}
+                    and block.type == BlockType.TECHNICAL.value
+                    and _PRESENTER_HEADING_ONLY.match(original)
+                ):
+                    continue
                 if warning not in block.warnings:
                     block.warnings.append(warning)
+            if block.type == BlockType.SYNC.value and _is_rejected_dot_sync_credit(original):
+                block.warnings.append(SYNC_CREDIT_REJECTED_WARNING)
             if block.type != BlockType.UNKNOWN.value and block.original_label:
                 block.label_confirmed = True
                 if content:
@@ -748,6 +799,7 @@ def _generate_normalization_unlocked(
                 message = f"LLM classification failed: {type(error).__name__}: {error}"
                 for block in batch:
                     block.warnings.append(message)
+            _recover_llm_unresolved_voiceover(blocks, video_cue_re)
 
     for block in blocks:
         if block.type == BlockType.VOICEOVER.value:
@@ -1421,7 +1473,19 @@ def validate_for_confirmation_detailed(
                 )
         if block.type == BlockType.SYNC.value:
             if not block.speaker.strip():
-                add("sync_no_speaker", block, f"Sync block {block.order} has no speaker")
+                # A sync typed only by scene context (splice) is not an
+                # explicit label: the author may mean the same speaker.
+                opener = blocks_by_uid.get(block.scene_uid)
+                add(
+                    "sync_no_speaker",
+                    block,
+                    f"Sync block {block.order} has no speaker",
+                    "warning"
+                    if opener is not None
+                    and opener.speaker.strip()
+                    and SYNC_CREDIT_REJECTED_WARNING not in block.warnings
+                    else "error",
+                )
             elif re.search(r"\b(?:читает|по[её]т)\s*$", block.speaker, re.IGNORECASE):
                 add(
                     "sync_direction_as_speaker",
@@ -1722,7 +1786,21 @@ def _annotate_scene_context(blocks: list[NormalizedBlock]) -> None:
             _apply_type(block, link.scene_type, DecisionSource.BUILTIN_RULE.value, 0.8)
             block.speaker = ""
             block.role = ""
+            opener = blocks[link.scene_index] if link.scene_index >= 0 else None
+            # A ``+`` splice is the same hero's own recording: it keeps the
+            # opening block's speaker.  Dash replies stay unattributed.
+            if (
+                link.kind == "splice"
+                and opener is not None
+                and opener.type == BlockType.SYNC.value
+                and link.scene_type == BlockType.SYNC.value
+                and opener.speaker.strip()
+            ):
+                block.speaker = opener.speaker
+                block.role = opener.role
             _extract_block_metadata(block)
+        elif link.suggested_type and not block.suggested_type:
+            block.suggested_type = link.suggested_type
         if link.warning and link.warning not in block.warnings:
             block.warnings.append(link.warning)
 
@@ -1770,6 +1848,7 @@ def _annotate_continuation_context(
             previous is not None
             and block.type == BlockType.UNKNOWN.value
             and AMBIGUOUS_CAPS_WARNING not in block.warnings
+            and TIMECODE_NOTE_WARNING not in block.warnings
             and not block.original_label
             and (
                 previous.type == BlockType.VOICEOVER.value
@@ -1814,6 +1893,7 @@ def _annotate_continuation_context(
                 donor = splice_donor
             if (
                 not block.speaker
+                and SYNC_CREDIT_REJECTED_WARNING not in block.warnings
                 and donor is not None
                 and donor.type == BlockType.SYNC.value
                 and donor.speaker
@@ -2131,6 +2211,16 @@ _SYNC_CANDIDATE_STOPWORDS = {
 }
 
 
+def _set_name_and_source(block: NormalizedBlock, label: str) -> None:
+    """``Имя (фильм)`` -> speaker ``Имя`` + source_description ``фильм``; plain name as is."""
+    split = _SYNC_NAME_SOURCE_SPLIT.match(label.strip())
+    if split:
+        block.speaker = split.group("name").strip()
+        block.source_description = split.group("source").strip()
+    else:
+        block.speaker = label.strip()
+
+
 def _looks_like_plausible_sync_credit(candidate: str) -> bool:
     """Reject a speaker-name/credit match whose first word is a bare
     sentence-leading pronoun or conjunction rather than a plausible name.
@@ -2140,6 +2230,121 @@ def _looks_like_plausible_sync_credit(candidate: str) -> bool:
     """
     first_word = candidate.split(",", 1)[0].strip().split(" ")[:1]
     return not first_word or first_word[0].casefold() not in _SYNC_CANDIDATE_STOPWORDS
+
+
+# ``СНХ. <кредит>: речь``: after a full stop the text before the colon is a
+# credit only when it looks like a short name or role.  Finite-verb endings are
+# the unambiguous ones (past tense, 3pl, 2nd person); the ambiguous ``-л/-ла/
+# -ет/-ит/-ем/-им`` are skipped on purpose: they end real names (Павел, Мила,
+# Максим) and the capital-letter rule already rejects lowercase verbs.
+_DOT_CREDIT_VERB_RE = re.compile(
+    r"^[а-яё]{3,}(?:лся|лась|лись|ли|ло|ете|ите|ешь|ишь|ют|ат|ят)$", re.IGNORECASE
+)
+_DOT_CREDIT_STOPWORDS = frozenset(
+    {
+        "хорошо",
+        "плохо",
+        "ладно",
+        "конечно",
+        "понятно",
+        "ясно",
+        "итак",
+        "вот",
+        "ну",
+        "тогда",
+        "потом",
+        "теперь",
+        "значит",
+        "кстати",
+        "например",
+        "сегодня",
+        "вчера",
+        "завтра",
+        "здесь",
+        "потому",
+        "когда",
+        "если",
+        "почему",
+        "как",
+        "это",
+        "эти",
+        "все",
+        "всё",
+    }
+)
+PUNCTUATION_ONLY_WARNING = "punctuation-only paragraph treated as technical: check manually"
+EDITORIAL_CUE_CAPS_WARNING = "editorial cue by caps: check manually"
+# Finite-verb endings only (no ``-ла/-ло``: they end nouns such as ``СЕРИАЛА``).
+_CAPS_CUE_VERB_RE = re.compile(
+    r"\b[а-яё]{3,}(?:ется|ится|ются|ятся|лся|лась|лись|ет|ит|ют|ат|ят|ут)\b", re.IGNORECASE
+)
+SYNC_CREDIT_REJECTED_WARNING = "sync credit after full stop not recognized: speaker not identified"
+
+
+def _is_plausible_dot_sync_credit(speaker: str) -> bool:
+    """1-3 capitalised words, no finite verb, no stop-word (``Отец``, ``Иванов Иван``)."""
+    words = re.sub(r"\([^)]*\)", " ", speaker).split()
+    if not 1 <= len(words) <= 3:
+        return False
+    for word in words:
+        core = word.strip("«»\"“”'-–—")
+        if not core or not core[0].isupper():
+            return False
+        if core.casefold() in _DOT_CREDIT_STOPWORDS or core.casefold() in _SYNC_CANDIDATE_STOPWORDS:
+            return False
+        if _DOT_CREDIT_VERB_RE.match(core):
+            return False
+    return True
+
+
+def _is_rejected_dot_sync_credit(text: str) -> bool:
+    """``СНХ. Мы пришли: да`` -- the marker is explicit, the credit is not."""
+    match = _EXPLICIT_SYNC_CREDIT.match(_structural_text(text))
+    if not match or match.group("sep") != ".":
+        return False
+    speaker = match.group("speaker").strip(" \t,;:")
+    return not (
+        not re.search(r"[.!?…,;]", speaker)
+        and _looks_like_plausible_sync_credit(speaker)
+        and _is_plausible_dot_sync_credit(speaker)
+    )
+
+
+def _timecode_note_kind(text: str) -> str:
+    """``5:50 заметка`` / ``31-55 кт мозга`` / ``20:30-дискотека``.
+
+    ``"note"``: a paragraph that opens with a short two-component timecode (not
+    bracketed, not a ``T1 - T2`` range) followed by a link or a short remark
+    (up to ``_TIMECODE_NOTE_MAX_WORDS`` words, no finite verb) is an editor's
+    note about the source.  ``"ambiguous"``: the same opening, but the tail
+    reads like speech (a finite verb or a long remark) -- ``12:30 Мы пришли
+    домой`` / ``10-15 человек пришли``: the caller must keep it ``unknown`` so a
+    person decides.  ``""``: not a short timecode note.  Full ``H:MM:SS``
+    timecodes and ``(00:12:30)`` keep opening a sync.
+    """
+    match = _TIMECODE.match(text.lstrip())
+    if not match:
+        return ""
+    token = match.group(1)
+    if not re.fullmatch(r"\d{1,2}[:.\-][0-5]\d", token):
+        return ""
+    stripped = text.lstrip()
+    if not _is_unambiguous_timecode_match(stripped, match.start(1), match.end(1)):
+        return ""
+    if _TIMECODE_RANGE.match(stripped):
+        return ""
+    tail = re.sub(r"^\s*[-–—]?\s*", "", stripped[match.end(1) :])
+    if _URL_RE.search(tail):
+        return "note"
+    if tail.rstrip().endswith((".", "!", "?", "…", "»", '"', "”")):
+        return ""
+    if len(tail.split()) <= _TIMECODE_NOTE_MAX_WORDS and not _PERSONAL_VERB_RE.search(tail):
+        return "note"
+    return "ambiguous"
+
+
+def _is_unlabelled_timecode_note(text: str) -> bool:
+    return _timecode_note_kind(text) == "note"
 
 
 def _starts_with_unambiguous_timecode(text: str) -> bool:
@@ -2390,7 +2595,12 @@ def _split_label(text: str) -> tuple[str, str]:
     if explicit_sync:
         marker = explicit_sync.group("marker").strip()
         speaker = explicit_sync.group("speaker").strip(" \t,;:")
-        return f"{marker}, {speaker}", explicit_sync.group("content").strip()
+        if explicit_sync.group("sep") == "," or (
+            not re.search(r"[.!?…,;]", speaker)
+            and _looks_like_plausible_sync_credit(speaker)
+            and _is_plausible_dot_sync_credit(speaker)
+        ):
+            return f"{marker}, {speaker}", explicit_sync.group("content").strip()
     dash_credit = _parse_snh_dash_credit(text)
     if dash_credit:
         return dash_credit["marker"], dash_credit["content"]
@@ -2507,6 +2717,7 @@ def _classify_by_rules(
     block: NormalizedBlock,
     memory: NormalizationMemory,
     video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+    in_scene: bool = False,
 ) -> None:
     marker = normalize_marker(block.original_label)
     stripped = _structural_text(block.original_text).strip()
@@ -2521,6 +2732,17 @@ def _classify_by_rules(
         block.speaker = label_only_sync.group(1).strip()
         block.text_for_tts = ""
         return
+    if (
+        not block.original_label
+        and stripped
+        and not re.search(r"\w", stripped)
+        and not re.match(r"^\(\s*(?:…|\.\.\.)\s*\)", stripped)
+    ):
+        # ``.`` / ``…`` / ``—`` carries no speech: it must neither continue a
+        # voiceover nor reach TTS, but a person should see it.
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+        block.warnings.append(PUNCTUATION_ONLY_WARNING)
+        return
     structure = _paragraph_structure(block.original_text)
     if structure.has_label_conflict:
         # ``ЗК СНХ ...``: two competing service labels. Which one the author
@@ -2528,6 +2750,9 @@ def _classify_by_rules(
         # human decides and nothing from the credit reaches TTS.
         return
     if structure.is_technical_cue and not marker:
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
+        return
+    if _PRESENTER_HEADING_ONLY.match(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
         return
     if marker:
@@ -2581,6 +2806,12 @@ def _classify_by_rules(
         stripped.endswith(":") and not _TIMECODE.search(stripped)
     ):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
+        if not marker and _EDITORIAL_VOICEOVER_CUE.match(stripped) and stripped.isupper():
+            # A cue recognised only by capitals can swallow shouted narration.
+            if SECTION_HEADING_WARNING not in block.warnings:
+                block.warnings.append(SECTION_HEADING_WARNING)
+            if stripped.endswith(".") or _CAPS_CUE_VERB_RE.search(stripped):
+                block.warnings.append(EDITORIAL_CUE_CAPS_WARNING)
         return
     _label, content = _split_label(block.original_text)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
@@ -2591,8 +2822,23 @@ def _classify_by_rules(
         or _SYNC_NAME_ONLY_LABEL.match(block.original_label)
     ) and _TIMECODE.match(sync_content):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+    elif (
+        _NAMED_VOICE_LABEL.match(block.original_label) and content and not _TIMECODE.match(content)
+    ):
+        # ``Голос «X»: текст`` is narration read in a character's voice; an
+        # empty text is only a cue (handled above as technical).
+        _apply_type(block, BlockType.VOICEOVER.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _parse_unlabeled_sync_credit(block.original_text):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.8)
+    elif (
+        not block.original_label
+        and (note_kind := _timecode_note_kind(stripped))
+        and not (in_scene and not _URL_RE.search(stripped))
+    ):
+        if note_kind == "note":
+            _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.7)
+        if TIMECODE_NOTE_WARNING not in block.warnings:
+            block.warnings.append(TIMECODE_NOTE_WARNING)
     elif _starts_with_unambiguous_timecode(stripped) or re.match(r"^\s*\((?:…|\.\.\.)\)", stripped):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _EDITORIAL_TIMECODE_PREFIX.match(stripped):
@@ -2785,7 +3031,7 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
             block.speaker = credited.group(1).strip()
             block.role = credited.group(2).strip()
         elif _SYNC_NAME_ONLY_LABEL.match(block.original_label):
-            block.speaker = block.original_label.strip()
+            _set_name_and_source(block, block.original_label)
         if block.speaker:
             has_sync_metadata = True
         elif match:
@@ -2806,7 +3052,7 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
             block.role = label_match.group(2).strip()
             has_sync_metadata = True
         elif name_only_match and _TIMECODE.match(fragment_source):
-            block.speaker = block.original_label.strip()
+            _set_name_and_source(block, block.original_label)
             has_sync_metadata = True
         elif block.continuation_of_type == BlockType.SYNC.value and block.speaker:
             # The preceding labelled sync supplied the interviewee. Keep a
@@ -3012,6 +3258,164 @@ def _llm_sync_suggestion_has_signal(block: NormalizedBlock, item: dict[str, Any]
     return block.continuation_of_type == BlockType.SYNC.value
 
 
+_LLM_PLACEHOLDERS = frozenset({"unknown", "none", "null", "n/a", "na", "нет", "неизвестно"})
+
+
+def _llm_field_value(value: Any) -> str:
+    """Text of an LLM metadata field; placeholder words ("unknown", "null") mean "empty"."""
+    text = str(value).strip() if value else ""
+    return "" if text.casefold() in _LLM_PLACEHOLDERS else text
+
+
+NARRATION_RECOVERED_WARNING = (
+    "LLM left a plain narration-like paragraph unresolved; kept as voiceover: check manually"
+)
+_RECOVERED_LLM_WARNING_PREFIXES = ("LLM returned an unknown type", "LLM confidence ")
+_VOICE_READING_CUE_RE = re.compile(r"\b(?:голос|читает|читают|зачитывает)\b", re.IGNORECASE)
+_NARRATION_MIN_WORDS = 4
+_LLM_SCENE_OPINIONS = frozenset({BlockType.SYNC.value, BlockType.LIFE.value, BlockType.HOST.value})
+
+
+def _is_voice_reading_cue(block: NormalizedBlock) -> bool:
+    """``Голос «Лили»:`` / ``... читает письмо:`` -- a cue announcing text read aloud."""
+    text = block.original_text.strip()
+    return (
+        block.type == BlockType.TECHNICAL.value
+        and text.endswith(":")
+        and not _TIMECODE.search(text)
+        and bool(_VOICE_READING_CUE_RE.search(text))
+    )
+
+
+_LINK_RE = re.compile(r"(?:https?:)?//|\bwww\.|\b[\w-]+\.(?:ru|com|org|net|by|ua)\b", re.IGNORECASE)
+_FOOTAGE_REMARK_START_RE = re.compile(
+    r"^(?:здесь|тут|сюда|далее|потом)?\s*(?:кадры?|фото\w*|видео\w*|хроник\w*|съ[её]мк\w*|"
+    r"фрагмент\w*|архив\w*|титр\w*|заставк\w*|график\w*|карт[аы]|анимаци\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_narration_sentence(text: str) -> bool:
+    """Capitalised unlabelled prose with a finite verb.
+
+    Not a heading or slogan (all caps), not a lower-case remark ("кадры из
+    фильма о ..."), a link, a footage remark, or a caption ending with ``:``.
+    """
+    stripped = text.strip()
+    words = stripped.split()
+    first_letter = next((char for char in stripped if char.isalpha()), "")
+    return (
+        len(words) >= _NARRATION_MIN_WORDS
+        and first_letter.isupper()
+        and any(char.islower() for char in stripped)
+        and not stripped.isupper()
+        and not stripped.endswith(":")
+        and not _LINK_RE.search(stripped)
+        and not _FOOTAGE_REMARK_START_RE.match(stripped)
+        and not _TIMECODE.search(stripped)
+        and bool(_PERSONAL_VERB_RE.search(stripped))
+    )
+
+
+_CREDIT_LINE_RE = re.compile(
+    r"[А-ЯЁA-Z][\w\-]+(?:\s+[А-ЯЁA-Z][\w\-]+){1,2}\s*,\s*[^\s,]+(?:\s+[^\s,]+){0,2}"
+)
+
+
+def _looks_like_credit_line(text: str) -> bool:
+    """``Имя Фамилия, роль``: capitalised name, a comma, a short role; no finite verb.
+
+    Verse such as ``Кроме любви твоей,`` (lowercase words, trailing comma) is not one.
+    """
+    stripped = text.strip()
+    return (
+        _CREDIT_LINE_RE.fullmatch(stripped) is not None
+        and len(stripped.split()) <= 5
+        and not _SENTENCE_END_PUNCT_RE.search(stripped)
+        and not _PERSONAL_VERB_RE.search(stripped)
+    )
+
+
+def _llm_pinned_non_voiceover(block: NormalizedBlock) -> bool:
+    """The LLM (or a guard) already pointed the block elsewhere: do not override."""
+    return (
+        any("contradicts the preceding LIFE scene" in warning for warning in block.warnings)
+        or bool(block.scene_uid)
+        or block.suggested_type not in ("", BlockType.VOICEOVER.value)
+    )
+
+
+def _recover_llm_unresolved_voiceover(
+    blocks: list[NormalizedBlock], video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE
+) -> None:
+    """Return LLM-unresolved plain paragraphs to voiceover where the layout says so.
+
+    Run once after every LLM batch is applied, in document order (so a chain
+    of paragraphs resolves one by one):
+
+    * a paragraph straight after a voiceover block (or after a cue such as
+      ``Голос «Лили»:``) continues it -- a letter, a quotation or lines of
+      verse split over several paragraphs, exactly as an unlabelled paragraph
+      continues a ``ЗК`` block before the LLM runs;
+    * otherwise an ordinary sentence the model refused to classify is kept as
+      narration.
+
+    Every recovery replaces the low-confidence/unknown warning with
+    ``NARRATION_RECOVERED_WARNING`` so the reviewer still sees it.  Labelled
+    blocks, all-caps ambiguities, timecoded text, dialogue replies, splices,
+    footage/shot-list remarks, blocks right after (or inside) a LIFE/SYNC
+    scene and blocks the LLM pinned to another type are never touched.
+    """
+    previous: NormalizedBlock | None = None
+    in_scene = False  # previous block is a LIFE/SYNC scene or unresolved text inside one
+    for block in blocks:
+        after_scene = in_scene or (
+            previous is not None and previous.type in (BlockType.LIFE.value, BlockType.SYNC.value)
+        )
+        in_scene = after_scene and block.type == BlockType.UNKNOWN.value
+        if (
+            not after_scene
+            and block.type == BlockType.UNKNOWN.value
+            and block.source == DecisionSource.LLM.value
+            and not block.original_label
+            and not _llm_pinned_non_voiceover(block)
+            and AMBIGUOUS_CAPS_WARNING not in block.warnings
+            and not _paragraph_structure(block.original_text).has_label_conflict
+            and not _TIMECODE.search(block.original_text)
+            and not is_plus_splice(block.original_text)
+            and not is_dialogue_reply(block.original_text)
+            and _technical_heuristic_confidence(block.original_text, video_cue_re) is None
+            and not _LINK_RE.search(block.original_text)
+            and not _FOOTAGE_REMARK_START_RE.match(block.original_text.strip())
+        ):
+            continues = (
+                previous is not None
+                and (previous.type == BlockType.VOICEOVER.value or _is_voice_reading_cue(previous))
+                and bool(re.search(r"[^\W\d_]", block.original_text))
+                and not _looks_like_credit_line(block.original_text)
+            )
+            if continues or _looks_like_narration_sentence(block.original_text):
+                block.warnings = [
+                    warning
+                    for warning in block.warnings
+                    if not warning.startswith(_RECOVERED_LLM_WARNING_PREFIXES)
+                ]
+                if not block.suggested_type:
+                    block.suggested_type = BlockType.VOICEOVER.value
+                block.warnings.append(NARRATION_RECOVERED_WARNING)
+                if continues:
+                    block.continuation_of_type = BlockType.VOICEOVER.value
+                    _apply_type(
+                        block, BlockType.VOICEOVER.value, DecisionSource.BUILTIN_RULE.value, 0.8
+                    )
+                else:
+                    _apply_type(
+                        block, BlockType.VOICEOVER.value, DecisionSource.BUILTIN_RULE.value, 0.7
+                    )
+                block.text_for_tts = block.normalized_text
+        previous = block
+
+
 def _apply_llm_results(
     blocks: list[NormalizedBlock],
     results: list[dict[str, Any]],
@@ -3034,6 +3438,16 @@ def _apply_llm_results(
             confidence = float(item.get("confidence", 0.6))
         except (TypeError, ValueError):
             block.warnings.append(f"LLM returned invalid confidence {item.get('confidence')!r}")
+            continue
+        if target_type != BlockType.TECHNICAL.value and _EDITORIAL_VOICEOVER_CUE.match(
+            block.original_text.strip()
+        ):
+            # A footage remark ("ФР СЕРИАЛА, ГДЕ ... – ЕСТЬ") is never speech:
+            # the model cannot turn it into voiceover/sync/host/life.
+            block.warnings.append(
+                f"LLM type '{target_type}' ignored: the line is an editorial cue (technical)"
+            )
+            _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
             continue
         if target_type == BlockType.SYNC.value and not _llm_sync_suggestion_has_signal(block, item):
             # Never trust an LLM "sync" label on faith: a real sync always
@@ -3064,6 +3478,11 @@ def _apply_llm_results(
                 )
                 continue
             block.source = DecisionSource.LLM.value
+            llm_type = str(item.get("type", ""))
+            if llm_type in _LLM_SCENE_OPINIONS and not block.suggested_type:
+                # Remember an explicit sync/life/host opinion: the narration
+                # recovery must not override it.
+                block.suggested_type = llm_type
             block.confidence = max(0.0, min(1.0, confidence))
             if confidence < _LLM_CONFIDENCE_THRESHOLD:
                 block.warnings.append(
@@ -3098,8 +3517,9 @@ def _apply_llm_results(
             else:
                 block.original_label = ""
         for key in ("speaker", "role", "timecode_start", "timecode_end", "notes"):
-            if item.get(key):
-                setattr(block, key, str(item[key]).strip())
+            value = _llm_field_value(item.get(key))
+            if value:
+                setattr(block, key, value)
         if block.type == BlockType.VOICEOVER.value:
             if _llm_text_truncated(block):
                 # The model saw only an excerpt, so its text_for_tts would

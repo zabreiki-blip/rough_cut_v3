@@ -22,7 +22,7 @@ from .scenario_structure import find_timecodes
 
 # Bump whenever scene/dialogue/continuation context (and the neighbour context
 # sent to the LLM) changes behaviour; part of the LLM cache fingerprint.
-SCENE_CONTEXT_VERSION = 1
+SCENE_CONTEXT_VERSION = 3
 
 SCENE_TYPES = frozenset({"life", "sync", "host"})
 _SPLICE_TYPES = frozenset({"life", "sync"})
@@ -31,8 +31,8 @@ SPLICE_CONTINUES_WARNING = "leading '+' splice continues previous block: check m
 SPLICE_ORPHAN_WARNING = (
     "leading '+' splice has no previous LIFE/SYNC block to continue: check manually"
 )
-SCENE_REPLY_NO_SPEAKER_WARNING = (
-    "reply joined to the previous {scene} scene; speaker is not stated: check manually"
+DASH_REPLY_UNDECIDED_WARNING = (
+    "dash reply after {scene}: interviewer question or hero? check manually"
 )
 LONG_REPLY_WARNING = "long dash paragraph joined to the {scene} scene as a reply: check manually"
 SCENE_OPENER_CHANGED_WARNING = "scene opener changed: check reply type"
@@ -65,12 +65,15 @@ class SceneLink:
     there is none).  ``kind`` is ``reply``, ``splice`` or ``continuation``
     (a block that already had the scene type and only needs the link).
     ``scene_type`` is the type to assign; empty means "leave unknown".
+    ``suggested_type`` is only a hint for a block left unknown (a dash reply
+    after SYNC may be the interviewer's off-screen question, not the hero).
     """
 
     scene_index: int
     kind: str
     scene_type: str = ""
     warning: str = ""
+    suggested_type: str = ""
 
 
 def is_dialogue_reply(text: str) -> bool:
@@ -195,14 +198,24 @@ def plan_scene_context(blocks: Sequence[Any]) -> list[SceneLink | None]:
                 else:
                     link = SceneLink(-1, "splice", "", SPLICE_ORPHAN_WARNING)
             elif scene_start is not None and is_dialogue_reply(block.original_text):
+                # In a LIFE scene a dash replica is part of the scene.  After
+                # SYNC/HOST it may be the interviewer's question (voiceover),
+                # so it is not typed automatically.
+                undecided = scene_type != "life"
                 warning = (
-                    SCENE_REPLY_NO_SPEAKER_WARNING.format(scene=scene_type.upper())
-                    if scene_type != "life"
+                    DASH_REPLY_UNDECIDED_WARNING.format(scene=scene_type.upper())
+                    if undecided
                     else ""
                 )
                 if is_long_reply(block.original_text):
                     warning = LONG_REPLY_WARNING.format(scene=scene_type.upper())
-                link = SceneLink(scene_start, "reply", scene_type, warning)
+                link = SceneLink(
+                    scene_start,
+                    "reply",
+                    "" if undecided else scene_type,
+                    warning,
+                    scene_type if undecided else "",
+                )
         elif (
             effective in SCENE_TYPES
             and scene_start is not None
@@ -211,7 +224,9 @@ def plan_scene_context(blocks: Sequence[Any]) -> list[SceneLink | None]:
         ):
             link = SceneLink(scene_start, "continuation")
         plan.append(link)
-        if link is not None and link.scene_type:
+        if link is not None and link.suggested_type:
+            effective = scene_type  # undecided reply: the scene stays open
+        elif link is not None and link.scene_type:
             effective = link.scene_type  # joined to the open scene
         elif link is None or link.kind != "continuation":
             if effective in SCENE_TYPES:
@@ -229,7 +244,11 @@ def neighbour_context(
 
     def brief(block: Any) -> dict[str, str]:
         text = " ".join(str(block.original_text).split())
-        item = {"type": str(block.type), "text": text[:max_chars]}
+        # An unclassified neighbour is not a verdict: sending "unknown" made
+        # the model copy it onto plain narration sitting in a run of
+        # still-unresolved paragraphs.
+        kind = str(block.type)
+        item = {"type": "unresolved" if kind == "unknown" else kind, "text": text[:max_chars]}
         if block.original_label:
             item["label"] = str(block.original_label)
         return item

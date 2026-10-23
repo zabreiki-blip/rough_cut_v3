@@ -240,9 +240,10 @@ def test_sync_scene_reply_does_not_invent_speaker(tmp_path: Path) -> None:
     blocks = _run(tmp_path, ["СНХ Иван Петров (00:01:00) Я так считаю.", "— Да.", "— Нет."])
     assert blocks[0]["speaker"] == "Иван Петров"
     for reply in blocks[1:]:
-        assert reply["type"] == "sync" and reply["speaker"] == ""
+        assert reply["type"] == "unknown" and reply["speaker"] == ""
+        assert reply["suggested_type"] == "sync"
         assert reply["scene_uid"] == blocks[0]["uid"]
-        assert any("speaker is not stated" in w for w in reply["warnings"])
+        assert any("interviewer question or hero" in w for w in reply["warnings"])
 
 
 def test_blank_paragraphs_do_not_reach_parser(tmp_path: Path) -> None:

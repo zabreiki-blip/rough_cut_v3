@@ -216,6 +216,48 @@ def extract_paragraphs_from_docx(path: Path) -> list[DocxParagraph]:
     return result
 
 
+_WORD_FIELD_ARGS = r'(?:\s*(?:\\[*#@A-Za-z](?:\s+[A-Za-z]+)?|"[^"]*"|_[A-Za-z]\w*))*'
+# ``HYPERLINK "url" \l "anchor"``: the URL is kept as plain text (it is a
+# technical-note signal for the classifier), the keyword and switches go.
+# A visible text equal to the URL is not repeated.
+_HYPERLINK_RE = re.compile(
+    r'\bHYPERLINK\s*"(?P<url>[^"]*)"(?:\s*\\[A-Za-z](?:\s*"[^"]*")?)*'
+    r"(?:\s*(?P<dup>(?P=url))(?=\s|\Z))?",
+    re.MULTILINE,
+)
+_WORD_FIELD_CODE_RE = re.compile(
+    # ``HYPERLINK \l "anchor"`` without a URL: nothing worth keeping.
+    r'\bHYPERLINK\s*\\[A-Za-z]\s*"[^"]*"(?:\s*\\[A-Za-z](?:\s*"[^"]*")?)*'
+    # ``PAGEREF _Toc123 \h`` / ``TOC \o "1-3" \h`` / ``PAGE \* MERGEFORMAT``: a
+    # bare word is not a field, so a switch or bookmark argument is required.
+    + r"|\b(?:PAGEREF|NUMPAGES|PAGE|TOC)(?:\s+(?:\\[*#@A-Za-z](?:\s+[A-Za-z]+)?|_[A-Za-z]\w*))"
+    + _WORD_FIELD_ARGS
+    + r"|^[ \t]*PAGE[ \t]+\d+[ \t]*$"
+    + r"|\\\*\s*(?:MERGEFORMAT|CHARFORMAT|Arabic|ROMAN|roman|Upper|Lower)\b",
+    re.MULTILINE,
+)
+
+
+def _keep_hyperlink_url(match: re.Match[str]) -> str:
+    return match.group("url") if match.group("dup") else match.group("url") + " "
+
+
+def strip_word_field_codes(text: str) -> str:
+    """Drop Word field instructions that legacy converters leak into the text.
+
+    ``HYPERLINK "url"Видимый текст`` becomes ``url Видимый текст`` (the URL is
+    kept, the keyword and quotes/switches are dropped); ``PAGE 3``,
+    ``PAGEREF _Toc1 \\h``, ``TOC \\o "1-3"`` and ``\\* MERGEFORMAT`` vanish.
+    Ordinary text, including a plain word ``page`` or ``TOC``, is left alone.
+    """
+    text, links = _HYPERLINK_RE.subn(_keep_hyperlink_url, text)
+    cleaned, count = _WORD_FIELD_CODE_RE.subn("", text)
+    if not (links or count):
+        return text
+    cleaned = re.sub(r"(?<=\S)[ \t]{2,}", " ", cleaned)
+    return re.sub(r"[ \t]+$", "", cleaned, flags=re.MULTILINE)
+
+
 def extract_text_from_doc(path: Path) -> str:
     # ``catdoc`` wraps output to the document's visual line width by default,
     # turning one Word paragraph into many fake scenario blocks. Prefer
@@ -235,7 +277,7 @@ def extract_text_from_doc(path: Path) -> str:
                 check=True,
                 timeout=60,
             )
-            return normalize_whitespace(proc.stdout)
+            return normalize_whitespace(strip_word_field_codes(proc.stdout))
         except FileNotFoundError:
             continue
         except subprocess.CalledProcessError as exc:

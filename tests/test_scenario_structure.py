@@ -87,6 +87,20 @@ def test_number_that_is_speech_is_kept(text: str, speech: str) -> None:
     assert result.speech == speech
 
 
+@pytest.mark.parametrize(
+    ("text", "number", "speech"),
+    [
+        ("ЗК1.4 Март 2005 года. Авиабаза.", "1.4", "Март 2005 года. Авиабаза."),
+        ("ЗК0.1 Июля он вернулся.", "0.1", "Июля он вернулся."),
+        ("ЗК 1.4: Март 2005 года.", "1.4", "Март 2005 года."),
+    ],
+)
+def test_compound_author_number_is_always_a_number(text: str, number: str, speech: str) -> None:
+    result = parse_paragraph(text)
+    assert result.author_number == number
+    assert result.speech == speech
+
+
 def test_ranges_point_into_the_untouched_source() -> None:
     text = "  ЗК14: В том году…  "
     result = parse_paragraph(text)
