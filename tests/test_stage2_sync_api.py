@@ -3181,7 +3181,11 @@ def test_sync_budget_freezes_cloud_backend_and_options_before_worker_start(sync_
     job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
     assert job["status"] == "completed"
     assert dispatched[0]["backend"] == "cloud-audio"
-    assert dispatched[0]["cloud_options"] == {
+    cloud_options = dict(dispatched[0]["cloud_options"])
+    # Succeeded paid chunks are cached in the project (work/transcripts/asr-chunks).
+    chunk_cache_dir = cloud_options.pop("chunk_cache_dir")
+    assert Path(chunk_cache_dir).parts[-3:] == ("work", "transcripts", "asr-chunks")
+    assert cloud_options == {
         "max_cost_usd": "1",
         "usd_per_minute_estimate": "0.06",
         "initial_cost_usd": "0",
