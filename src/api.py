@@ -104,6 +104,7 @@ from stage1.validator import validate_stage1
 from stage2.timeline_parser import (
     life_parts,
     normalized_sync_fragments,
+    is_label_only_sync,
     parse_normalized_timeline,
     sync_fragment_id,
 )
@@ -1496,6 +1497,8 @@ def _sync_job_with_live_summary(job: dict) -> dict:
         valid_ids = {
             str(unit.get("segment_id") or "")
             for unit in _sync_alignment_units(
+        if block_type == "sync" and is_label_only_sync(block):
+            continue
                 [
                     block
                     for block in confirmed.get("blocks", [])

@@ -30,6 +30,7 @@ TIMECODE_REMNANT_IN_TEXT = "timecode_remnant_in_text"
 FALSE_HERO_FROM_CUE = "false_hero_from_cue"
 LOST_SPLICE = "lost_splice"
 UNMATCHED_SPEECH = "unmatched_speech"
+MONTAGE_NOTE_IN_TTS = "montage_note_in_tts"
 
 
 @dataclass(frozen=True)
@@ -69,11 +70,38 @@ _SERVICE_WORDS = frozenset(
         "закадр",
         "life",
         "sync",
+        # Montage remarks that the parser can take for a speaker name
+        # (``СЮДА НУЖНО СНХ``, ``КАДРЫ ИЗ ФИЛЬМА``, ``ВОЗДУХ НА МУЗЫКЕ``).
+        "сюда",
+        "кадр",
+        "кадры",
+        "кадров",
+        "нужно",
+        "воздух",
+        "вставка",
+        "вставить",
+        "фрагмент",
+        "реконструкция",
+        "хроника",
+        "титр",
+        "титры",
+        "музыка",
+        "фото",
+        "фотография",
+        "скл",
+        "склейка",
     }
 )
 _TIMECODE_FRAGMENT = re.compile(
     r"\(\s*[\d:.]*\s*$|(?<![\d:.])\d{1,2}[:.][0-5]\d[:.][0-5]\d(?![\d:.])"
 )
+# Sync / splice labels are never narration, wherever they stand in the voiced
+# text: ``Синх СторожевойТо``, ``... СКЛ ...``, ``СЮДА НУЖНО СНХ``.  ``Синхрон``
+# alone is a normal word, so it counts only before a capitalised name.
+_SYNC_LABEL_IN_TEXT = re.compile(
+    r"(?<![А-Яа-яЁёA-Za-z])(?:(?i:синх|снх|скл)(?![А-Яа-яЁёA-Za-z])|(?i:синхрон)\s+[А-ЯЁ])"
+)
+_MONTAGE_NOTE_MAX_WORDS = 12
 _TEXT_REMNANT = re.compile(r"^\s*(?:\)|\d{1,2}[:.][0-5]\d(?:[:.][0-5]\d)?\s*\))")
 _WORD = re.compile(r"[^\W\d_]{4,}")
 _MIN_MISSING_WORDS = 4
@@ -107,6 +135,16 @@ def check_service_label_in_tts(block: Any, structure_of: StructureOf) -> list[tu
     if not tts.strip():
         return []
     head = structure_of(tts)
+    found = _SYNC_LABEL_IN_TEXT.search(tts)
+    if found and not (head.label in _SERVICE_LABELS and head.label_raw.isupper()):
+        label = found.group(0).strip()
+        return [
+            (
+                SERVICE_LABEL_IN_TTS,
+                f"Block {block.order} has a sync/splice label '{label}' in its TTS text",
+                ERROR,
+            )
+        ]
     if head.label in _SERVICE_LABELS and (head.author_number or head.label_raw.isupper()):
         removable = (
             is_zk_label(head.label_raw) and not head.has_label_conflict and bool(head.speech)
@@ -120,6 +158,66 @@ def check_service_label_in_tts(block: Any, structure_of: StructureOf) -> list[tu
             )
         ]
     return []
+
+
+_MONTAGE_STEM_LEN = 5
+_MONTAGE_STEMS = frozenset(
+    w[:_MONTAGE_STEM_LEN] for w in _SERVICE_WORDS if len(w) >= _MONTAGE_STEM_LEN
+)
+
+
+def _has_montage_word(text: str) -> bool:
+    """True if any word of ``text`` is a montage/service word, matched by stem."""
+    for token in re.findall(r"[^\W\d_]+", text):
+        folded = _fold(token)
+        if folded in _SERVICE_WORDS:
+            return True
+        if len(folded) >= _MONTAGE_STEM_LEN and folded[:_MONTAGE_STEM_LEN] in _MONTAGE_STEMS:
+            return True
+    return False
+
+
+def _from_zk_label(block: Any) -> bool:
+    """True if the block came from a ``ЗК.`` voiceover label (command block)."""
+    label = str(getattr(block, "original_label", "") or "").strip()
+    if not label:
+        words = str(getattr(block, "original_text", "") or "").split()
+        label = words[0].rstrip(".:") if words else ""
+    return bool(label) and is_zk_label(label)
+
+
+def check_montage_note_in_tts(block: Any) -> list[tuple[str, str, str]]:
+    """Voiced text written entirely in capitals may be a montage remark.
+
+    ``НА БЭКСТЕЙДЖЕ``, ``КАДРЫ ИЗ ФИЛЬМА...``, ``РЕКОНСТРУКЦИЯ ПИСЬМА`` are
+    instructions for the editor, not narration.  The block is blocking only if
+    it contains a montage/service word or comes from a ``ЗК.`` label; a plain
+    capitals line (``ФСБ РФ``, ``НАТО США``) is only a warning.  A reviewer who
+    deliberately authored the text or the block type also gets only a warning.
+    """
+    if block.type != "voiceover" or block.absorbed_by_uid:
+        return []
+    tts = str(block.text_for_tts or "").strip()
+    letters = [ch for ch in tts if ch.isalpha()]
+    words = [w for w in re.findall(r"[^\W\d_]+", tts) if len(w) >= 2]
+    if (
+        not letters
+        or not all(ch.isupper() for ch in letters)
+        or len(words) < 2
+        or len(words) > _MONTAGE_NOTE_MAX_WORDS
+    ):
+        return []
+    fields = set(getattr(block, "manual_fields", None) or [])
+    manual = _speech_edited_by_human(block) or "type" in fields
+    blocking = _has_montage_word(tts) or _from_zk_label(block)
+    return [
+        (
+            MONTAGE_NOTE_IN_TTS,
+            f"Block {block.order} voiceover text is written in capitals and looks like a "
+            f"montage note: '{tts[:40]}'",
+            ERROR if blocking and not manual else WARNING,
+        )
+    ]
 
 
 def check_timecode_in_fields(block: Any) -> list[tuple[str, str]]:
@@ -267,5 +365,6 @@ def structural_checks(block: Any, structure_of: StructureOf) -> list[tuple[str, 
     return [
         *check_service_label_in_tts(block, structure_of),
         *((code, message, ERROR) for code, message in plain),
+        *check_montage_note_in_tts(block),
         *check_unmatched_speech(block, structure_of),
     ]

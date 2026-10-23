@@ -54,11 +54,13 @@ from .scenario_structure import (
     LEAD_IN_WARNING,
     STANDUP_WARNING,
     STRUCTURE_PARSER_VERSION,
+    SYNC_LABEL_ONLY_RE,
     ParagraphStructure,
     canonicalize_timecodes,
     find_repeated_author_numbers,
     parse_paragraph,
     parse_timecode,
+    split_inline_sync_label,
     split_timed_parts,
     strip_leading_zk_label,
     timecode_warnings,
@@ -265,11 +267,7 @@ _DOT_CREDIT_MAX_WORDS = 4
 # of a separate paragraph carrying the actual (often mid-sentence-timecoded)
 # quote. Recognized independently of the generic marker machinery below,
 # which requires an exact alias match and cannot absorb a trailing name.
-_SYNC_LABEL_ONLY_MARKER = re.compile(
-    r"^\s*(?:Синх|СНХ|Синхрон)\s+"
-    r"([А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)*)\s*$",
-    re.IGNORECASE,
-)
+_SYNC_LABEL_ONLY_MARKER = SYNC_LABEL_ONLY_RE
 _SYNC_CONTINUATION_NOTE = re.compile(r"^\s*\((?:продолжение(?:\s+синхрона?)?)\)\s*", re.IGNORECASE)
 _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"^\s*\((?:[^)\n]{{1,240}}\)\s*:?\s*|[^:\n]{{1,240}}:\s*)"
@@ -2731,6 +2729,18 @@ def _classify_by_rules(
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
         block.speaker = label_only_sync.group(1).strip()
         block.text_for_tts = ""
+        # Explicit "context without a clip": downstream stages must not turn
+        # the header into a quote of its own.
+        block.label_only = True
+        return
+    inline_sync = None if block.original_label else split_inline_sync_label(stripped)
+    if inline_sync:
+        # ``Синх СторожевойТо, что...``: the label is glued to the quote (or
+        # followed by a splice marker). The unambiguous border makes it a sync
+        # quote of that speaker; it must never reach TTS as narration.
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 0.9)
+        block.speaker = inline_sync[0]
+        block.text_for_tts = ""
         return
     if (
         not block.original_label
@@ -2963,6 +2973,7 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
     fragment_source = _SYNC_CONTINUATION_NOTE.sub("", normalized_view)
     has_sync_metadata = False
     explicit_label = _EXPLICIT_SYNC_LABEL.match(block.original_label)
+    inline_sync = None if block.original_label else split_inline_sync_label(normalized_view)
     match = _SYNC_METADATA.match(normalized_view)
     dash_credit = _parse_snh_dash_credit(block.original_text)
     unlabeled_credit = _parse_unlabeled_sync_credit(block.original_text)
@@ -2997,6 +3008,14 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         # parts are still extracted below.
         fragment_source = normalized_view
         has_sync_metadata = True
+    elif inline_sync and block.speaker == inline_sync[0]:
+        fragment_source = inline_sync[1]
+        has_sync_metadata = True
+        if not _extract_sync_fragments(fragment_source):
+            # No timecode and no splice: the whole rest is one searchable quote.
+            block.sync_fragments = [SyncFragment(text=fragment_source, timecode_start="")]
+            block.normalized_text = fragment_source
+            return
     elif dash_credit and normalize_marker(block.original_label) == normalize_marker(
         dash_credit["marker"]
     ):

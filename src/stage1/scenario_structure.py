@@ -423,6 +423,44 @@ def detect_technical_cue(text: str) -> str:
     return ""
 
 
+# A paragraph that is *only* a sync label with an interviewee name and no quote:
+# ``Синх Сторожевой``.  It announces the speaker for the paragraph(s) that follow.
+SYNC_LABEL_ONLY_RE = re.compile(
+    r"^\s*(?:Синх|СНХ|Синхрон)\s+"
+    r"([А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)*)\s*$",
+    re.IGNORECASE,
+)
+_SYNC_WORD = r"(?i:Синх|СНХ|Синхрон)"
+# ``Синх СторожевойТо, что...``: the name and the quote are glued; the border is
+# the lower->upper case change inside the word.
+_SYNC_GLUED_RE = re.compile(
+    rf"^\s*{_SYNC_WORD}\s+(?P<name>[А-ЯЁ][а-яё\-]{{2,}}?)(?P<rest>[А-ЯЁ](?![А-ЯЁ]{{2}}).*)$",
+    re.DOTALL,
+)
+# ``Синх Сторожева СКЛ Эльза...`` / ``Синх Сторожева и тогда...``: one capitalised
+# word, then a splice marker or a lower-case word, so the name cannot go further.
+_SYNC_SPACED_RE = re.compile(
+    rf"^\s*{_SYNC_WORD}\s+(?P<name>[А-ЯЁ][а-яё\-]{{2,}})[ \t]+"
+    r"(?P<rest>(?:СКЛ(?:ЕЙКА)?\b|[а-яё]).*)$",
+    re.DOTALL,
+)
+
+
+def split_inline_sync_label(text: str) -> tuple[str, str] | None:
+    """``(name, quote)`` of ``Синх <Имя><цитата>`` written without a separator.
+
+    Only the unambiguous forms are split: the name ends at a lower->upper case
+    change (``СторожевойТо``) or is a single capitalised word followed by a
+    splice marker / lower-case word.  ``Синх Иванов Пётр сказал`` is ambiguous
+    (is ``Пётр`` a part of the name?) and returns ``None``.
+    """
+    for pattern in (_SYNC_GLUED_RE, _SYNC_SPACED_RE):
+        match = pattern.match(text)
+        if match:
+            return match.group("name"), match.group("rest").strip()
+    return None
+
+
 def _number_key(number: str) -> str:
     """``07`` -> ``7``, ``01.010`` -> ``1.10``: components without leading zeros."""
     return re.sub(r"(?<!\d)0+(?=\d)", "", number)

@@ -90,6 +90,10 @@ class NormalizedBlock:
     proposed_memory_rule_id: int | None = None
     continuation_of_type: str = ""
     absorbed_by_uid: str = ""
+    # ``Синх <Имя>`` on its own line: a speaker header that carries no quote.
+    # It only announces the interviewee for the next paragraph and must not
+    # become a timeline segment / search unit of its own.
+    label_only: bool = False
     # UID of the block that opened the LIFE/SYNC/HOST scene this block belongs
     # to (dialogue replies, ``+`` splices, continuations).  Empty for the
     # opening block itself and for blocks outside a scene.  Optional: older

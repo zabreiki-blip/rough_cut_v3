@@ -6,7 +6,12 @@ import wave
 from pathlib import Path
 from typing import Any, Iterable
 
-from stage1.scenario_structure import find_timecodes, iter_timecode_tokens, normalize_timecode_value
+from stage1.scenario_structure import (
+    SYNC_LABEL_ONLY_RE,
+    find_timecodes,
+    iter_timecode_tokens,
+    normalize_timecode_value,
+)
 
 from .models import FullTimeline, TimelineSegment
 
@@ -130,6 +135,23 @@ def _merge_adjacent_sync_fragments(segments: list[TimelineSegment]) -> list[Time
 def sync_fragment_id(block_uid: str, index: int, count: int) -> str:
     """Return a stable match id while preserving legacy ids for one-part blocks."""
     return block_uid if count <= 1 else f"{block_uid}::fragment:{index + 1}"
+
+
+def is_label_only_sync(block: dict) -> bool:
+    """True for a ``Синх <Имя>`` header: speaker context that has no quote of its own.
+
+    Honours the explicit ``label_only`` flag and, for normalizations saved before
+    the flag existed, recognises the same bare header (no fragments, no timecode).
+    """
+    if str(block.get("type") or "").lower() != "sync" or block.get("sync_fragments"):
+        return False
+    if block.get("label_only"):
+        return True
+    return (
+        not str(block.get("timecode_start") or "").strip()
+        and not str(block.get("original_label") or "").strip()
+        and bool(SYNC_LABEL_ONLY_RE.match(str(block.get("original_text") or "").strip()))
+    )
 
 
 def normalized_sync_fragments(block: dict, *, preserve_whole: bool = False) -> list[dict[str, str]]:
@@ -534,6 +556,11 @@ def parse_normalized_timeline(
                     ),
                 )
             )
+            continue
+
+        if is_label_only_sync(block):
+            # Speaker context for the next quote, not a clip: no segment, no
+            # placeholder.
             continue
 
         if block_type in {"sync", "host"}:
