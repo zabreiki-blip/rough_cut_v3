@@ -55,6 +55,9 @@ class TimelineSegment:
     voiceover_kind: str = "tts"
     audio_source_duration_sec: float = 0.0
     audio_source_sha256: str = ""
+    # ``recorded_unavailable``: the block is published as recorded but its audio/range is gone
+    # (it falls back to TTS in a draft; a complete build is blocked).
+    voiceover_problem: str = ""
     # placeholder PNG (generated for SNH)
     placeholder_path: str = ""
     # Text that is actually expected in speech recognition. The canonical

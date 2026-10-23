@@ -119,11 +119,43 @@ def test_readiness_recording_missing_changed_text_and_range(env: Env, tmp_path: 
     assert (row["voice_source"], row["ready"], row["reason"]) == (
         "none",
         False,
-        "recording_missing",
+        "recorded_unavailable",
     )
+    assert row["detail"] == "recording_missing" and row["unavailable"] is True
+    assert voiceover_readiness(env.paths, env.doc, speaker_dir)["unavailable"] == [
+        row["segment_id"]
+    ]
     recording.write_bytes(backup)
     # range beyond recording duration
     published["blocks"][0]["source_out_sec"] = published["recordings"][0]["duration_sec"] + 5
     atomic_write_json(env.paths["recorded_voiceover_published"], published)
     row = voiceover_readiness(env.paths, env.doc, speaker_dir)["blocks"][0]
-    assert (row["ready"], row["reason"]) == (False, "range_invalid")
+    assert (row["ready"], row["reason"], row["detail"]) == (
+        False,
+        "recorded_unavailable",
+        "range_invalid",
+    )
+
+
+def test_unavailable_recorded_block_is_a_complete_build_blocker(env: Env) -> None:
+    from stage2.assembly_plan import validate_plan_complete
+
+    plan = {
+        "items": [
+            {
+                "uid": "b1",
+                "segment_id": "zk1",
+                "type": "zk",
+                "order": 1,
+                "required": True,
+                "status": "ready",
+                "reason": "",
+                "voiceover_problem": "recorded_unavailable",
+                "wav": {"path": "tts.wav", "duration_sec": 2.0, "kind": "tts"},
+            }
+        ]
+    }
+    blockers = validate_plan_complete(plan, path_exists=lambda _path: True)
+    assert [(b["segment_id"], b["reason"]) for b in blockers] == [("zk1", "recorded_unavailable")]
+    plan["items"][0]["voiceover_problem"] = ""  # no problem: the TTS fallback of a draft is fine
+    assert validate_plan_complete(plan, path_exists=lambda _path: True) == []

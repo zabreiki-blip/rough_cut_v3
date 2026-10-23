@@ -4,6 +4,7 @@ import functools
 import io
 import json
 from pathlib import Path
+import threading
 from typing import Any
 import wave
 
@@ -14,6 +15,7 @@ import api_voiceover_routes
 from api_voiceover_jobs import reserve_voiceover_project
 from atomic_io import atomic_write_json
 from voiceover import publish as publish_module
+from voiceover import storage as storage_module
 from voiceover.storage import load_recorded_voiceover, register_recording_file
 
 SENTENCES = [
@@ -450,8 +452,15 @@ def test_crashed_publication_is_rolled_forward(env: Env) -> None:
         env.paths["recorded_voiceover_publish_intent"],
         {"schema_version": 1, "published": published},
     )
-    assert env.state()["published"]["published_sha256"] == published["published_sha256"]
+    # GET only reports the unfinished publication; it never completes it
+    published_state = env.state()["published"]
+    assert published_state["pending_recovery"] is True and published_state["exists"] is False
+    assert env.paths["recorded_voiceover_publish_intent"].exists()
+    # recovery runs under reservation + lock: in apply
+    applied = env.edit("POST", "/apply")
+    assert applied.status_code == 200, applied.get_json()
     assert not env.paths["recorded_voiceover_publish_intent"].exists()
+    assert env.state()["published"]["published_sha256"] == published["published_sha256"]
 
 
 def test_scan_registers_dropped_recording_and_starts_local_alignment(
@@ -461,8 +470,8 @@ def test_scan_registers_dropped_recording_and_starts_local_alignment(
 
     monkeypatch.setattr(
         api.voiceover_jobs,
-        "trigger_voiceover_autodetect",
-        functools.partial(api_voiceover_jobs.trigger_voiceover_autodetect, run_async=False),
+        "autodetect_voiceover",
+        functools.partial(api_voiceover_jobs.autodetect_voiceover, run_async=False),
     )
     empty = env.call("POST", "/scan").get_json()["result"]
     assert empty["job"] is None  # nothing dropped: TTS as before
@@ -472,3 +481,119 @@ def test_scan_registers_dropped_recording_and_starts_local_alignment(
     assert env.calls == 1
     assert [b["range"]["status"] for b in result["state"]["blocks"][:3]] == ["needs_review"] * 3
     assert env.call("POST", "/scan").get_json()["result"]["job"] is None  # registered once
+
+
+def upload(env: Env, payload: bytes, name: str):
+    return env.client.post(
+        BASE + "/source",
+        data={"project": "demo", "audio": (io.BytesIO(payload), name)},
+        content_type="multipart/form-data",
+    )
+
+
+def test_get_never_completes_a_publication_that_is_in_progress(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.register()
+    env.run_job()
+    env.edit("PATCH", "/ranges/b1", status="confirmed")
+    atomic_write_json(env.paths["normalized"], env.doc)
+    real = api_voiceover_routes.publish_recorded_voiceover
+    seen: list[dict] = []
+
+    def publishing(paths, published):
+        atomic_write_json(
+            paths["recorded_voiceover_publish_intent"],
+            {"schema_version": 1, "published": published},
+        )
+        seen.append(env.state()["published"])  # a GET while apply is running
+        assert env.paths["recorded_voiceover_publish_intent"].exists()
+        assert not env.paths["recorded_voiceover_published"].exists()
+        return real(paths, published)
+
+    monkeypatch.setattr(api_voiceover_routes, "publish_recorded_voiceover", publishing)
+    assert env.edit("POST", "/apply").status_code == 200
+    assert seen[0]["pending_recovery"] is True and seen[0]["exists"] is False
+
+
+def test_registration_prepares_outside_the_project_lock(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    free: list[bool] = []
+
+    def convert(source: Path, destination: Path) -> None:
+        def probe() -> None:
+            lock = api._project_transition_lock("demo")
+            free.append(lock.acquire(blocking=False))
+            if free[-1]:
+                lock.release()
+
+        worker = threading.Thread(target=probe)
+        worker.start()
+        worker.join()
+        make_wav(destination, seconds=2.0)
+
+    monkeypatch.setattr(storage_module, "ffmpeg_to_pcm_wav", convert)
+    response = upload(env, b"fake mp3 payload", "voice.mp3")
+    assert response.status_code == 200, response.get_json()
+    assert free == [True]  # ffmpeg ran without the transition lock
+    assert len(load_recorded_voiceover(env.paths)["recordings"]) == 1
+
+
+def test_registration_is_rejected_while_a_voiceover_job_is_active(env: Env) -> None:
+    payload = make_wav(env.paths["input"] / "src.wav", seconds=2.0).read_bytes()
+    assert reserve_voiceover_project(api, "demo")
+    try:
+        response = upload(env, payload, "take.wav")
+        assert response.status_code == 409
+    finally:
+        api._VOICEOVER_RUNTIME.active_projects.discard("demo")
+    assert not list(env.paths["inbox_voiceover"].iterdir())
+    assert load_recorded_voiceover(env.paths)["recordings"] == []
+
+
+def test_uploading_a_registered_recording_again_leaves_no_duplicate(env: Env) -> None:
+    payload = make_wav(env.paths["input"] / "src.wav", seconds=2.0).read_bytes()
+    first = upload(env, payload, "take.wav").get_json()["result"]["recording"]
+    second = upload(env, payload, "copy of take.wav")
+    assert second.status_code == 200
+    assert second.get_json()["result"]["recording"]["id"] == first["id"]
+    assert [p.name for p in env.paths["inbox_voiceover"].iterdir()] == ["take.wav"]
+    assert len(load_recorded_voiceover(env.paths)["recordings"]) == 1
+
+
+def test_scan_without_confirmed_scenario_registers_but_asks_to_confirm(env: Env) -> None:
+    env.doc = None
+    make_wav(env.paths["inbox_voiceover"] / "Закадр.wav")
+    result = env.call("POST", "/scan").get_json()["result"]
+    assert result["job"] is None and result["registered"] == 1
+    assert result["scenario_confirmed"] is False
+    assert "Подтвердите сценарий" in result["message"]
+    assert env.calls == 0 and len(result["state"]["recordings"]) == 1
+
+
+def test_scan_while_a_job_runs_defers_the_new_part(env: Env) -> None:
+    make_wav(env.paths["inbox_voiceover"] / "Закадр.wav")
+    assert reserve_voiceover_project(api, "demo")
+    try:
+        result = env.call("POST", "/scan").get_json()["result"]
+    finally:
+        api._VOICEOVER_RUNTIME.active_projects.discard("demo")
+    assert result["pending"] is True and result["job"] is None and result["registered"] == 0
+    assert load_recorded_voiceover(env.paths)["recordings"] == []
+
+
+def test_patch_loses_to_a_concurrent_save_with_409(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.register()
+    env.run_job()
+    real = api_voiceover_routes.save_recorded_voiceover
+
+    def raced(paths, data, **kwargs):
+        real(paths, load_recorded_voiceover(paths))  # someone else saved after our read
+        return real(paths, data, **kwargs)
+
+    monkeypatch.setattr(api_voiceover_routes, "save_recorded_voiceover", raced)
+    response = env.edit("PATCH", "/ranges/b1", status="confirmed")
+    assert response.status_code == 409

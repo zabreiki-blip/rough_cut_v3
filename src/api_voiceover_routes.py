@@ -41,9 +41,15 @@ from voiceover.publish import (
     recover_publication,
     tts_available_uids,
 )
+from voiceover.models import RecordingSource
 from voiceover.storage import (
+    PreparedRecording,
+    StaleMapError,
+    commit_prepared_recording,
+    discard_prepared_recording,
     load_recorded_voiceover,
-    register_recording_file,
+    prepare_recording_file,
+    prepare_voiceover_scan,
     safe_project_file,
     save_recorded_voiceover,
 )
@@ -171,7 +177,7 @@ def _block_view(block: Any, item: Mapping | None, tts: set[str]) -> dict[str, An
 def _state(
     services: ModuleType, project: str, paths: Mapping[str, Path], document: Mapping | None
 ) -> dict[str, Any]:
-    recover_publication(paths)
+    # Read-only: finishing an interrupted publication is done under reservation + lock.
     data = load_recorded_voiceover(paths)
     published = load_published(paths)
     tts = tts_available_uids(paths)
@@ -196,6 +202,7 @@ def _state(
         "recordings": data["recordings"],
         "blocks": blocks,
         "published": {
+            "pending_recovery": Path(paths["recorded_voiceover_publish_intent"]).is_file(),
             "exists": bool(published),
             "published_sha256": published.get("published_sha256", ""),
             "published_generation": published.get("published_generation", 0),
@@ -236,38 +243,38 @@ def _source_upload(services: ModuleType):
     paths = services._ensure_project(project)
     inbox_id = (form.get("inbox_file_id") or request.args.get("inbox_file_id") or "").strip()
     uploaded = request.files.get("audio") or request.files.get("file")
-    with services._project_transition_lock(project):
-        if inbox_id:
-            return _register_inbox_file(services, project, paths, inbox_id)
-        if uploaded is None or not uploaded.filename:
-            raise _fail(services, "multipart field 'audio' or 'inbox_file_id' is required", 400)
-        suffix = Path(uploaded.filename).suffix.lower()
-        if suffix not in ALLOWED_SOURCE_SUFFIXES:
-            raise _fail(services, "recording must be a WAV or MP3 file", 415)
-        max_bytes = int(
-            services.app.config.get("SYNC_AUDIO_MAX_BYTES")
-            or os.getenv("SYNC_AUDIO_MAX_BYTES")
-            or 4 * 1024 * 1024 * 1024
-        )
-        if request.content_length is not None and request.content_length > max_bytes:
-            raise _fail(services, "audio upload is too large", 413)
-        folder = Path(paths["inbox_voiceover"])
-        folder.mkdir(parents=True, exist_ok=True)
-        services._cleanup_stale_uploads(folder)
-        final = folder / _clean_upload_name(uploaded.filename, suffix)
-        if final.exists():
-            final = final.with_name(f"{final.stem}-{uuid.uuid4().hex[:6]}{suffix}")
-        temporary = final.with_name(f".{final.name}.{uuid.uuid4().hex}.upload")
-        try:
-            services._copy_stream_limited(uploaded.stream, temporary, max_bytes)
-            os.replace(temporary, final)
-        except services.AudioUploadTooLargeError as exc:
-            temporary.unlink(missing_ok=True)
-            raise _fail(services, str(exc), 413) from exc
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-        return _register_file(services, project, paths, final, remove_on_error=True)
+    # Copying, hashing and ffmpeg run before the project lock; it is held only to register.
+    if inbox_id:
+        return _register_inbox_file(services, project, paths, inbox_id)
+    if uploaded is None or not uploaded.filename:
+        raise _fail(services, "multipart field 'audio' or 'inbox_file_id' is required", 400)
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in ALLOWED_SOURCE_SUFFIXES:
+        raise _fail(services, "recording must be a WAV or MP3 file", 415)
+    max_bytes = int(
+        services.app.config.get("SYNC_AUDIO_MAX_BYTES")
+        or os.getenv("SYNC_AUDIO_MAX_BYTES")
+        or 4 * 1024 * 1024 * 1024
+    )
+    if request.content_length is not None and request.content_length > max_bytes:
+        raise _fail(services, "audio upload is too large", 413)
+    folder = Path(paths["inbox_voiceover"])
+    folder.mkdir(parents=True, exist_ok=True)
+    services._cleanup_stale_uploads(folder)
+    final = folder / _clean_upload_name(uploaded.filename, suffix)
+    if final.exists():
+        final = final.with_name(f"{final.stem}-{uuid.uuid4().hex[:6]}{suffix}")
+    temporary = final.with_name(f".{final.name}.{uuid.uuid4().hex}.upload")
+    try:
+        services._copy_stream_limited(uploaded.stream, temporary, max_bytes)
+        os.replace(temporary, final)
+    except services.AudioUploadTooLargeError as exc:
+        temporary.unlink(missing_ok=True)
+        raise _fail(services, str(exc), 413) from exc
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return _register_file(services, project, paths, final, uploaded_copy=True)
 
 
 def _register_inbox_file(services: ModuleType, project: str, paths, inbox_id: str):
@@ -280,15 +287,40 @@ def _register_inbox_file(services: ModuleType, project: str, paths, inbox_id: st
 
 
 def _register_file(
-    services: ModuleType, project: str, paths, file: Path, *, remove_on_error: bool = False
+    services: ModuleType, project: str, paths, file: Path, *, uploaded_copy: bool = False
 ):
+    """Prepare outside the lock, then register under it (not while a job is active).
+
+    ``uploaded_copy`` is a file that this request just wrote into the drop folder: it
+    is removed when the request fails or the recording is already registered.
+    """
+
+    prepared: PreparedRecording | RecordingSource | None = None
     try:
-        recording = register_recording_file(paths, file)
-    except Exception as exc:  # unreadable/non-PCM/ffmpeg failure/wave.Error
-        if remove_on_error:
+        try:
+            prepared = prepare_recording_file(paths, file)
+        except Exception as exc:  # unreadable/non-PCM/ffmpeg failure/wave.Error
+            raise _fail(services, f"invalid recording: {exc}", 415) from exc
+        with services._project_transition_lock(project):
+            if _recognition_running(services, project):
+                raise _fail(services, "recognition or publication is running; try again later", 409)
+            if isinstance(prepared, RecordingSource):
+                recording = prepared
+                if uploaded_copy:  # the same content is already registered: no duplicate
+                    file.unlink(missing_ok=True)
+            else:
+                try:
+                    recording = commit_prepared_recording(paths, prepared)
+                except Exception as exc:
+                    raise _fail(services, f"invalid recording: {exc}", 415) from exc
+            return _source_response(services, project, paths, recording)
+    except BaseException:
+        if uploaded_copy:
             file.unlink(missing_ok=True)
-        raise _fail(services, f"invalid recording: {exc}", 415) from exc
-    return _source_response(services, project, paths, recording)
+        raise
+    finally:
+        if isinstance(prepared, PreparedRecording):
+            discard_prepared_recording(prepared)  # no-op once committed
 
 
 def _jobs_start(services: ModuleType):
@@ -303,6 +335,7 @@ def _jobs_start(services: ModuleType):
         if not reserve_voiceover_project(services, project):
             raise _fail(services, f"another project task is active for {project}", 409)
         try:
+            recover_publication(paths)
             job = create_voiceover_job(services, project, document)
             _start_worker(
                 run_voiceover_job,
@@ -333,17 +366,32 @@ def _scan(services: ModuleType):
     payload = _payload(services)
     project = _project_of(services, payload.get("project"))
     paths = services._ensure_project(project)
-    with services._project_transition_lock(project):
-        document, _reason = services._confirmed_normalization(project)
-        if "expected_revision_id" in payload and document is not None:
-            _check_revision(services, payload, document)
-        job = services._trigger_voiceover_autodetect(project, document)
+    prepared = prepare_voiceover_scan(paths)  # hashing/copy/ffmpeg outside the lock
+    try:
+        with services._project_transition_lock(project):
+            document, _reason = services._confirmed_normalization(project)
+            if "expected_revision_id" in payload and document is not None:
+                _check_revision(services, payload, document)
+            outcome = services._autodetect_voiceover(project, document, prepared)
+            state = _state(services, project, paths, document)
+    finally:
+        for item in prepared:
+            discard_prepared_recording(item)  # no-op for the committed ones
+    message = ""
+    if outcome.pending:
+        message = "Идёт распознавание: новая запись будет обработана после его завершения."
+    elif outcome.registered and not outcome.scenario_confirmed:
+        message = "Запись зарегистрирована. Подтвердите сценарий, чтобы запустить распознавание."
     return jsonify(
         {
             "ok": True,
             "result": {
-                "job": job,
-                "state": _state(services, project, paths, document),
+                "job": outcome.job,
+                "registered": len(outcome.registered),
+                "pending": outcome.pending,
+                "scenario_confirmed": outcome.scenario_confirmed,
+                "message": message,
+                "state": state,
             },
         }
     )
@@ -390,6 +438,7 @@ def _locked_edit(services: ModuleType, project: str, paths, document, payload):
 
     if _recognition_running(services, project):
         raise _fail(services, "recognition or publication is running; try again later", 409)
+    recover_publication(paths)  # nothing is publishing here: no reservation is active
     data = load_recorded_voiceover(paths)
     _check_generation(services, payload, data)
     _check_draft_revision(services, data, document)
@@ -445,7 +494,12 @@ def _commit_range(
     data["ranges"] = ranges
     if not data.get("scenario_revision_id"):
         data["scenario_revision_id"] = str(document.get("scenario_revision_id") or "")
-    saved = save_recorded_voiceover(paths, data)  # bumps the generation
+    try:
+        saved = save_recorded_voiceover(paths, data, expected_generation=data["generation"])
+    except StaleMapError as exc:
+        raise _fail(
+            services, "markup changed since it was loaded (generation mismatch)", 409
+        ) from exc
     return {"range": result, "generation": saved["generation"]}
 
 

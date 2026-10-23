@@ -673,6 +673,9 @@ def parse_normalized_timeline(
                 "block_uid": block_uid,
                 "revision_status": revision_status,
                 "spoken_text": spoken,
+                "voiceover_problem": (
+                    "recorded_unavailable" if choice.reason == "recorded_unavailable" else ""
+                ),
             }
             if choice.kind == "recorded" and choice.path is not None:
                 segments.append(
@@ -691,9 +694,7 @@ def parse_normalized_timeline(
                     )
                 )
             elif choice.kind == "none":
-                segments.append(
-                    TimelineSegment(**common, duration_sec=0.0, voiceover_kind="none")
-                )
+                segments.append(TimelineSegment(**common, duration_sec=0.0, voiceover_kind="none"))
             else:
                 segments.append(
                     TimelineSegment(

@@ -79,6 +79,9 @@ def _number(value: object) -> float | None:
     return float(value)
 
 
+RECORDED_UNAVAILABLE = "recorded_unavailable"
+
+
 @dataclass(frozen=True)
 class VoiceoverChoice:
     kind: str  # recorded | tts | none
@@ -91,6 +94,7 @@ class VoiceoverChoice:
     speech_out_sec: float = 0.0
     audio_source_duration_sec: float = 0.0
     audio_source_sha256: str = ""
+    detail: str = ""  # why a published recorded range cannot be used (reason is then unavailable)
 
 
 def resolve_voiceover(
@@ -132,22 +136,23 @@ def resolve_voiceover(
         None,
     )
     path = files.get(recording_id)
+    # A confirmed recorded block whose audio vanished is a build problem, not a silent TTS.
     if recording is None or path is None:
-        return VoiceoverChoice(fallback, "recording_unknown")
+        return VoiceoverChoice(fallback, RECORDED_UNAVAILABLE, detail="recording_unknown")
     if not path.is_file():
-        return VoiceoverChoice(fallback, "recording_missing")
+        return VoiceoverChoice(fallback, RECORDED_UNAVAILABLE, detail="recording_missing")
     duration = _number(recording.get("duration_sec"))
     values = [
         _number(entry.get(key))
         for key in ("source_in_sec", "source_out_sec", "speech_in_sec", "speech_out_sec")
     ]
     if duration is None or any(value is None for value in values):
-        return VoiceoverChoice(fallback, "range_invalid")
+        return VoiceoverChoice(fallback, RECORDED_UNAVAILABLE, detail="range_invalid")
     source_in, source_out, speech_in, speech_out = (
         float(value) for value in values if value is not None
     )
     if not 0 <= source_in < source_out <= duration + RANGE_EPS:
-        return VoiceoverChoice(fallback, "range_invalid")
+        return VoiceoverChoice(fallback, RECORDED_UNAVAILABLE, detail="range_invalid")
     return VoiceoverChoice(
         "recorded",
         "confirmed",
@@ -208,6 +213,8 @@ def voiceover_readiness(
                 "block_uid": str(block.get("uid") or "").strip(),
                 "voice_source": choice.kind,
                 "reason": choice.reason,
+                "detail": choice.detail,
+                "unavailable": choice.reason == RECORDED_UNAVAILABLE,
                 "ready": choice.kind in {"recorded", "tts"}
                 and (choice.kind == "recorded" or has_tts),
                 "has_tts": has_tts,
@@ -219,5 +226,7 @@ def voiceover_readiness(
         "ready": sum(1 for row in rows if row["ready"]),
         "recorded": sum(1 for row in rows if row["voice_source"] == "recorded"),
         "missing": [row["segment_id"] for row in rows if not row["ready"]],
+        # Recorded blocks whose audio/range is gone: TTS in a draft, a blocker when complete.
+        "unavailable": [row["segment_id"] for row in rows if row["unavailable"]],
         "published_sha256": published_fingerprint(published),
     }

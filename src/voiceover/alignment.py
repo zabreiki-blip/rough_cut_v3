@@ -269,6 +269,33 @@ def _restart_prefix(
     return None
 
 
+def _gap_belongs_to_next_blocks(
+    blocks: Sequence[_Block],
+    position: int,
+    stream: _Stream,
+    last: _Reading,
+    again: _Reading,
+) -> bool:
+    """True when the filler between two readings is read text of a following block."""
+
+    if again.start <= last.end + 1:
+        return False
+    for follower in blocks[position + 1 : position + 4]:
+        if not follower.tokens:
+            continue
+        found, _ = _find(
+            follower.tokens,
+            stream,
+            last.end + 1,
+            again.start,
+            margin=0.0,
+            minimum=FOUND_MIN_COVERAGE,
+        )
+        if found is not None and found.start < again.start:
+            return True
+    return False
+
+
 def _align_part(
     blocks: Sequence[_Block],
     first_block: int,
@@ -305,7 +332,9 @@ def _align_part(
         prefix = _restart_prefix(tokens, stream, best, cursor)
         readings = [best]
         # Identical neighbouring texts: every reading belongs to its own block.
-        if following is None or following.tokens != tokens:
+        # A later (non-adjacent) block with the same text owns the next reading too.
+        repeated_later = any(item.tokens == tokens for item in blocks[position + 1 :])
+        if not repeated_later:
             slack = 3 + size // 10  # filler words allowed between two readings
             while True:
                 last = readings[-1]
@@ -327,6 +356,8 @@ def _align_part(
                         and rival.coverage >= again.coverage - 0.1
                     ):
                         break  # this reading fits the next block, not a duplicate
+                if _gap_belongs_to_next_blocks(blocks, position, stream, last, again):
+                    break  # the tokens in between are the following block(s)
                 readings.append(again)
         end = readings[-1].end
         ambiguous = any(
@@ -366,6 +397,9 @@ class _Item:
     source_in: float = 0.0
     source_out: float = 0.0
     key: tuple[int, int] = (0, 0)  # (block position, item number)
+    first_token: int = -1  # stream token span of the interval (-1: unknown)
+    last_token: int = -1
+    near_foreign: bool = False  # padding was cut by speech that belongs to no block
 
 
 def _speech(stream: _Stream, first: int, last: int) -> tuple[float, float]:
@@ -374,10 +408,21 @@ def _speech(stream: _Stream, first: int, last: int) -> tuple[float, float]:
     return start, end
 
 
-def _pad(items: list[_Item], duration: float, config: MatcherConfig) -> None:
-    """Head/tail padding clamped to the middle of the pause towards the neighbours."""
+def _pad(
+    items: list[_Item], duration: float, config: MatcherConfig, stream: _Stream | None = None
+) -> None:
+    """Head/tail padding clamped to the middle of the pause towards the neighbours.
+
+    Words of the recording that belong to no found interval (a skipped or misplaced
+    block) also limit the padding, so unmarked speech never leaks into a range.
+    """
 
     items.sort(key=lambda item: (item.speech_in, item.speech_out))
+    covered = bytearray(len(stream.starts) if stream is not None else 0)
+    for item in items:
+        for token in range(max(item.first_token, 0), item.last_token + 1):
+            if token < len(covered):
+                covered[token] = 1
     for index, item in enumerate(items):
         low = 0.0
         if index > 0:
@@ -385,6 +430,23 @@ def _pad(items: list[_Item], duration: float, config: MatcherConfig) -> None:
         high = duration
         if index + 1 < len(items):
             high = (item.speech_out + items[index + 1].speech_in) / 2
+        if stream is not None and item.first_token >= 0:
+            before = next((t for t in range(item.first_token - 1, -1, -1) if not covered[t]), None)
+            if before is not None and stream.ends[before] <= item.speech_in:
+                cut = (stream.ends[before] + item.speech_in) / 2
+                if cut > low:
+                    low = cut
+                if cut > item.speech_in - config.head_padding_sec:
+                    item.near_foreign = True
+            after = next(
+                (t for t in range(item.last_token + 1, len(covered)) if not covered[t]), None
+            )
+            if after is not None and stream.starts[after] >= item.speech_out:
+                cut = (item.speech_out + stream.starts[after]) / 2
+                if cut < high:
+                    high = cut
+                if cut < item.speech_out + config.tail_padding_sec:
+                    item.near_foreign = True
         item.source_in = min(
             max(item.speech_in - config.head_padding_sec, low, 0.0), item.speech_in
         )
@@ -460,12 +522,22 @@ def align_voiceover(
     for position, (part_number, result) in found.items():
         stream = streams[part_number]
         reading_items = [
-            _Item(*_speech(stream, item.start, item.end), key=(position, number))
+            _Item(
+                *_speech(stream, item.start, item.end),
+                key=(position, number),
+                first_token=item.start,
+                last_token=item.end,
+            )
             for number, item in enumerate(result.readings)
         ]
         prefix_item = None
         if result.prefix is not None:
-            prefix_item = _Item(*_speech(stream, *result.prefix), key=(position, -1))
+            prefix_item = _Item(
+                *_speech(stream, *result.prefix),
+                key=(position, -1),
+                first_token=result.prefix[0],
+                last_token=result.prefix[1],
+            )
         full = [item for item in result.readings if not item.partial]
         if full:
             chosen = reading_items[result.readings.index(full[-1])]
@@ -478,7 +550,7 @@ def align_voiceover(
         block_items[position] = (reading_items, prefix_item, chosen)
     # Padding is computed over all intervals of a recording at once.
     for part_number, items in items_by_part.items():
-        _pad(items, streams[part_number].duration_sec, cfg)
+        _pad(items, streams[part_number].duration_sec, cfg, streams[part_number])
     for position, (reading_items, prefix_item, chosen) in block_items.items():
         if chosen.key[1] == -2:  # merged span of partial readings only
             chosen.source_in = reading_items[0].source_in
@@ -514,6 +586,8 @@ def align_voiceover(
             notes.append("частичный дубль")
         if result.ambiguous:
             notes.append("неоднозначное совпадение")
+        if any(item.near_foreign for item in reading_items):
+            notes.append("рядом нераспознанная речь")
         if result.confidence < LOW_CONFIDENCE:
             notes.append("низкая уверенность")
         takes: list[Take] = []

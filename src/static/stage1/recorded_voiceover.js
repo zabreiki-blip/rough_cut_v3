@@ -168,6 +168,9 @@ export function renderBlocksHtml(state) {
       const disabled = block.tts_available ? "" : ' disabled title="Для блока нет TTS-аудио"';
       buttons.push(`<button type="button" class="btn btn-sm" data-rv-action="use-tts"${disabled}>Использовать TTS</button>`);
     }
+    if (source !== "none" || (range && range.voice_source !== "none")) {
+      buttons.push('<button type="button" class="btn btn-sm" data-rv-action="use-none">Без озвучки</button>');
+    }
     let html = `<tr class="rv-row" data-uid="${uid}" data-recording="${escaped(range ? range.recording_id : "")}">`
       + `<td>${index + 1}</td>`
       + `<td class="rv-text">${escaped(block.display_text)}</td>`
@@ -313,6 +316,9 @@ export async function scanRecordedInbox({ now = Date.now } = {}) {
     setText(ids.rv_notice, "Найдена запись диктора — идёт сопоставление");
     if (ids.rv_notice) ids.rv_notice.hidden = false;
     setVoiceMode("recorded");
+  } else if (result.message) {
+    setText(ids.rv_notice, result.message);
+    if (ids.rv_notice) ids.rv_notice.hidden = false;
   }
   return result;
 }
@@ -384,7 +390,23 @@ export function setBlockVoiceSource(uid, source) {
   });
 }
 
+// Short summary of what the publication will do, per block: Диктор / TTS / нет.
+export function applySummaryText(state) {
+  const counts = { recorded: 0, tts: 0, none: 0 };
+  for (const block of (state && state.blocks) || []) {
+    const source = block.publish_preview ? block.publish_preview.voice_source : "none";
+    counts[source in counts ? source : "none"] += 1;
+  }
+  return `${SOURCE_LABELS.recorded}: ${counts.recorded}, ${SOURCE_LABELS.tts}: ${counts.tts}, ${SOURCE_LABELS.none}: ${counts.none}`;
+}
+
+function askConfirm(text) {
+  const ask = typeof globalThis.confirm === "function" ? globalThis.confirm.bind(globalThis) : null;
+  return ask ? Boolean(ask(text)) : true; // no dialogs outside of a browser
+}
+
 export async function applyRecording() {
+  if (!askConfirm(`Применить запись диктора к редакции?\n${applySummaryText(rvState)}`)) return false;
   let summary = null;
   const ok = await mutate(async () => {
     summary = await requestJSON(`${BASE}/apply`, "POST", guard());
@@ -511,6 +533,8 @@ function onBlocksClick(event) {
     safely(() => setBlockVoiceSource(uid, "tts"));
   } else if (action === "use-recorded") {
     safely(() => setBlockVoiceSource(uid, "recorded"));
+  } else if (action === "use-none") {
+    safely(() => setBlockVoiceSource(uid, "none"));
   }
 }
 

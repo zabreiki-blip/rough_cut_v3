@@ -10,7 +10,9 @@ import wave
 import pytest
 
 from atomic_io import atomic_write_json
+import api_voiceover_jobs
 from api_voiceover_jobs import (
+    autodetect_voiceover,
     cancel_voiceover_job,
     create_voiceover_job,
     local_asr_backend,
@@ -167,8 +169,8 @@ def test_asr_cache_is_reused_and_independent_of_scenario_text(paths: dict[str, P
     cache_dir = paths["recorded_voiceover_asr"]
     assert len(list(cache_dir.glob("*.json"))) == 1
     assert asr_cache_path(
-        paths, recording.sha256, {"backend": "auto", "model": "", "language": "ru"}
-    ).exists()
+        paths, recording.sha256, {"backend": "faster-whisper", "model": "", "language": "ru"}
+    ).exists()  # the engine that really ran, not the requested "auto"
     ranges = {item["block_uid"]: item for item in load_recorded_voiceover(paths)["ranges"]}
     assert ranges["b1"]["status"] == "needs_review"
     assert ranges["b2"]["status"] == "missing"
@@ -320,3 +322,56 @@ def test_autodetect_without_new_file_or_scenario_does_nothing(paths: dict[str, P
         is None
     )
     assert asr.calls == []
+
+
+def test_asr_cache_key_follows_the_resolved_engine(
+    paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register(paths)
+    asr = FakeAsr(asr_payload(*SENTENCES))
+    services = make_services(paths, asr)
+    engine = {"name": "mlx-whisper"}
+    monkeypatch.setattr(api_voiceover_jobs, "resolve_backend", lambda _requested: engine["name"])
+
+    run_job(services, paths, scenario(*SENTENCES))
+    run_job(services, paths, scenario(*SENTENCES))
+    assert len(asr.calls) == 1  # same engine: cached
+    engine["name"] = "faster-whisper"  # "auto" now resolves to another engine
+    run_job(services, paths, scenario(*SENTENCES))
+    assert len(asr.calls) == 2
+    assert len(list(paths["recorded_voiceover_asr"].glob("*.json"))) == 2
+
+
+def test_new_part_during_a_job_is_picked_up_after_it_finishes(paths: dict[str, Path]) -> None:
+    first = register(paths, "часть 1.wav")
+    asr = FakeAsr(asr_payload(*SENTENCES))
+    services = make_services(paths, asr)
+    doc = scenario(*SENTENCES)
+    assert api_voiceover_jobs.reserve_voiceover_project(services, "demo")
+    job = create_voiceover_job(services, "demo", doc)
+    make_wav(paths["inbox_voiceover"] / "часть 2.wav", seconds=70.0)
+
+    busy = autodetect_voiceover(services, "demo", doc, run_async=False)
+
+    assert busy.job is None and busy.pending is True
+    assert [r["id"] for r in load_recorded_voiceover(paths)["recordings"]] == [first.id]
+    run_voiceover_job(services, job_id=job["id"], project="demo", normalization=doc)
+
+    assert len(load_recorded_voiceover(paths)["recordings"]) == 2
+    statuses = sorted(item["status"] for item in services._VOICEOVER_RUNTIME.jobs.values())
+    assert statuses == ["completed", "completed"]
+    assert "demo" not in services._VOICEOVER_RUNTIME.active_projects
+
+
+def test_autodetect_requires_a_confirmed_scenario(paths: dict[str, Path]) -> None:
+    make_wav(paths["inbox_voiceover"] / "запись.wav")
+    asr = FakeAsr(asr_payload(*SENTENCES))
+    services = make_services(paths, asr)
+    draft = {**scenario(*SENTENCES), "status": "draft"}
+    atomic_write_json(paths["normalized"], draft)  # nothing passed explicitly: the file is read
+
+    result = autodetect_voiceover(services, "demo", None, run_async=False)
+
+    assert result.job is None and result.scenario_confirmed is False
+    assert len(result.registered) == 1 and asr.calls == []
+    assert "demo" not in services._VOICEOVER_RUNTIME.active_projects

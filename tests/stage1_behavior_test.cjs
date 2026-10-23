@@ -2619,6 +2619,39 @@ async function testRecordedApplyButton({ state }) {
   });
 }
 
+async function testRecordedNoVoiceoverAndApplyConfirm() {
+  const originalConfirm = globalThis.confirm;
+  try {
+    await withRvFetch({
+      [`PATCH ${RV}/blocks/b1/voice-source`]: { result: { range: {}, generation: 8 } },
+      [`POST ${RV}/apply`]: { result: { published_sha256: "abc", summary: { recorded: 1 } } },
+      [`GET ${RV}`]: { result: rvFixture({ generation: 8 }) },
+      "GET /stage1/status": { result: {} },
+    }, async (rv, mock) => {
+      rv.setRecordedState(rvFixture());
+      const html = rv.renderBlocksHtml(rv.getRecordedState());
+      assert.ok(html.includes('data-rv-action="use-none"') && html.includes("Без озвучки"));
+      assert.strictEqual(await rv.setBlockVoiceSource("b1", "none"), true);
+      const patch = mock.calls.find((call) => call.method === "PATCH");
+      assert.strictEqual(patch.body.voice_source, "none");
+
+      rv.setRecordedState(rvFixture());
+      assert.strictEqual(rv.applySummaryText(rvFixture()), "Диктор: 1, TTS: 1, нет: 1");
+      const asked = [];
+      globalThis.confirm = (text) => { asked.push(text); return false; };
+      assert.strictEqual(await rv.applyRecording(), false);
+      assert.strictEqual(asked.length, 1);
+      assert.ok(asked[0].includes("Диктор: 1") && asked[0].includes("TTS: 1") && asked[0].includes("нет: 1"), asked[0]);
+      assert.ok(!mock.calls.some((call) => call.path === `${RV}/apply`), "declined dialog must not publish");
+      globalThis.confirm = () => true;
+      assert.strictEqual(await rv.applyRecording(), true);
+      assert.ok(mock.calls.some((call) => call.method === "POST" && call.path === `${RV}/apply`));
+    });
+  } finally {
+    if (originalConfirm === undefined) delete globalThis.confirm; else globalThis.confirm = originalConfirm;
+  }
+}
+
 async function testRecordedLoudnessWarning({ state }) {
   const { ids } = state;
   const rv = await recordedModule();
@@ -2731,6 +2764,7 @@ async function main() {
     ["testRecordedTtsOverride", () => testRecordedTtsOverride(modules)],
     ["testRecordedStaleConflict", () => testRecordedStaleConflict(modules)],
     ["testRecordedApplyButton", () => testRecordedApplyButton(modules)],
+    ["testRecordedNoVoiceoverAndApplyConfirm", () => testRecordedNoVoiceoverAndApplyConfirm()],
     ["testRecordedLoudnessWarning", () => testRecordedLoudnessWarning(modules)],
     ["testRecordedEscaping", () => testRecordedEscaping(modules)],
     ["testRecordedPlayerStopsAtOut", () => testRecordedPlayerStopsAtOut(modules)],

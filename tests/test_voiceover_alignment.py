@@ -410,3 +410,50 @@ def test_long_recording_aligns_in_reasonable_time() -> None:
     assert all(item.status == "needs_review" for item in ranges)
     for item, (start, _end) in zip(ranges, expected, strict=True):
         assert item.speech_in_sec == pytest.approx(start, abs=0.01)
+
+
+def test_filler_between_readings_that_is_the_next_block_is_not_a_duplicate() -> None:
+    first = "Сегодня мы расскажем всё"
+    second = "Мост строили годами"
+    doc = scenario(("voiceover", first), ("voiceover", second), ("voiceover", first))
+    rec = Recording()
+    rec.say(first, pause=0.0)
+    rec.say(second, pause=0.0)
+    rec.say(first, pause=0.0)
+
+    result = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert all(item.status != "missing" for item in result.values())
+    assert "дубли" not in result["b1"].note and result["b1"].takes == ()
+    assert result["b1"].speech_out_sec < result["b2"].speech_in_sec < result["b3"].speech_in_sec
+
+
+def test_unmarked_speech_of_a_skipped_block_is_not_padded_into_neighbour() -> None:
+    a, b, c = SENTENCES[0], SENTENCES[1], SENTENCES[2]
+    doc = scenario(("voiceover", a), ("voiceover", b), ("voiceover", c))
+    rec = Recording()
+    rec.say(a)
+    rec.say(c, pause=0.3)
+    rec.say(b, pause=0.3)  # read out of order: found after c, the cursor has moved on
+
+    result = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    found = [item for item in result.values() if item.status != "missing"]
+    spans = sorted((item.source_in_sec, item.source_out_sec, item.block_uid) for item in found)
+    words = rec.words
+    for item in found:
+        own = [
+            w
+            for w in words
+            if item.speech_in_sec - 1e-6 <= w.start and w.end <= item.speech_out_sec + 1e-6
+        ]
+        foreign = [
+            w
+            for w in words
+            if w not in own and item.source_in_sec < w.end and w.start < item.source_out_sec
+        ]
+        assert not foreign, (item.block_uid, spans)

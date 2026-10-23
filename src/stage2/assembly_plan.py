@@ -118,6 +118,11 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
             "source_sha256": str(segment.get("audio_source_sha256") or "") if recorded else None,
         },
         "placeholder": {"path": str(segment.get("placeholder_path") or "")},
+        **(
+            {"voiceover_problem": str(segment["voiceover_problem"])}
+            if seg_type == "zk" and segment.get("voiceover_problem")
+            else {}
+        ),
         "provenance": {
             "match_status": str(segment.get("match_status") or ""),
             "confidence": _num(segment.get("match_confidence")),
@@ -220,6 +225,14 @@ def validate_plan_complete(
     for item in sorted(items, key=lambda entry: int(entry.get("order") or 0)):
         found: list[tuple[str, str]] = []
         item_type = str(item.get("type") or "")
+        if item.get("voiceover_problem"):
+            # Draft: TTS fallback with a warning; complete: the recording is gone.
+            found.append(
+                (
+                    str(item["voiceover_problem"]),
+                    "recorded voiceover is unavailable (file or range)",
+                )
+            )
         if item.get("required") and item.get("status") != "ready":
             reason = str(item.get("reason") or item.get("status") or "not_ready")
             found.append((reason, f"status={item.get('status')}"))

@@ -9,6 +9,8 @@ active voiceover here, and the paid cloud ASR backend is never used.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -21,14 +23,18 @@ from job_runtime import asr_slot, get_job, release_project, reserve_project, tri
 from stage2.sync_models import WordIndex
 from stage2.sync_transcript import ingest_word_index
 from stage2.whisper_process import WhisperCancelledError
+from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from voiceover.alignment import PartIndex, align_voiceover
 from voiceover.models import RecordingSource
 from voiceover.storage import (
+    PreparedRecording,
     asr_cache_path,
+    commit_prepared_scan,
+    discard_prepared_recording,
     load_recorded_voiceover,
+    prepare_voiceover_scan,
     safe_project_file,
-    save_recorded_voiceover,
-    scan_recorded_voiceover,
+    update_recorded_voiceover,
 )
 
 VOICEOVER_JOBS_MAX = 100
@@ -246,7 +252,12 @@ def run_voiceover_job(
         paths = services._project_paths(project)
         backend = str(job.get("asr_backend") or local_asr_backend())
         model = os.getenv("SYNC_WHISPER_MODEL", "").strip()
-        config = _asr_config(backend, model, language)
+        # The cache key holds the engine that really runs, not the requested "auto".
+        try:
+            effective_backend = resolve_backend(backend)
+        except (WhisperUnavailableError, ValueError):
+            effective_backend = backend
+        config = _asr_config(effective_backend, model, language)
         data = load_recorded_voiceover(paths)
         by_id = {item["id"]: item for item in data["recordings"]}
         sources: list[RecordingSource] = []
@@ -309,10 +320,9 @@ def run_voiceover_job(
             "with_duplicates": sum(bool(item["takes"]) for item in proposals),
         }
 
-        # Cancellation and the draft-map commit share one boundary.
-        with runtime.lock:
-            check_stop()
-            current = load_recorded_voiceover(paths)
+        # Cancellation and the draft-map commit share one boundary; the map itself is
+        # re-read and written under the map lock (shared with recording registration).
+        def commit(current: dict[str, Any]) -> None:
             current_ids = {item["id"]: item["sha256"] for item in current["recordings"]}
             if any(
                 current_ids.get(rid) != job["recording_sha256"][rid] for rid in job["recording_ids"]
@@ -321,7 +331,10 @@ def run_voiceover_job(
             current["ranges"] = _merge_ranges(current["ranges"], proposals)
             current["scenario_revision_id"] = job.get("scenario_revision_id", "")
             current["normalization_version"] = job.get("normalization_version", 1)
-            save_recorded_voiceover(paths, current)
+
+        with runtime.lock:
+            check_stop()
+            update_recorded_voiceover(paths, commit)
         update_voiceover_job(
             services,
             job_id,
@@ -354,6 +367,7 @@ def run_voiceover_job(
         with runtime.lock:
             runtime.cancel_events.pop(job_id, None)
         release_voiceover_project(services, project)
+        _retrigger_pending(services, project, normalization)
 
 
 def _transcribe(
@@ -396,34 +410,88 @@ def _transcribe(
         )
 
 
-def trigger_voiceover_autodetect(
+@dataclass
+class AutodetectResult:
+    """Outcome of a scan of ``ЗАГРУЗИТЬ/Закадр/``."""
+
+    job: dict[str, Any] | None = None
+    registered: list[Any] = field(default_factory=list)
+    pending: bool = False  # a voiceover job runs: the new files wait for its end
+    scenario_confirmed: bool = False
+
+
+def _pending_set(services: VoiceoverJobServices) -> set[str]:
+    runtime = services._VOICEOVER_RUNTIME
+    pending = getattr(runtime, "pending_autodetect", None)
+    if pending is None:
+        pending = set()
+        runtime.pending_autodetect = pending  # type: ignore[attr-defined]
+    return pending
+
+
+def _confirmed_scenario(
+    services: VoiceoverJobServices, project: str, explicit: Mapping[str, Any] | None
+) -> Mapping[str, Any] | None:
+    """The scenario to align against; ``None`` unless it is confirmed and has blocks."""
+
+    document = explicit
+    if document is None:
+        confirmed = getattr(services, "_confirmed_normalization", None)
+        if callable(confirmed):
+            document = confirmed(project)[0]
+        else:
+            document = services._read_json_safe(services._project_paths(project)["normalized"])
+    if not document or not document.get("blocks"):
+        return None
+    if str(document.get("status", "")).lower() != "confirmed":
+        return None
+    return document
+
+
+def autodetect_voiceover(
     services: VoiceoverJobServices,
     project: str,
     normalization: Mapping[str, Any] | None = None,
     *,
+    prepared: list[PreparedRecording] | None = None,
     converter: Any = None,
     run_async: bool = True,
-) -> dict[str, Any] | None:
-    """Scan ``ЗАГРУЗИТЬ/Закадр/``; if a new recording appeared, queue a local alignment job.
+) -> AutodetectResult:
+    """Register new files of ``ЗАГРУЗИТЬ/Закадр/`` and queue a local alignment job.
 
-    Returns the queued job, or ``None`` when nothing new was found, no confirmed
-    scenario is available or another voiceover job already runs for the project
-    (the recording stays registered and can be aligned on a later trigger).
+    Callers hold the project transition lock; ``prepared`` (from
+    ``prepare_voiceover_scan``) lets them do the slow hashing/copy/ffmpeg before it.
+    Only a *confirmed* scenario starts a job: otherwise the recordings are registered
+    and ``scenario_confirmed`` is false. While another voiceover job runs the new files
+    are not registered; ``pending`` is set and the scan repeats when the job ends.
     """
 
     paths = services._project_paths(project)
-    if not scan_recorded_voiceover(paths, converter=converter):
-        return None
-    document = (
-        normalization
-        if normalization is not None
-        else services._read_json_safe(paths["normalized"])
-    )
-    if not document or not document.get("blocks"):
-        return None
+    if prepared is None:
+        prepared = prepare_voiceover_scan(paths, converter=converter)
+    document = _confirmed_scenario(services, project, normalization)
+    result = AutodetectResult(scenario_confirmed=document is not None)
+    if not prepared:
+        return result
     if not reserve_voiceover_project(services, project):
-        return None
+        runtime = services._VOICEOVER_RUNTIME
+        with runtime.lock:
+            voiceover_active = project in runtime.active_projects
+            if voiceover_active:
+                _pending_set(services).add(project)
+        if voiceover_active:
+            for item in prepared:
+                discard_prepared_recording(item)
+            result.pending = True
+            return result
+        # Another kind of task is active: keep the recordings, align them on demand.
+        result.registered = commit_prepared_scan(paths, prepared)
+        return result
     try:
+        result.registered = commit_prepared_scan(paths, prepared)
+        if not result.registered or document is None:
+            release_voiceover_project(services, project)
+            return result
         job = create_voiceover_job(services, project, document)
     except Exception:
         release_voiceover_project(services, project)
@@ -434,8 +502,55 @@ def trigger_voiceover_autodetect(
         "project": project,
         "normalization": document,
     }
+    result.job = job
     if run_async:
         threading.Thread(target=run_voiceover_job, kwargs=kwargs, daemon=True).start()
     else:
         run_voiceover_job(**kwargs)
-    return job
+    return result
+
+
+def _retrigger_pending(
+    services: VoiceoverJobServices, project: str, normalization: Mapping[str, Any] | None
+) -> None:
+    """Repeat the scan for files that appeared while the job was running."""
+
+    runtime = services._VOICEOVER_RUNTIME
+    with runtime.lock:
+        pending = _pending_set(services)
+        if project not in pending:
+            return
+        pending.discard(project)
+    try:
+        prepared = prepare_voiceover_scan(services._project_paths(project))
+        lock = getattr(services, "_project_transition_lock", None)
+        with lock(project) if callable(lock) else nullcontext():
+            document = _confirmed_scenario(
+                services,
+                project,
+                None
+                if callable(getattr(services, "_confirmed_normalization", None))
+                else normalization,
+            )
+            autodetect_voiceover(services, project, document, prepared=prepared, run_async=False)
+    except Exception:  # best effort: the files stay in the folder for the next scan
+        return
+
+
+def trigger_voiceover_autodetect(
+    services: VoiceoverJobServices,
+    project: str,
+    normalization: Mapping[str, Any] | None = None,
+    *,
+    converter: Any = None,
+    run_async: bool = True,
+) -> dict[str, Any] | None:
+    """Scan ``ЗАГРУЗИТЬ/Закадр/``; if a new recording appeared, queue a local alignment job.
+
+    Returns the queued job, or ``None`` when nothing new was found, the scenario is not
+    confirmed or another voiceover job runs (see :func:`autodetect_voiceover`).
+    """
+
+    return autodetect_voiceover(
+        services, project, normalization, converter=converter, run_async=run_async
+    ).job

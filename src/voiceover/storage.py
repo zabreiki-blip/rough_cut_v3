@@ -14,12 +14,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Any, Callable, Mapping
+import threading
+from typing import Any, Callable, Iterator, Mapping
 import unicodedata
+import uuid
 import wave
 
 from atomic_io import atomic_write_json
@@ -165,18 +169,62 @@ def load_recorded_voiceover(paths: Mapping[str, Path]) -> dict[str, Any]:
     return _normalize_map(raw, Path(paths["root"]))
 
 
-def save_recorded_voiceover(paths: Mapping[str, Path], data: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate ``data``, bump the monotonic generation and write atomically."""
+class StaleMapError(RuntimeError):
+    """The map on disk changed after the caller read it (generation compare-and-swap)."""
+
+
+_MAP_LOCKS: dict[str, threading.RLock] = {}
+_MAP_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def map_lock(paths: Mapping[str, Path]) -> Iterator[None]:
+    """The one lock of the working map: registration and job commits are serialized by it."""
+
+    key = str(paths["recorded_voiceover"])
+    with _MAP_LOCKS_GUARD:
+        lock = _MAP_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
+
+
+def save_recorded_voiceover(
+    paths: Mapping[str, Path],
+    data: Mapping[str, Any],
+    *,
+    expected_generation: int | None = None,
+) -> dict[str, Any]:
+    """Validate ``data``, bump the monotonic generation and write atomically.
+
+    With ``expected_generation`` the write is a compare-and-swap: a map that changed
+    on disk since it was read raises :class:`StaleMapError` instead of being overwritten.
+    """
 
     root = Path(paths["root"])
-    normalized = _normalize_map(data, root)
-    on_disk = read_json_safe(paths["recorded_voiceover"]).get("generation")
-    disk_generation = on_disk if isinstance(on_disk, int) and not isinstance(on_disk, bool) else 0
-    normalized["generation"] = max(normalized["generation"], disk_generation) + 1
-    normalized.pop("rejected", None)
-    atomic_write_json(paths["recorded_voiceover"], normalized)
+    with map_lock(paths):
+        normalized = _normalize_map(data, root)
+        on_disk = read_json_safe(paths["recorded_voiceover"]).get("generation")
+        disk_generation = (
+            on_disk if isinstance(on_disk, int) and not isinstance(on_disk, bool) else 0
+        )
+        if expected_generation is not None and disk_generation != expected_generation:
+            raise StaleMapError("recorded voiceover map changed; reload and retry")
+        normalized["generation"] = max(normalized["generation"], disk_generation) + 1
+        normalized.pop("rejected", None)
+        atomic_write_json(paths["recorded_voiceover"], normalized)
     normalized["rejected"] = []
     return normalized
+
+
+def update_recorded_voiceover(
+    paths: Mapping[str, Path], mutate: Callable[[dict[str, Any]], Any]
+) -> dict[str, Any]:
+    """Re-read the map under the map lock, apply ``mutate`` and save (no lost updates)."""
+
+    with map_lock(paths):
+        data = load_recorded_voiceover(paths)
+        mutate(data)
+        return save_recorded_voiceover(paths, data)
 
 
 def asr_cache_key(sha256: str, config: Mapping[str, Any]) -> str:
@@ -257,13 +305,36 @@ def _reindex(recordings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ordered
 
 
-def register_recording_file(
+@dataclass
+class PreparedRecording:
+    """A recording already copied/converted into a private temporary store directory."""
+
+    digest: str
+    temp_dir: Path
+    original_name: str
+    montage_name: str
+    duration_sec: float
+    sample_rate: int
+    channels: int
+    part_name: str
+
+
+def discard_prepared_recording(prepared: PreparedRecording) -> None:
+    shutil.rmtree(prepared.temp_dir, ignore_errors=True)
+
+
+def prepare_recording_file(
     paths: Mapping[str, Path],
     source: Path,
     *,
     converter: Converter | None = None,
-) -> RecordingSource:
-    """Import ``source`` into the immutable store and register it once (by content hash)."""
+    digest: str | None = None,
+) -> PreparedRecording | RecordingSource:
+    """Heavy part of the import (hash, copy, ffmpeg) into a temporary directory.
+
+    Does not touch the map, so callers run it outside any project lock. Returns the
+    existing record when the content hash is already registered.
+    """
 
     root = Path(paths["root"]).resolve()
     source = Path(source)
@@ -273,20 +344,19 @@ def register_recording_file(
     if not resolved.is_relative_to(root) or not resolved.is_file():
         raise ValueError("recording must be a file inside the project")
 
-    digest = _sha256_file(resolved)
-    data = load_recorded_voiceover(paths)
-    for existing in data["recordings"]:
+    digest = digest or _sha256_file(resolved)
+    for existing in load_recorded_voiceover(paths)["recordings"]:
         if existing["sha256"] == digest:
             return RecordingSource.from_dict(existing)
 
-    store = Path(paths["voiceover_recordings"]) / digest
-    created_store = not store.exists()
-    store.mkdir(parents=True, exist_ok=True)
+    parent = Path(paths["voiceover_recordings"])
+    parent.mkdir(parents=True, exist_ok=True)
+    temp = parent / f".tmp-{uuid.uuid4().hex}"
+    temp.mkdir()
     try:
-        original = store / f"original{resolved.suffix.lower()}"
-        if not original.exists():
-            _copy_atomic(resolved, original)
-            _freeze(original)
+        original = temp / f"original{resolved.suffix.lower()}"
+        _copy_atomic(resolved, original)
+        _freeze(original)
         montage = original
         probed: tuple[float, int, int] | None = None
         if original.suffix == ".wav":
@@ -295,40 +365,134 @@ def register_recording_file(
             except (wave.Error, EOFError):
                 probed = None  # not plain PCM: convert below
         if probed is None:
-            montage = store / "montage.wav"
-            if not montage.exists():
-                partial = store / "montage.partial.wav"
-                try:
-                    (converter or ffmpeg_to_pcm_wav)(original, partial)
-                    os.replace(partial, montage)
-                finally:
-                    partial.unlink(missing_ok=True)
-                _freeze(montage)
+            montage = temp / "montage.wav"
+            partial = temp / "montage.partial.wav"
+            try:
+                (converter or ffmpeg_to_pcm_wav)(original, partial)
+                os.replace(partial, montage)
+            finally:
+                partial.unlink(missing_ok=True)
+            _freeze(montage)
             probed = _probe_pcm_wav(montage)
     except BaseException:
-        if created_store:
-            shutil.rmtree(store, ignore_errors=True)
+        shutil.rmtree(temp, ignore_errors=True)
         raise
-
     duration, rate, channels = probed
-    recording = RecordingSource(
-        id=f"rec_{digest[:16]}",
-        asset=montage.relative_to(root).as_posix(),
-        sha256=digest,
+    return PreparedRecording(
+        digest=digest,
+        temp_dir=temp,
+        original_name=original.name,
+        montage_name=montage.name,
         duration_sec=duration,
         sample_rate=rate,
         channels=channels,
-        part_index=0,
         part_name=_nfc(resolved.name),
-        original_asset=original.relative_to(root).as_posix(),
     )
-    data["recordings"] = _reindex([*data["recordings"], recording.to_dict()])
-    saved = save_recorded_voiceover(paths, data)
+
+
+def commit_prepared_recording(
+    paths: Mapping[str, Path], prepared: PreparedRecording
+) -> RecordingSource:
+    """Atomic registration: rename the prepared directory and update the map."""
+
+    root = Path(paths["root"]).resolve()
+    with map_lock(paths):
+        data = load_recorded_voiceover(paths)
+        for existing in data["recordings"]:
+            if existing["sha256"] == prepared.digest:
+                discard_prepared_recording(prepared)
+                return RecordingSource.from_dict(existing)
+        store = Path(paths["voiceover_recordings"]) / prepared.digest
+        if store.exists():  # leftover of an interrupted registration (not in the map)
+            shutil.rmtree(store)
+        os.replace(prepared.temp_dir, store)
+        try:
+            recording = RecordingSource(
+                id=f"rec_{prepared.digest[:16]}",
+                asset=(store.resolve() / prepared.montage_name).relative_to(root).as_posix(),
+                sha256=prepared.digest,
+                duration_sec=prepared.duration_sec,
+                sample_rate=prepared.sample_rate,
+                channels=prepared.channels,
+                part_index=0,
+                part_name=prepared.part_name,
+                original_asset=(store.resolve() / prepared.original_name)
+                .relative_to(root)
+                .as_posix(),
+            )
+            data["recordings"] = _reindex([*data["recordings"], recording.to_dict()])
+            saved = save_recorded_voiceover(paths, data)
+        except BaseException:
+            shutil.rmtree(store, ignore_errors=True)
+            raise
     return next(
         RecordingSource.from_dict(item)
         for item in saved["recordings"]
         if item["id"] == recording.id
     )
+
+
+def register_recording_file(
+    paths: Mapping[str, Path],
+    source: Path,
+    *,
+    converter: Converter | None = None,
+) -> RecordingSource:
+    """Import ``source`` into the immutable store and register it once (by content hash)."""
+
+    prepared = prepare_recording_file(paths, source, converter=converter)
+    if isinstance(prepared, RecordingSource):
+        return prepared
+    try:
+        return commit_prepared_recording(paths, prepared)
+    finally:
+        discard_prepared_recording(prepared)  # no-op once renamed into the store
+
+
+def prepare_voiceover_scan(
+    paths: Mapping[str, Path],
+    *,
+    converter: Converter | None = None,
+) -> list[PreparedRecording]:
+    """Find new files in ``ЗАГРУЗИТЬ/Закадр/`` and prepare them (outside any project lock).
+
+    Content hashes come from the inbox hash cache, so only new or changed files are
+    read in full. Unreadable files are skipped.
+    """
+
+    root = Path(paths["root"])
+    known = {item["sha256"] for item in load_recorded_voiceover(paths)["recordings"]}
+    prepared: list[PreparedRecording] = []
+    for item in discover_project_inbox(root)["voiceover_files"]:
+        digest = str(item["fingerprint"]).removeprefix("sha256:")
+        if digest in known:
+            continue
+        try:
+            result = prepare_recording_file(
+                paths, root / item["relative_path"], converter=converter, digest=digest
+            )
+        except (OSError, ValueError, RuntimeError, wave.Error, EOFError):
+            continue
+        known.add(digest)
+        if isinstance(result, PreparedRecording):
+            prepared.append(result)
+    return prepared
+
+
+def commit_prepared_scan(
+    paths: Mapping[str, Path], prepared: list[PreparedRecording]
+) -> list[RecordingSource]:
+    """Register prepared recordings (short critical section); returns the new ones."""
+
+    registered: list[RecordingSource] = []
+    for item in prepared:
+        try:
+            registered.append(commit_prepared_recording(paths, item))
+        except (OSError, ValueError, RuntimeError, wave.Error, EOFError):
+            continue
+        finally:
+            discard_prepared_recording(item)
+    return registered
 
 
 def scan_recorded_voiceover(
@@ -343,19 +507,5 @@ def scan_recorded_voiceover(
     not started here.
     """
 
-    root = Path(paths["root"])
-    known = {item["sha256"] for item in load_recorded_voiceover(paths)["recordings"]}
-    registered: list[RecordingSource] = []
-    for item in discover_project_inbox(root)["voiceover_files"]:
-        digest = str(item["fingerprint"]).removeprefix("sha256:")
-        if digest in known:
-            continue
-        try:
-            recording = register_recording_file(
-                paths, root / item["relative_path"], converter=converter
-            )
-        except (OSError, ValueError, RuntimeError, wave.Error, EOFError):
-            continue
-        known.add(digest)
-        registered.append(recording)
-    return registered
+    prepared = prepare_voiceover_scan(paths, converter=converter)
+    return commit_prepared_scan(paths, prepared)

@@ -2020,6 +2020,16 @@ def _trigger_voiceover_autodetect(project: str, normalization: dict | None = Non
     )
 
 
+def _autodetect_voiceover(
+    project: str, normalization: dict | None = None, prepared: list | None = None
+):
+    """Like ``_trigger_voiceover_autodetect`` but returns the full scan outcome."""
+
+    return voiceover_jobs.autodetect_voiceover(
+        _voiceover_job_services(), project, normalization, prepared=prepared
+    )
+
+
 def _cancel_voiceover_job(job_id: str) -> tuple[dict | None, str | None]:
     return voiceover_jobs.cancel_voiceover_job(_voiceover_job_services(), job_id)
 

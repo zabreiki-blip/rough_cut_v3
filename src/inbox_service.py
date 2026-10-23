@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 import unicodedata
 
+from atomic_io import atomic_write_json
+
 
 SCENARIO_EXTENSIONS = frozenset({".doc", ".docx", ".md", ".txt"})
 VIDEO_EXTENSIONS = frozenset(
@@ -102,6 +104,43 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _cached_sha256(
+    path: Path,
+    relative_path: str,
+    stat: Any,
+    cache: dict[str, Any] | None,
+    cache_out: dict[str, Any] | None,
+) -> str:
+    """Content hash reused while (path, size, mtime_ns) are unchanged."""
+
+    if cache is None or cache_out is None:
+        return _sha256(path)
+    entry = cache.get(relative_path)
+    if (
+        isinstance(entry, dict)
+        and entry.get("size") == stat.st_size
+        and entry.get("mtime_ns") == stat.st_mtime_ns
+        and isinstance(entry.get("sha256"), str)
+    ):
+        digest = entry["sha256"]
+    else:
+        digest = _sha256(path)
+    cache_out[relative_path] = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": digest,
+    }
+    return digest
+
+
+def _load_hash_cache(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def _safe_files(
     directory: Path,
     *,
@@ -142,6 +181,8 @@ def _discover_category(
     extensions: frozenset[str],
     default_kind: InboxKind,
     hash_content: bool = True,
+    hash_cache: dict[str, Any] | None = None,
+    hash_cache_out: dict[str, Any] | None = None,
 ) -> list[InboxFile]:
     # Locations are ordered by preference. This makes a copy placed in the new,
     # user-facing folder canonical while preserving visibility of legacy inputs.
@@ -159,7 +200,9 @@ def _discover_category(
                 stat = path.stat()
                 relative_path = path.relative_to(safe_root).as_posix()
                 if hash_content:
-                    identity_hash = _sha256(path)
+                    identity_hash = _cached_sha256(
+                        path, relative_path, stat, hash_cache, hash_cache_out
+                    )
                 else:
                     identity = json.dumps(
                         {
@@ -245,12 +288,23 @@ def discover_project_inbox(project_root: Path) -> dict[str, Any]:
         default_kind="video",
         hash_content=False,
     )
+    # Recordings are large: their hashes are cached by (path, size, mtime_ns).
+    cache_path = root / "work" / "inbox_hash_cache.json"
+    hash_cache = _load_hash_cache(cache_path)
+    hash_cache_out: dict[str, Any] = {}
     voiceovers = _discover_category(
         ((resolve_inbox_dir(root, "ЗАГРУЗИТЬ", "Закадр"), "upload"),),
         project_root=root,
         extensions=VOICEOVER_EXTENSIONS,
         default_kind="voiceover",
+        hash_cache=hash_cache,
+        hash_cache_out=hash_cache_out,
     )
+    if hash_cache_out != hash_cache:
+        try:
+            atomic_write_json(cache_path, hash_cache_out)
+        except OSError:
+            pass  # the cache is an optimization only
     return {
         "scenario_files": [item.to_dict() for item in scenarios],
         "review_files": [item.to_dict() for item in reviews],
