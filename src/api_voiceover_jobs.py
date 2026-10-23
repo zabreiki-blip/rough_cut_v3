@@ -69,6 +69,11 @@ def _blocks_snapshot_hash(normalization: Mapping[str, Any]) -> str:
 
 def reserve_voiceover_project(services: VoiceoverJobServices, project: str) -> bool:
     runtime = services._VOICEOVER_RUNTIME
+    # Recognition must not overlap TTS, a revision change or a publication: the host
+    # exposes the cross-registry check (callers hold the project transition lock).
+    busy = getattr(services, "_project_has_active_mutation", None)
+    if callable(busy) and busy(project):
+        return False
     return reserve_project(runtime.lock, runtime.active_projects, project)
 
 
@@ -187,7 +192,11 @@ def _merge_ranges(
     """Proposals replace automatic ranges; confirmed/manual decisions on unchanged text stay."""
 
     def decided(item: Mapping[str, Any]) -> bool:
-        return item.get("status") == "confirmed" or bool(item.get("manual_range"))
+        return (
+            item.get("status") == "confirmed"
+            or bool(item.get("manual_range"))
+            or item.get("origin") == "manual"
+        )
 
     keep = {item["block_uid"]: item for item in existing if decided(item)}
     merged: list[dict[str, Any]] = []
@@ -196,7 +205,18 @@ def _merge_ranges(
         uid = proposal["block_uid"]
         previous = keep.get(uid)
         if previous is not None and previous.get("text_sha256") == proposal["text_sha256"]:
-            merged.append(previous)
+            if previous.get("status") == "missing":
+                # A manual per-block decision (e.g. "use TTS") made while nothing was
+                # found stays on top of the range that the new recognition found.
+                merged.append(
+                    {
+                        **proposal,
+                        "voice_source": previous.get("voice_source", proposal["voice_source"]),
+                        "origin": "manual",
+                    }
+                )
+            else:
+                merged.append(previous)
         else:
             merged.append(proposal)
         used.add(uid)

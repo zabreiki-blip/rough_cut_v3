@@ -472,6 +472,16 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 | DELETE, PATCH | `/stage1/normalization/memory/<int:rule_id>` | `stage1_normalization_memory_delete`, `stage1_normalization_memory_update` |
 | POST | `/stage1/normalization/reset` | `stage1_normalization_reset` |
 | GET | `/stage1/openrouter-usage` | `stage1_openrouter_usage` |
+| GET | `/stage1/recorded-voiceover` | `recorded_voiceover_state` |
+| POST | `/stage1/recorded-voiceover/apply` | `recorded_voiceover_apply` |
+| GET | `/stage1/recorded-voiceover/audio` | `recorded_voiceover_audio` |
+| PATCH | `/stage1/recorded-voiceover/blocks/<block_uid>/voice-source` | `recorded_voiceover_voice_source` |
+| GET | `/stage1/recorded-voiceover/jobs/<job_id>` | `recorded_voiceover_job_status` |
+| POST | `/stage1/recorded-voiceover/jobs/<job_id>/cancel` | `recorded_voiceover_job_cancel` |
+| POST | `/stage1/recorded-voiceover/jobs/start` | `recorded_voiceover_job_start` |
+| PATCH | `/stage1/recorded-voiceover/ranges/<block_uid>` | `recorded_voiceover_range_patch` |
+| POST | `/stage1/recorded-voiceover/scan` | `recorded_voiceover_scan` |
+| POST | `/stage1/recorded-voiceover/source` | `recorded_voiceover_source` |
 | GET | `/stage1/status` | `stage1_status` |
 | POST | `/stage1/tts` | `stage1_tts` |
 | GET | `/stage1/tts-jobs/<job_id>` | `stage1_tts_job_status` |

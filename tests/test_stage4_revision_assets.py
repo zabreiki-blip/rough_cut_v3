@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import wave
 
+import pytest
+
 from atomic_io import atomic_write_json
 from project_service import ensure_project
 from stage4.revision_assets import (
@@ -14,6 +16,7 @@ from stage4.revision_assets import (
     snapshot_revision_assets,
 )
 from stage4.versioning import (
+    _asset_projection_mismatches,
     activate_revision,
     ensure_baseline,
     import_revision,
@@ -618,3 +621,97 @@ def test_merge_voiceover_manifest_item_omits_degraded_keys_by_default(tmp_path: 
     assert entry["fingerprint"] == "styled-fp"
     assert "degraded" not in entry
     assert "style" not in entry
+
+
+def _publish_recorded(paths: dict[str, Path], revision_id: str, uids: list[str]) -> Path:
+    """Publish a recorded map for ``uids`` (one range each) over a registered recording."""
+    from voiceover.storage import register_recording_file
+    from stage4.revision_assets import recorded_map_fingerprint
+
+    source = paths["inbox_voiceover"] / "take.wav"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(source), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(8_000)
+        output.writeframes(b"\x01\x00" * 8_000 * 30)
+    recording = register_recording_file(paths, source)
+    published = {
+        "schema_version": 1,
+        "kind": "recorded_voiceover",
+        "scenario_revision_id": revision_id,
+        "recordings": [recording.to_dict()],
+        "blocks": [
+            {
+                "block_uid": uid,
+                "text_sha256": "h",
+                "voice_source": "recorded",
+                "origin": "auto",
+                "recording_id": recording.id,
+                "source_in_sec": 1.0 + index * 5,
+                "source_out_sec": 4.0 + index * 5,
+                "speech_in_sec": 1.0 + index * 5,
+                "speech_out_sec": 4.0 + index * 5,
+            }
+            for index, uid in enumerate(uids)
+        ],
+    }
+    published["published_sha256"] = recorded_map_fingerprint(published)
+    atomic_write_json(paths["recorded_voiceover_published"], published)
+    return paths["root"] / recording.original_asset
+
+
+def test_recorded_voiceover_is_snapshotted_inherited_and_restored_per_revision(
+    tmp_path: Path,
+) -> None:
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    original = _publish_recorded(paths, "rev_0001", ["voice-stable"])
+
+    _import_with_voiceover_insert(tmp_path, paths)
+    # the unchanged block keeps its range in the new revision; the inserted one has none
+    inherited = _read_json(paths["scenario_versions"] / "rev_0002.recorded_voiceover.json")
+    assert [b["block_uid"] for b in inherited["blocks"]] == ["voice-stable"]
+    assert inherited["scenario_revision_id"] == "rev_0002"
+
+    activate_revision("rev_0002", paths)
+    active = _read_json(paths["recorded_voiceover_published"])
+    assert active["scenario_revision_id"] == "rev_0002"
+    # the shared recording is never fanned out into positional zkN aliases
+    assert not any(p.stat().st_size > 10_000 for p in paths["speaker"].rglob("zk*.wav"))
+
+    activate_revision("rev_0001", paths)
+    restored = _read_json(paths["recorded_voiceover_published"])
+    assert restored["scenario_revision_id"] == "rev_0001"
+    assert restored["blocks"][0]["source_in_sec"] == 1.0
+    assert not inspect_revision_state(paths)["blocking"]
+
+    # integrity is checked by the kind of voiceover: a lost recording is reported, and a
+    # revision that needs it cannot be activated
+    original.chmod(0o644)
+    original.unlink()
+    mismatches = _asset_projection_mismatches(paths, "rev_0001")
+    assert any(item.startswith("recorded_voiceover_asset:") for item in mismatches)
+    with pytest.raises(FileNotFoundError):
+        activate_revision("rev_0002", paths)
+
+
+def test_published_map_of_another_revision_is_an_integrity_mismatch(tmp_path: Path) -> None:
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    _publish_recorded(paths, "rev_0009", ["voice-stable"])
+    assert "recorded_voiceover" in _asset_projection_mismatches(paths, "rev_0001")
+
+
+def test_revision_without_recorded_snapshot_clears_the_published_map(tmp_path: Path) -> None:
+    paths, _source, _old_audio = _prepare_legacy_baseline(tmp_path)
+    ensure_baseline("demo", paths)
+    _import_with_voiceover_insert(tmp_path, paths)
+    activate_revision("rev_0002", paths)
+    _publish_recorded(paths, "rev_0002", ["new-import-uid"])
+    activate_revision("rev_0001", paths)  # rev_0001 has no recorded ranges
+    assert not paths["recorded_voiceover_published"].exists()
+    activate_revision("rev_0002", paths)  # rev_0002 was snapshotted when it was left
+    assert _read_json(paths["recorded_voiceover_published"])["blocks"][0]["block_uid"] == (
+        "new-import-uid"
+    )

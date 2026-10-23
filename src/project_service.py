@@ -61,6 +61,8 @@ def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
         "active_voiceover_manifest": work / "voiceover_manifest.json",
         "recorded_voiceover": work / "recorded_voiceover.json",
         "recorded_voiceover_asr": work / "recorded_voiceover_asr",
+        "recorded_voiceover_published": work / "recorded_voiceover_published.json",
+        "recorded_voiceover_publish_intent": work / "recorded_voiceover_publish_intent.json",
         "recorded_voiceover_job_status": work / "recorded_voiceover_job_status.json",
         "sync_audio": work / "sync_audio",
         "sync_transcripts": work / "transcripts",

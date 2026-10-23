@@ -22,6 +22,8 @@ from stage4.revision_assets import (
     activation_intent_path,
     clear_activation_intent,
     create_revision_asset_snapshots,
+    published_map_path,
+    recorded_map_problems,
     revision_speaker_alias_dir,
     restore_revision_assets,
     snapshot_revision_assets,
@@ -252,6 +254,18 @@ def _asset_projection_mismatches(project_paths: dict[str, Path], active_id: str)
     prepared_id = str(prepared.get("scenario_revision_id") or "")
     if prepared_id and prepared_id != active_id:
         mismatches.append("prepared")
+
+    # Recorded voiceover is checked by its own kind: the published map must belong to the
+    # active revision and its recording files must be intact (no zkN aliases involved).
+    try:
+        published = _read_json(published_map_path(project_paths))
+    except (OSError, ValueError):
+        published = {}
+    if published:
+        if str(published.get("scenario_revision_id") or "") != active_id:
+            mismatches.append("recorded_voiceover")
+        else:
+            mismatches.extend(recorded_map_problems(project_paths, published))
 
     try:
         manifest = _read_json(project_paths["active_voiceover_manifest"])

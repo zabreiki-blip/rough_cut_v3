@@ -95,6 +95,147 @@ def revision_speaker_alias_dir(project_paths: dict[str, Path], revision_id: str)
     return project_paths["speaker"] / "revisions" / revision_id
 
 
+# --- Recorded (shared-file) voiceover -------------------------------------------
+# A recorded voiceover is a different kind of asset than the TTS manifest: the
+# published map names ranges of immutable recording files, so it is snapshotted,
+# validated and restored on its own (``<revision>.recorded_voiceover.json``) and
+# never fanned out into positional ``zkN`` aliases.
+
+RECORDED_SNAPSHOT_SUFFIX = ".recorded_voiceover.json"
+
+
+def safe_project_asset(project_paths: Any, value: str) -> Path | None:
+    """Project-relative asset path (no absolute path, no escape from the project root)."""
+    return _project_asset_path(project_paths, value)
+
+
+def published_map_path(project_paths: dict[str, Path]) -> Path:
+    return project_paths.get("recorded_voiceover_published") or (
+        project_paths["work"] / "recorded_voiceover_published.json"
+    )
+
+
+def recorded_snapshot_path(project_paths: dict[str, Path], revision_id: str) -> Path:
+    return project_paths["scenario_versions"] / f"{revision_id}{RECORDED_SNAPSHOT_SUFFIX}"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def recorded_map_problems(
+    project_paths: dict[str, Path], published: dict[str, Any], *, verify_hash: bool = False
+) -> list[str]:
+    """Integrity problems of a published recorded map (missing or changed recordings)."""
+    problems: list[str] = []
+    recordings = {
+        str(item.get("id") or ""): item
+        for item in published.get("recordings", [])
+        if isinstance(item, dict)
+    }
+    used = {
+        str(block.get("recording_id") or "")
+        for block in published.get("blocks", [])
+        if isinstance(block, dict) and block.get("voice_source") == "recorded"
+    }
+    for recording_id in sorted(used):
+        item = recordings.get(recording_id)
+        if item is None:
+            problems.append(f"recorded_voiceover_source:{recording_id}")
+            continue
+        asset = _project_asset_path(project_paths, str(item.get("asset") or ""))
+        original = _project_asset_path(project_paths, str(item.get("original_asset") or ""))
+        if asset is None or not asset.is_file() or original is None or not original.is_file():
+            problems.append(f"recorded_voiceover_asset:{recording_id}")
+        elif verify_hash and _sha256_file(original) != str(item.get("sha256") or ""):
+            problems.append(f"recorded_voiceover_hash:{recording_id}")
+    return problems
+
+
+def snapshot_recorded_voiceover(revision_id: str, project_paths: dict[str, Path]) -> str:
+    """Copy the active published map into the revision snapshot; return its file name or ''."""
+    published = _read_json(published_map_path(project_paths))
+    if not published or str(published.get("scenario_revision_id") or "") != revision_id:
+        return ""
+    destination = recorded_snapshot_path(project_paths, revision_id)
+    _atomic_copy(published_map_path(project_paths), destination)
+    return destination.name
+
+
+def inherit_recorded_voiceover(
+    revision_id: str,
+    parent_id: str,
+    reusable_uids: set[str],
+    project_paths: dict[str, Path],
+) -> None:
+    """New revision keeps recorded ranges of unchanged/moved blocks (matched by block UID)."""
+    parent = _read_json(recorded_snapshot_path(project_paths, parent_id)) if parent_id else {}
+    if not parent:
+        active = _read_json(published_map_path(project_paths))
+        if active and str(active.get("scenario_revision_id") or "") == parent_id:
+            parent = active
+    blocks = [
+        dict(block)
+        for block in parent.get("blocks", [])
+        if isinstance(block, dict)
+        and block.get("voice_source") == "recorded"
+        and str(block.get("block_uid") or "") in reusable_uids
+    ]
+    if not blocks:
+        return
+    used = {str(block.get("recording_id") or "") for block in blocks}
+    inherited = {
+        **{k: v for k, v in parent.items() if k not in {"blocks", "recordings"}},
+        "scenario_revision_id": revision_id,
+        "recordings": [
+            item
+            for item in parent.get("recordings", [])
+            if isinstance(item, dict) and str(item.get("id") or "") in used
+        ],
+        "blocks": blocks,
+        "inherited_from": parent_id,
+    }
+    # published_sha256 is a fingerprint of recordings+blocks (see voiceover.publish).
+    inherited["published_sha256"] = recorded_map_fingerprint(inherited)
+    atomic_write_json(recorded_snapshot_path(project_paths, revision_id), inherited)
+
+
+def recorded_map_fingerprint(published: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {"recordings": published.get("recordings", []), "blocks": published.get("blocks", [])},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validate_recorded_snapshot(revision_id: str, project_paths: dict[str, Path]) -> None:
+    snapshot = recorded_snapshot_path(project_paths, revision_id)
+    if not snapshot.is_file():
+        return
+    published = _read_json(snapshot)
+    if not published or str(published.get("scenario_revision_id") or "") != revision_id:
+        raise ValueError("invalid recorded voiceover snapshot")
+    problems = recorded_map_problems(project_paths, published, verify_hash=True)
+    if problems:
+        raise FileNotFoundError(f"Recorded voiceover asset check failed: {problems[0]}")
+
+
+def restore_recorded_voiceover(revision_id: str, project_paths: dict[str, Path]) -> None:
+    """Make the published map match ``revision_id`` (no snapshot -> no recorded ranges)."""
+    snapshot = recorded_snapshot_path(project_paths, revision_id)
+    target = published_map_path(project_paths)
+    if snapshot.is_file():
+        _atomic_copy(snapshot, target)
+    else:
+        target.unlink(missing_ok=True)
+
+
 def prepared_from_normalized(normalized: dict[str, Any]) -> dict[str, Any]:
     blocks = [
         block
@@ -250,6 +391,9 @@ def snapshot_revision_assets(revision_id: str, project_paths: dict[str, Path]) -
         revision["prepared_snapshot"] = prepared_snapshot.name
     atomic_write_json(voiceover_snapshot, voiceover_manifest)
     revision["voiceover_manifest_snapshot"] = voiceover_snapshot.name
+    recorded_snapshot = snapshot_recorded_voiceover(revision_id, project_paths)
+    if recorded_snapshot:
+        revision["recorded_voiceover_snapshot"] = recorded_snapshot
     if project_paths["timeline"].is_file():
         timeline_snapshot = project_paths["timeline_versions"] / f"{revision_id}.full_timeline.json"
         _atomic_copy(project_paths["timeline"], timeline_snapshot)
@@ -319,6 +463,8 @@ def validate_revision_assets(
         if source is None or not source.is_file():
             raise FileNotFoundError(f"Voiceover asset not found for {block_id}")
 
+    validate_recorded_snapshot(revision_id, project_paths)
+
     if not isinstance(normalized.get("blocks"), list):
         raise ValueError("invalid normalized snapshot")
 
@@ -376,6 +522,7 @@ def create_revision_asset_snapshots(
             "items": inherited,
         },
     )
+    inherit_recorded_voiceover(revision_id, parent_id, reusable_uids, project_paths)
     return prepared_snapshot.name, voiceover_snapshot.name
 
 
@@ -574,6 +721,7 @@ def restore_revision_assets(
 
     atomic_write_json(project_paths["prepared"], prepared_payload)
     atomic_write_json(project_paths["active_voiceover_manifest"], manifest)
+    restore_recorded_voiceover(revision_id, project_paths)
     for block_id, staged_path in staged.items():
         alias = alias_dir / f"{block_id}.wav"
         staged_path.replace(alias)
