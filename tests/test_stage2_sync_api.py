@@ -3787,18 +3787,17 @@ def test_ensure_sync_wav_keeps_wav_when_media_duration_is_unknown(sync_api) -> N
     run.assert_not_called()
 
 
-def test_ensure_sync_wav_recreates_wav_older_than_media(sync_api) -> None:
+def test_ensure_sync_wav_keeps_wav_older_than_media_when_duration_matches(sync_api) -> None:
     _client, _projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
         sync_api, wav_sec=60, media_sec=60, wav_newer=False
     )
-    calls = []
     with (
         patch.object(api, "_media_duration_or_none", return_value=60.0),
-        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(60.0, calls)),
+        patch.object(api.subprocess, "run") as run,
     ):
         assert api._ensure_sync_wav(source, paths) == canonical
-    assert len(calls) == 1
-    assert canonical.stat().st_mtime > time.time() - 100
+    run.assert_not_called()
+    assert _wav_seconds(canonical) == 60.0
 
 
 def test_sync_start_drops_index_built_from_stale_guide_wav(sync_api, monkeypatch) -> None:

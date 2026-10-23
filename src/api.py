@@ -1138,9 +1138,10 @@ def _stale_canonical_wav_media(
     """Return the review media when the canonical WAV was not made from it.
 
     A canonical WAV is the decoded audio of the source media. It is stale when
-    it is older than the media file or its duration differs from the media
-    duration by more than ``max(1 s, 0.5%)`` (e.g. it was extracted from a
-    different, longer version of the recording). Unknown durations never
+    its duration differs from the media duration by more than
+    ``max(1 s, 0.5%)`` (e.g. it was extracted from a different, longer version
+    of the recording). Modification times are ignored: a copied file keeps the
+    same audio but may have a newer or older mtime. Unknown durations never
     count as a mismatch.
     """
     if source.source_kind != "review_media" or not source.media_path.strip():
@@ -1150,14 +1151,6 @@ def _stale_canonical_wav_media(
     if not media.is_relative_to(paths["root"].resolve()):
         raise ValueError("media_path must be inside the project directory")
     if not media.is_file() or media == canonical.resolve():
-        return None
-    try:
-        if canonical.stat().st_mtime < media.stat().st_mtime - 1.0:
-            app.logger.warning(
-                "Canonical sync WAV of %s is older than its media; re-extracting", source.id
-            )
-            return media
-    except OSError:
         return None
     media_duration = _media_duration_or_none(media)
     wav_duration = _wav_duration_or_none(canonical)
