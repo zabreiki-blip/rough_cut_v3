@@ -24,7 +24,13 @@ from stage2.sync_offset_clusters import (
     is_promotion_candidate,
 )
 from stage2.sync_storage import SyncMatchStore
-from stage_common import classify_sync_matches, is_life_match
+from stage_common import (
+    classify_sync_matches,
+    is_life_match,
+    match_is_current_revision,
+    normalization_unit_texts,
+    unit_text_sha256,
+)
 from sync_cost_tracker import ProgressPersistGate, SyncCostTracker
 
 
@@ -439,10 +445,25 @@ def run_match_phase(
         and item.metadata.get("normalization_revision") in (None, "", normalization_revision)
         and str(item.metadata.get("scenario_revision_id") or "") in ("", scenario_revision_id)
     }
+    # Manual confirmations of an older revision whose unit text is unchanged still belong
+    # to this normalization: they are neither rematched nor demoted (unless forced).
+    carried_ids: set[str] = set()
+    if not ctx.rematch_confirmed:
+        accepted, _stale_ids, _stale_confirmed = classify_sync_matches(
+            list(existing.values()), normalization, {str(item.id) for item in sources}
+        )
+        carried_ids = {
+            item.segment_id
+            for item in accepted
+            if item.status == "confirmed"
+            and not is_life_match(item)
+            and not match_is_current_revision(item, normalization)
+        }
+    carried_texts = normalization_unit_texts(normalization, carried_ids) if carried_ids else {}
     units = ctx.alignment_units(
         blocks,
         source_speakers=source_speakers,
-        preserve_whole_uids=confirmed_parent_ids,
+        preserve_whole_uids=confirmed_parent_ids | carried_ids,
     )
     matcher_config = ctx.matcher_config_cls(search_window_sec=ctx.search_window_sec)
     local_indexes = _load_local_indexes(ctx, indexes)
@@ -600,6 +621,14 @@ def run_match_phase(
         prior_matching_fingerprint = (
             str(prior.metadata.get("matching_fingerprint") or "") if prior else ""
         )
+        if prior and segment_id in carried_ids:
+            prior_is_current = True
+            prior.metadata["normalization_revision"] = normalization_revision
+            prior.metadata["scenario_revision_id"] = scenario_revision_id
+            prior.metadata.setdefault(
+                "unit_text_sha256", unit_text_sha256(carried_texts.get(segment_id))
+            )
+            checkpoint_state["dirty"] = True
         if prior and not prior_is_current:
             # Do not let a stale match contribute to progress/final summary
             # or survive a failed rematch for the active scenario revision.

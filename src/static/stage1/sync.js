@@ -10,6 +10,7 @@ import {
 let syncMatches = [];
 let syncMatchesRevision = 0;
 let staleLifeIds = new Set();
+let staleConfirmationIds = new Set();
 let currentSyncJobId = "";
 let syncPollTimer = null;
 let syncPollFailures = 0;
@@ -391,7 +392,11 @@ function renderSyncMatches(document) {
     if (stat) stat.hidden = !(value > 0);
   }
 
-  const lifeHtml = renderLifeCards();
+  const staleNote = staleConfirmationIds.size
+    ? `<div class="sync-match-note" data-confirmation-stale>ручных подтверждений устарело: ${
+        staleConfirmationIds.size} — текст фрагмента изменился, сопоставьте их заново</div>`
+    : "";
+  const lifeHtml = staleNote + renderLifeCards();
   const reviewItems = syncMatches.filter((match) => {
     const status = normalizedMatchStatus(match.status);
     return status === "needs_review" || status === "unmatched" || retimePendingReview(match);
@@ -585,6 +590,12 @@ export async function loadSyncWorkspace(quiet) {
   staleLifeIds = new Set(
     (Array.isArray(matchesDocument.stale_life_assignments) ? matchesDocument.stale_life_assignments : [])
       .map(String),
+  );
+  // Confirmations of other types (sync/host) dropped because the text changed.
+  staleConfirmationIds = new Set(
+    (Array.isArray(matchesDocument.stale_confirmations) ? matchesDocument.stale_confirmations : [])
+      .map(String)
+      .filter((id) => !staleLifeIds.has(id)),
   );
   renderSyncSources();
   renderSyncMatches(matchesDocument);

@@ -29,13 +29,14 @@ from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage2.assembly_plan import build_assembly_plan
 from stage_common import (
     TIMELINE_MATCHES_CHANGED_ERROR,
-    _scenario_revision_matches,
     _timeline_is_current,
     _timeline_matches_are_current,
     classify_sync_matches,
     current_sync_matches,
+    is_life_match,
     life_text_sha256,
     sync_matches_fingerprint,
+    unit_text_sha256,
 )
 
 if TYPE_CHECKING:
@@ -620,15 +621,11 @@ def _stage2_sync_job_status_alias(services: ModuleType):
 
 
 def _confirmed_parent_ids(
-    matches: list[SyncMatch], revision: object, scenario_id: object
+    matches: list[SyncMatch], normalization: dict, source_ids: set[str] | None = None
 ) -> set[str]:
-    return {
-        item.segment_id
-        for item in matches
-        if item.status == "confirmed"
-        and item.metadata.get("normalization_revision") in (None, "", revision)
-        and _scenario_revision_matches(item.metadata.get("scenario_revision_id"), scenario_id)
-    }
+    """Ids of confirmed matches valid for the normalization (older revisions carried over)."""
+    accepted, _stale, _stale_confirmed = classify_sync_matches(matches, normalization, source_ids)
+    return {item.segment_id for item in accepted if item.status == "confirmed"}
 
 
 def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
@@ -643,6 +640,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
     try:
         if request.method == "GET":
             matches = match_store.list()
+            stale_confirmation_ids: list[str] = []
             stale_life_ids: list[str] = []
             confirmed, _reason = services._confirmed_normalization(project)
             normalization_document = confirmed or services._read_json_safe(paths["normalized"])
@@ -653,22 +651,23 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                     for block in normalization_document.get("blocks", [])
                     if str(block.get("type") or "").lower() in {"sync", "host", "life"}
                 ]
-                revision = normalization_document.get("revision")
-                scenario_revision_id = normalization_document.get("scenario_revision_id")
+                source_ids = {item.id for item in source_store.list()}
+                life_ids = {item.segment_id for item in matches if is_life_match(item)}
                 valid_ids = {
                     str(unit.get("segment_id") or "")
                     for unit in services._sync_alignment_units(
                         confirmed_blocks,
                         preserve_whole_uids=_confirmed_parent_ids(
-                            matches, revision, scenario_revision_id
+                            matches, normalization_document, source_ids
                         ),
                     )
                     if str(unit.get("segment_id") or "")
                 }
-                # One shared decision (revision filter + LIFE carry-over by text hash).
-                matches, _stale, stale_life_ids = classify_sync_matches(
-                    matches, normalization_document
+                # One shared decision (revision filter + confirmation carry-over by text hash).
+                matches, _stale, stale_confirmation_ids = classify_sync_matches(
+                    matches, normalization_document, source_ids
                 )
+                stale_life_ids = [item for item in stale_confirmation_ids if item in life_ids]
                 matches = [item for item in matches if item.segment_id in valid_ids]
             return jsonify(
                 {
@@ -676,7 +675,9 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                     "result": {
                         "project": project,
                         "matches": [services._match_api_dict(item) for item in matches],
-                        # LIFE assignments dropped because the LIFE text changed.
+                        # Manual confirmations dropped because the unit text changed (or the
+                        # source is gone); ``stale_life_assignments`` is the LIFE subset.
+                        "stale_confirmations": stale_confirmation_ids,
                         "stale_life_assignments": stale_life_ids,
                         **services._sync_summary(matches),
                     },
@@ -708,9 +709,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
             for unit in services._sync_alignment_units(
                 confirmed_blocks,
                 preserve_whole_uids=_confirmed_parent_ids(
-                    stored_matches,
-                    confirmed.get("revision"),
-                    confirmed.get("scenario_revision_id"),
+                    stored_matches, confirmed, {item.id for item in source_store.list()}
                 ),
             )
             if str(unit.get("segment_id") or "")
@@ -757,6 +756,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 # The server owns block_type: it follows the unit, never the client.
                 metadata.pop("block_type", None)
                 metadata.pop("life_text_sha256", None)
+                metadata.pop("unit_text_sha256", None)
                 if is_life_unit:
                     metadata["block_type"] = "life"
                 metadata["parent_block_uid"] = str(unit.get("parent_block_uid") or segment_id)
@@ -792,8 +792,11 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                             "life requires status=confirmed, source_id and "
                             "source_in_sec < source_out_sec"
                         )
-                    # Survives a revision bump only while the LIFE text stays the same.
                     match.metadata["life_text_sha256"] = life_text_sha256(unit.get("text"))
+                if match.status == "confirmed":
+                    # A manual confirmation survives a revision bump only while the unit
+                    # text stays the same.
+                    match.metadata["unit_text_sha256"] = unit_text_sha256(unit.get("text"))
                 source = sources_by_id.get(match.source_id)
                 if (
                     source

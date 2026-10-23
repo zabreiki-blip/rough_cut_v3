@@ -1077,3 +1077,90 @@ def test_manual_edit_during_run_is_not_overwritten_by_retime(tmp_path: Path) -> 
     assert saved is edited
     assert (saved.source_in_sec, saved.source_out_sec) == (30.0, 34.0)
     assert "retimed_from" not in saved.metadata
+
+
+_CARRY_BLOCK = {
+    "uid": "a",
+    "order": 1,
+    "type": "sync",
+    "speaker": "Иван",
+    "original_text": "Иван: 00:10 Реплика синхрона",
+    "normalized_text": "Иван: 00:10 Реплика синхрона",
+    "timecode_start": "00:10",
+}
+
+
+def _carry_harness(*, block_text: str = "Иван: 00:10 Реплика синхрона", **meta: Any) -> _Harness:
+    from stage_common import normalization_unit_texts, unit_text_sha256
+
+    h = _Harness(["a"])
+    block = {**_CARRY_BLOCK, "original_text": block_text, "normalized_text": block_text}
+    h._normalization = {"revision": 3, "blocks": [block]}
+    old_text = normalization_unit_texts({"blocks": [_CARRY_BLOCK]})["a"]
+    prior = _prior(
+        "a",
+        status="confirmed",
+        fingerprint="old",
+        normalization_revision=2,
+        unit_text_sha256=unit_text_sha256(old_text),
+        manual_updated_at="2025-01-01T00:00:00+00:00",
+        **meta,
+    )
+    prior.source_id = "s"
+    prior.source_in_sec = 12.0
+    prior.source_out_sec = 18.5
+    h.store.items = [prior]
+    return h
+
+
+def test_confirmed_prior_of_older_revision_with_same_text_is_carried_not_rematched() -> None:
+    h = _carry_harness()
+
+    result = h.run(load_normalization=lambda _p: h._normalization)
+
+    assert h.matched == []
+    (kept,) = h.store.items
+    assert kept.status == "confirmed"
+    assert (kept.source_in_sec, kept.source_out_sec) == (12.0, 18.5)
+    assert kept.metadata["manual_updated_at"] == "2025-01-01T00:00:00+00:00"
+    assert kept.metadata["normalization_revision"] == 3
+    assert result.matches == [kept] and result.processed == 1
+
+
+def test_confirmed_prior_of_older_revision_with_changed_text_is_rematched() -> None:
+    h = _carry_harness(block_text="Иван: 00:10 Совсем другая реплика")
+
+    h.run(load_normalization=lambda _p: h._normalization)
+
+    assert h.matched == ["a"]
+    assert [m.status for m in h.store.items] == ["auto_matched"]
+
+
+def test_carried_confirmed_prior_is_rematched_when_rematch_confirmed() -> None:
+    h = _carry_harness()
+
+    h.run(load_normalization=lambda _p: h._normalization, rematch_confirmed=True)
+
+    assert h.matched == ["a"]
+    assert [m.status for m in h.store.items] == ["auto_matched"]
+
+
+def test_carried_confirmed_match_is_still_retimed_or_flagged_for_review(tmp_path: Path) -> None:
+    from stage_common import normalization_unit_texts, unit_text_sha256
+
+    h = _Harness(["a"])
+    normalization = {"revision": 3, "blocks": [_CARRY_BLOCK]}
+    old = _rt_confirmed(source_in=8.5)  # hand-edited boundary: retime only flags it
+    old.metadata["normalization_revision"] = 2
+    old.metadata["unit_text_sha256"] = unit_text_sha256(
+        normalization_unit_texts(normalization)["a"]
+    )
+    h.store.items = [old]
+
+    _RetimeSetup(tmp_path).run(h, load_normalization=lambda _p: normalization)
+
+    saved = h.store.items[0]
+    assert h.matched == []
+    assert (saved.source_in_sec, saved.source_out_sec) == (8.5, 14.0)
+    assert saved.status == "confirmed" and saved.metadata["retime_pending_review"] is True
+    assert saved.metadata["normalization_revision"] == 3

@@ -1285,6 +1285,13 @@ async function testSyncLifeCardUnassignAndStale({ state, sync }) {
     html = ids.sync_review_list.innerHTML;
     assert.ok(html.includes("назначение устарело: текст LIFE изменился"), html);
     assert.ok(!html.includes("Снять материал"), "nothing to remove when unassigned");
+
+    // Stale sync/host confirmations (not LIFE) are announced with a count.
+    matchesResult = { items: [], stale_confirmations: ["sync-a", "life-a"], stale_life_assignments: ["life-a"] };
+    await sync.loadSyncWorkspace(true);
+    html = ids.sync_review_list.innerHTML;
+    assert.ok(html.includes("data-confirmation-stale"), html);
+    assert.ok(html.includes("ручных подтверждений устарело: 1"), html);
   } finally {
     globalThis.fetch = originalFetch;
     appState.syncFeatureAvailable = originalSyncFeatureAvailable;

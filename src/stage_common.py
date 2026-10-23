@@ -37,73 +37,150 @@ def _timeline_is_current(timeline: dict, normalization: dict) -> bool:
     )
 
 
-def life_text_sha256(text: object) -> str:
-    """Hash of a LIFE unit text (whitespace-normalized): identifies what was assigned."""
+def unit_text_sha256(text: object) -> str:
+    """Hash of a unit text (whitespace-normalized): identifies what was confirmed by hand."""
     return hashlib.sha256(" ".join(str(text or "").split()).encode("utf-8")).hexdigest()
+
+
+def life_text_sha256(text: object) -> str:
+    """LIFE alias of ``unit_text_sha256`` (``metadata.life_text_sha256`` stays readable)."""
+    return unit_text_sha256(text)
 
 
 def is_life_match(match: Any) -> bool:
     return str((match.metadata or {}).get("block_type") or "") == "life"
 
 
-def life_unit_texts(normalization: dict) -> dict[str, str]:
-    """``{unit id: text}`` of every LIFE unit of the normalization.
+def normalization_unit_texts(
+    normalization: dict,
+    preserve_whole_uids: set[str] | None = None,
+    *,
+    types: frozenset[str] = frozenset({"sync", "host", "life"}),
+) -> dict[str, str]:
+    """``{unit id: text}`` of the sync/host/LIFE units of the normalization.
 
-    Built from the same fragments as the sync alignment units, so the hash stored at
-    PATCH time and the one compared at read time come from one source.
+    Built from the same fragments as the sync alignment units
+    (``api._sync_alignment_units``), so the hash stored at PATCH time and the one
+    compared at read time come from one source.  ``preserve_whole_uids`` are blocks kept
+    as one unit because they carry a confirmed match.
     """
-    from stage2.sync_quote import life_unit_fragments
-    from stage2.timeline_parser import sync_fragment_id
+    from stage2.sync_quote import _sync_quote, life_unit_fragments
+    from stage2.timeline_parser import (
+        is_label_only_sync,
+        normalized_sync_fragments,
+        sync_fragment_id,
+    )
 
+    preserve = preserve_whole_uids or set()
     texts: dict[str, str] = {}
     for block in normalization.get("blocks") or []:
-        if not isinstance(block, dict) or str(block.get("type") or "").lower() != "life":
+        if not isinstance(block, dict):
             continue
+        block_type = str(block.get("type") or "").lower()
         uid = str(block.get("uid") or "").strip()
-        if not uid:
+        if block_type not in types or not uid:
             continue
-        fragments = life_unit_fragments(block)
+        if block_type == "sync":
+            if is_label_only_sync(block):
+                continue
+            fragments = normalized_sync_fragments(
+                block
+                if block.get("sync_fragments")
+                else {**block, "normalized_text": _sync_quote(block)},
+                preserve_whole=uid in preserve,
+            )
+        else:
+            fragments = life_unit_fragments(block, life_only=block_type == "life")
         for index, fragment in enumerate(fragments):
             texts[sync_fragment_id(uid, index, len(fragments))] = str(fragment["text"])
     return texts
 
 
+def life_unit_texts(normalization: dict) -> dict[str, str]:
+    """``{unit id: text}`` of every LIFE unit of the normalization."""
+    return normalization_unit_texts(normalization, types=frozenset({"life"}))
+
+
+def match_is_current_revision(match: Any, normalization: dict) -> bool:
+    """True when the match was stored for this normalization/scenario revision (or is legacy)."""
+    metadata = match.metadata or {}
+    return metadata.get("normalization_revision") in (
+        None,
+        "",
+        normalization.get("revision"),
+    ) and _scenario_revision_matches(
+        metadata.get("scenario_revision_id"), normalization.get("scenario_revision_id")
+    )
+
+
+def _text_key(text: object) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _confirmation_matches_unit(match: Any, text: str, source_ids: set[str] | None) -> bool:
+    """A manual confirmation of an older revision still describes this unit text."""
+    if source_ids is not None and str(getattr(match, "source_id", "") or "") not in source_ids:
+        return False
+    metadata = match.metadata or {}
+    stored_hash = metadata.get("unit_text_sha256") or metadata.get("life_text_sha256")
+    if stored_hash:
+        return stored_hash == unit_text_sha256(text)
+    if is_life_match(match):
+        return False  # a LIFE text is never guessed: only the stored hash proves it
+    # Legacy confirmation without a hash: the text it was matched against.
+    wanted = _text_key(text)
+    return wanted in {
+        _text_key(getattr(match, "query_text", "")),
+        _text_key(metadata.get("query_text")),
+    } and bool(wanted)
+
+
 def classify_sync_matches(
-    matches: list, normalization: dict
+    matches: list, normalization: dict, source_ids: set[str] | None = None
 ) -> tuple[list, list[str], list[str]]:
-    """Split stored matches into current ones, stale ids and stale LIFE assignment ids.
+    """Split stored matches into current ones, stale ids and stale confirmation ids.
 
     The single place that decides whether a match belongs to the current normalization.
-    A manual LIFE assignment survives a revision change when its unit still exists and
-    the LIFE text is unchanged (``life_text_sha256``); a changed text makes it stale and
-    reports the uid in the third list so the UI can say why the assignment disappeared.
+    A manual confirmation (sync/host/LIFE) of an older revision survives when its unit
+    still exists, its text is unchanged (``unit_text_sha256``; legacy ones without a hash
+    are compared by ``query_text``; LIFE needs the hash) and its source exists (checked
+    when ``source_ids`` is given).  A changed text makes it stale and reports the id in
+    the third list so the UI can say why the confirmation disappeared.
     """
-    revision = normalization.get("revision")
-    scenario_revision_id = normalization.get("scenario_revision_id")
-    life_texts: dict[str, str] | None = None
+    texts: dict[str, str] | None = None
+    block_uids: set[str] = set()
+    older_confirmed = {
+        match.segment_id
+        for match in matches
+        if match.status == "confirmed" and not match_is_current_revision(match, normalization)
+    }
     current: list = []
     stale_ids: list[str] = []
-    stale_life_ids: list[str] = []
+    stale_confirmed: list[str] = []
     for match in matches:
-        metadata = match.metadata
-        if metadata.get("normalization_revision") in (
-            None,
-            "",
-            revision,
-        ) and _scenario_revision_matches(metadata.get("scenario_revision_id"), scenario_revision_id):
+        if match_is_current_revision(match, normalization):
             current.append(match)
             continue
-        if is_life_match(match):
-            if life_texts is None:
-                life_texts = life_unit_texts(normalization)
-            text = life_texts.get(match.segment_id)
-            if text is not None:
-                if metadata.get("life_text_sha256") == life_text_sha256(text):
-                    current.append(match)
-                    continue
-                stale_life_ids.append(match.segment_id)
+        if match.status == "confirmed" or is_life_match(match):
+            if texts is None:
+                texts = normalization_unit_texts(normalization, older_confirmed)
+                block_uids = {
+                    str(block.get("uid") or "").strip()
+                    for block in normalization.get("blocks") or []
+                    if isinstance(block, dict)
+                }
+            text = texts.get(match.segment_id)
+            if text is not None and _confirmation_matches_unit(match, text, source_ids):
+                current.append(match)
+                continue
+            parent = (
+                str((match.metadata or {}).get("parent_block_uid") or "")
+                or str(match.segment_id).split("::fragment:")[0]
+            )
+            if text is not None or parent in block_uids:
+                stale_confirmed.append(match.segment_id)
         stale_ids.append(match.segment_id)
-    return current, stale_ids, stale_life_ids
+    return current, stale_ids, stale_confirmed
 
 
 def current_sync_matches(matches: list, normalization: dict) -> tuple[list, list[str]]:
