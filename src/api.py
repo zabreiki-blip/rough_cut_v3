@@ -31,9 +31,11 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from api_core_routes import register_core_routes
 import api_final_review_jobs as final_review_jobs
+import api_voiceover_jobs as voiceover_jobs
 import api_stage1_jobs as stage1_jobs
 from api_service_contracts import (
     FinalReviewJobServices,
+    VoiceoverJobServices,
     NormalizationJobServices,
     SyncWorkerServices,
     TtsJobServices,
@@ -260,6 +262,7 @@ _FINAL_REVIEW_JOBS = _FINAL_REVIEW_RUNTIME.jobs
 _FINAL_REVIEW_JOBS_LOCK = _FINAL_REVIEW_RUNTIME.lock
 _FINAL_REVIEW_ACTIVE_PROJECTS = _FINAL_REVIEW_RUNTIME.active_projects
 _FINAL_REVIEW_CANCEL_EVENTS = _FINAL_REVIEW_RUNTIME.cancel_events
+_VOICEOVER_RUNTIME = JobRegistry()
 _NORMALIZATION_RUNTIME = JobRegistry()
 _NORMALIZATION_JOBS = _NORMALIZATION_RUNTIME.jobs
 _NORMALIZATION_JOBS_LOCK = _NORMALIZATION_RUNTIME.lock
@@ -276,6 +279,9 @@ register_job_registry("озвучки", _TTS_JOBS_LOCK, _TTS_ACTIVE_PROJECTS)
 register_job_registry("нормализации", _NORMALIZATION_JOBS_LOCK, _NORMALIZATION_ACTIVE_PROJECTS)
 register_job_registry("сопоставления СНХ", _SYNC_JOBS_LOCK, _SYNC_ACTIVE_PROJECTS)
 register_job_registry("финальной проверки", _FINAL_REVIEW_JOBS_LOCK, _FINAL_REVIEW_ACTIVE_PROJECTS)
+register_job_registry(
+    "распознавания закадра", _VOICEOVER_RUNTIME.lock, _VOICEOVER_RUNTIME.active_projects
+)
 
 
 class AudioUploadTooLargeError(ValueError):
@@ -1990,6 +1996,28 @@ def _final_review_job_services() -> FinalReviewJobServices:
     """Resolve dependencies late while exposing a typed worker boundary."""
 
     return cast(FinalReviewJobServices, sys.modules[__name__])
+
+
+def _voiceover_job_services() -> VoiceoverJobServices:
+    """Late-bound dependencies of recorded-voiceover recognition jobs."""
+
+    return cast(VoiceoverJobServices, sys.modules[__name__])
+
+
+def _trigger_voiceover_autodetect(project: str, normalization: dict | None = None) -> dict | None:
+    """Scan ЗАГРУЗИТЬ/Закадр/ and queue a local-only alignment job for a new recording."""
+
+    return voiceover_jobs.trigger_voiceover_autodetect(
+        _voiceover_job_services(), project, normalization
+    )
+
+
+def _cancel_voiceover_job(job_id: str) -> tuple[dict | None, str | None]:
+    return voiceover_jobs.cancel_voiceover_job(_voiceover_job_services(), job_id)
+
+
+def _get_voiceover_job(job_id: str) -> dict | None:
+    return voiceover_jobs.get_voiceover_job(_voiceover_job_services(), job_id)
 
 
 def _reserve_final_review_project(project: str) -> bool:

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Callable, Mapping
@@ -34,8 +35,15 @@ def _nfc(name: str) -> str:
     return unicodedata.normalize("NFC", name)
 
 
-def _part_sort_key(name: str) -> tuple[str, str]:
-    return (_nfc(name).casefold(), _nfc(name))
+def _part_sort_key(name: str) -> tuple[tuple[Any, ...], str]:
+    """Natural order: digit runs compare as numbers ("часть 2" < "часть 10")."""
+
+    folded = _nfc(name).casefold()
+    # re.split with a capture group alternates text (even) and digits (odd).
+    chunks = tuple(
+        int(chunk) if index % 2 else chunk for index, chunk in enumerate(re.split(r"(\d+)", folded))
+    )
+    return (chunks, _nfc(name))
 
 
 def _sha256_file(path: Path) -> str:
@@ -113,11 +121,14 @@ def _normalize_map(raw: Mapping[str, Any], root: Path) -> dict[str, Any]:
             reject("range is not an object")
             continue
         owner = recordings.get(str(item.get("recording_id", "")))
-        if owner is None:
+        is_missing = item.get("status") == "missing"
+        if owner is None and not is_missing:
             reject("unknown recording")
             continue
         try:
-            parsed = VoiceoverRange.from_dict(item, duration_sec=owner.duration_sec)
+            parsed = VoiceoverRange.from_dict(
+                item, duration_sec=owner.duration_sec if owner is not None else 1.0
+            )
         except (ValueError, TypeError) as exc:
             reject(f"invalid range: {exc}")
             continue

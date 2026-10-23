@@ -349,6 +349,7 @@ def test_job_registries_are_visible_from_api_and_stage4_routes_in_priority_order
         "нормализации",
         "сопоставления СНХ",
         "финальной проверки",
+        "распознавания закадра",
         "подготовки Stage 3",
     ]
 

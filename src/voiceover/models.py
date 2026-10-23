@@ -150,13 +150,19 @@ class VoiceoverRange:
     selected_take: int | None = None  # None: auto (last full take)
     origin: str = "auto"
     voice_source: str = "recorded"
+    note: str = ""  # human-readable flag: "дубли: 3", "частичный дубль", ...
+    display_text: str = ""  # original scenario text of the block (for the UI)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], *, duration_sec: float) -> "VoiceoverRange":
-        start, end, speech_in, speech_out = _validated_bounds(data, duration_sec)
         status = data.get("status", "needs_review")
         if status not in RANGE_STATUSES:
             raise ValueError(f"unknown status: {status!r}")
+        if status == "missing":
+            # A block that was not found has no range: zero placeholder bounds.
+            start = end = speech_in = speech_out = 0.0
+        else:
+            start, end, speech_in, speech_out = _validated_bounds(data, duration_sec)
         origin = data.get("origin", "auto")
         if origin not in ORIGINS:
             raise ValueError(f"unknown origin: {origin!r}")
@@ -169,6 +175,8 @@ class VoiceoverRange:
         if not isinstance(raw_takes, (list, tuple)):
             raise ValueError("takes must be a list")
         takes = tuple(Take.from_dict(item, duration_sec=duration_sec) for item in raw_takes)
+        if status == "missing" and takes:
+            raise ValueError("a missing block cannot have takes")
         selected = data.get("selected_take")
         if selected is not None:
             selected = _int(selected, "selected_take", minimum=0)
@@ -180,7 +188,9 @@ class VoiceoverRange:
         return cls(
             block_uid=_text(data.get("block_uid"), "block_uid"),
             text_sha256=_text(data.get("text_sha256", ""), "text_sha256", required=False),
-            recording_id=_text(data.get("recording_id"), "recording_id"),
+            recording_id=_text(
+                data.get("recording_id", ""), "recording_id", required=status != "missing"
+            ),
             source_in_sec=start,
             source_out_sec=end,
             speech_in_sec=speech_in,
@@ -192,6 +202,8 @@ class VoiceoverRange:
             selected_take=selected,
             origin=origin,
             voice_source=voice_source,
+            note=_text(data.get("note", ""), "note", required=False),
+            display_text=_text(data.get("display_text", ""), "display_text", required=False),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,4 +222,6 @@ class VoiceoverRange:
             "selected_take": self.selected_take,
             "origin": self.origin,
             "voice_source": self.voice_source,
+            "note": self.note,
+            "display_text": self.display_text,
         }

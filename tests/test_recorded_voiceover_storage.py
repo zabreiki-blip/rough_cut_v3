@@ -436,13 +436,13 @@ def test_scan_without_folder_is_noop(paths: dict[str, Path]) -> None:
 def test_scan_sorts_parts_by_name_and_reindexes_late_arrivals(paths: dict[str, Path]) -> None:
     make_wav(paths["inbox_voiceover"] / "Часть 2.wav", seconds=1.0)
     make_wav(paths["inbox_voiceover"] / "Часть 3.wav", seconds=1.5)
-    make_wav(paths["inbox_voiceover"] / "часть 10.wav", seconds=2.0)  # lexicographic, not natural
+    make_wav(paths["inbox_voiceover"] / "часть 10.wav", seconds=2.0)  # natural: 10 after 3
 
     scan_recorded_voiceover(paths)
     names = [
         (r["part_index"], r["part_name"]) for r in load_recorded_voiceover(paths)["recordings"]
     ]
-    assert names == [(0, "часть 10.wav"), (1, "Часть 2.wav"), (2, "Часть 3.wav")]
+    assert names == [(0, "Часть 2.wav"), (1, "Часть 3.wav"), (2, "часть 10.wav")]
 
     make_wav(paths["inbox_voiceover"] / "Часть 1.wav", seconds=2.5)
     scan_recorded_voiceover(paths)
@@ -451,9 +451,9 @@ def test_scan_sorts_parts_by_name_and_reindexes_late_arrivals(paths: dict[str, P
     ]
     assert names == [
         (0, "Часть 1.wav"),
-        (1, "часть 10.wav"),
-        (2, "Часть 2.wav"),
-        (3, "Часть 3.wav"),
+        (1, "Часть 2.wav"),
+        (2, "Часть 3.wav"),
+        (3, "часть 10.wav"),
     ]
 
 

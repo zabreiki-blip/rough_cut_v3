@@ -76,6 +76,23 @@ class FinalReviewJobServices(Protocol):
     ) -> JsonDict: ...
 
 
+class VoiceoverJobServices(Protocol):
+    """Dependencies consumed by recorded-voiceover recognition jobs."""
+
+    _VOICEOVER_RUNTIME: Any  # job_runtime.JobRegistry
+    _ASR_SEMAPHORE: Any
+
+    def _project_paths(self, project: str) -> dict[str, Path]: ...
+
+    def _utc_now_iso(self) -> str: ...
+
+    def _atomic_write_json_file(self, path: Path, payload: JsonDict) -> None: ...
+
+    def _read_json_safe(self, path: Path) -> JsonDict: ...
+
+    def transcribe_audio(self, audio_path: Path, **options: Any) -> JsonDict: ...
+
+
 class TtsJobServices(Protocol):
     """Dependencies consumed by Stage 1 TTS job helpers."""
 
