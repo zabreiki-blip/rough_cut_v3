@@ -102,9 +102,9 @@ from stage1.normalizer import (
 from stage1.scenario_structure import find_timecodes, normalize_timecode_value
 from stage1.validator import validate_stage1
 from stage2.timeline_parser import (
+    is_label_only_sync,
     life_parts,
     normalized_sync_fragments,
-    is_label_only_sync,
     parse_normalized_timeline,
     sync_fragment_id,
 )
@@ -1395,6 +1395,8 @@ def _sync_alignment_units(
             speaker = speaker_selector
             if speaker:
                 last_speaker[block_type] = speaker
+        if block_type == "sync" and is_label_only_sync(block):
+            continue
         if block_type == "sync":
             fragments = normalized_sync_fragments(
                 block
@@ -1497,8 +1499,6 @@ def _sync_job_with_live_summary(job: dict) -> dict:
         valid_ids = {
             str(unit.get("segment_id") or "")
             for unit in _sync_alignment_units(
-        if block_type == "sync" and is_label_only_sync(block):
-            continue
                 [
                     block
                     for block in confirmed.get("blocks", [])
