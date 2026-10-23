@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Literal
+import unicodedata
 
 
 SCENARIO_EXTENSIONS = frozenset({".doc", ".docx", ".md", ".txt"})
@@ -27,7 +28,9 @@ VIDEO_EXTENSIONS = frozenset(
 AUDIO_EXTENSIONS = frozenset({".mp3", ".wav"})
 REVIEW_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
-InboxKind = Literal["scenario", "video", "audio"]
+VOICEOVER_EXTENSIONS = AUDIO_EXTENSIONS
+
+InboxKind = Literal["scenario", "video", "audio", "voiceover"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,38 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _nfc_fold(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def resolve_inbox_dir(root: Path, *names: str) -> Path:
+    """Return the existing directory ``root/names`` tolerating NFC/NFD spelling.
+
+    macOS volumes (and archives made there) may store Cyrillic folder names in
+    NFD, while Linux compares names byte-wise. When the literal path is absent,
+    each component is matched by its NFC form; if nothing matches the literal
+    (NFC) path is returned so callers may still create it.
+    """
+
+    current = root
+    for name in names:
+        literal = current / name
+        if literal.exists():
+            current = literal
+            continue
+        match = None
+        if current.is_dir():
+            try:
+                for child in sorted(current.iterdir(), key=lambda item: item.name):
+                    if _nfc_fold(child.name) == _nfc_fold(name):
+                        match = child
+                        break
+            except OSError:
+                match = None
+        current = match if match is not None else literal
+    return current
 
 
 def _sha256(path: Path) -> str:
@@ -147,7 +182,7 @@ def _discover_category(
                 continue
             extension = path.suffix.lower()
             kind: InboxKind = default_kind
-            if default_kind != "scenario":
+            if default_kind not in ("scenario", "voiceover"):
                 kind = "audio" if extension in AUDIO_EXTENSIONS else "video"
             by_fingerprint[fingerprint] = InboxFile(
                 file_id=f"inbox_{identity_hash[:20]}",
@@ -193,7 +228,7 @@ def discover_project_inbox(project_root: Path) -> dict[str, Any]:
     root = project_root.resolve()
     scenarios = _discover_category(
         (
-            (root / "ЗАГРУЗИТЬ" / "Сценарии", "upload"),
+            (resolve_inbox_dir(root, "ЗАГРУЗИТЬ", "Сценарии"), "upload"),
             (root / "input", "legacy"),
         ),
         project_root=root,
@@ -202,7 +237,7 @@ def discover_project_inbox(project_root: Path) -> dict[str, Any]:
     )
     reviews = _discover_category(
         (
-            (root / "ЗАГРУЗИТЬ" / "Просмотровки", "upload"),
+            (resolve_inbox_dir(root, "ЗАГРУЗИТЬ", "Просмотровки"), "upload"),
             (root / "media" / "reviews", "legacy"),
         ),
         project_root=root,
@@ -210,7 +245,14 @@ def discover_project_inbox(project_root: Path) -> dict[str, Any]:
         default_kind="video",
         hash_content=False,
     )
+    voiceovers = _discover_category(
+        ((resolve_inbox_dir(root, "ЗАГРУЗИТЬ", "Закадр"), "upload"),),
+        project_root=root,
+        extensions=VOICEOVER_EXTENSIONS,
+        default_kind="voiceover",
+    )
     return {
         "scenario_files": [item.to_dict() for item in scenarios],
         "review_files": [item.to_dict() for item in reviews],
+        "voiceover_files": [item.to_dict() for item in voiceovers],
     }
