@@ -1794,3 +1794,29 @@ ins.word-added {
     flex-wrap: nowrap;
   }
 }
+
+/* Recorded voiceover ("Готовая запись") */
+.voice-mode-switch { display: flex; gap: 8px; margin-bottom: 14px; }
+.voice-mode-switch .btn.active { background: var(--accent-glow); color: var(--accent-light); border-color: var(--accent); }
+.recorded-panel { margin-bottom: 16px; }
+.recorded-panel .muted { color: var(--muted); font-size: 12px; }
+.rv-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+.rv-line { margin: 8px 0; font-size: 13px; }
+.rv-notice { padding: 8px 12px; margin-bottom: 8px; border-radius: var(--radius-sm); background: var(--blue-dim); color: var(--blue); }
+.rv-message { padding: 8px 12px; margin: 8px 0; border-radius: var(--radius-sm); background: var(--orange-dim); color: var(--orange); }
+.rv-warning { padding: 8px 12px; margin: 10px 0; border-radius: var(--radius-sm); background: var(--orange-dim); color: var(--orange); font-size: 12px; }
+#rv_player { width: 100%; margin: 8px 0; }
+.rv-table-wrap { max-height: 520px; overflow: auto; }
+.rv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.rv-table th, .rv-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.rv-text { max-width: 360px; white-space: pre-wrap; }
+.rv-time { width: 76px; }
+.rv-status[data-status="confirmed"], .rv-source[data-source="recorded"] { color: var(--green); }
+.rv-status[data-status="needs_review"], .rv-source[data-source="tts"] { color: var(--orange); }
+.rv-status[data-status="missing"], .rv-source[data-source="none"] { color: var(--red); }
+.rv-badge { display: inline-block; padding: 1px 6px; margin: 0 2px 2px 0; border-radius: 10px; background: var(--blue-dim); color: var(--blue); font-size: 11px; }
+.rv-badge-warn { background: var(--orange-dim); color: var(--orange); }
+.rv-takes { list-style: none; margin: 6px 0; padding: 0; }
+.rv-take { padding: 3px 0; }
+.rv-take-selected { color: var(--green); }
+.rv-apply { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; margin-top: 10px; }

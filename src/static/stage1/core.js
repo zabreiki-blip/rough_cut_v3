@@ -291,6 +291,21 @@ export const sourceLabels = {
   unknown: "не определено",
 };
 
+// Per-block readiness (recorded range OR TTS wav) from the /stage1/status `voiceover`
+// object. `counted: false` means an old status without it: callers fall back to zkN.wav.
+export function readyBlocksSummary(status) {
+  const voice = status && status.voiceover;
+  if (!voice || typeof voice.total !== "number") {
+    return { counted: false, ready: 0, total: 0, recorded: 0, missing: [], text: "" };
+  }
+  const ready = Number(voice.ready || 0);
+  const total = Number(voice.total || 0);
+  const recorded = Number(voice.recorded || 0);
+  const missing = Array.isArray(voice.missing) ? voice.missing : [];
+  const suffix = recorded > 0 ? ` (по записи диктора: ${recorded})` : "";
+  return { counted: true, ready, total, recorded, missing, text: `Готово блоков: ${ready} из ${total}${suffix}` };
+}
+
 export function escaped(value) {
   return String(value == null ? "" : value)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")

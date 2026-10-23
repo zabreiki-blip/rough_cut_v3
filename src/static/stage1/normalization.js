@@ -5,7 +5,7 @@ import { ids, appState, project } from "./state.js";
 import {
   toast, appendLog, requestJSON, confirmDialog, escaped,
   blockTypeLabels, sourceLabels, setStepState, updateActionAvailability,
-  assertRequiredPath, safely,
+  assertRequiredPath, safely, readyBlocksSummary,
 } from "./core.js";
 import { renderOpenRouterUsage } from "./usage.js";
 
@@ -998,9 +998,14 @@ async function deleteMemoryRule(ruleId) {
 export function applyStatus(status) {
   renderOpenRouterUsage(status.openrouter_usage || {});
   const prepared = Number(status.prepared_items_count || 0);
-  const wav = Number(status.speaker_files_count || 0);
-  const missing = Array.isArray(status.missing_ids) ? status.missing_ids.length : 0;
-  const pct = prepared > 0 ? Math.round((wav / prepared) * 100) : 0;
+  // A block is voiced by a recorded range OR a TTS wav: count ready blocks, not zkN.wav files.
+  const voice = readyBlocksSummary(status);
+  const wav = voice.counted ? voice.ready : Number(status.speaker_files_count || 0);
+  const missing = voice.counted
+    ? Math.max(0, voice.total - voice.ready)
+    : (Array.isArray(status.missing_ids) ? status.missing_ids.length : 0);
+  const voiceTotal = voice.counted ? voice.total : prepared;
+  const pct = voiceTotal > 0 ? Math.round((wav / voiceTotal) * 100) : 0;
 
   ids.m_prepared.textContent = String(prepared);
   ids.m_wav.textContent = String(wav);
@@ -1010,13 +1015,13 @@ export function applyStatus(status) {
   ids.f_manual.textContent = status.manual_markers_used ? "yes" : "no";
   ids.f_manifest.textContent = status.manifest_exists ? "ready" : "missing";
   ids.progress_bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-  ids.speaker_hint.textContent = `${wav} файлов`;
+  ids.speaker_hint.textContent = voice.counted ? voice.text : `${wav} файлов`;
 
   // Update pipeline steps
   if (prepared > 0) {
     setStepState(ids.step_analyze, "completed");
   }
-  if (wav > 0 && missing === 0 && prepared > 0) {
+  if (wav > 0 && missing === 0 && voiceTotal > 0) {
     setStepState(ids.step_tts, "completed");
   } else if (wav > 0) {
     setStepState(ids.step_tts, "active");

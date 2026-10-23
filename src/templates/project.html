@@ -279,6 +279,40 @@
 
     <section id="tab_voiceover" class="workspace-panel" data-tab-panel="voiceover" hidden>
 
+    <div class="voice-mode-switch" role="group" aria-label="Источник озвучки">
+      <button id="voice_mode_tts" class="btn btn-sm active" type="button" aria-pressed="true">Синтез</button>
+      <button id="voice_mode_recorded" class="btn btn-sm" type="button" aria-pressed="false">Готовая запись</button>
+    </div>
+
+    <section id="recorded_panel" class="panel recorded-panel" hidden>
+      <h2>Готовая запись диктора</h2>
+      <p class="muted">Один общий файл записи сопоставляется со сценарием: у каждого закадрового блока появляется диапазон in/out. Файл можно положить в <code>ЗАГРУЗИТЬ/Закадр</code> или загрузить здесь.</p>
+      <div id="rv_notice" class="rv-notice" role="status" hidden></div>
+      <div class="rv-toolbar">
+        <input id="rv_file" type="file" accept=".wav,.mp3,audio/wav,audio/mpeg">
+        <button id="btn_rv_upload" class="btn btn-sm" type="button">Загрузить файл</button>
+        <button id="btn_rv_scan" class="btn btn-sm" type="button">Проверить ЗАГРУЗИТЬ/Закадр</button>
+        <button id="btn_rv_align" class="btn btn-sm btn-primary" type="button" disabled>Сопоставить со сценарием</button>
+        <button id="btn_rv_cancel" class="btn btn-sm" type="button" hidden>Остановить</button>
+      </div>
+      <p class="rv-line"><span id="rv_recordings">Файл записи не выбран.</span> Задача: <strong id="rv_job_status" data-state="idle">задача не запускалась</strong></p>
+      <div id="rv_message" class="rv-message" role="alert" hidden></div>
+      <audio id="rv_player" controls preload="metadata"></audio>
+      <div class="rv-table-wrap">
+        <table class="rv-table">
+          <thead><tr><th>№</th><th>Текст</th><th>in — out, с</th><th>Статус</th><th>Источник</th><th>Пометки</th><th>Действия</th></tr></thead>
+          <tbody id="rv_blocks"></tbody>
+        </table>
+      </div>
+      <div id="rv_loudness_warning" class="rv-warning" role="status" hidden></div>
+      <div class="rv-apply">
+        <button id="btn_rv_apply" class="btn btn-primary" type="button" disabled>Применить запись к редакции</button>
+        <small id="rv_apply_hint" class="muted"></small>
+      </div>
+    </section>
+
+    <div id="tts_mode_panel">
+
     <!-- Pipeline Steps -->
     <section class="pipeline">
       <div class="step" id="step_analyze" data-state="pending">
@@ -323,7 +357,7 @@
       </div>
       <div class="stat">
         <div class="stat-value" id="m_wav">0</div>
-        <div class="stat-label">WAV файлов</div>
+        <div class="stat-label">Блоков готово</div>
       </div>
       <div class="stat">
         <div class="stat-value stat-warn" id="m_missing">0</div>
@@ -501,6 +535,7 @@
           <div id="speaker_items" class="speaker-grid"></div>
         </div>
       </section>
+    </div>
     </div>
     </section>
 

@@ -2336,6 +2336,350 @@ async function testNormalizationHistoryDiffRestore({ state, normalization }) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Recorded voiceover (готовая запись диктора): recorded_voiceover.js
+// ---------------------------------------------------------------------------
+
+function recordedModule() {
+  return import(moduleUrl("recorded_voiceover.js"));
+}
+
+function rvTake(inSec, outSec, partial = false) {
+  return {
+    source_in_sec: inSec, source_out_sec: outSec, speech_in_sec: inSec + 0.1,
+    speech_out_sec: outSec - 0.1, confidence: 0.9, partial,
+  };
+}
+
+function rvBlock(uid, text, range, preview) {
+  return {
+    block_uid: uid, display_text: text, text_sha256: `sha-${uid}`,
+    range, text_changed: false, tts_available: preview.voice_source === "tts",
+    publish_preview: { origin: "auto", reason: "", ...preview },
+  };
+}
+
+function rvRange(uid, patch = {}) {
+  return {
+    block_uid: uid, text_sha256: `sha-${uid}`, recording_id: "rec1", status: "needs_review",
+    source_in_sec: 10, source_out_sec: 20, speech_in_sec: 10.1, speech_out_sec: 19.9,
+    voice_source: "recorded", origin: "auto", takes: [], selected_take: null, note: "",
+    confidence: 0.9, manual_range: false, ...patch,
+  };
+}
+
+function rvFixture(patch = {}) {
+  return {
+    project: "demo", scenario_confirmed: true, scenario_revision_id: "rev_0003",
+    generation: 7, draft_revision_id: "rev_0003", draft_stale: false,
+    recordings: [{ id: "rec1", asset: "speaker/rec1.wav", duration_sec: 120 }],
+    blocks: [
+      rvBlock("b1", "Первый блок", rvRange("b1", { status: "confirmed" }), { voice_source: "recorded" }),
+      rvBlock("b2", "Второй блок", rvRange("b2", {
+        note: "дубли: 3; частичный дубль",
+        takes: [rvTake(30, 40), rvTake(50, 60, true), rvTake(70, 80)],
+      }), { voice_source: "tts", reason: "not_confirmed" }),
+      rvBlock("b3", "Третий блок", null, { voice_source: "none", reason: "no_range" }),
+    ],
+    published: { exists: false, is_current: false, summary: {} },
+    job: null,
+    ...patch,
+  };
+}
+
+function rvFetchMock(routes) {
+  const calls = [];
+  const fn = async (url, options = {}) => {
+    const parsed = new URL(String(url), "http://localhost");
+    const method = options.method || "GET";
+    const call = {
+      method, path: parsed.pathname, search: parsed.search,
+      body: typeof options.body === "string" ? JSON.parse(options.body) : options.body,
+    };
+    calls.push(call);
+    const handler = routes[`${method} ${parsed.pathname}`];
+    if (!handler) throw new Error(`rv: unexpected request ${method} ${parsed.pathname}`);
+    const out = typeof handler === "function" ? handler(call) : handler;
+    const status = out.status || 200;
+    const payload = out.payload || { ok: true, result: out.result };
+    return { ok: status < 400, status, text: async () => JSON.stringify(payload), json: async () => payload };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+async function withRvFetch(routes, body) {
+  const rv = await recordedModule();
+  const original = globalThis.fetch;
+  const mock = rvFetchMock(routes);
+  globalThis.fetch = mock;
+  try {
+    await body(rv, mock);
+  } finally {
+    globalThis.fetch = original;
+    rv.stopRecordedPolling();
+  }
+}
+
+const RV = "/stage1/recorded-voiceover";
+
+async function testRecordedReadyCounter({ state, normalization }) {
+  const rv = await recordedModule();
+  const { ids } = state;
+  const summary = rv.readyBlocksSummary({ voiceover: { total: 5, ready: 3, recorded: 2 } });
+  assert.strictEqual(summary.counted, true);
+  assert.strictEqual(summary.ready, 3);
+  assert.ok(summary.text.includes("3 из 5"), summary.text);
+  normalization.applyStatus({
+    prepared_items_count: 5, speaker_files_count: 0, missing_ids: ["zk1", "zk2", "zk3", "zk4", "zk5"],
+    voiceover: { total: 5, ready: 3, recorded: 2, missing: ["zk4", "zk5"] },
+  });
+  assert.strictEqual(ids.m_wav.textContent, "3");
+  assert.strictEqual(ids.m_missing.textContent, "2");
+  assert.strictEqual(ids.m_progress.textContent, "60%");
+  // Old statuses without per-block readiness keep the zkN.wav behaviour.
+  normalization.applyStatus({ prepared_items_count: 4, speaker_files_count: 2, missing_ids: ["zk3", "zk4"], speaker_files: [] });
+  assert.strictEqual(ids.m_wav.textContent, "2");
+  assert.strictEqual(ids.m_missing.textContent, "2");
+}
+
+async function testRecordedJobRestoredAfterReload({ state }) {
+  const { ids } = state;
+  const running = { id: "job1", status: "running", message: "Transcribing", transcription_processed_sec: 30, transcription_duration_sec: 120 };
+  await withRvFetch({
+    [`GET ${RV}`]: (call) => ({ result: rvFixture({ job: call && jobDone.value ? { ...running, status: "completed" } : running }) }),
+    [`GET ${RV}/jobs/job1`]: () => ({ result: { ...running, status: "completed", summary: {} } }),
+  }, async (rv, mock) => {
+    const originalSetTimeout = window.setTimeout;
+    const scheduled = [];
+    window.setTimeout = (fn, delay, ...rest) => {
+      if (delay === rv.POLL_INTERVAL_MS) { scheduled.push(fn); return -1; }
+      return originalSetTimeout(fn, delay, ...rest);
+    };
+    try {
+      await rv.restoreRecordedJob();
+      assert.ok(ids.rv_job_status.textContent.includes("идёт сопоставление"), ids.rv_job_status.textContent);
+      assert.strictEqual(rv.canApplyRecording(rv.getRecordedState()), false, "apply is blocked while the job runs");
+      assert.strictEqual(scheduled.length, 1, "polling of the restored job must be scheduled");
+      jobDone.value = true;
+      await scheduled[0]();
+      assert.ok(mock.calls.some((call) => call.path === `${RV}/jobs/job1`));
+      assert.ok(ids.rv_job_status.textContent.includes("готово"), ids.rv_job_status.textContent);
+      assert.strictEqual(scheduled.length, 1, "no further polling after the terminal status");
+    } finally {
+      window.setTimeout = originalSetTimeout;
+    }
+  });
+}
+const jobDone = { value: false };
+
+async function testRecordedAutodetectNotice({ state }) {
+  const { ids } = state;
+  let now = 1000000;
+  await withRvFetch({
+    [`POST ${RV}/scan`]: () => ({ result: { job: { id: "job2", status: "queued" }, state: rvFixture({ job: { id: "job2", status: "queued" } }) } }),
+    [`GET ${RV}/jobs/job2`]: () => ({ result: { id: "job2", status: "running" } }),
+  }, async (rv, mock) => {
+    const originalSetTimeout = window.setTimeout;
+    window.setTimeout = (fn, delay, ...rest) => (delay === rv.POLL_INTERVAL_MS ? -1 : originalSetTimeout(fn, delay, ...rest));
+    try {
+      rv.setRecordedState(rvFixture());
+      await rv.scanRecordedInbox({ now: () => now });
+      assert.ok(ids.rv_notice.textContent.includes("Найдена запись диктора — идёт сопоставление"), ids.rv_notice.textContent);
+      assert.strictEqual(ids.rv_notice.hidden, false);
+      const scans = () => mock.calls.filter((call) => call.path === `${RV}/scan`).length;
+      assert.strictEqual(scans(), 1);
+      now += 1000;
+      await rv.scanRecordedInbox({ now: () => now });
+      assert.strictEqual(scans(), 1, "scan must be throttled");
+      now += 60000;
+      await rv.scanRecordedInbox({ now: () => now });
+      assert.strictEqual(scans(), 2);
+    } finally {
+      window.setTimeout = originalSetTimeout;
+    }
+  });
+}
+
+async function testRecordedSourceColumnAndBadges() {
+  const rv = await recordedModule();
+  const doc = rvFixture();
+  const [b1, b2, b3] = doc.blocks;
+  assert.strictEqual(rv.blockSourceLabel(b1), "Диктор");
+  assert.strictEqual(rv.blockSourceLabel(b2), "TTS");
+  assert.strictEqual(rv.blockSourceLabel(b3), "нет");
+  assert.deepStrictEqual(rv.blockBadges(b2), ["дубли: 3", "частичный дубль"]);
+  assert.deepStrictEqual(rv.blockBadges(b1), []);
+  const html = rv.renderBlocksHtml(doc);
+  for (const fragment of ["Диктор", "TTS", "нет", "дубли: 3", "частичный дубль", "Первый блок", 'data-uid="b2"']) {
+    assert.ok(html.includes(fragment), `missing ${fragment}`);
+  }
+  // Takes of the block: each can be listened to and selected; the last full take is the default.
+  assert.strictEqual((html.match(/data-rv-action="play-take"/g) || []).length, 3);
+  assert.strictEqual((html.match(/data-rv-action="select-take"/g) || []).length, 3);
+  assert.strictEqual(rv.effectiveTakeIndex(b2.range), 2);
+  assert.strictEqual(rv.effectiveTakeIndex({ ...b2.range, selected_take: 0 }), 0);
+}
+
+async function testRecordedConfirmPatchesBounds() {
+  await withRvFetch({
+    [`PATCH ${RV}/ranges/b2`]: { result: { range: {}, generation: 8 } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 8 }) },
+  }, async (rv, mock) => {
+    rv.setRecordedState(rvFixture());
+    assert.deepStrictEqual(rv.buildRangePatch(rvRange("b2"), 10, 20, "confirmed"), { status: "confirmed" });
+    assert.deepStrictEqual(
+      rv.buildRangePatch(rvRange("b2"), 10.5, 21.25, "confirmed"),
+      { source_in_sec: 10.5, source_out_sec: 21.25, status: "confirmed" },
+    );
+    assert.throws(() => rv.buildRangePatch(rvRange("b2"), 20, 10, "confirmed"), /меньше/);
+    assert.throws(() => rv.buildRangePatch(rvRange("b2"), -1, 10, "confirmed"), /./);
+    assert.strictEqual(await rv.confirmBlock("b2", { inSec: 10.5, outSec: 21.25 }), true);
+    const patch = mock.calls.find((call) => call.method === "PATCH");
+    assert.deepStrictEqual(patch.body, {
+      project: patch.body.project, expected_revision_id: "rev_0003", expected_generation: 7,
+      source_in_sec: 10.5, source_out_sec: 21.25, status: "confirmed",
+    });
+    assert.ok(mock.calls.some((call) => call.method === "GET" && call.path === RV), "state is reloaded after PATCH");
+    assert.strictEqual(rv.getRecordedState().generation, 8);
+  });
+}
+
+async function testRecordedTakeSelection() {
+  await withRvFetch({
+    [`PATCH ${RV}/ranges/b2`]: { result: { range: {}, generation: 8 } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 8 }) },
+  }, async (rv, mock) => {
+    rv.setRecordedState(rvFixture());
+    assert.strictEqual(await rv.selectTake("b2", 0), true);
+    const patch = mock.calls.find((call) => call.method === "PATCH");
+    assert.strictEqual(patch.body.selected_take, 0);
+    assert.strictEqual(patch.body.expected_generation, 7);
+    assert.ok(!("source_in_sec" in patch.body), "take selection must not carry boundaries");
+  });
+}
+
+async function testRecordedTtsOverride() {
+  await withRvFetch({
+    [`PATCH ${RV}/blocks/b1/voice-source`]: { result: { range: {}, generation: 8 } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 8 }) },
+  }, async (rv, mock) => {
+    rv.setRecordedState(rvFixture());
+    const html = rv.renderBlocksHtml(rv.getRecordedState());
+    assert.ok(html.includes('data-rv-action="use-tts"'));
+    assert.strictEqual(await rv.setBlockVoiceSource("b1", "tts"), true);
+    const patch = mock.calls.find((call) => call.method === "PATCH");
+    assert.strictEqual(patch.body.voice_source, "tts");
+    assert.strictEqual(patch.body.expected_revision_id, "rev_0003");
+    assert.strictEqual(patch.body.expected_generation, 7);
+  });
+}
+
+async function testRecordedStaleConflict({ state }) {
+  const { ids } = state;
+  await withRvFetch({
+    [`PATCH ${RV}/ranges/b2`]: { status: 409, payload: { ok: false, error: "markup changed since it was loaded (generation mismatch)" } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 9 }) },
+  }, async (rv, mock) => {
+    rv.setRecordedState(rvFixture());
+    assert.strictEqual(await rv.confirmBlock("b2", {}), false);
+    assert.ok(ids.rv_message.textContent.includes("изменились"), ids.rv_message.textContent);
+    assert.ok(ids.rv_message.textContent.includes("перезагружено"), ids.rv_message.textContent);
+    assert.strictEqual(rv.getRecordedState().generation, 9, "state must be reloaded after 409");
+    assert.ok(mock.calls.filter((call) => call.method === "GET").length >= 1);
+  });
+}
+
+async function testRecordedApplyButton({ state }) {
+  const { ids } = state;
+  const rv = await recordedModule();
+  const none = rvFixture({ blocks: [rvFixture().blocks[1], rvFixture().blocks[2]] });
+  assert.strictEqual(rv.canApplyRecording(none), false);
+  assert.strictEqual(rv.canApplyRecording(rvFixture()), true, "one confirmed block is enough");
+  assert.strictEqual(rv.canApplyRecording(rvFixture({ job: { status: "running" } })), false);
+  assert.strictEqual(rv.canApplyRecording(rvFixture({ draft_stale: true })), false);
+  const stale = rvFixture();
+  stale.blocks[0].text_changed = true;
+  assert.strictEqual(rv.canApplyRecording(stale), false, "confirmed block with changed text does not count");
+  rv.setRecordedState(none);
+  assert.strictEqual(ids.btn_rv_apply.disabled, true);
+  rv.setRecordedState(rvFixture());
+  assert.strictEqual(ids.btn_rv_apply.disabled, false);
+  assert.ok(/TTS/.test(ids.rv_apply_hint.textContent) && ids.rv_apply_hint.textContent.includes("остальные"), ids.rv_apply_hint.textContent);
+  await withRvFetch({
+    [`POST ${RV}/apply`]: { result: { published_sha256: "abc", summary: { recorded: 1 } } },
+    [`GET ${RV}`]: { result: rvFixture() },
+    "GET /stage1/status": { result: {} },
+  }, async (rv2, mock) => {
+    rv2.setRecordedState(rvFixture());
+    assert.strictEqual(await rv2.applyRecording(), true);
+    const post = mock.calls.find((call) => call.path === `${RV}/apply`);
+    assert.strictEqual(post.body.expected_generation, 7);
+    assert.strictEqual(post.body.expected_revision_id, "rev_0003");
+  });
+}
+
+async function testRecordedLoudnessWarning({ state }) {
+  const { ids } = state;
+  const rv = await recordedModule();
+  assert.ok(rv.mixedVolumeWarning(rvFixture()).includes("громкост"));
+  const onlyRecorded = rvFixture({ blocks: [rvFixture().blocks[0]] });
+  assert.strictEqual(rv.mixedVolumeWarning(onlyRecorded), "");
+  rv.setRecordedState(rvFixture());
+  assert.strictEqual(ids.rv_loudness_warning.hidden, false);
+  assert.ok(ids.rv_loudness_warning.textContent.includes("громкост"));
+  rv.setRecordedState(onlyRecorded);
+  assert.strictEqual(ids.rv_loudness_warning.hidden, true);
+}
+
+async function testRecordedEscaping({ state }) {
+  const { ids } = state;
+  const rv = await recordedModule();
+  const evil = '<img src=x onerror=alert(1)>"\'<script>alert(2)</script>';
+  const doc = rvFixture({
+    blocks: [rvBlock('b"><x', evil, rvRange('b"><x', { note: evil, takes: [rvTake(1, 2)] }), { voice_source: "recorded", reason: evil })],
+  });
+  const html = rv.renderBlocksHtml(doc);
+  assert.ok(!html.includes("<img"), "raw <img leaked");
+  assert.ok(!html.includes("<script"), "raw <script leaked");
+  assert.ok(!html.includes('"><x'), "attribute breakout");
+  assert.ok(html.includes("&lt;img"));
+  const jobText = rv.jobSummaryText({ status: "failed", error: evil, message: evil });
+  assert.ok(jobText.includes("ошибка"), "job error is shown as plain text (assigned via textContent)");
+  rv.setRecordedState(doc);
+  assert.ok(!String(ids.rv_blocks.innerHTML).includes("<img"));
+}
+
+async function testRecordedPlayerStopsAtOut({ state }) {
+  const { ids } = state;
+  const rv = await recordedModule();
+  const player = ids.rv_player;
+  let played = 0;
+  let paused = 0;
+  player.play = () => { played += 1; return Promise.resolve(); };
+  player.pause = () => { paused += 1; };
+  rv.setRecordedState(rvFixture());
+  rv.playRange(12.5, 15, "rec1");
+  assert.strictEqual(player.currentTime, 12.5);
+  assert.strictEqual(played, 1);
+  assert.ok(String(player.src).includes("/stage1/recorded-voiceover/audio?"), player.src);
+  assert.ok(String(player.src).includes("recording_id=rec1"));
+  player.currentTime = 14.9;
+  player.dispatch("timeupdate");
+  assert.strictEqual(paused, 0);
+  player.currentTime = 15.01;
+  player.dispatch("timeupdate");
+  assert.strictEqual(paused, 1, "playback must stop at the end of the range");
+  // A new range replaces the previous stop handler.
+  rv.playRange(40, 41, "rec1");
+  player.currentTime = 15.5;
+  player.dispatch("timeupdate");
+  assert.strictEqual(paused, 1);
+  player.currentTime = 41.2;
+  player.dispatch("timeupdate");
+  assert.strictEqual(paused, 2);
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
@@ -2378,6 +2722,18 @@ async function main() {
     ["testSyncLifeCardUnassignAndStale", () => testSyncLifeCardUnassignAndStale(modules)],
     ["testGroupReviewOnlySelectedBlocks", () => testGroupReviewOnlySelectedBlocks(modules)],
     ["testNormalizationHistoryDiffRestore", () => testNormalizationHistoryDiffRestore(modules)],
+    ["testRecordedReadyCounter", () => testRecordedReadyCounter(modules)],
+    ["testRecordedJobRestoredAfterReload", () => testRecordedJobRestoredAfterReload(modules)],
+    ["testRecordedAutodetectNotice", () => testRecordedAutodetectNotice(modules)],
+    ["testRecordedSourceColumnAndBadges", () => testRecordedSourceColumnAndBadges(modules)],
+    ["testRecordedConfirmPatchesBounds", () => testRecordedConfirmPatchesBounds(modules)],
+    ["testRecordedTakeSelection", () => testRecordedTakeSelection(modules)],
+    ["testRecordedTtsOverride", () => testRecordedTtsOverride(modules)],
+    ["testRecordedStaleConflict", () => testRecordedStaleConflict(modules)],
+    ["testRecordedApplyButton", () => testRecordedApplyButton(modules)],
+    ["testRecordedLoudnessWarning", () => testRecordedLoudnessWarning(modules)],
+    ["testRecordedEscaping", () => testRecordedEscaping(modules)],
+    ["testRecordedPlayerStopsAtOut", () => testRecordedPlayerStopsAtOut(modules)],
   ];
 
   let passed = 0;
