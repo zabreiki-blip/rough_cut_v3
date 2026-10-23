@@ -221,6 +221,19 @@ export function describeStage3Placeholders(result) {
   return text;
 }
 
+export function stage3BuildLabel(result) {
+  const buildId = String((result && result.build_id) || "");
+  return buildId ? `Сборка ${buildId}: ` : "";
+}
+
+// The immutable build is addressed by id, so a later prepare cannot swap the file under the link.
+export function stage3DownloadUrl(result) {
+  const url = String((result && result.download_url) || "");
+  const buildId = String((result && result.build_id) || "");
+  if (!url || !buildId || /[?&]build_id=/.test(url)) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}build_id=${encodeURIComponent(buildId)}`;
+}
+
 async function applyCompletedStage3Job(job, download) {
   const result = job.result || {};
   if (job.kind === "scan") {
@@ -237,15 +250,15 @@ async function applyCompletedStage3Job(job, download) {
   renderStage3SourceMapping(result.source_mapping || []);
   renderStage3Blockers([]);
   ids.stage3_media_message.textContent =
-    `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
+    `${stage3BuildLabel(result)}Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
     + `${describeStage3Placeholders(result)}.`;
   appendLog(
-    `Timeline XML (${result.format || "nested"}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
+    `Timeline XML (${result.format || "nested"}${result.build_id ? `, build ${result.build_id}` : ""}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
     + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
   );
   if (download && result.download_url) {
-    toast("XML готов. Начинаю загрузку.", "success");
-    window.location.href = result.download_url;
+    toast(`XML готов${result.build_id ? ` (сборка ${result.build_id})` : ""}. Начинаю загрузку.`, "success");
+    window.location.href = stage3DownloadUrl(result);
   }
 }
 

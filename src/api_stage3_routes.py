@@ -19,6 +19,7 @@ from atomic_io import atomic_write_json, atomic_write_text
 from export_naming import xml_export_filename
 from job_runtime import trim_terminal_jobs
 from stage2.assembly_plan import build_assembly_plan, plan_to_report, validate_plan_complete
+from stage3 import builds as stage3_builds
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
@@ -354,6 +355,10 @@ def _project_transition(project: str, services: ModuleType):
     return factory(project) if callable(factory) else nullcontext()
 
 
+def _builds_dir(paths: dict) -> Path:
+    return Path(paths.get("builds") or Path(paths["work"]) / "builds")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -513,6 +518,7 @@ def _perform_prepare(
         return {
             "project": project,
             "format": "legacy",
+            "build_id": None,
             "mode": mode,
             "complete": not blockers,
             "blocker_count": len(blockers),
@@ -554,6 +560,15 @@ def _perform_prepare(
     if progress:
         progress(80, "Генерация nested XML")
     xml_text = build_nested_xml(host_timeline, export_catalog, plan=plan)
+    timeline_sha256 = hashlib.sha256(timeline_bytes).hexdigest()
+    inputs = stage3_builds.collect_inputs(
+        timeline_data=timeline_data,
+        timeline_sha256=timeline_sha256,
+        plan=plan,
+        mapping_catalog=mapping.catalog,
+        unmapped_source_ids=mapping.unmapped_source_ids,
+    )
+    build_id = stage3_builds.compute_build_id(inputs, mode)
     filename = _nested_timeline_filename(project, timeline_data.get("scenario_revision_id"))
     output_path = paths["work"] / filename
     filename_stem = output_path.stem
@@ -562,20 +577,36 @@ def _perform_prepare(
         filename = f"{filename_stem}_{collision}.xml"
         output_path = paths["work"] / filename
         collision += 1
-    atomic_write_text(output_path, xml_text)
-    atomic_write_json(paths["work"] / "assembly_plan.json", plan)
     mapping_payload = mapping.to_dict()
     mapping_payload["normalization_revision"] = timeline_data.get("normalization_revision")
     mapping_payload["scenario_revision_id"] = str(timeline_data.get("scenario_revision_id") or "")
     mapping_payload["nested_timeline_filename"] = filename
-    mapping_payload["timeline_sha256"] = hashlib.sha256(timeline_bytes).hexdigest()
-    mapping_payload["plan_sha256"] = hashlib.sha256(
-        json.dumps(plan, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    mapping_payload["timeline_sha256"] = timeline_sha256
+    mapping_payload["plan_sha256"] = stage3_builds.sha256_text(stage3_builds.canonical_json(plan))
     mapping_payload["sync_matches_fingerprint"] = str(
         timeline_data.get("sync_matches_fingerprint") or ""
     )
+    mapping_payload["build_id"] = build_id
+    # Publish the immutable build first (one atomic rename).  The legacy files in work/ and the
+    # latest.json pointer follow, so a failure anywhere leaves the previous pointer untouched.
+    builds_dir = _builds_dir(paths)
+    stage3_builds.publish_build(
+        builds_dir,
+        mode=mode,
+        complete=not blockers,
+        inputs=inputs,
+        plan=plan,
+        xml_text=xml_text,
+        xml_filename=xml_export_filename(
+            project, timeline_data.get("scenario_revision_id"), build_id=build_id
+        ),
+        mapping_payload=mapping_payload,
+    )
+    atomic_write_text(output_path, xml_text)
+    atomic_write_json(paths["work"] / "assembly_plan.json", plan)
     atomic_write_json(paths["work"] / "stage3_source_mapping.json", mapping_payload)
+    stage3_builds.set_latest(builds_dir, build_id)
+    stage3_builds.safe_rotate(builds_dir)
     mapped = [
         source_id
         for source_id, detail in mapping.details.items()
@@ -584,11 +615,12 @@ def _perform_prepare(
     return {
         "project": project,
         "format": "nested",
+        "build_id": build_id,
         "mode": mode,
         "complete": not blockers,
         "blocker_count": len(blockers),
         "filename": filename,
-        "download_url": f"/stage3/export/xml?project={project}",
+        "download_url": f"/stage3/export/xml?project={project}&build_id={build_id}",
         "media_count": len(host_catalog.get("sources", [])),
         "audio_count": sum(
             1
@@ -881,6 +913,49 @@ def _start_job(
     )
 
 
+def _current_timeline_inputs(project: str, services: ModuleType, paths: dict) -> dict | None:
+    """Subset of build inputs describing the live timeline, or None when it is not current."""
+
+    try:
+        timeline_bytes = (paths["work"] / "full_timeline.json").read_bytes()
+        timeline_data = json.loads(timeline_bytes.decode("utf-8"))
+        confirmed, _reason = services._confirmed_normalization(project)
+        if not confirmed or not _timeline_is_current(timeline_data, confirmed):
+            return None
+        _source_store, match_store = services._sync_stores(paths)
+        if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
+            return None
+    except (OSError, ValueError, AttributeError):
+        return None
+    return {
+        "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
+        "normalization_revision": timeline_data.get("normalization_revision"),
+        "timeline_sha256": hashlib.sha256(timeline_bytes).hexdigest(),
+        "sync_matches_fingerprint": str(timeline_data.get("sync_matches_fingerprint") or ""),
+    }
+
+
+def _send_build_xml(builds_dir: Path, build: dict, services: ModuleType, *, stale: bool):
+    """Serve builds/<id>/timeline.xml after verifying it against build.json."""
+
+    try:
+        stage3_builds.verify_build_xml(builds_dir, build)
+    except ValueError as exc:
+        return services._json_error(f"build {build.get('build_id')} is corrupted: {exc}", 500)
+    build_id = str(build["build_id"])
+    response = send_from_directory(
+        builds_dir / build_id,
+        stage3_builds.XML_FILENAME,
+        as_attachment=True,
+        download_name=str((build.get("outputs") or {}).get("xml_filename") or f"{build_id}.xml"),
+        mimetype="application/xml",
+    )
+    response.headers["X-RC-Build-Id"] = build_id
+    if stale:
+        response.headers["X-RC-Build-Stale"] = "1"
+    return response
+
+
 def register_stage3_routes(app: Flask, services: ModuleType) -> None:
     jobs: dict[str, dict] = {}
     jobs_lock = threading.RLock()
@@ -1021,6 +1096,32 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         # top level for clients that read {summary, complete_ready, blockers} directly.
         return jsonify({"ok": True, "result": result, **result})
 
+    @app.get("/stage3/builds")
+    def stage3_builds_history():
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+            builds_dir = _builds_dir(services._project_paths(project))
+            try:
+                latest_id = stage3_builds.load_latest_id(builds_dir)
+            except ValueError:
+                latest_id = None
+            history = [
+                {
+                    "build_id": build["build_id"],
+                    "created_at": build.get("created_at"),
+                    "mode": build.get("mode"),
+                    "complete": bool(build.get("complete")),
+                    "summary": build.get("summary"),
+                }
+                for build in stage3_builds.list_builds(builds_dir)
+            ]
+        except ValueError as exc:
+            return services._json_error(str(exc), 400)
+        except Exception as exc:
+            return services._internal_error(exc)
+        result = {"project": project, "latest_build_id": latest_id, "builds": history}
+        return jsonify({"ok": True, "result": result, **result})
+
     @app.get("/stage3/export/xml")
     def stage3_export_xml():
         try:
@@ -1028,6 +1129,15 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             paths = services._project_paths(project)
         except ValueError as exc:
             return services._json_error(str(exc), 400)
+        builds_dir = _builds_dir(paths)
+        requested_build_id = str(request.args.get("build_id") or "").strip()
+        if requested_build_id:
+            build = stage3_builds.load_build(builds_dir, requested_build_id)
+            if build is None:
+                return services._json_error(f"build {requested_build_id} not found", 404)
+            current = _current_timeline_inputs(project, services, paths)
+            stale = current is None or not stage3_builds.build_is_current(build, current)
+            return _send_build_xml(builds_dir, build, services, stale=stale)
         timeline_path = paths["work"] / "full_timeline.json"
         try:
             timeline_bytes = timeline_path.read_bytes()
@@ -1047,6 +1157,29 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         _source_store, match_store = services._sync_stores(paths)
         if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
             return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
+        try:
+            latest_id = stage3_builds.load_latest_id(builds_dir)
+        except ValueError as exc:
+            return services._json_error(str(exc), 500)
+        if latest_id:
+            latest = stage3_builds.load_build(builds_dir, latest_id)
+            if latest is None:
+                return services._json_error(f"build {latest_id} not found", 404)
+            current = {
+                "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
+                "normalization_revision": timeline_data.get("normalization_revision"),
+                "timeline_sha256": hashlib.sha256(timeline_bytes).hexdigest(),
+                "sync_matches_fingerprint": str(
+                    timeline_data.get("sync_matches_fingerprint") or ""
+                ),
+            }
+            if not stage3_builds.build_is_current(latest, current):
+                return services._json_error(
+                    "stage3_rebuild_required: stale build — таймлайн изменился после "
+                    "подготовки Stage 3, подготовьте XML заново",
+                    409,
+                )
+            return _send_build_xml(builds_dir, latest, services, stale=False)
         mapping_path = paths["work"] / "stage3_source_mapping.json"
         try:
             mapping_data = json.loads(mapping_path.read_text(encoding="utf-8"))

@@ -60,6 +60,7 @@ def project_paths(project: str, projects_dir: Path) -> dict[str, Path]:
         "sync_audio": work / "sync_audio",
         "sync_transcripts": work / "transcripts",
         "timeline": work / "full_timeline.json",
+        "builds": work / "builds",
     }
 
 

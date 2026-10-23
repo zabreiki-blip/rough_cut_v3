@@ -499,6 +499,7 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 | GET, PUT | `/stage2/sync-sources/<source_id>/audio` | `stage2_sync_source_audio` |
 | PUT | `/stage2/sync-sources/<source_id>/words` | `stage2_sync_source_words` |
 | GET | `/stage2/timeline` | `stage2_timeline` |
+| GET | `/stage3/builds` | `stage3_builds_history` |
 | GET | `/stage3/export/xml` | `stage3_export_xml` |
 | GET | `/stage3/jobs/<job_id>` | `stage3_job_status` |
 | POST | `/stage3/jobs/prepare/start` | `stage3_prepare_job_start` |

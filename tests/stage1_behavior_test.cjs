@@ -1225,6 +1225,20 @@ async function testStage3ModesAndBlockers({ state, stage3 }) {
   }
 }
 
+function testStage3BuildIdInLabelAndDownloadUrl({ stage3 }) {
+  assert.strictEqual(stage3.stage3BuildLabel({}), "");
+  assert.strictEqual(stage3.stage3BuildLabel({ build_id: "0123456789abcdef" }), "Сборка 0123456789abcdef: ");
+  const base = "/stage3/export/xml?project=BRIK";
+  assert.strictEqual(
+    stage3.stage3DownloadUrl({ download_url: base, build_id: "0123456789abcdef" }),
+    `${base}&build_id=0123456789abcdef`,
+  );
+  const withId = `${base}&build_id=0123456789abcdef`;
+  assert.strictEqual(stage3.stage3DownloadUrl({ download_url: withId, build_id: "0123456789abcdef" }), withId);
+  assert.strictEqual(stage3.stage3DownloadUrl({ download_url: base, build_id: null }), base, "legacy result keeps its URL");
+  assert.strictEqual(stage3.stage3DownloadUrl({}), "");
+}
+
 // Audit item 4: the editor sees fragment counts and build warnings BEFORE export;
 // unresolved fragments need an explicit confirmation, cancel aborts the export.
 async function testExportXmlPreExportSummary({ state, stage3 }) {
@@ -2015,6 +2029,7 @@ async function main() {
     ["testStage3PlaceholderDescription", () => testStage3PlaceholderDescription(modules)],
     ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
     ["testStage3ModesAndBlockers", () => testStage3ModesAndBlockers(modules)],
+    ["testStage3BuildIdInLabelAndDownloadUrl", () => testStage3BuildIdInLabelAndDownloadUrl(modules)],
     ["testNormalizationEditDuringConfirm", () => testNormalizationEditDuringConfirm(modules)],
     ["testNormalizationSaveAcceptsRevisionAfterEdit", () => testNormalizationSaveAcceptsRevisionAfterEdit(modules)],
     ["testApplyStatusSyncsTimelineReady", () => testApplyStatusSyncsTimelineReady(modules)],

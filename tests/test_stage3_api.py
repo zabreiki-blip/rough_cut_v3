@@ -308,8 +308,9 @@ def test_prepare_versioned_nested_export_persists_its_filename_for_download(clie
     downloaded = http.get("/stage3/export/xml?project=BRIK")
     assert downloaded.status_code == 200
     assert downloaded.data == b"<xml/>"
+    build_id = response.get_json()["result"]["build_id"]
     assert re.search(
-        r'filename="?BRIK_V2_\d{8}_\d{6}\.xml"?',
+        rf'filename="?BRIK_V2_{build_id}\.xml"?',
         downloaded.headers["Content-Disposition"],
     )
 
