@@ -37,6 +37,13 @@ class TimelineSegment:
     speech_out_sec: float = 0.0
     match_status: str = ""
     match_confidence: float = 0.0
+    # Match diagnostics (empty for timelines built before they were recorded).
+    unmatched_reason: str = ""
+    match_strategy: str = ""
+    # Range was set or kept by the editor (``manual_updated_at`` on the match).
+    manual_range: bool = False
+    # ``block_uid`` of the fragments merged into this segment.
+    merged_from: list[str] = field(default_factory=list)
     # ZK-specific
     wav_path: str = ""
     # placeholder PNG (generated for SNH)

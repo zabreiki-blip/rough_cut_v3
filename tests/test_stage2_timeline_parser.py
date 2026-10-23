@@ -7,7 +7,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from stage2.models import TimelineSegment
-from stage2.timeline_parser import parse_normalized_timeline, parse_timeline
+from stage2.timeline_parser import (
+    _merge_adjacent_sync_fragments,
+    parse_normalized_timeline,
+    parse_timeline,
+)
 
 
 class ZkIdContractTest(unittest.TestCase):
@@ -349,6 +353,80 @@ class NormalizedTimelineTest(unittest.TestCase):
             )
             self.assertEqual([item.start_sec for item in timeline.segments], [0.0, 4.0])
             self.assertEqual([item.duration_sec for item in timeline.segments], [4.0, 12.0])
+
+    def test_sync_segment_records_match_diagnostics(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            document = {
+                "status": "confirmed",
+                "blocks": [
+                    {
+                        "uid": "a",
+                        "order": 1,
+                        "type": "sync",
+                        "speaker": "ИВАН",
+                        "normalized_text": "Первый",
+                    },
+                    {
+                        "uid": "b",
+                        "order": 2,
+                        "type": "sync",
+                        "speaker": "ПЕТР",
+                        "normalized_text": "Второй",
+                    },
+                ],
+            }
+            matches = {
+                "a": {
+                    "source_id": "ivan_01",
+                    "source_in_sec": 1.0,
+                    "source_out_sec": 4.0,
+                    "confidence": 0.9,
+                    "status": "confirmed",
+                    "strategy": "fuzzy",
+                    "metadata": {"manual_updated_at": "2026-10-20T10:00:00+00:00"},
+                },
+                "b": {
+                    "status": "not_found",
+                    "strategy": "no_candidates",
+                    "metadata": {"unmatched_reason": "no_candidate"},
+                },
+            }
+
+            first, second = parse_normalized_timeline(
+                document, base, base, "TEST", sync_matches=matches, sync_sources={}
+            ).segments
+
+            self.assertTrue(first.manual_range)
+            self.assertEqual(first.match_strategy, "fuzzy")
+            self.assertEqual(first.unmatched_reason, "")
+            self.assertFalse(second.manual_range)
+            self.assertEqual(second.unmatched_reason, "no_candidate")
+            self.assertEqual(second.match_strategy, "no_candidates")
+
+    def test_merged_sync_fragment_keeps_merged_uids(self) -> None:
+        def seg(uid: str, s_in: float, s_out: float) -> TimelineSegment:
+            return TimelineSegment(
+                id=uid,
+                type="snh",
+                text=uid,
+                duration_sec=s_out - s_in,
+                block_uid=uid,
+                parent_block_uid="parent",
+                source_id="x",
+                source_in_sec=s_in,
+                source_out_sec=s_out,
+                speech_in_sec=s_in,
+                speech_out_sec=s_out,
+                match_status="auto_matched",
+            )
+
+        merged = _merge_adjacent_sync_fragments(
+            [seg("p::fragment:1", 0, 2), seg("p::fragment:2", 2, 4), seg("p::fragment:3", 4, 6)]
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].merged_from, ["p::fragment:2", "p::fragment:3"])
 
     def test_one_sync_block_expands_to_independently_matched_fragments(self) -> None:
         with TemporaryDirectory() as tmp:

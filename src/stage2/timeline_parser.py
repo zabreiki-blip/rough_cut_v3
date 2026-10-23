@@ -127,6 +127,7 @@ def _merge_adjacent_sync_fragments(segments: list[TimelineSegment]) -> list[Time
             previous.duration_sec = previous.source_out_sec - previous.source_in_sec
             previous.match_confidence = min(previous.match_confidence, segment.match_confidence)
             previous.timecode_end = segment.timecode_end
+            previous.merged_from.append(segment.block_uid or segment.id)
         else:
             merged.append(segment)
     return merged
@@ -639,6 +640,9 @@ def parse_normalized_timeline(
                         speech_out_sec=speech_out,
                         match_status=match_status,
                         match_confidence=float(field(match, "confidence", 0.0) or 0.0),
+                        unmatched_reason=str(match_metadata.get("unmatched_reason") or ""),
+                        match_strategy=str(field(match, "strategy", "") or ""),
+                        manual_range=bool(match_metadata.get("manual_updated_at")),
                         placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
                         spoken_text=_spoken_text(
                             fragment["text"],

@@ -166,3 +166,56 @@ def timeline_sync_summary(timeline: object) -> dict[str, int]:
             counts["needs_review" if status == "needs_review" else "not_found"] += 1
             counts["placeholders"] += 1
     return counts
+
+
+def _has_speaker(segment: dict) -> bool:
+    """True when the segment names a speaker that can be matched to a source file."""
+    # Imported lazily: stage2 modules import stage_common.
+    from stage2.sync_matcher import speaker_name_tokens
+
+    speaker = str(segment.get("speaker") or "").strip()
+    # The timeline parser falls back to the segment prefix when the block has no speaker.
+    if not speaker or speaker.lower() in {"snh", "host"}:
+        return False
+    return bool(speaker_name_tokens(speaker))
+
+
+def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str | None:
+    """Single classifier: why a timeline segment is not (fully) assembled, or None if ready.
+
+    Reasons: ``missing_wav``, ``no_speaker``, ``no_file``, ``asr_failed``, ``not_found``,
+    ``needs_review``, ``unmapped_source`` (only when ``mapped`` is given) and
+    ``life_unassigned``.  ``tech`` segments never produce a reason.
+    """
+    segment_type = segment.get("type")
+    if segment_type == "zk":
+        try:
+            duration = _as_float(segment.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        return None if segment.get("wav_path") and duration > 0 else "missing_wav"
+    if segment_type == "life":
+        return "life_unassigned"
+    if segment_type not in {"snh", "host"}:
+        return None
+
+    status = str(segment.get("match_status") or "")
+    if status == "needs_review" or (status == "confirmed" and segment.get("retime_pending_review")):
+        return "needs_review"
+    source_id = str(segment.get("source_id") or "")
+    if is_exportable_match(
+        segment_type,
+        status,
+        source_id,
+        segment.get("source_in_sec"),
+        segment.get("source_out_sec"),
+    ):
+        if mapped is not None and source_id not in mapped:
+            return "unmapped_source"
+        return None
+    unmatched = str(segment.get("unmatched_reason") or "")
+    if unmatched == "asr_failed":
+        return "asr_failed"
+    if unmatched == "no_eligible_source":
+        return "no_file" if _has_speaker(segment) else "no_speaker"
+    return "not_found"
