@@ -3579,3 +3579,283 @@ def test_sync_job_stops_review_and_completes_when_budget_exceeded_midway(
     assert job["llm_reviewed"] == 1
     assert job.get("segment_failures", []) == []
     assert job["done"] == job["total"]
+
+
+def _prepare_non_wav_review_media(sync_api, *, rel="media/reviews/Люля.mpg"):
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    media = projects / "demo" / rel
+    media.parent.mkdir(parents=True, exist_ok=True)
+    media.write_bytes(b"\x00\x00\x01\xba not a RIFF container")
+    created = client.post(
+        "/stage2/sync-sources",
+        json={
+            "project": "demo",
+            "id": "review",
+            "source_kind": "review_media",
+            "media_path": rel,
+            "guide_audio": rel,
+            "premiere_sequence": "Люля",
+            "speaker": "Люля",
+            "duration_sec": 100.0,
+        },
+    )
+    assert created.status_code == 201, created.get_json()
+    return client
+
+
+def _fake_ffmpeg(duration_sec=120.0, calls=None, returncode=0, stderr=b""):
+    """subprocess.run stand-in: writes a tiny valid WAV to the output arg."""
+
+    def run(command, **kwargs):
+        if calls is not None:
+            calls.append(list(command))
+        if returncode == 0:
+            Path(command[-1]).write_bytes(_wav_bytes(duration_sec, sample_rate=10))
+        else:
+            Path(command[-1]).write_bytes(b"partial")
+        return type("Done", (), {"returncode": returncode, "stdout": b"", "stderr": stderr})()
+
+    return run
+
+
+def _sync_audio_dir(projects):
+    return projects / "demo" / "work" / "sync_audio"
+
+
+def _start_cloud_review_job(client):
+    return client.post(
+        "/stage2/sync-jobs/start",
+        json={"project": "demo", "asr_engine": "cloud", "source_scope": "review_media"},
+    )
+
+
+def test_sync_audio_duration_probes_non_wav_media(tmp_path) -> None:
+    import api_stage2_routes
+
+    media = tmp_path / "x.mpg"
+    media.write_bytes(b"\x00\x00\x01\xba not a RIFF container")
+    with patch("api_stage2_routes.probe_media_duration", return_value=12.5) as probe:
+        assert api_stage2_routes._sync_audio_duration(media, "review") == 12.5
+    probe.assert_called_once()
+    from stage2.cloud_asr import CloudAudioAsrError
+
+    with patch("api_stage2_routes.probe_media_duration", side_effect=CloudAudioAsrError("boom")):
+        with pytest.raises(ValueError, match="review.*boom"):
+            api_stage2_routes._sync_audio_duration(media, "review")
+
+
+def test_sync_start_extracts_wav_from_non_wav_review_media(sync_api, monkeypatch) -> None:
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    monkeypatch.delenv("SYNC_CLOUD_ASR_OVERLAP_SEC", raising=False)
+    monkeypatch.delenv("SYNC_CLOUD_ASR_CHUNK_MINUTES", raising=False)
+    options, calls = [], []
+
+    def transcribe(_path, **kwargs):
+        options.append(kwargs["cloud_options"])
+        return _budget_transcript(0)
+
+    with (
+        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(120.0, calls)),
+        patch("api_stage2_routes.probe_media_duration") as probe,
+        patch.object(api, "transcribe_audio", side_effect=transcribe),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 200, response.get_json()
+    probe.assert_not_called()
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:3] == ["ffmpeg", "-nostdin", "-y"]
+    assert command[command.index("-i") + 1].endswith("Люля.mpg")
+    for flag, value in (("-map", "0:a:0"), ("-ac", "1"), ("-ar", "48000"), ("-c:a", "pcm_s16le")):
+        assert command[command.index(flag) + 1] == value
+    assert "-vn" in command
+    assert command[command.index("-af") + 1] == "aresample=async=1:first_pts=0"
+    canonical = _sync_audio_dir(projects) / "review.wav"
+    assert canonical.is_file()
+    assert [item.name for item in _sync_audio_dir(projects).iterdir()] == ["review.wav"]
+    # The stored source is untouched.
+    stored = client.get("/stage2/sync-sources?project=demo").get_json()["result"]["sources"][0]
+    assert stored["guide_audio"] == "media/reviews/Люля.mpg"
+    assert stored["media_path"] == "media/reviews/Люля.mpg"
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["estimated_cost_usd"] == "0.12"
+    assert [item["duration_sec"] for item in options] == [120.0]
+
+
+def test_sync_start_extracts_wav_for_local_backend_too(sync_api) -> None:
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    calls = []
+    with (
+        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(30.0, calls)),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start",
+            json={"project": "demo", "asr_engine": "local", "source_scope": "review_media"},
+        )
+    assert response.status_code == 200, response.get_json()
+    assert len(calls) == 1
+    assert (_sync_audio_dir(projects) / "review.wav").is_file()
+
+
+def test_sync_start_skips_ffmpeg_when_canonical_wav_exists(sync_api, monkeypatch) -> None:
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    audio_dir = _sync_audio_dir(projects)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    (audio_dir / "review.wav").write_bytes(_wav_bytes(60, sample_rate=10))
+    with (
+        patch.object(api.subprocess, "run") as run,
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 200, response.get_json()
+    run.assert_not_called()
+
+
+def test_sync_start_skips_ffmpeg_when_guide_audio_is_already_wav(sync_api, monkeypatch) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    rel = "media/reviews/guide.wav"
+    media = projects / "demo" / rel
+    media.parent.mkdir(parents=True)
+    media.write_bytes(_wav_bytes(60, sample_rate=10))
+    created = client.post(
+        "/stage2/sync-sources",
+        json={
+            "project": "demo",
+            "id": "review",
+            "source_kind": "review_media",
+            "media_path": rel,
+            "guide_audio": rel,
+            "premiere_sequence": "Люля",
+            "speaker": "Люля",
+            "duration_sec": 60.0,
+        },
+    )
+    assert created.status_code == 201, created.get_json()
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    with (
+        patch.object(api.subprocess, "run") as run,
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 200, response.get_json()
+    run.assert_not_called()
+    assert not (_sync_audio_dir(projects) / "review.wav").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["exit", "missing", "timeout", "invalid_output"],
+)
+def test_sync_start_reports_ffmpeg_failure_and_cleans_up(sync_api, failure) -> None:
+    import subprocess
+
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    if failure == "exit":
+        fake = _fake_ffmpeg(returncode=1, stderr=b"noise\nStream map '0:a:0' matches no streams")
+    elif failure == "missing":
+        fake = FileNotFoundError("ffmpeg")
+    elif failure == "timeout":
+        fake = subprocess.TimeoutExpired("ffmpeg", 1)
+    else:
+
+        def fake(command, **kwargs):
+            Path(command[-1]).write_bytes(b"not a wav")
+            return type("Done", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    with (
+        patch.object(api.subprocess, "run", side_effect=fake),
+        patch.object(api, "transcribe_audio") as transcribe,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 400
+    message = response.get_json()["error"]
+    assert "review" in message
+    if failure == "exit":
+        assert "matches no streams" in message
+    transcribe.assert_not_called()
+    audio_dir = _sync_audio_dir(projects)
+    assert not audio_dir.exists() or list(audio_dir.iterdir()) == []
+
+
+def test_sync_start_rejects_guide_audio_escaping_project(sync_api) -> None:
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    outside = projects.parent / "outside.mpg"
+    outside.write_bytes(b"\x00\x00\x01\xba")
+    paths = api._ensure_project("demo")
+    store = api.SyncSourceStore(paths["sync_sources"])
+    source = store.list()[0]
+    store.save(api.SyncSource.from_dict({**source.to_dict(), "guide_audio": str(outside)}))
+    with patch.object(api.subprocess, "run") as run:
+        response = _start_cloud_review_job(client)
+        assert response.status_code == 400
+        assert "inside the project directory" in response.get_json()["error"]
+        with pytest.raises(ValueError, match="inside the project directory"):
+            api._ensure_sync_wav(store.list()[0], paths)
+    run.assert_not_called()
+    audio_dir = _sync_audio_dir(projects)
+    assert not audio_dir.exists() or list(audio_dir.iterdir()) == []
+
+
+def test_stale_mpg_word_index_is_retranscribed_after_wav_extraction(sync_api, monkeypatch) -> None:
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    paths = api._ensure_project("demo")
+    mpg = projects / "demo" / "media/reviews/Люля.mpg"
+    stale = WordIndex(
+        source_id="review",
+        words=[WordTimestamp("старое", 0.0, 0.5)],
+        generated_at="old",
+    )
+    config = api._transcription_config(backend="cloud-audio", model=None, language="ru")
+    stale.metadata[api._TRANSCRIPTION_CACHE_KEY] = api._transcription_cache_metadata(
+        mpg, config, origin="generated"
+    )
+    api.save_word_index(api._word_index_path(paths, "review"), stale)
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    with (
+        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(60.0)),
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)) as transcribe,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 200, response.get_json()
+    transcribe.assert_called_once()
+    fresh = api.load_word_index(api._word_index_path(paths, "review"), "review")
+    assert [word.word for word in fresh.words] == ["маленькая"]
+
+
+def test_sync_cloud_preflight_keeps_wave_path_for_real_wav(sync_api, monkeypatch) -> None:
+    client = _prepare_budget_sources(sync_api, [60])
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    with (
+        patch("api_stage2_routes.probe_media_duration") as probe,
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)),
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = client.post(
+            "/stage2/sync-jobs/start", json={"project": "demo", "asr_engine": "cloud"}
+        )
+    assert response.status_code == 200, response.get_json()
+    probe.assert_not_called()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert job["estimated_cost_usd"] == "0.06"

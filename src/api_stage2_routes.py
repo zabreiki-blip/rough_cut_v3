@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import wraps
 from decimal import Decimal, InvalidOperation
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,7 +17,13 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from api_final_review_jobs import canonical_decimal_string
 from cost_budget import LLM_TTS_ENV_NAMES, CostGuardConfig
 from export_naming import xml_export_filename
-from stage2.cloud_asr import DEFAULT_OVERLAP_SEC, plan_cloud_chunks, resolve_chunk_minutes
+from stage2.cloud_asr import (
+    DEFAULT_OVERLAP_SEC,
+    CloudAudioAsrError,
+    _probe_duration as probe_media_duration,
+    plan_cloud_chunks,
+    resolve_chunk_minutes,
+)
 from sync_asr_phase import _cloud_index_is_outdated, index_coverage_report
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage_common import (
@@ -283,6 +290,40 @@ def _stage2_sync_source_words(services: ModuleType, source_id: str):
     )
 
 
+def _sync_audio_duration(audio_path: Path, source_id: str) -> float:
+    """Duration for the cloud cost preflight.
+
+    Canonical sync WAVs use the fast ``wave`` path.  Review media may point
+    ``guide_audio`` at a viewing video (e.g. .mpg) that execution decodes via
+    ffmpeg, so a non-WAV file falls back to the same ffprobe the cloud adapter
+    uses.  The result is frozen into the job options and is authoritative.
+    """
+    try:
+        with wave.open(str(audio_path), "rb") as stream:
+            duration_sec = stream.getnframes() / float(stream.getframerate())
+    except (EOFError, wave.Error):
+        try:
+            duration_sec = probe_media_duration(audio_path)
+        except (CloudAudioAsrError, OSError, ValueError) as exc:
+            raise ValueError(f"cannot determine media duration for {source_id}: {exc}") from exc
+    except (OSError, ZeroDivisionError) as exc:
+        raise ValueError(f"invalid sync WAV for {source_id}: {exc}") from exc
+    if not math.isfinite(duration_sec) or duration_sec <= 0:
+        raise ValueError(f"sync audio duration must be positive for {source_id}")
+    return duration_sec
+
+
+def _selected_sync_sources(
+    sources: list[Any], source_ids: tuple[str, ...], source_scope: str
+) -> list[Any]:
+    return [
+        source
+        for source in sources
+        if not (source_scope == "review_media" and source.source_kind != "review_media")
+        and not (source_ids and source.id not in source_ids)
+    ]
+
+
 def _sync_cloud_preflight(
     services: ModuleType,
     paths: dict[str, Path],
@@ -304,11 +345,7 @@ def _sync_cloud_preflight(
     ).get("cloud_timestamp_mapping")
     estimate = Decimal("0")
     source_options: dict[str, Any] = {}
-    for source in sources:
-        if source_scope == "review_media" and source.source_kind != "review_media":
-            continue
-        if source_ids and source.id not in source_ids:
-            continue
+    for source in _selected_sync_sources(sources, source_ids, source_scope):
         try:
             audio_path = services._resolve_sync_audio_path(source, paths)
         except ValueError:
@@ -339,13 +376,7 @@ def _sync_cloud_preflight(
                     # generated cloud indexes are retranscribed, so they
                     # must be budgeted here as well.
                     continue
-        try:
-            with wave.open(str(audio_path), "rb") as stream:
-                duration_sec = stream.getnframes() / float(stream.getframerate())
-        except (OSError, EOFError, wave.Error, ZeroDivisionError) as exc:
-            raise ValueError(f"invalid sync WAV for {source.id}: {exc}") from exc
-        if duration_sec <= 0:
-            raise ValueError(f"sync WAV duration must be positive for {source.id}")
+        duration_sec = _sync_audio_duration(audio_path, source.id)
         chunks = plan_cloud_chunks(duration_sec, chunk_minutes, overlap_sec)
         estimate += sum(
             (
@@ -445,6 +476,14 @@ def _stage2_sync_job_start(services: ModuleType):
         if not uses_cloud_backend and payload.get("model") is not None
         else None
     )
+
+    # The pipeline works from WAV for both backends: decode review media
+    # (e.g. .mpg) into the canonical sync WAV before preflight and the worker.
+    try:
+        for source in _selected_sync_sources(sources, source_ids, source_scope):
+            services._ensure_sync_wav(source, paths)
+    except (OSError, TypeError, ValueError) as exc:
+        return services._json_error(str(exc), 400)
 
     budget_fields: dict[str, Any] = {"estimated_cost_usd": "0", "cost_limit_usd": 0.0}
     cloud_source_options: dict[str, Any] | None = None

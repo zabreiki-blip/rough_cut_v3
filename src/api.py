@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 import platform
 import re
+import subprocess
 import sys
 import threading
+import wave
 import time
 from typing import BinaryIO, cast
 import uuid
@@ -1048,6 +1050,12 @@ def _resolve_sync_audio_path(source: SyncSource, paths: dict[str, Path]) -> Path
     canonical = _canonical_audio_path(paths, source.id)
     if canonical.is_file():
         return canonical
+    return _resolve_guide_media_path(source, paths)
+
+
+def _resolve_guide_media_path(source: SyncSource, paths: dict[str, Path]) -> Path:
+    """Resolve ``guide_audio`` itself (ignoring the canonical WAV)."""
+    canonical = _canonical_audio_path(paths, source.id)
     value = str(source.guide_audio or "").strip()
     if not value:
         return canonical
@@ -1064,6 +1072,100 @@ def _resolve_sync_audio_path(source: SyncSource, paths: dict[str, Path]) -> Path
         if resolved.is_file():
             return resolved
     return candidates[0].resolve()
+
+
+_SYNC_WAV_LOCKS: dict[str, threading.Lock] = {}
+_SYNC_WAV_LOCKS_GUARD = threading.Lock()
+_SYNC_WAV_DEFAULT_TIMEOUT_SEC = 600.0
+
+
+def _sync_wav_lock(source_id: str) -> threading.Lock:
+    with _SYNC_WAV_LOCKS_GUARD:
+        return _SYNC_WAV_LOCKS.setdefault(source_id, threading.Lock())
+
+
+def _is_valid_wav(path: Path) -> bool:
+    """True for a readable RIFF/WAVE file with a sane header."""
+    try:
+        with wave.open(str(path), "rb") as stream:
+            return stream.getframerate() > 0 and stream.getnchannels() > 0
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
+def _sync_wav_timeout_sec() -> float:
+    try:
+        value = float(os.getenv("SYNC_WAV_EXTRACT_TIMEOUT_SEC", "").strip())
+    except ValueError:
+        return _SYNC_WAV_DEFAULT_TIMEOUT_SEC
+    return value if value > 0 else _SYNC_WAV_DEFAULT_TIMEOUT_SEC
+
+
+def _ffmpeg_stderr_tail(value: object, limit: int = 300) -> str:
+    text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
+    return " ".join(text.split())[-limit:]
+
+
+def _ensure_sync_wav(source: SyncSource, paths: dict[str, Path]) -> Path | None:
+    """Guarantee that a source has a WAV for ASR; return its path.
+
+    Review media may point ``guide_audio`` at a viewing video (.mpg etc.).
+    The pipeline works from WAV, so such a file is decoded once into the
+    canonical ``sync_audio/<id>.wav`` (atomic replace). The stored source is
+    left untouched: the canonical file takes precedence in the resolver.
+    Returns ``None`` when the source has no media file at all (the worker
+    keeps reporting that per source). Raises ``ValueError`` on a path escape
+    or an ffmpeg failure.
+    """
+    canonical = _canonical_audio_path(paths, source.id)
+    with _sync_wav_lock(source.id):
+        if canonical.is_file() and _is_valid_wav(canonical):
+            return canonical
+        guide = _resolve_guide_media_path(source, paths)
+        if not guide.is_file():
+            if canonical.is_file():
+                raise ValueError(f"invalid canonical sync WAV for {source.id}")
+            return None
+        if guide.resolve() != canonical.resolve() and _is_valid_wav(guide):
+            return guide
+        if guide.resolve() == canonical.resolve():
+            raise ValueError(f"invalid canonical sync WAV for {source.id}")
+
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        temporary = canonical.with_name(f".{canonical.name}.{uuid.uuid4().hex}.upload")
+        # Corrupted/missing audio packets (e.g. DVD .mpg) are padded with silence so
+        # WAV time stays aligned with the media timeline instead of drifting.
+        command = [
+            "ffmpeg", "-nostdin", "-y", "-i", str(guide),
+            "-vn", "-map", "0:a:0", "-af", "aresample=async=1:first_pts=0",
+            "-ac", "1", "-ar", "48000",
+            "-c:a", "pcm_s16le", "-f", "wav", str(temporary),
+        ]  # fmt: skip
+        try:
+            try:
+                proc = subprocess.run(
+                    command,
+                    capture_output=True,
+                    timeout=_sync_wav_timeout_sec(),
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(f"ffmpeg not found; cannot extract WAV for {source.id}") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError(f"ffmpeg timed out extracting WAV for {source.id}") from exc
+            except OSError as exc:
+                raise ValueError(f"ffmpeg failed to start for {source.id}: {exc}") from exc
+            if proc.returncode != 0:
+                raise ValueError(
+                    f"ffmpeg failed extracting WAV for {source.id} (exit {proc.returncode}): "
+                    f"{_ffmpeg_stderr_tail(proc.stderr)}"
+                )
+            if not temporary.is_file() or not _is_valid_wav(temporary):
+                raise ValueError(f"ffmpeg produced an invalid WAV for {source.id}")
+            os.replace(temporary, canonical)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return canonical
 
 
 _TRANSCRIPTION_CACHE_KEY = "transcription_cache"
