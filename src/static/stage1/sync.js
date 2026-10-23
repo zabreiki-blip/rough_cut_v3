@@ -268,8 +268,12 @@ function syncCounts(document) {
 }
 
 function updateSyncAsrControls() {
-  if (!ids.sync_whisper_model) return;
   const isCloud = (ids.sync_asr_engine?.value || "local") === "cloud";
+  // Audio verification needs the cloud engine (and its API key); local runs never send it.
+  if (ids.sync_audio_verify) {
+    ids.sync_audio_verify.disabled = !isCloud || appState.syncJobRunning;
+  }
+  if (!ids.sync_whisper_model) return;
   ids.sync_whisper_model.disabled = isCloud;
   ids.sync_whisper_model.title = isCloud
     ? "Small и Medium используются только для локального Whisper"
@@ -285,7 +289,29 @@ const MATCH_REVIEW_REASON_LABELS = {
   head_truncated_vs_local: "По локальной расшифровке обрезано начало",
   range_disagrees_with_local: "Диапазон расходится с локальной расшифровкой",
   local_text_mismatch: "На этом месте локальная расшифровка содержит другой текст",
+  timing_unreliable: "Таймкоды ненадёжны — проверьте границы",
+  timing_unrefined: "Таймкоды ещё не уточнены — проверьте границы",
+  audio_mismatch: "По звуку не совпадает",
+  audio_partial: "По звуку — частично",
+  audio_match_wide_range: "Звучит, но диапазон слишком широкий",
 };
+
+// Audio-LLM verification result of a match (backend: metadata.audio_verified).
+// Returns plain text (the caller escapes it) or "" when the match was not checked.
+function audioVerifyText(match) {
+  const audio = match?.metadata?.audio_verified;
+  if (!audio || typeof audio !== "object") return "";
+  const heard = String(audio.heard_text || "").trim();
+  const heardPart = heard ? ` — слышно: «${heard}»` : "";
+  if (audio.verdict === "match") return "проверено по звуку";
+  if (audio.verdict === "no_match") return `по звуку: не совпадает${heardPart}`;
+  if (audio.verdict === "partial") {
+    const coverage = Number(audio.coverage);
+    const share = Number.isFinite(coverage) ? ` (${Math.round(coverage * 100)}%)` : "";
+    return `по звуку: звучит частично${share}${heardPart}`;
+  }
+  return "";
+}
 
 // LIFE inserts are never matched automatically: the editor assigns a source range by
 // hand (PATCH /stage2/sync-matches/<unit id>, same endpoint as a manual СНХ confirm).
@@ -485,6 +511,10 @@ function renderSyncMatches(document) {
         .map((text) => `<div class="sync-match-llm">${escaped(text)}.</div>`)
         .join("");
     })();
+    const audioText = audioVerifyText(match);
+    const audioHint = audioText
+      ? `<div class="sync-match-llm" data-audio-verify>${escaped(audioText)}.</div>`
+      : "";
     const unmatchedReasons = {
       query_too_short: "Фраза слишком короткая для поиска по записи.",
       no_eligible_source: "Нет записи: для этого спикера ещё нет источника — реплика будет найдена после загрузки.",
@@ -560,6 +590,7 @@ function renderSyncMatches(document) {
         ${retimeHint}
         ${timingHint}
         ${verificationHint}
+        ${audioHint}
         ${unmatchedReason ? `<div class="sync-match-speaker-filter">${escaped(unmatchedReason)}</div>` : ""}
         ${speakerFilterHint}
         <div class="sync-match-meta" data-sync-meta>
@@ -686,9 +717,15 @@ function renderSyncJob(value) {
   const warningSuffix = sourceWarnings.length
     ? ` · ${sourceWarnings.map((item) => item.warning || item.source_id || "предупреждение").join("; ")}`
     : "";
+  const audioChecked = Number(job.audio_verified || 0);
+  const audioCost = Number(job.audio_cost_usd || 0);
+  const audioSuffix = audioChecked > 0
+    ? ` · по звуку: проверено ${audioChecked}, подтверждено ${Number(job.audio_promoted || 0)}, отклонено ${
+      Number(job.audio_rejected || 0)}${audioCost > 0 ? ` ($${audioCost.toFixed(4)})` : ""}`
+    : "";
   ids.sync_job_message.textContent = (segmentFailures.length
     ? `${message} · ошибок сегментов: ${segmentFailures.length} (${segmentFailures[0].segment_id || "без ID"}: ${segmentFailures[0].error || "ошибка"})`
-    : message) + warningSuffix;
+    : message) + audioSuffix + warningSuffix;
   ids.sync_job_numbers.textContent = totalSources > 0
     ? `${completedSources}/${totalSources} файлов · ${pct}%`
     : (total > 0 ? `${done}/${total}` : `${pct}%`);
@@ -810,25 +847,34 @@ async function pollSyncJob(statusUrl) {
   }
 }
 
+// Body of POST /stage2/sync-jobs/start. ``audio_verify`` is sent only for the cloud engine:
+// the checkbox is on by default, a local run keeps the backend default (off).
+export function buildSyncStartPayload() {
+  const asrEngine = ids.sync_asr_engine?.value || "local";
+  return {
+    project,
+    timecode_mode: ids.sync_timecode_mode?.value || "relative",
+    // Small/Medium are local Whisper model sizes. Cloud ASR chooses its
+    // own configured provider/model default, so never send a local ID.
+    model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined,
+    asr_engine: asrEngine,
+    source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all",
+    audio_verify: asrEngine === "cloud" && ids.sync_audio_verify
+      ? Boolean(ids.sync_audio_verify.checked)
+      : undefined,
+  };
+}
+
 async function startSyncAlignment() {
   appendLog("Stage 2 sync: запуск распознавания и сопоставления...");
   if (ids.btn_sync_cancel) {
     ids.btn_sync_cancel.disabled = false;
     ids.btn_sync_cancel.textContent = "Остановить после текущего шага";
   }
-  const asrEngine = ids.sync_asr_engine?.value || "local";
   const response = await optionalRequestJSON(
     "/stage2/sync-jobs/start",
     "POST",
-    {
-      project,
-      timecode_mode: ids.sync_timecode_mode?.value || "relative",
-      // Small/Medium are local Whisper model sizes. Cloud ASR chooses its
-      // own configured provider/model default, so never send a local ID.
-      model: asrEngine === "local" ? (ids.sync_whisper_model?.value || "small") : undefined,
-      asr_engine: asrEngine,
-      source_scope: appState.stage3MediaCount > 0 ? "review_media" : "all",
-    },
+    buildSyncStartPayload(),
   );
   if (!response.available) {
     appState.syncFeatureAvailable = false;

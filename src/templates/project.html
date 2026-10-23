@@ -592,6 +592,10 @@
                   <option value="cloud">Облако (быстро, ~2¢/час, платно)</option>
                 </select>
               </label>
+              <label class="sync-audio-verify" title="Только для облачного движка: спорные и неточные совпадения вырезаются из записи и проверяются аудио-моделью">
+                <input type="checkbox" id="sync_audio_verify" checked disabled>
+                <span>Проверять спорные синхроны по звуку (~$0.0007 за фрагмент, лимит $0.50 за запуск)</span>
+              </label>
               <label class="sync-timecode-mode">
                 <span>Модель Whisper (только локально)</span>
                 <select id="sync_whisper_model">

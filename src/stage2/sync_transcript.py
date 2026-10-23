@@ -151,6 +151,15 @@ def ingest_word_index(
             # index is interpolated even though it carries explicit words.
             if str(backend_metadata.get("timestamp_precision") or "").lower() == "interpolated":
                 interpolated = True
+        # A persisted index keeps the marker in ``metadata`` (``backend_metadata`` is nested
+        # there, not a payload key): honour it, or a reload of a cloud index whose retime
+        # was rejected would silently look word-precise.
+        persisted_backend = metadata.get("backend_metadata")
+        if str(metadata.get("timestamp_precision") or "").lower() == "interpolated" or (
+            isinstance(persisted_backend, dict)
+            and str(persisted_backend.get("timestamp_precision") or "").lower() == "interpolated"
+        ):
+            interpolated = True
         for key in ("backend", "audio_path", "schema_version"):
             if key in payload:
                 metadata[key] = payload[key]

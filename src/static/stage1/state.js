@@ -99,6 +99,7 @@ export const ids = {
   sync_timecode_mode: el("sync_timecode_mode"),
   sync_whisper_model: el("sync_whisper_model"),
   sync_asr_engine: el("sync_asr_engine"),
+  sync_audio_verify: el("sync_audio_verify"),
   sync_job_metrics: el("sync_job_metrics"),
   sync_metric_backend: el("sync_metric_backend"),
   sync_metric_wall_time: el("sync_metric_wall_time"),

@@ -424,6 +424,9 @@ def _stage2_sync_job_start(services: ModuleType):
     asr_engine = str(payload.get("asr_engine") or "local").strip().lower()
     if asr_engine not in {"local", "cloud"}:
         return services._json_error("asr_engine должен быть 'local' или 'cloud'", 400)
+    audio_verify = payload.get("audio_verify")
+    if audio_verify is not None and not isinstance(audio_verify, bool):
+        return services._json_error("audio_verify must be true or false", 400)
     try:
         sources = services.SyncSourceStore(paths["sync_sources"]).list()
     except ValueError as exc:
@@ -545,6 +548,7 @@ def _stage2_sync_job_start(services: ModuleType):
                 "source_scope": source_scope,
                 "force_transcribe": bool(payload.get("force_transcribe", False)),
                 "search_window_sec": search_window_sec,
+                "audio_verify": audio_verify,
             },
             daemon=True,
         )

@@ -149,3 +149,38 @@ def test_explicit_words_from_interpolating_backend_keep_interpolated_precision()
         "s1",
     )
     assert index.metadata["timestamp_precision"] == "interpolated"
+
+
+def _cloud_payload(precision: str) -> dict:
+    return {
+        "source_id": "src",
+        "language": "ru",
+        "model": "cloud",
+        "metadata": {
+            "backend": "cloud-audio",
+            "timestamp_precision": precision,
+            "backend_metadata": {"timestamp_precision": "interpolated"},
+        },
+        "words": [{"word": "привет", "start": 0.0, "end": 0.5}],
+    }
+
+
+def test_persisted_interpolated_precision_survives_reload(tmp_path: Path) -> None:
+    # A cloud index whose retime was rejected (retime_attempt.json status=rejected) keeps
+    # ``interpolated`` on disk; the reload must not turn it into "word".
+    path = tmp_path / "src.words.json"
+    path.write_text(json.dumps(_cloud_payload("interpolated")), encoding="utf-8")
+    (tmp_path / "src.retime_attempt.json").write_text('{"status": "rejected"}', encoding="utf-8")
+    assert load_word_index(path, "src").metadata["timestamp_precision"] == "interpolated"
+
+
+def test_persisted_retimed_precision_wins_over_nested_interpolated(tmp_path: Path) -> None:
+    path = tmp_path / "src.words.json"
+    path.write_text(json.dumps(_cloud_payload("retimed")), encoding="utf-8")
+    assert load_word_index(path, "src").metadata["timestamp_precision"] == "retimed"
+
+
+def test_persisted_word_precision_stays_word() -> None:
+    payload = _cloud_payload("word")
+    payload["metadata"]["backend_metadata"] = {"timestamp_precision": "word"}
+    assert ingest_word_index(payload, "src").metadata["timestamp_precision"] == "word"

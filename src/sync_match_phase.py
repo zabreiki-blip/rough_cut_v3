@@ -24,6 +24,11 @@ from stage2.sync_offset_clusters import (
     is_promotion_candidate,
 )
 from stage2.sync_storage import SyncMatchStore
+from stage2.sync_window_refine import (
+    CACHE_DIRNAME as WINDOW_REFINE_CACHE_DIRNAME,
+    WindowRefineSettings,
+    refine_matches,
+)
 from stage_common import (
     classify_sync_matches,
     is_life_match,
@@ -124,6 +129,13 @@ class SyncMatchContext:
     # ``(paths, source_id) -> index file``: next to it lies the retime map used to carry
     # confirmed matches over to retimed word times. ``None`` disables that pass.
     word_index_path: Callable[[Any, str], Path] | None = None
+    # Window refine of interpolated-source candidates (stage2.sync_window_refine). It runs
+    # only when ``word_index_path`` is set. ``resolve_audio_path(source, paths)`` finds the
+    # guide WAV (default: canonical ``sync_audio/<id>.wav``, then ``guide_audio``);
+    # ``transcribe_window(clip, model)`` returns clip-relative words (default: the shared
+    # killable faster-whisper worker).
+    resolve_audio_path: Callable[[Any, Mapping[str, Path]], Path | None] | None = None
+    transcribe_window: Callable[[Path, str], list[dict[str, Any]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -370,6 +382,95 @@ def _review_match(
             }
         )
     return match
+
+
+def _default_audio_path(source: Any, paths: Mapping[str, Path]) -> Path | None:
+    """Canonical guide WAV of a source, else its ``guide_audio`` under the project/work dirs."""
+    sync_audio = paths.get("sync_audio")
+    if sync_audio is not None:
+        canonical = Path(sync_audio) / f"{source.id}.wav"
+        if canonical.is_file():
+            return canonical
+    value = str(getattr(source, "guide_audio", "") or "").strip()
+    if not value:
+        return None
+    configured = Path(value)
+    roots = [None] if configured.is_absolute() else [paths.get("root"), paths.get("work")]
+    for root in roots:
+        candidate = configured if root is None else Path(root) / configured
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _refine_window_candidates(
+    ctx: SyncMatchContext,
+    matches: Mapping[str, Any],
+    current_ids: set[str],
+    sources: Sequence[Any],
+    indexes: Sequence[Any],
+    *,
+    auto_threshold: float,
+    on_checkpoint: Callable[[list[str]], None] | None = None,
+) -> list[str]:
+    """Pin candidates of interpolated sources to the audio with a local per-window pass.
+
+    Returns the ids of matches that were touched (the caller marks them as rematched so
+    the checkpoint merge keeps these copies). Failures only leave a match unrefined.
+    """
+    if ctx.word_index_path is None:
+        return []
+    settings = WindowRefineSettings.from_env(ctx.getenv)
+    if not settings.enabled:
+        return []
+    resolver = ctx.resolve_audio_path or _default_audio_path
+    transcripts = ctx.paths.get("sync_transcripts")
+
+    def on_progress(done: int, total: int) -> None:
+        ctx.update_job(
+            ctx.job_id,
+            persist=ctx.should_persist_progress(),
+            message=f"Уточнение границ по окну: {done}/{total}",
+            window_refine_done=done,
+            window_refine_total=total,
+        )
+
+    report = refine_matches(
+        [item for key, item in matches.items() if key in current_ids],
+        sources,
+        indexes,
+        settings=settings,
+        resolve_audio_path=lambda source: resolver(source, ctx.paths),
+        is_manual=_is_manual_match,
+        cache_dir=(Path(transcripts) / WINDOW_REFINE_CACHE_DIRNAME) if transcripts else None,
+        transcribe_fn=ctx.transcribe_window,
+        auto_threshold=auto_threshold,
+        ensure_not_cancelled=ctx.ensure_not_cancelled,
+        on_progress=on_progress,
+        on_checkpoint=on_checkpoint,
+    )
+    if report.candidates:
+        ctx.logger.info(
+            "Sync job=%s: window refine: %d candidates, %d refined, %d demoted, "
+            "%d windows recognised, %d from cache, %d over the limit",
+            ctx.job_id,
+            report.candidates,
+            len(report.refined),
+            len(report.downgraded),
+            report.transcribed,
+            report.cache_hits,
+            report.skipped_limit,
+        )
+        ctx.update_job(
+            ctx.job_id,
+            persist=False,
+            window_refine_candidates=report.candidates,
+            window_refine_refined=len(report.refined),
+            window_refine_demoted=len(report.downgraded),
+            window_refine_cache_hits=report.cache_hits,
+            window_refine_skipped_limit=report.skipped_limit,
+        )
+    return report.changed_ids
 
 
 def _load_local_indexes(ctx: SyncMatchContext, indexes: Sequence[Any]) -> list[Any]:
@@ -774,6 +875,26 @@ def run_match_phase(
             llm_review_failures=list(review.failures),
             **cost_tracker.llm_cost_fields(),
         )
+    def checkpoint_refined(touched_ids: list[str]) -> None:
+        # Reused matches were not rematched: keep the refined copies over the persisted ones.
+        if touched_ids:
+            rematched_this_run.update(touched_ids)
+            checkpoint_state["dirty"] = True
+            checkpoint_matches()
+
+    refined_ids = _refine_window_candidates(
+        ctx,
+        existing,
+        current_ids,
+        matching_sources,
+        indexes,
+        auto_threshold=auto_threshold,
+        on_checkpoint=checkpoint_refined,
+    )
+    if refined_ids:
+        # Reused matches were not rematched: keep these copies over the persisted ones.
+        rematched_this_run.update(refined_ids)
+        checkpoint_state["dirty"] = True
     checkpoint_matches()
     return SyncMatchResult(
         matches=[item for key, item in existing.items() if key in summary_ids],

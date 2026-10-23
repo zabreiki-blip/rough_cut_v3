@@ -115,8 +115,6 @@ def test_cache_hit_skips_request_and_key_depends_on_quote(tmp_path):
     "request_kwargs",
     [
         {"error": RuntimeError("network down")},
-        {"content": "не JSON вообще"},
-        {"content": json.dumps({"verdict": "maybe"})},
     ],
 )
 def test_errors_become_error_verdict_and_are_not_cached(tmp_path, request_kwargs):
@@ -154,6 +152,97 @@ def test_budget_exhaustion_propagates(tmp_path):
     with pytest.raises(CostBudgetExceeded):
         _verify(wav, request, budget=budget)
     assert request.calls == []
+
+
+def test_unknown_cost_reserves_and_books_the_estimate(tmp_path):
+    wav = _write_wav(tmp_path / "a.wav", 6)
+    budget = CostBudget.for_llm_tts({"ROUGH_CUT_MAX_USD_PER_JOB": "1"})  # ASR rate is zero
+    seen: dict = {}
+
+    def request(**kwargs):
+        seen["reserved"] = budget.snapshot()["reserved_usd"]
+        return FakeRequest(cost=None)(**kwargs)
+
+    result = _verify(wav, request, budget=budget)
+    assert seen["reserved"] > 0  # not the zero ASR estimate of the LLM/TTS budget
+    assert result.cost_estimated and result.cost_usd == pytest.approx(seen["reserved"])
+    snapshot = budget.snapshot()
+    assert snapshot["reserved_usd"] == 0
+    assert snapshot["spent_usd"] == pytest.approx(result.cost_usd)
+    assert snapshot["estimated_spent_usd"] == pytest.approx(result.cost_usd)
+
+
+def test_estimate_rate_uses_env_or_doubled_default():
+    assert sav.clip_usd_per_minute({}) == Decimal("0.007")
+    assert sav.clip_usd_per_minute({sav.RATE_ENV: "0.02"}) == Decimal("0.02")
+    assert sav.clip_usd_per_minute({sav.RATE_ENV: "junk"}) == Decimal("0.007")
+
+
+def test_request_exception_after_send_books_estimate_and_clears_reservation(tmp_path):
+    wav = _write_wav(tmp_path / "a.wav", 6)
+    budget = CostBudget.for_llm_tts({})
+    result = _verify(wav, FakeRequest(error=RuntimeError("read timeout")), budget=budget)
+    assert result.verdict == "error" and result.cost_estimated and result.cost_usd > 0
+    snapshot = budget.snapshot()
+    assert snapshot["reserved_usd"] == 0
+    assert snapshot["spent_usd"] == pytest.approx(result.cost_usd)
+
+
+def test_unsent_request_is_released_without_cost(tmp_path):
+    import httpx
+
+    wav = _write_wav(tmp_path / "a.wav", 6)
+    budget = CostBudget.for_llm_tts({})
+    result = _verify(wav, FakeRequest(error=httpx.ConnectError("refused")), budget=budget)
+    assert result.verdict == "error" and not result.cost_usd
+    assert budget.snapshot()["reserved_usd"] == 0 and budget.snapshot()["spent_usd"] == 0
+
+
+def test_cancellation_after_send_settles_the_reservation(tmp_path):
+    wav = _write_wav(tmp_path / "a.wav", 6)
+    budget = CostBudget.for_llm_tts({})
+    with pytest.raises(KeyboardInterrupt):
+        _verify(wav, FakeRequest(error=KeyboardInterrupt()), budget=budget)
+    assert budget.snapshot()["reserved_usd"] == 0
+
+
+def test_parse_error_is_cached_as_paid_error_and_not_paid_twice(tmp_path):
+    wav = _write_wav(tmp_path / "a.wav", 6)
+    cache = tmp_path / "cache"
+    first_request = FakeRequest(content="не JSON вообще")
+    first = _verify(wav, first_request, cache_dir=cache)
+    assert first.verdict == "error" and first.reason.startswith("parse:") and first.paid
+    assert first.cost_usd == 0.002
+    second_request = FakeRequest()
+    second = _verify(wav, second_request, cache_dir=cache)
+    assert second.verdict == "error" and second.cached and second_request.calls == []
+    # an explicit flag pays again and replaces the cached error
+    retry_request = FakeRequest()
+    retried = _verify(wav, retry_request, cache_dir=cache, retry_parse_errors=True)
+    assert retried.verdict == "match" and len(retry_request.calls) == 1
+    again = _verify(wav, FakeRequest(content="x"), cache_dir=cache)
+    assert again.verdict == "match" and again.cached
+
+
+def test_cache_write_uses_unique_tmp_and_survives_parallel_writers(tmp_path):
+    import threading
+
+    path = tmp_path / "cache" / "k.json"
+    errors: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            for _ in range(30):
+                sav._write_cache(path, sav.AudioVerdict("match", coverage=1.0))
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors
+    assert json.loads(path.read_text(encoding="utf-8"))["verdict"] == "match"
+    assert [p.name for p in path.parent.iterdir()] == ["k.json"]
 
 
 # --- eval script -----------------------------------------------------------

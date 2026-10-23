@@ -1893,6 +1893,13 @@ def _create_sync_job(project: str) -> dict:
         "asr_cost_usd_total": 0.0,
         "asr_timestamp_precision": "",
         "transcription_wall_sec_total": 0.0,
+        "audio_verified": 0,
+        "audio_promoted": 0,
+        "audio_rejected": 0,
+        "audio_partial": 0,
+        "audio_errors": 0,
+        "audio_skipped": 0,
+        "audio_cost_usd": 0.0,
         "created_at": now,
         "started_at": "",
         "finished_at": "",
@@ -1959,6 +1966,7 @@ def _run_sync_job(
     source_scope: str,
     force_transcribe: bool,
     search_window_sec: float,
+    audio_verify: bool | None = None,
 ) -> None:
     run_sync_job(
         _sync_worker_services(),
@@ -1974,6 +1982,7 @@ def _run_sync_job(
         source_scope=source_scope,
         force_transcribe=force_transcribe,
         search_window_sec=search_window_sec,
+        audio_verify=audio_verify,
     )
 
 

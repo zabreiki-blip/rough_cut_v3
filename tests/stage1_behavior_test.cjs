@@ -1353,6 +1353,123 @@ async function testSyncJobIncompleteAndAsrFailedLabel({ state, sync }) {
   }
 }
 
+// Audio verification: the job summary shows the counters and the card shows the verdict
+// with the heard text escaped.
+function testSyncAudioVerifyControl({ state, sync, core }) {
+  const { ids, appState } = state;
+  const original = {
+    engine: ids.sync_asr_engine.value,
+    checked: ids.sync_audio_verify.checked,
+    running: appState.syncJobRunning,
+  };
+  try {
+    appState.syncJobRunning = false;
+    ids.sync_audio_verify.checked = true;
+    ids.sync_asr_engine.value = "cloud";
+    ids.sync_asr_engine.dispatch("change");
+    assert.strictEqual(ids.sync_audio_verify.disabled, false);
+    assert.strictEqual(sync.buildSyncStartPayload().audio_verify, true);
+
+    ids.sync_audio_verify.checked = false;
+    assert.strictEqual(sync.buildSyncStartPayload().audio_verify, false);
+
+    // Local engine: the checkbox is locked and the field is not sent (backend default: off).
+    ids.sync_asr_engine.value = "local";
+    ids.sync_asr_engine.dispatch("change");
+    assert.strictEqual(ids.sync_audio_verify.disabled, true);
+    assert.strictEqual(sync.buildSyncStartPayload().audio_verify, undefined);
+
+    // The shared availability refresh keeps the cloud-only lock and locks during a run.
+    ids.sync_asr_engine.value = "cloud";
+    appState.syncJobRunning = true;
+    core.updateActionAvailability();
+    assert.strictEqual(ids.sync_audio_verify.disabled, true);
+    appState.syncJobRunning = false;
+    core.updateActionAvailability();
+    assert.strictEqual(ids.sync_audio_verify.disabled, false);
+  } finally {
+    ids.sync_asr_engine.value = original.engine;
+    ids.sync_audio_verify.checked = original.checked;
+    appState.syncJobRunning = original.running;
+    core.updateActionAvailability();
+  }
+}
+
+async function testSyncAudioVerifyDisplay({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+  const load = async (job, metadata) => {
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      let body = { items: [] };
+      if (target.includes("/sync-matches")) {
+        body = { items: [{
+          segment_id: "av1", status: "needs_review", speaker: "ИВАН", source_id: "media_a1",
+          source_in_sec: 1, source_out_sec: 4, metadata,
+        }] };
+      } else if (target.includes("/sync-jobs/status")) {
+        body = job;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: body }) };
+    };
+    await sync.loadSyncWorkspace(true);
+  };
+  try {
+    await load(
+      { id: "a1", status: "completed", complete: true, message: "Completed",
+        audio_verified: 12, audio_promoted: 5, audio_rejected: 2, audio_cost_usd: 0.0084 },
+      {},
+    );
+    const message = ids.sync_job_message.textContent;
+    assert.ok(message.includes("по звуку: проверено 12, подтверждено 5, отклонено 2 ($0.0084)"), message);
+    await load({ id: "a2", status: "completed", complete: true, message: "Completed" }, {});
+    assert.ok(!ids.sync_job_message.textContent.includes("по звуку"), ids.sync_job_message.textContent);
+
+    await load(
+      { id: "a3", status: "completed", complete: true, message: "Completed" },
+      { review_reason: "audio_mismatch", audio_verified: {
+        verdict: "no_match", coverage: 0, heard_text: "<img src=x onerror=1> другое" } },
+    );
+    let html = ids.sync_review_list.innerHTML;
+    assert.ok(html.includes("по звуку: не совпадает — слышно: «"), html);
+    assert.ok(html.includes("&lt;img src=x onerror=1&gt; другое"), html);
+    assert.ok(!html.includes("<img src=x"), html);
+
+    await load(
+      { id: "a3", status: "completed", complete: true, message: "Completed" },
+      { audio_verified: { verdict: "partial", coverage: 0.5, heard_text: "половина" } },
+    );
+    html = ids.sync_review_list.innerHTML;
+    assert.ok(html.includes("по звуку: звучит частично (50%) — слышно: «половина»"), html);
+
+    await load(
+      { id: "a3", status: "completed", complete: true, message: "Completed" },
+      { audio_verified: { verdict: "match", coverage: 1, heard_text: "x" } },
+    );
+    assert.ok(ids.sync_review_list.innerHTML.includes("проверено по звуку"), ids.sync_review_list.innerHTML);
+    await load({ id: "a3", status: "completed", complete: true, message: "Completed" }, {});
+    assert.ok(!ids.sync_review_list.innerHTML.includes("по звуку"), ids.sync_review_list.innerHTML);
+
+    const labelled = {
+      timing_unreliable: "Таймкоды ненадёжны — проверьте границы",
+      timing_unrefined: "Таймкоды ещё не уточнены",
+      audio_mismatch: "По звуку не совпадает",
+      audio_partial: "По звуку — частично",
+      audio_match_wide_range: "Звучит, но диапазон слишком широкий",
+    };
+    for (const [reason, text] of Object.entries(labelled)) {
+      await load({ id: "a4", status: "completed", complete: true, message: "Completed" }, { review_reason: reason });
+      assert.ok(ids.sync_review_list.innerHTML.includes(text), `${reason}: ${ids.sync_review_list.innerHTML}`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+  }
+}
+
 // Stage 3 prepare result: the UI shows the total placeholder count, duration and reasons,
 // not just the narrow unmapped-source swap counter.
 function testStage3PlaceholderDescription({ stage3 }) {
@@ -2245,6 +2362,8 @@ async function main() {
     ["testBuildTimelineSurfacesWarnings", () => testBuildTimelineSurfacesWarnings(modules)],
     ["testSyncMatchVerificationReasons", () => testSyncMatchVerificationReasons(modules)],
     ["testSyncJobIncompleteAndAsrFailedLabel", () => testSyncJobIncompleteAndAsrFailedLabel(modules)],
+    ["testSyncAudioVerifyControl", () => testSyncAudioVerifyControl(modules)],
+    ["testSyncAudioVerifyDisplay", () => testSyncAudioVerifyDisplay(modules)],
     ["testStage3PlaceholderDescription", () => testStage3PlaceholderDescription(modules)],
     ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
     ["testStage3ModesAndBlockers", () => testStage3ModesAndBlockers(modules)],

@@ -530,6 +530,29 @@ def _timing_gate_flags(index: WordIndex) -> list[str]:
     return [TIMING_UNREFINED_FLAG] if precision in _UNRELIABLE_TIMESTAMP_PRECISIONS else []
 
 
+def unreliable_timing_source_ids(indexes: Iterable[WordIndex]) -> set[str]:
+    """Sources whose word times are still interpolated (never retimed or retime rejected).
+
+    The single definition shared by the window refine and the audio verify passes.
+    """
+    return {index.source_id for index in indexes if _timing_gate_flags(index)}
+
+
+def match_timing_unreliable(match: Any, unreliable_sources: set[str]) -> bool:
+    """Whether a match's range rests on unreliable timing.
+
+    True for a match on an unreliable source, a window-refined one (``window_refined``)
+    and one the refine demoted (``review_reason == "timing_unreliable"``): all deserve
+    a listen.
+    """
+    metadata = getattr(match, "metadata", None) or {}
+    return (
+        getattr(match, "source_id", "") in unreliable_sources
+        or bool(metadata.get("window_refined"))
+        or metadata.get("review_reason") == "timing_unreliable"
+    )
+
+
 def _semantic_gate_flags(query_text: str, candidate_text: str) -> list[str]:
     """Detect meaning-inverting divergences that a purely textual similarity
     score cannot see (negation, changed numbers), so a strong fuzzy match can

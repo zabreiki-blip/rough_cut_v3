@@ -291,3 +291,38 @@ def test_early_setup_failure_fails_job_and_releases_project(sync_api, dependency
     # Проект можно резервировать повторно (иначе следующий старт даст 409).
     assert api._reserve_sync_project("demo")
     api._release_sync_project("demo")
+
+
+def test_match_phase_gets_cancel_aware_window_transcriber(sync_api) -> None:
+    client, projects = sync_api
+    _prepare(client, projects, count=1)
+    seen: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
+
+    def fake_transcribe(clip, **kwargs):
+        calls.append({"clip": clip, **kwargs})
+        return {"words": [{"word": "а", "start": 0.0, "end": 0.5}]}
+
+    import api_sync_worker
+
+    real_run_match_phase = api_sync_worker.run_match_phase
+
+    def spy(ctx, *args, **kwargs):
+        seen["ctx"] = ctx
+        seen["words"] = ctx.transcribe_window(Path("clip.wav"), "small")
+        return real_run_match_phase(ctx, *args, **kwargs)
+
+    with (
+        patch.object(api_sync_worker, "run_match_phase", spy),
+        patch.object(api, "transcribe_audio", fake_transcribe),
+    ):
+        job = _run(client)
+
+    assert job["status"] == "completed"
+    assert seen["words"] == [{"word": "а", "start": 0.0, "end": 0.5}]
+    assert seen["ctx"].resolve_audio_path is not None
+    (call,) = calls
+    assert call["backend"] == "faster-whisper" and call["model"] == "small"
+    assert call["language"] == "ru"
+    assert call["cancel_event"] is not None  # the job's cancel event reaches the Whisper worker
+    _assert_released()

@@ -20,7 +20,9 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -44,6 +46,11 @@ VERIFY_MAX_OUTPUT_TOKENS = 2048
 _FFMPEG_TIMEOUT_SEC = 300.0
 _PCM_BYTES_PER_SEC = 16_000 * 2  # mono s16le 16 kHz
 _VERDICTS = ("match", "partial", "no_match")
+# Observed ~0.0035 $/min for the audio model; doubled as a safety margin for unknown costs.
+DEFAULT_USD_PER_MINUTE = Decimal("0.007")
+RATE_ENV = "ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE"
+RETRY_PARSE_ENV = "SYNC_AUDIO_VERIFY_RETRY_PARSE"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 _PROMPT_RU = (
     "Ты проверяешь синхрон интервью. Послушай аудиофрагмент и сравни услышанную "
@@ -74,6 +81,8 @@ class AudioVerdict:
     cost_usd: float | None = None
     reason: str = ""
     cached: bool = False
+    paid: bool = False  # a billed request was made (an unreadable answer is cached, not repeated)
+    cost_estimated: bool = False  # cost_usd is our estimate, the provider reported none
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -91,6 +100,20 @@ def resolve_model(settings: Mapping[str, str] | None = None) -> str:
         if value:
             return value
     return DEFAULT_MODEL
+
+
+def clip_usd_per_minute(settings: Mapping[str, str] | None = None) -> Decimal:
+    """Rate for estimating the cost of one clip when the provider reports none."""
+    env = os.environ if settings is None else settings
+    try:
+        value = Decimal(str(env.get(RATE_ENV) or "").strip())
+    except InvalidOperation:
+        return DEFAULT_USD_PER_MINUTE
+    return value if value.is_finite() and value > 0 else DEFAULT_USD_PER_MINUTE
+
+
+def estimate_clip_usd(duration_sec: float, settings: Mapping[str, str] | None = None) -> Decimal:
+    return Decimal(str(max(0.0, duration_sec))) * clip_usd_per_minute(settings) / Decimal("60")
 
 
 def build_prompt(quote: str, speaker: str) -> str:
@@ -222,9 +245,15 @@ def _read_cache(path: Path) -> dict[str, Any] | None:
 def _write_cache(path: Path, verdict: AudioVerdict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(verdict.to_dict(), ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        # Unique tmp in the same folder: parallel writers of one key never clash.
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.stem + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(verdict.to_dict(), ensure_ascii=False))
+            os.replace(tmp_name, path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
     except OSError:
         logger.debug("Не удалось записать кэш sync_audio_verify", exc_info=True)
 
@@ -242,8 +271,12 @@ def verify_clip(
     usage_callback: Callable[[dict[str, Any]], Any] | None = None,
     margin_sec: float = DEFAULT_MARGIN_SEC,
     cache_dir: Path | str | None = None,
+    retry_parse_errors: bool | None = None,
 ) -> AudioVerdict:
     model = resolve_model(settings)
+    if retry_parse_errors is None:
+        env = os.environ if settings is None else settings
+        retry_parse_errors = str(env.get(RETRY_PARSE_ENV) or "").strip().lower() in _TRUE_VALUES
     try:
         pcm = extract_pcm(
             Path(audio_path), max(0.0, start_sec - margin_sec), end_sec + margin_sec
@@ -262,7 +295,11 @@ def verify_clip(
                 result = AudioVerdict(**cached)
             except TypeError:
                 result = None
-            if result is not None and result.verdict in _VERDICTS:
+            if result is not None and (
+                result.verdict in _VERDICTS
+                # A paid answer we could not parse is not paid for again, unless asked.
+                or (result.verdict == "error" and result.paid and not retry_parse_errors)
+            ):
                 result.cached = True
                 return result
 
@@ -273,8 +310,11 @@ def verify_clip(
         return AudioVerdict("error", model=model, reason=f"encode: {exc}")
 
     call = request_fn or make_default_request_fn(settings)
+    estimate = estimate_clip_usd(duration_sec, settings)
     # CostBudgetExceeded намеренно не перехватывается: пакет должен остановиться.
-    reservation_id = budget.reserve_attempt(duration_sec) if budget is not None else None
+    reservation_id = (
+        budget.reserve_usd(estimate, "Audio verification clip") if budget is not None else None
+    )
     try:
         content, cost, raw = call(
             audio_b64=audio_b64,
@@ -283,10 +323,28 @@ def verify_clip(
             model=model,
             duration_sec=duration_sec,
         )
-    except Exception as exc:  # сеть, HTTP, неверная конфигурация — не роняем пакет
-        return AudioVerdict("error", model=model, reason=f"request: {exc}")
+    except BaseException as exc:
+        # Provably unsent (no connection) is free; anything else may have been billed,
+        # so the estimate is booked as spent instead of staying reserved forever.
+        unsent = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+        if budget is not None and reservation_id is not None:
+            if unsent:
+                budget.release(reservation_id)
+            else:
+                budget.settle(reservation_id, None, estimate_if_unknown=True)
+        if not isinstance(exc, Exception):
+            raise  # cancellation / interpreter exit propagates after the books are settled
+        return AudioVerdict(
+            "error",
+            model=model,
+            reason=f"request: {exc}",
+            cost_usd=None if unsent else float(estimate),
+            cost_estimated=not unsent,
+        )
     if budget is not None and reservation_id is not None:
-        budget.settle(reservation_id, cost)
+        budget.settle(reservation_id, cost, estimate_if_unknown=True)
+    cost_estimated = cost is None
+    effective_cost = float(estimate) if cost is None else cost
     if usage_callback is not None:
         try:
             usage_callback(
@@ -302,8 +360,20 @@ def verify_clip(
     try:
         parsed = parse_verdict_content(content)
     except ValueError as exc:
-        return AudioVerdict("error", model=model, cost_usd=cost, reason=f"parse: {exc}")
-    result = AudioVerdict(model=model, cost_usd=cost, **parsed)
+        failed = AudioVerdict(
+            "error",
+            model=model,
+            cost_usd=effective_cost,
+            reason=f"parse: {exc}",
+            paid=True,
+            cost_estimated=cost_estimated,
+        )
+        if cache_path is not None:
+            _write_cache(cache_path, failed)
+        return failed
+    result = AudioVerdict(
+        model=model, cost_usd=effective_cost, paid=True, cost_estimated=cost_estimated, **parsed
+    )
     if cache_path is not None:
         _write_cache(cache_path, result)
     return result

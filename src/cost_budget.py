@@ -229,6 +229,10 @@ class CostBudget:
     def reserve_attempt(self, seconds: float) -> str:
         return self._reserve(self.estimate_seconds(seconds), "Cloud ASR attempt")
 
+    def reserve_usd(self, estimate: object, what: str = "Request") -> str:
+        """Reserve an explicit USD estimate (for operations with their own rate)."""
+        return self._reserve(_nonnegative_decimal(estimate, "estimate"), what)
+
     def reserve_llm_attempt(self, messages: Sequence[Mapping[str, Any]], max_tokens: int) -> str:
         estimate = self.estimate_llm(messages_text_chars(messages), max_tokens)
         return self._reserve(estimate, "LLM request")

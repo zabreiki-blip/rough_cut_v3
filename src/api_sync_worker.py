@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from api_service_contracts import SyncWorkerServices
 from sync_asr_failures import mark_asr_failed_matches
+from sync_audio_verify_phase import (
+    CACHE_SUBDIR,
+    AudioVerifyResult,
+    persist_audio_results,
+    snapshot_matches,
+    resolve_audio_verify,
+    run_audio_verification,
+)
 from sync_asr_phase import SyncAsrContext, run_asr_phase
 from sync_match_phase import (
     SyncMatchCheckpoint,
@@ -11,8 +23,58 @@ from sync_match_phase import (
     run_match_phase,
 )
 from sync_cost_tracker import SyncCostTracker, _AsrMetrics
+from job_runtime import asr_slot
+from stage2.whisper_runner import is_no_words_error
 
 logger = logging.getLogger(__name__)
+
+
+def make_window_transcriber(
+    transcribe_audio: Callable[..., dict[str, Any]],
+    *,
+    asr_semaphore: Any,
+    cancel_event: threading.Event | None,
+    ensure_not_cancelled: Callable[[], None],
+    language: str,
+    update_job: Callable[..., object],
+    job_id: str,
+    timeout_seconds: float | None = None,
+) -> Callable[[Path, str], list[dict[str, Any]]]:
+    """Local-Whisper transcriber of one window clip for the sync window refine.
+
+    Same discipline as the ordinary worker ASR: the global ASR slot is held only around
+    the call (waiting cancel-aware) and the killable Whisper process gets the job's
+    ``cancel_event``, so a cancelled job interrupts the window instead of finishing it.
+    """
+
+    def transcribe_window(clip: Path, model: str) -> list[dict[str, Any]]:
+        with asr_slot(
+            asr_semaphore,
+            check_stop=ensure_not_cancelled,
+            on_wait=lambda: update_job(
+                job_id, message="Waiting for an ASR slot", asr_waiting=True
+            ),
+            on_acquired=lambda: update_job(
+                job_id, message="Уточнение границ по окну", asr_waiting=False
+            ),
+        ):
+            try:
+                result = transcribe_audio(
+                    clip,
+                    backend="faster-whisper",
+                    model=model,
+                    language=language,
+                    cancel_event=cancel_event,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:
+                # No speech after VAD is an empty window, not an engine failure.
+                if is_no_words_error(exc):
+                    return []
+                raise
+        return list(result.get("words") or [])
+
+    return transcribe_window
 
 
 def run_sync_job(
@@ -30,6 +92,7 @@ def run_sync_job(
     source_scope: str,
     force_transcribe: bool,
     search_window_sec: float,
+    audio_verify: bool | None = None,
 ) -> None:
     _project_paths = services._project_paths
     _sync_stores = services._sync_stores
@@ -184,6 +247,18 @@ def run_sync_job(
         indexes = asr_result.indexes
         source_failures = asr_result.source_failures
 
+        def _optional_sync_audio_path(source: Any, source_paths: Any) -> Path | None:
+            # The window refine treats a missing guide as "unavailable", not as a job failure.
+            try:
+                return _resolve_sync_audio_path(source, source_paths)
+            except Exception:
+                logger.warning(
+                    "Guide audio of source %s unavailable for window refine",
+                    getattr(source, "id", ""),
+                    exc_info=True,
+                )
+                return None
+
         match_result = run_match_phase(
             SyncMatchContext(
                 job_id=job_id,
@@ -216,6 +291,17 @@ def run_sync_job(
                 matching_fingerprint=_sync_matching_fingerprint,
                 sync_summary=_sync_summary,
                 word_index_path=_word_index_path,
+                resolve_audio_path=_optional_sync_audio_path,
+                transcribe_window=make_window_transcriber(
+                    transcribe_audio,
+                    asr_semaphore=services._ASR_SEMAPHORE,
+                    cancel_event=cancel_event,
+                    ensure_not_cancelled=ensure_not_cancelled,
+                    language=language,
+                    update_job=_update_sync_job,
+                    job_id=job_id,
+                    timeout_seconds=(app.config.get("SYNC_WHISPER_TIMEOUT_SECONDS") or None),
+                ),
             ),
             sources,
             indexes,
@@ -255,6 +341,76 @@ def run_sync_job(
                     )
                     if relabelled:
                         match_store.replace_all(stored)
+        audio_fields: dict[str, object] = {}
+        enabled, audio_note = resolve_audio_verify(audio_verify, asr_engine, os.environ)
+        source_warnings = list(asr_result.source_warnings)
+        if audio_note:
+            source_warnings.append({"source_id": "", "warning": audio_note})
+        if enabled:
+            budget = cost_tracker.llm_budget
+            if budget is None:
+                cost_env = job.get("llm_cost_env")
+                if not cost_tracker.init_llm_budget(
+                    cost_env if isinstance(cost_env, dict) else os.environ
+                ):
+                    source_warnings.append(
+                        {
+                            "source_id": "",
+                            "warning": "проверка по звуку отключена: неверные настройки бюджета",
+                        }
+                    )
+                budget = cost_tracker.llm_budget
+            if budget is not None:
+                _update_sync_job(job_id, message="Verifying matches by audio")
+
+                def report_audio_progress(partial: AudioVerifyResult, total: int) -> None:
+                    _update_sync_job(
+                        job_id,
+                        persist=should_persist_progress(),
+                        message=f"Verifying matches by audio: {partial.checked}/{total}",
+                        **partial.job_fields(),
+                    )
+
+                audio_result = AudioVerifyResult()
+                with _SYNC_DATA_LOCK:
+                    audio_snapshot = snapshot_matches(match_store.list())
+                try:
+                    run_audio_verification(
+                        match_result.matches,
+                        sources,
+                        indexes,
+                        resolve_audio_path=lambda source: _resolve_sync_audio_path(source, paths),
+                        cache_dir=paths["sync_transcripts"] / CACHE_SUBDIR,
+                        budget=budget,
+                        environ=os.environ,
+                        now=_utc_now_iso(),
+                        usage_callback=services._make_openrouter_usage_callback(
+                            project, stage="assembly", operation="sync_audio_verify", job_id=job_id
+                        ),
+                        ensure_not_cancelled=ensure_not_cancelled,
+                        on_progress=report_audio_progress,
+                        result=audio_result,
+                    )
+                finally:
+                    # Verdicts already paid for are kept even if the job is cancelled;
+                    # only matches verified in this run are written, and never over an
+                    # edit made while the job was running.
+                    if audio_result.changed_ids:
+                        with _SYNC_DATA_LOCK:
+                            stored = match_store.list()
+                            if persist_audio_results(
+                                stored,
+                                match_result.matches,
+                                audio_result.changed_ids,
+                                audio_snapshot,
+                            ):
+                                match_store.replace_all(stored)
+                source_warnings.extend(
+                    {"source_id": "", "warning": text} for text in audio_result.warnings
+                )
+                audio_fields = audio_result.job_fields()
+        if len(source_warnings) != len(asr_result.source_warnings):
+            audio_fields["source_warnings"] = source_warnings
         summary = _sync_summary(match_result.matches)
         # ``status`` stays "completed" (terminal for polling and the UI); an
         # incomplete result is expressed by ``complete`` / ``degraded_sources``.
@@ -289,6 +445,7 @@ def run_sync_job(
             llm_review_failures=match_result.llm_review_failures,
             **cost_tracker.llm_cost_fields(),
             **asr_metrics,
+            **audio_fields,
             **summary,
         )
     except _JobCancelled:
