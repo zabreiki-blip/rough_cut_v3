@@ -16,6 +16,7 @@ from stage2 import index_retiming, local_hole_repair
 from stage2.match_retiming import retime_map_path
 from stage2.cached_index_repair import has_unrecovered_holes, repair_cached_index_holes
 from stage2.cloud_asr import plan_cloud_chunks
+from stage2.sync_transcript import reference_audio_mismatch
 from stage2.whisper_runner import is_no_words_error, resolve_backend
 from sync_cost_tracker import ProgressPersistGate, SyncCostTracker, _AsrMetrics
 
@@ -81,6 +82,24 @@ class SyncAsrResult:
     # Failed sources whose transcription was actually attempted (as opposed to a
     # missing/unreadable guide file): their segments are "asr_failed".
     asr_failed_source_ids: list[str] = field(default_factory=list)
+
+
+def _stale_reference_audio_warning(
+    source_id: str, mismatch: Mapping[str, float], *, reindexed: bool
+) -> dict[str, str]:
+    return {
+        "source_id": source_id,
+        "warning": (
+            f"В источнике {source_id} опорное аудио не соответствует медиа "
+            f"(аудио {mismatch['audio_duration_sec']:.0f} с, медиа "
+            f"{mismatch['media_duration_sec']:.0f} с): расшифровка отброшена"
+            + (
+                ", источник перераспознаётся."
+                if reindexed
+                else "; пересоздайте WAV из медиа и запустите синхронизацию заново."
+            )
+        ),
+    }
 
 
 def _coverage_warning(source_id: str, metadata: Mapping[str, Any]) -> dict[str, str] | None:
@@ -612,6 +631,30 @@ def run_asr_phase(
                 ):
                     cache_metadata["audio"] = audio_signature
                     save_word_index(index_path, cached_index)
+
+            if cached_index is not None:
+                stale_audio = reference_audio_mismatch(
+                    cached_index, float(source.duration_sec or 0.0)
+                )
+                if stale_audio is not None:
+                    # The index describes a reference audio of another (longer)
+                    # version of the recording: its words cannot be scaled onto
+                    # the media, so it must never reach matching.
+                    audio_replaced = (
+                        audio_is_available
+                        and audio_path is not None
+                        and not _word_index_audio_matches(
+                            cached_index, audio_path, audio_signature=audio_signature
+                        )
+                    )
+                    reindexed = (audio_replaced or should_force) and selected_for_transcription
+                    source_warnings.append(
+                        _stale_reference_audio_warning(source.id, stale_audio, reindexed=reindexed)
+                    )
+                    _update_sync_job(job_id, source_warnings=list(source_warnings))
+                    cached_index = None
+                    if not reindexed:
+                        continue
 
             if cached_index is not None:
                 # A word index is always relative to its guide media, so

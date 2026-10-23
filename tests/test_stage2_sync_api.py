@@ -3714,6 +3714,7 @@ def test_sync_start_skips_ffmpeg_when_canonical_wav_exists(sync_api, monkeypatch
     audio_dir.mkdir(parents=True, exist_ok=True)
     (audio_dir / "review.wav").write_bytes(_wav_bytes(60, sample_rate=10))
     with (
+        patch.object(api, "_media_duration_or_none", return_value=60.0),
         patch.object(api.subprocess, "run") as run,
         patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)),
         patch.object(api.threading, "Thread", _ImmediateThread),
@@ -3721,6 +3722,162 @@ def test_sync_start_skips_ffmpeg_when_canonical_wav_exists(sync_api, monkeypatch
         response = _start_cloud_review_job(client)
     assert response.status_code == 200, response.get_json()
     run.assert_not_called()
+
+
+def _prepare_canonical_wav_vs_media(sync_api, *, wav_sec, media_sec, wav_newer=True):
+    client = _prepare_non_wav_review_media(sync_api)
+    _client, projects = sync_api
+    media = projects / "demo" / "media/reviews/Люля.mpg"
+    audio_dir = _sync_audio_dir(projects)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    canonical = audio_dir / "review.wav"
+    canonical.write_bytes(_wav_bytes(wav_sec, sample_rate=10))
+    now = time.time()
+    os.utime(media, (now - 1000, now - 1000))
+    stamp = now - 500 if wav_newer else now - 2000
+    os.utime(canonical, (stamp, stamp))
+    paths = api._ensure_project("demo")
+    source = api.SyncSourceStore(paths["sync_sources"]).list()[0]
+    return client, projects, paths, source, canonical
+
+
+def _wav_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as stream:
+        return stream.getnframes() / stream.getframerate()
+
+
+def test_ensure_sync_wav_recreates_wav_when_duration_differs_from_media(sync_api) -> None:
+    _client, _projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
+        sync_api, wav_sec=60, media_sec=30
+    )
+    calls = []
+    with (
+        patch.object(api, "_media_duration_or_none", return_value=30.0),
+        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(30.0, calls)),
+    ):
+        assert api._ensure_sync_wav(source, paths) == canonical
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("-i") + 1].endswith("Люля.mpg")
+    assert _wav_seconds(canonical) == 30.0
+    assert [item.name for item in canonical.parent.iterdir()] == ["review.wav"]
+
+
+def test_ensure_sync_wav_keeps_wav_matching_media(sync_api) -> None:
+    _client, _projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
+        sync_api, wav_sec=60, media_sec=60
+    )
+    with (
+        patch.object(api, "_media_duration_or_none", return_value=60.4),
+        patch.object(api.subprocess, "run") as run,
+    ):
+        assert api._ensure_sync_wav(source, paths) == canonical
+    run.assert_not_called()
+    assert _wav_seconds(canonical) == 60.0
+
+
+def test_ensure_sync_wav_keeps_wav_when_media_duration_is_unknown(sync_api) -> None:
+    _client, _projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
+        sync_api, wav_sec=60, media_sec=60
+    )
+    with (
+        patch.object(api, "_media_duration_or_none", return_value=None),
+        patch.object(api.subprocess, "run") as run,
+    ):
+        assert api._ensure_sync_wav(source, paths) == canonical
+    run.assert_not_called()
+
+
+def test_ensure_sync_wav_recreates_wav_older_than_media(sync_api) -> None:
+    _client, _projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
+        sync_api, wav_sec=60, media_sec=60, wav_newer=False
+    )
+    calls = []
+    with (
+        patch.object(api, "_media_duration_or_none", return_value=60.0),
+        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(60.0, calls)),
+    ):
+        assert api._ensure_sync_wav(source, paths) == canonical
+    assert len(calls) == 1
+    assert canonical.stat().st_mtime > time.time() - 100
+
+
+def test_sync_start_drops_index_built_from_stale_guide_wav(sync_api, monkeypatch) -> None:
+    client, projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
+        sync_api, wav_sec=60, media_sec=30
+    )
+    # Index "repaired" by linear scaling although its WAV was longer than the media.
+    stale = WordIndex(
+        source_id="review",
+        words=[WordTimestamp("старое", 0.0, 0.5), WordTimestamp("конец", 99.0, 100.0)],
+        generated_at="old",
+        metadata={
+            "backend_metadata": {"duration_sec": 60.0},
+            "timestamp_scale_repair": {
+                "observed_end_sec": 59.5,
+                "duration_sec": 30.0,
+                "scale": 0.5,
+            },
+        },
+    )
+    config = api._transcription_config(backend="cloud-audio", model=None, language="ru")
+    stale.metadata[api._TRANSCRIPTION_CACHE_KEY] = api._transcription_cache_metadata(
+        canonical, config, origin="generated"
+    )
+    api.save_word_index(api._word_index_path(paths, "review"), stale)
+    source_store = api.SyncSourceStore(paths["sync_sources"])
+    source_store.save(api.SyncSource.from_dict({**source.to_dict(), "duration_sec": 30.0}))
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    with (
+        patch.object(api, "_media_duration_or_none", return_value=30.0),
+        patch.object(api.subprocess, "run", side_effect=_fake_ffmpeg(30.0)),
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)) as transcribe,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 200, response.get_json()
+    transcribe.assert_called_once()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    warnings = [item["warning"] for item in job["source_warnings"]]
+    assert any("опорное аудио не соответствует медиа" in text for text in warnings), warnings
+    fresh = api.load_word_index(api._word_index_path(paths, "review"), "review")
+    assert [word.word for word in fresh.words] == ["маленькая"]
+
+
+def test_sync_start_does_not_retranscribe_unfixable_stale_guide_wav(sync_api, monkeypatch) -> None:
+    client, projects, paths, source, canonical = _prepare_canonical_wav_vs_media(
+        sync_api, wav_sec=60, media_sec=30
+    )
+    stale = WordIndex(
+        source_id="review",
+        words=[WordTimestamp("старое", 0.0, 0.5), WordTimestamp("конец", 58.0, 59.5)],
+        generated_at="old",
+        metadata={"backend_metadata": {"duration_sec": 60.0}},
+    )
+    config = api._transcription_config(backend="cloud-audio", model=None, language="ru")
+    stale.metadata[api._TRANSCRIPTION_CACHE_KEY] = api._transcription_cache_metadata(
+        canonical, config, origin="generated"
+    )
+    api.save_word_index(api._word_index_path(paths, "review"), stale)
+    source_store = api.SyncSourceStore(paths["sync_sources"])
+    source_store.save(api.SyncSource.from_dict({**source.to_dict(), "duration_sec": 30.0}))
+    monkeypatch.setenv("ROUGH_CUT_MAX_USD_PER_JOB", "5")
+    monkeypatch.setenv("ROUGH_CUT_CLOUD_ASR_USD_PER_MINUTE_ESTIMATE", "0.06")
+    with (
+        # media duration cannot be probed: the WAV is kept and still stale
+        patch.object(api, "_media_duration_or_none", return_value=None),
+        patch.object(api.subprocess, "run") as run,
+        patch.object(api, "transcribe_audio", return_value=_budget_transcript(0)) as transcribe,
+        patch.object(api.threading, "Thread", _ImmediateThread),
+    ):
+        response = _start_cloud_review_job(client)
+    assert response.status_code == 200, response.get_json()
+    run.assert_not_called()
+    transcribe.assert_not_called()
+    job = client.get(response.get_json()["result"]["status_url"]).get_json()["result"]
+    assert any(
+        "опорное аудио не соответствует медиа" in item["warning"] for item in job["source_warnings"]
+    )
 
 
 def test_sync_start_skips_ffmpeg_when_guide_audio_is_already_wav(sync_api, monkeypatch) -> None:

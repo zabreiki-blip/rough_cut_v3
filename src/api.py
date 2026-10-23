@@ -6,6 +6,7 @@ import hmac
 import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -128,6 +129,7 @@ from stage2.assembly_manifest import (
     attach_scenario_revision,
     validate_assembly_manifest,
 )
+from stage2.cloud_asr import _probe_duration as probe_media_duration
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
 from stage_common import (
     _timeline_matches_are_current,
@@ -1112,6 +1114,66 @@ def _ffmpeg_stderr_tail(value: object, limit: int = 300) -> str:
     return " ".join(text.split())[-limit:]
 
 
+def _media_duration_or_none(path: Path) -> float | None:
+    """ffprobe duration of a media file; ``None`` when it cannot be determined."""
+    try:
+        value = float(probe_media_duration(path))
+    except Exception:  # noqa: BLE001 - unknown duration must never break a sync start
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _wav_duration_or_none(path: Path) -> float | None:
+    try:
+        with wave.open(str(path), "rb") as stream:
+            rate = stream.getframerate()
+            return stream.getnframes() / rate if rate > 0 else None
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+def _stale_canonical_wav_media(
+    source: SyncSource, paths: dict[str, Path], canonical: Path
+) -> Path | None:
+    """Return the review media when the canonical WAV was not made from it.
+
+    A canonical WAV is the decoded audio of the source media. It is stale when
+    it is older than the media file or its duration differs from the media
+    duration by more than ``max(1 s, 0.5%)`` (e.g. it was extracted from a
+    different, longer version of the recording). Unknown durations never
+    count as a mismatch.
+    """
+    if source.source_kind != "review_media" or not source.media_path.strip():
+        return None
+    media_value = Path(source.media_path)
+    media = (media_value if media_value.is_absolute() else paths["root"] / media_value).resolve()
+    if not media.is_relative_to(paths["root"].resolve()):
+        raise ValueError("media_path must be inside the project directory")
+    if not media.is_file() or media == canonical.resolve():
+        return None
+    try:
+        if canonical.stat().st_mtime < media.stat().st_mtime - 1.0:
+            app.logger.warning(
+                "Canonical sync WAV of %s is older than its media; re-extracting", source.id
+            )
+            return media
+    except OSError:
+        return None
+    media_duration = _media_duration_or_none(media)
+    wav_duration = _wav_duration_or_none(canonical)
+    if media_duration is None or wav_duration is None:
+        return None
+    if abs(wav_duration - media_duration) > max(1.0, media_duration * 0.005):
+        app.logger.warning(
+            "Canonical sync WAV of %s lasts %.1f s but its media %.1f s; re-extracting",
+            source.id,
+            wav_duration,
+            media_duration,
+        )
+        return media
+    return None
+
+
 def _ensure_sync_wav(source: SyncSource, paths: dict[str, Path]) -> Path | None:
     """Guarantee that a source has a WAV for ASR; return its path.
 
@@ -1119,23 +1181,30 @@ def _ensure_sync_wav(source: SyncSource, paths: dict[str, Path]) -> Path | None:
     The pipeline works from WAV, so such a file is decoded once into the
     canonical ``sync_audio/<id>.wav`` (atomic replace). The stored source is
     left untouched: the canonical file takes precedence in the resolver.
+    An existing canonical WAV that does not match the review media (older, or
+    a different duration) is decoded again; the word index built from the old
+    WAV then fails the audio-signature check and is re-transcribed.
     Returns ``None`` when the source has no media file at all (the worker
     keeps reporting that per source). Raises ``ValueError`` on a path escape
     or an ffmpeg failure.
     """
     canonical = _canonical_audio_path(paths, source.id)
     with _sync_wav_lock(source.id):
+        stale_media: Path | None = None
         if canonical.is_file() and _is_valid_wav(canonical):
-            return canonical
-        guide = _resolve_guide_media_path(source, paths)
-        if not guide.is_file():
-            if canonical.is_file():
+            stale_media = _stale_canonical_wav_media(source, paths, canonical)
+            if stale_media is None:
+                return canonical
+        guide = stale_media or _resolve_guide_media_path(source, paths)
+        if stale_media is None:
+            if not guide.is_file():
+                if canonical.is_file():
+                    raise ValueError(f"invalid canonical sync WAV for {source.id}")
+                return None
+            if guide.resolve() != canonical.resolve() and _is_valid_wav(guide):
+                return guide
+            if guide.resolve() == canonical.resolve():
                 raise ValueError(f"invalid canonical sync WAV for {source.id}")
-            return None
-        if guide.resolve() != canonical.resolve() and _is_valid_wav(guide):
-            return guide
-        if guide.resolve() == canonical.resolve():
-            raise ValueError(f"invalid canonical sync WAV for {source.id}")
 
         canonical.parent.mkdir(parents=True, exist_ok=True)
         temporary = canonical.with_name(f".{canonical.name}.{uuid.uuid4().hex}.upload")

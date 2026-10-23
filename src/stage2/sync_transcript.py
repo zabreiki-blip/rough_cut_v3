@@ -199,16 +199,67 @@ def load_word_index(
     return ingest_word_index(payload, source_id, model=model, language=language)
 
 
+_AUDIO_DURATION_TOLERANCE = 0.02
+
+
+def _transcribed_audio_duration(index: WordIndex) -> float:
+    """Duration of the audio the index was transcribed from (0 when unknown)."""
+    backend = index.metadata.get("backend_metadata")
+    if not isinstance(backend, dict):
+        return 0.0
+    try:
+        value = float(backend.get("duration_sec") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
+
+
+def reference_audio_mismatch(index: WordIndex, duration_sec: float) -> dict[str, float] | None:
+    """Detect an index made from a reference audio that is not the media.
+
+    Words that end where the transcribed audio ends (±2%) while the media is
+    notably shorter are not a stretched time axis: the guide audio belongs to
+    another (longer) version of the recording. Linear scaling would put every
+    word in the wrong place, so such an index (also one that was already
+    "repaired" by ``timestamp_scale_repair`` from such audio) must be
+    re-transcribed from audio that matches the media.
+    """
+    duration = float(duration_sec or 0.0)
+    audio_duration = _transcribed_audio_duration(index)
+    if duration <= 0 or audio_duration <= duration * (1.0 + _AUDIO_DURATION_TOLERANCE):
+        return None
+    repair = index.metadata.get("timestamp_scale_repair")
+    observed_end = index.duration_sec
+    if isinstance(repair, dict):
+        try:
+            observed_end = float(repair.get("observed_end_sec") or 0.0)
+        except (TypeError, ValueError):
+            observed_end = 0.0
+    if observed_end <= duration * (1.0 + _AUDIO_DURATION_TOLERANCE):
+        return None
+    if abs(audio_duration - observed_end) > observed_end * _AUDIO_DURATION_TOLERANCE:
+        return None
+    return {
+        "audio_duration_sec": audio_duration,
+        "media_duration_sec": duration,
+        "observed_end_sec": observed_end,
+    }
+
+
 def rescale_stretched_word_index(index: WordIndex, duration_sec: float) -> float | None:
     """Repair cached interpolated timestamps that extend past real media.
 
     Older cloud responses occasionally described a uniformly stretched time
     axis. Reusing such a cache makes valid quotes near the end of an interview
     impossible to match because their ranges lie beyond ffprobe duration.
+    Scaling is valid only for a stretched axis: when the transcribed audio
+    itself is that long (``reference_audio_mismatch``) nothing is scaled.
     """
     duration = float(duration_sec or 0.0)
     observed_end = index.duration_sec
     if duration <= 0 or observed_end <= duration * 1.02:
+        return None
+    if reference_audio_mismatch(index, duration) is not None:
         return None
     scale = duration / observed_end
     index.words = [
