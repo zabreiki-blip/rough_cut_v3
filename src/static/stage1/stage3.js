@@ -153,10 +153,14 @@ function finishStage3Job() {
 }
 
 const STAGE3_PLACEHOLDER_REASON_LABELS = {
-  sync_needs_review: "синхрон: проверить",
-  sync_not_found: "синхрон: не найден",
-  life: "LIFE",
-  unmapped_source: "источник не привязан",
+  missing_wav: "Нет WAV",
+  no_speaker: "Не указан спикер",
+  no_file: "Нет записи спикера",
+  asr_failed: "Сбой распознавания",
+  not_found: "Не найдено",
+  needs_review: "Нужна проверка",
+  unmapped_source: "Источник не подключён",
+  life_unassigned: "LIFE: материал не назначен",
 };
 
 export function describeStage3Placeholders(result) {

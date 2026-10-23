@@ -4,7 +4,6 @@ import json
 
 import pytest
 
-from api_stage3_routes import _placeholder_report
 from stage2.assembly_plan import build_assembly_plan, plan_to_report
 from stage2.models import FullTimeline, TimelineSegment
 from stage_common import placeholder_reason
@@ -245,28 +244,21 @@ def test_plan_hash_changes_with_timeline() -> None:
     )
 
 
-def test_plan_to_report_matches_legacy_placeholder_report() -> None:
+def test_plan_to_report_counts_synthetic_placeholders() -> None:
     timeline = _synthetic_timeline()
-    legacy = _placeholder_report(timeline, timeline, require_card=False)
 
     report = plan_to_report(build_assembly_plan(timeline, media_mapping={"ivan_01"}))
 
-    assert report["placeholder_segments"] == legacy["placeholder_segments"] == 84
-    assert report["placeholder_duration_sec"] == legacy["placeholder_duration_sec"] == 840.0
+    assert report["placeholder_segments"] == 84
+    assert report["placeholder_duration_sec"] == 840.0
     assert report["unmapped_source_placeholders"] == 0
     assert set(report) >= {"placeholder_breakdown", "plan_summary"}
 
 
-def test_plan_to_report_counts_unmapped_like_legacy() -> None:
+def test_plan_to_report_counts_unmapped_sources() -> None:
     timeline = {"segments": [_matched("snh1"), _matched("snh2")]}
-    exported = json.loads(json.dumps(timeline))
-    for segment in exported["segments"]:
-        segment.update(
-            match_status="not_found", source_id="", source_in_sec=0.0, source_out_sec=0.0
-        )
-    legacy = _placeholder_report(timeline, exported, require_card=False)
 
     report = plan_to_report(build_assembly_plan(timeline, media_mapping=set()))
 
-    assert report["unmapped_source_placeholders"] == legacy["unmapped_source_placeholders"] == 2
-    assert report["placeholder_duration_sec"] == legacy["placeholder_duration_sec"] == 20.0
+    assert report["unmapped_source_placeholders"] == 2
+    assert report["placeholder_duration_sec"] == 20.0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
 import json
 import re
 import threading
@@ -82,7 +83,7 @@ def test_prepare_uses_legacy_export_when_project_has_no_viewings(client) -> None
                 "width": 1920,
                 "height": 1080,
                 "normalization_revision": "norm-1",
-                "segments": [{"id": "snh1", "type": "snh"}],
+                "segments": [{"id": "snh1", "type": "snh", "duration_sec": 2.0}],
             }
         ),
         encoding="utf-8",
@@ -287,7 +288,7 @@ def test_prepare_versioned_nested_export_persists_its_filename_for_download(clie
             ]
         },
     )
-    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a: "<xml/>")
+    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a, **_k: "<xml/>")
     monkeypatch.setattr(
         api_stage3_routes,
         "map_catalog_to_timeline",
@@ -1085,11 +1086,6 @@ def test_timeline_sync_summary_agrees_with_exporter_placeholder_predicate() -> N
                         continue
                     exported = is_exportable_match(kind, status, source_id, source_in, source_out)
                     assert summary["placeholders"] == (0 if exported else 1), segment
-                    # the dict-based placeholder pass in the route uses the same predicate
-                    replaced = api_stage3_routes._placeholder_unmapped_sources(
-                        {"segments": [segment]}, set()
-                    )[1]
-                    assert replaced == (1 if exported else 0), segment
 
 
 def test_prepare_result_reports_sync_summary_of_exported_timeline(client) -> None:
@@ -1215,12 +1211,23 @@ def test_prepare_placeholder_count_matches_generated_xml(client) -> None:
     assert result["placeholder_segments"] == in_xml
     assert result["placeholder_duration_sec"] == pytest.approx(3.0 + 2.0 + 4.0 + 1.0 + 2.0)
     assert result["placeholder_breakdown"] == {
-        "sync_needs_review": {"segments": 1, "duration_sec": pytest.approx(3.0)},
-        "sync_not_found": {"segments": 1, "duration_sec": pytest.approx(2.0)},
-        "life": {"segments": 2, "duration_sec": pytest.approx(5.0)},
+        "needs_review": {"segments": 1, "duration_sec": pytest.approx(3.0)},
+        "not_found": {"segments": 1, "duration_sec": pytest.approx(2.0)},
+        "life_unassigned": {"segments": 2, "duration_sec": pytest.approx(5.0)},
         "unmapped_source": {"segments": 1, "duration_sec": pytest.approx(2.0)},
     }
     assert result["unmapped_source_placeholders"] == 1
+    assert result["plan_summary"]["placeholders"]["segments"] == 5
+    plan_path = paths["work"] / "assembly_plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["summary"] == result["plan_summary"]
+    assert [item["segment_id"] for item in plan["items"] if item["status"] == "placeholder"] == [
+        "r1", "n1", "l1", "l2", "u1",
+    ]
+    canonical = json.dumps(plan, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    stored = json.loads((paths["work"] / "stage3_source_mapping.json").read_text(encoding="utf-8"))
+    assert stored["plan_sha256"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert stored["timeline_sha256"]
     assert result["sync_summary"]["placeholders"] == 2  # excludes unmapped-source swaps
 
 
@@ -1246,7 +1253,7 @@ def test_prepare_legacy_placeholder_breakdown_is_reported(client) -> None:
     assert result["format"] == "legacy"
     assert result["placeholder_segments"] == 2
     assert result["placeholder_duration_sec"] == pytest.approx(5.0)
-    assert set(result["placeholder_breakdown"]) == {"sync_needs_review", "life"}
+    assert set(result["placeholder_breakdown"]) == {"needs_review", "life_unassigned"}
     assert result["unmapped_source_placeholders"] == 0
 
 
@@ -1293,7 +1300,7 @@ def test_stage3_download_is_refused_after_timeline_fingerprint_changes(client) -
     http, _paths = _nested_prepare_setup(client, [])
     write_timeline(match(3.0))
     builds = iter(["<xml>first</xml>", "<xml>second</xml>"])
-    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a: next(builds))
+    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a, **_k: next(builds))
 
     assert http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).status_code == 200
     first = http.get("/stage3/export/xml?project=BRIK")
@@ -1316,7 +1323,7 @@ def test_stage3_download_is_refused_after_timeline_fingerprint_changes(client) -
 def test_stage3_download_is_refused_when_timeline_file_changes_without_fingerprint(client) -> None:
     http, paths = _nested_prepare_setup(client, [_segment("l1", "life", 0.0, 2.0)])
     _h, _a, monkeypatch = client
-    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a: "<xml/>")
+    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a, **_k: "<xml/>")
     assert http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).status_code == 200
     assert http.get("/stage3/export/xml?project=BRIK").status_code == 200
 

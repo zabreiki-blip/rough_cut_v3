@@ -295,3 +295,107 @@ def test_audio_only_source_requires_placeholder_card() -> None:
 
     with pytest.raises(ValueError, match="has no placeholder card"):
         build_nested_xml(_timeline(), catalog)
+
+
+def _all_reasons_timeline() -> FullTimeline:
+    def snh(seg_id: str, start: float, **extra) -> TimelineSegment:
+        return TimelineSegment(
+            id=seg_id,
+            type="snh",
+            text=seg_id,
+            duration_sec=2,
+            start_sec=start,
+            placeholder_path="/tmp/card.png",
+            **extra,
+        )
+
+    matched = {
+        "match_status": "confirmed",
+        "source_id": "v1",
+        "source_in_sec": 1,
+        "source_out_sec": 3,
+    }
+    return FullTimeline(
+        project="P",
+        fps=25,
+        segments=[
+            snh("ready", 0, **matched),
+            snh("no_speaker", 2, match_status="not_found", unmatched_reason="no_eligible_source"),
+            snh(
+                "no_file",
+                4,
+                match_status="not_found",
+                unmatched_reason="no_eligible_source",
+                speaker="Смольников",
+            ),
+            snh("asr_failed", 6, match_status="not_found", unmatched_reason="asr_failed"),
+            snh("not_found", 8, match_status="not_found"),
+            snh("needs_review", 10, match_status="needs_review"),
+            snh(
+                "unmapped",
+                12,
+                match_status="auto_matched",
+                source_id="ghost",
+                source_in_sec=1,
+                source_out_sec=3,
+            ),
+            TimelineSegment(
+                id="life1",
+                type="life",
+                text="life",
+                duration_sec=3,
+                start_sec=14,
+                placeholder_path="/tmp/life.png",
+            ),
+            TimelineSegment(id="zk_ok", type="zk", text="zk", duration_sec=2, start_sec=17, wav_path="/a.wav"),
+            TimelineSegment(id="zk_missing", type="zk", text="zk", duration_sec=2, start_sec=19),
+        ],
+    )
+
+
+def test_placeholder_clips_match_assembly_plan_for_every_reason() -> None:
+    from stage2.assembly_plan import build_assembly_plan
+
+    timeline = _all_reasons_timeline()
+    catalog = {"v1": {"path": "/m/v1.mp4", "duration": 100, "fps": 25}}
+    plan = build_assembly_plan(timeline, media_mapping={"v1"})
+    by_reason = plan["summary"]["placeholders"]["by_reason"]
+    assert set(by_reason) == {
+        "no_speaker",
+        "no_file",
+        "asr_failed",
+        "not_found",
+        "needs_review",
+        "unmapped_source",
+        "life_unassigned",
+        "missing_wav",
+    }
+
+    root = _root(build_nested_xml(timeline, catalog, plan=plan))
+    final = root.find("./project/children/sequence")
+    assert final is not None
+    clips = final.findall("./media/video/track/clipitem")
+    placeholders = [c for c in clips if c.get("id", "").endswith("-placeholder")]
+    duration = sum((int(c.findtext("end")) - int(c.findtext("start"))) / 25 for c in placeholders)
+
+    summary = plan["summary"]["placeholders"]
+    assert len(placeholders) == summary["segments"] == 7
+    assert duration == pytest.approx(summary["duration_sec"])
+    assert len(clips) - len(placeholders) == 1  # the one ready nested clip
+    # zk with a wav is a voiceover; missing_wav yields neither a clip nor a placeholder
+    assert len(final.findall("./media/audio/track")[1].findall("clipitem")) == 1
+    assert by_reason["missing_wav"]["segments"] == 1
+
+
+def test_nested_xml_without_plan_builds_it_from_timeline() -> None:
+    timeline = _all_reasons_timeline()
+    catalog = {
+        "v1": {"path": "/m/v1.mp4", "duration": 100, "fps": 25},
+        "ghost": {"path": "/m/ghost.mp4", "duration": 100, "fps": 25},
+    }
+    # without a media mapping every catalogued source counts as mapped
+    root = _root(build_nested_xml(timeline, catalog))
+    final = root.find("./project/children/sequence")
+    assert final is not None
+    clips = final.findall("./media/video/track/clipitem")
+    assert len([c for c in clips if c.get("id", "").endswith("-placeholder")]) == 6

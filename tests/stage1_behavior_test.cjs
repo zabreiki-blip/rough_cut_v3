@@ -1143,16 +1143,33 @@ function testStage3PlaceholderDescription({ stage3 }) {
     placeholder_segments: 84,
     placeholder_duration_sec: 312.46,
     placeholder_breakdown: {
-      sync_needs_review: { segments: 50, duration_sec: 200 },
-      sync_not_found: { segments: 26, duration_sec: 100 },
-      life: { segments: 8, duration_sec: 12.46 },
+      needs_review: { segments: 50, duration_sec: 200 },
+      not_found: { segments: 26, duration_sec: 100 },
+      life_unassigned: { segments: 8, duration_sec: 12.46 },
     },
     unmapped_source_placeholders: 0,
   });
   assert.ok(text.startsWith("плейсхолдеров: 84 (312.5 с)"), text);
-  assert.ok(text.includes("синхрон: проверить: 50 / 200.0 с"), text);
-  assert.ok(text.includes("синхрон: не найден: 26"), text);
-  assert.ok(text.includes("LIFE: 8 / 12.5 с"), text);
+  assert.ok(text.includes("Нужна проверка: 50 / 200.0 с"), text);
+  assert.ok(text.includes("Не найдено: 26"), text);
+  assert.ok(text.includes("LIFE: материал не назначен: 8 / 12.5 с"), text);
+  const labels = {
+    missing_wav: "Нет WAV",
+    no_speaker: "Не указан спикер",
+    no_file: "Нет записи спикера",
+    asr_failed: "Сбой распознавания",
+    unmapped_source: "Источник не подключён",
+  };
+  const breakdown = {};
+  for (const reason of Object.keys(labels)) breakdown[reason] = { segments: 1, duration_sec: 2 };
+  const all = stage3.describeStage3Placeholders({
+    placeholder_segments: 4,
+    placeholder_duration_sec: 8,
+    placeholder_breakdown: breakdown,
+  });
+  for (const [reason, label] of Object.entries(labels)) {
+    assert.ok(all.includes(`${label}: 1 / 2.0 с`), `${reason}: ${all}`);
+  }
 }
 
 // Audit item 4: the editor sees fragment counts and build warnings BEFORE export;

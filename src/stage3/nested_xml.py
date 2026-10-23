@@ -18,6 +18,7 @@ from urllib.request import pathname2url
 import wave
 from xml.etree import ElementTree as ET
 
+from stage2.assembly_plan import build_assembly_plan
 from stage2.models import FullTimeline, TimelineSegment
 from stage_common import is_exportable_match
 
@@ -202,7 +203,29 @@ def _media_kind(value: Mapping[str, object]) -> str:
     return "audio" if Path(path).suffix.lower() in {".mp3", ".wav"} else "video"
 
 
-def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> None:
+def _plan_items(
+    timeline: FullTimeline, plan: Mapping[str, Any] | None
+) -> dict[int, Mapping[str, Any]]:
+    """Plan item for every timeline segment, keyed by the segment's position (plan ``order``)."""
+    if plan is None:
+        plan = build_assembly_plan(timeline)
+    raw_items = plan.get("items")
+    by_order: dict[int, Mapping[str, Any]] = {}
+    for item in raw_items if isinstance(raw_items, list) else []:
+        if isinstance(item, Mapping) and isinstance(item.get("order"), int):
+            by_order[item["order"]] = item
+    for index, segment in enumerate(timeline.segments):
+        item = by_order.get(index)
+        if item is None or str(item.get("segment_id") or "") != str(segment.id or ""):
+            raise ValueError(f"assembly plan has no item for segment {segment.id}")
+    return by_order
+
+
+def _validate(
+    timeline: FullTimeline,
+    sources: Mapping[str, MediaSource],
+    items: Mapping[int, Mapping[str, Any]],
+) -> None:
     if timeline.fps <= 0:
         raise ValueError("timeline fps must be positive")
     seen_segment_ids: set[str] = set()
@@ -226,7 +249,7 @@ def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> Non
             raise ValueError(f"audio source {source_id} has no placeholder card")
 
     previous_end = 0.0
-    for segment in timeline.segments:
+    for index, segment in enumerate(timeline.segments):
         if segment.id in seen_segment_ids:
             raise ValueError(f"duplicate timeline segment id: {segment.id}")
         seen_segment_ids.add(segment.id)
@@ -252,7 +275,7 @@ def _validate(timeline: FullTimeline, sources: Mapping[str, MediaSource]) -> Non
         )
         if segment.match_status in {"auto_matched", "confirmed"} and not matched:
             raise ValueError(f"matched segment {segment.id} has no valid source range")
-        if not matched:
+        if not matched or items[index].get("status") != "ready":
             continue
         matched_source = sources.get(segment.source_id)
         if matched_source is None:
@@ -515,12 +538,20 @@ def _voiceover_clip(
 def build_nested_xml(
     timeline: FullTimeline | Mapping[str, Any],
     catalog: Mapping[str, object] | Sequence[object],
+    *,
+    plan: Mapping[str, Any] | None = None,
 ) -> str:
-    """Return an XMEML v5 project containing viewing and final sequences."""
+    """Return an XMEML v5 project containing viewing and final sequences.
+
+    ``plan`` is the assembly plan (``stage2.assembly_plan.build_assembly_plan``) that decides
+    whether each segment becomes a nested clip, a placeholder or nothing.  Without it the plan
+    is built from the timeline alone, i.e. without a media mapping.
+    """
 
     full_timeline = _coerce_timeline(timeline)
     sources = _coerce_sources(catalog)
-    _validate(full_timeline, sources)
+    items = _plan_items(full_timeline, plan)
+    _validate(full_timeline, sources, items)
 
     # Every rendered viewing belongs in RC_VIEWINGS, including files without a
     # selected quote yet. Entries pointing at the same physical file share one
@@ -604,18 +635,12 @@ def build_nested_xml(
     voiceover_track = _sub(audio, "track")
 
     clip_number = 0
-    for segment in full_timeline.segments:
-        if segment.type == "tech" or segment.duration_sec <= 0:
+    for index, segment in enumerate(full_timeline.segments):
+        status = items[index].get("status")
+        if status == "skipped" or segment.type == "tech" or segment.duration_sec <= 0:
             continue
         entry = sequence_by_source.get(segment.source_id)
-        is_nested = entry is not None and is_exportable_match(
-            segment.type,
-            segment.match_status,
-            segment.source_id,
-            segment.source_in_sec,
-            segment.source_out_sec,
-        )
-        if is_nested and entry is not None:
+        if status == "ready" and segment.type in {"snh", "host"} and entry is not None:
             source, sequence_id, _, sequence_name = entry
             clip_number += 1
             _nested_clip(
@@ -638,7 +663,11 @@ def build_nested_xml(
                 media_type="audio",
                 timeline_fps=full_timeline.fps,
             )
-        elif segment.type in {"snh", "host", "life"} and segment.placeholder_path:
+        elif (
+            status == "placeholder"
+            and segment.type in {"snh", "host", "life"}
+            and segment.placeholder_path
+        ):
             clip_number += 1
             _placeholder_clip(
                 video_track,
@@ -646,7 +675,7 @@ def build_nested_xml(
                 clip_id=f"clip-final-{clip_number}-placeholder",
                 timeline=full_timeline,
             )
-        elif segment.type == "zk" and segment.wav_path:
+        elif status == "ready" and segment.type == "zk" and segment.wav_path:
             clip_number += 1
             _voiceover_clip(
                 voiceover_track,

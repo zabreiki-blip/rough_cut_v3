@@ -18,6 +18,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from atomic_io import atomic_write_json, atomic_write_text
 from export_naming import xml_export_filename
 from job_runtime import trim_terminal_jobs
+from stage2.assembly_plan import build_assembly_plan, plan_to_report
 from stage3.media_catalog import MEDIA_EXTENSIONS, MediaCatalogError, scan_media_directory
 from stage3.nested_xml import build_nested_xml
 from stage3.source_mapping import map_catalog_to_timeline, normalize_source_identity
@@ -26,7 +27,6 @@ from stage_common import (
     _scenario_revision_matches,
     _timeline_is_current,
     _timeline_matches_are_current,
-    is_exportable_match,
     timeline_sync_summary,
 )
 
@@ -93,96 +93,6 @@ def _host_timeline_paths(data: dict, *, project: str, project_root: Path) -> dic
                     str(segment[key]), project=project, project_root=project_root
                 )
     return result
-
-
-def _placeholder_unmapped_sources(data: dict, mapped_source_ids: set[str]) -> tuple[dict, int]:
-    result = deepcopy(data)
-    replaced = 0
-    for segment in result.get("segments", []):
-        if not isinstance(segment, dict):
-            continue
-        source_id = str(segment.get("source_id") or "")
-        matched = is_exportable_match(
-            segment.get("type"),
-            segment.get("match_status"),
-            source_id,
-            segment.get("source_in_sec"),
-            segment.get("source_out_sec"),
-        )
-        if not matched or source_id in mapped_source_ids:
-            continue
-        segment["match_status"] = "not_found"
-        segment["source_id"] = ""
-        segment["sequence_id"] = ""
-        segment["sequence_name"] = ""
-        segment["source_in_sec"] = 0.0
-        segment["source_out_sec"] = 0.0
-        replaced += 1
-    return result, replaced
-
-
-def _placeholder_report(
-    original: dict, exported: dict, *, require_card: bool = True
-) -> dict[str, object]:
-    """Count every placeholder the exported timeline contains, grouped by reason.
-
-    ``exported`` is the timeline handed to the XML builder (after unmapped sources were
-    replaced); ``original`` is the same timeline before that replacement, so segments that
-    only became placeholders because their source is unmapped get their own reason.
-    ``require_card`` mirrors the nested exporter, which emits a placeholder clip only for a
-    non-empty segment that carries a placeholder card.
-    """
-    breakdown: dict[str, dict[str, float]] = {}
-    originals = original.get("segments") if isinstance(original, dict) else None
-    exports = exported.get("segments") if isinstance(exported, dict) else None
-    originals = originals if isinstance(originals, list) else []
-    for index, segment in enumerate(exports if isinstance(exports, list) else []):
-        if not isinstance(segment, dict) or segment.get("type") not in {"snh", "host", "life"}:
-            continue
-        try:
-            duration = float(segment.get("duration_sec") or 0.0)
-        except (TypeError, ValueError):
-            duration = 0.0
-        if require_card and (duration <= 0 or not segment.get("placeholder_path")):
-            continue
-        status = str(segment.get("match_status") or "")
-        if segment["type"] == "life":
-            reason = "life"
-        elif is_exportable_match(
-            segment.get("type"),
-            status,
-            segment.get("source_id"),
-            segment.get("source_in_sec"),
-            segment.get("source_out_sec"),
-        ):
-            continue
-        else:
-            before = originals[index] if index < len(originals) else None
-            if isinstance(before, dict) and is_exportable_match(
-                before.get("type"),
-                before.get("match_status"),
-                before.get("source_id"),
-                before.get("source_in_sec"),
-                before.get("source_out_sec"),
-            ):
-                reason = "unmapped_source"
-            elif status == "needs_review":
-                reason = "sync_needs_review"
-            else:
-                reason = "sync_not_found"
-        entry = breakdown.setdefault(reason, {"segments": 0, "duration_sec": 0.0})
-        entry["segments"] += 1
-        entry["duration_sec"] = round(entry["duration_sec"] + max(duration, 0.0), 6)
-    return {
-        "placeholder_segments": sum(int(item["segments"]) for item in breakdown.values()),
-        "placeholder_duration_sec": round(
-            sum(item["duration_sec"] for item in breakdown.values()), 6
-        ),
-        "placeholder_breakdown": breakdown,
-        "unmapped_source_placeholders": int(
-            breakdown.get("unmapped_source", {}).get("segments", 0)
-        ),
-    }
 
 
 def _mapping_summary(mapping) -> list[dict]:
@@ -550,7 +460,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
             "audio_count": 0,
             "mapped_source_ids": [],
             "unmapped_source_ids": [],
-            **_placeholder_report(timeline_data, timeline_data, require_card=False),
+            **plan_to_report(build_assembly_plan(timeline_data)),
             "source_mapping": [],
             "sync_summary": sync_summary,
         }
@@ -570,11 +480,8 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     _annotate_media_kinds(mapping, host_catalog)
     mapped_timeline_source_ids = set(mapping.catalog)
     host_timeline = _host_timeline_paths(timeline_data, project=project, project_root=paths["root"])
-    export_timeline, _replaced = _placeholder_unmapped_sources(
-        host_timeline,
-        mapped_timeline_source_ids,
-    )
-    placeholder_report = _placeholder_report(host_timeline, export_timeline)
+    plan = build_assembly_plan(host_timeline, media_mapping=mapped_timeline_source_ids)
+    placeholder_report = plan_to_report(plan)
     export_catalog: dict[str, object] = {
         str(source["source_id"]): source
         for source in host_catalog.get("sources", [])
@@ -583,7 +490,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     export_catalog.update(mapping.catalog)
     if progress:
         progress(80, "Генерация nested XML")
-    xml_text = build_nested_xml(export_timeline, export_catalog)
+    xml_text = build_nested_xml(host_timeline, export_catalog, plan=plan)
     filename = _nested_timeline_filename(project, timeline_data.get("scenario_revision_id"))
     output_path = paths["work"] / filename
     filename_stem = output_path.stem
@@ -593,11 +500,15 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         output_path = paths["work"] / filename
         collision += 1
     atomic_write_text(output_path, xml_text)
+    atomic_write_json(paths["work"] / "assembly_plan.json", plan)
     mapping_payload = mapping.to_dict()
     mapping_payload["normalization_revision"] = timeline_data.get("normalization_revision")
     mapping_payload["scenario_revision_id"] = str(timeline_data.get("scenario_revision_id") or "")
     mapping_payload["nested_timeline_filename"] = filename
     mapping_payload["timeline_sha256"] = hashlib.sha256(timeline_bytes).hexdigest()
+    mapping_payload["plan_sha256"] = hashlib.sha256(
+        json.dumps(plan, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     mapping_payload["sync_matches_fingerprint"] = str(
         timeline_data.get("sync_matches_fingerprint") or ""
     )
