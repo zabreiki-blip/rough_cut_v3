@@ -10,10 +10,12 @@ import re
 from typing import Any
 import uuid
 
+from .assembly_plan import build_assembly_plan
 from .models import FullTimeline, TimelineSegment
 
-ASSEMBLY_MANIFEST_SCHEMA_VERSION = 1
-_MATCHED_STATUSES = {"auto_matched", "confirmed"}
+ASSEMBLY_MANIFEST_SCHEMA_VERSION = 2
+# v1 snapshots decided eligibility from raw segments; they stay readable.
+_SUPPORTED_SCHEMA_VERSIONS = {1, ASSEMBLY_MANIFEST_SCHEMA_VERSION}
 _PREMIERE_SOURCE_PREFIX = "RC_SRC_"
 
 
@@ -54,14 +56,24 @@ def _overlap(segment: TimelineSegment, clip: dict[str, Any]) -> float:
     return max(0.0, min(segment.end_sec, end) - max(segment.start_sec, start))
 
 
-def _block_snapshot(segment: TimelineSegment, clips: list[dict[str, Any]]) -> dict[str, Any]:
+def _plan_sha256(plan: dict[str, Any]) -> str:
+    # Same canonical form as stage3.builds.canonical_json/sha256_text.
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _block_snapshot(
+    segment: TimelineSegment, item: dict[str, Any], clips: list[dict[str, Any]]
+) -> dict[str, Any]:
     overlaps = sorted(
         ((clip, _overlap(segment, clip)) for clip in clips),
         key=lambda item: item[1],
         reverse=True,
     )
     positive = [item for item in overlaps if item[1] > 0]
-    expected_name = _normalized_source_name(segment.sequence_name)
+    plan_source = dict(item.get("source") or {})
+    edit_range = dict(item.get("edit_range") or {})
+    expected_name = _normalized_source_name(plan_source.get("sequence_name"))
     named = [
         item
         for item in positive
@@ -75,24 +87,25 @@ def _block_snapshot(segment: TimelineSegment, clips: list[dict[str, Any]]) -> di
     chosen = named[0] if named else (positive[0] if positive else None)
     actual = dict(chosen[0]) if chosen else None
     overlap_seconds = chosen[1] if chosen else 0.0
-    eligible = segment.type == "zk" or (
-        segment.type in {"snh", "host"} and segment.match_status in _MATCHED_STATUSES
-    )
+    # Eligibility is decided by the assembly plan only: ready items are what Stage 3 cuts.
+    eligible = item.get("status") == "ready"
     return {
         "segment_id": segment.id,
         "block_uid": segment.block_uid,
         "type": segment.type,
         "eligible_for_review": eligible,
         "match_status": segment.match_status,
+        "plan_status": item.get("status"),
+        "plan_reason": item.get("reason"),
         "timeline_in_sec": segment.start_sec,
         "timeline_out_sec": segment.end_sec,
         "duration_sec": segment.duration_sec,
         "expected_source": {
-            "source_id": segment.source_id,
-            "sequence_id": segment.sequence_id,
-            "sequence_name": segment.sequence_name,
-            "source_in_sec": segment.source_in_sec,
-            "source_out_sec": segment.source_out_sec,
+            "source_id": plan_source.get("source_id", ""),
+            "sequence_id": plan_source.get("sequence_id", ""),
+            "sequence_name": plan_source.get("sequence_name", ""),
+            "source_in_sec": edit_range.get("in_sec"),
+            "source_out_sec": edit_range.get("out_sec"),
         },
         "actual_audio_clip": actual,
         "actual_overlap_sec": round(overlap_seconds, 6),
@@ -167,6 +180,7 @@ def build_assembly_manifest(
     audio_path: Path,
     source_sequence: dict[str, Any],
     layout: dict[str, Any],
+    media_mapping: set[str] | None = None,
 ) -> dict[str, Any]:
     sequence_id = str(source_sequence.get("sequenceId") or "").strip()
     layout_sequence = dict(layout.get("sequence") or {})
@@ -180,7 +194,11 @@ def build_assembly_manifest(
     if not scenario_path.is_file():
         raise ValueError("scenario_normalized.json not found")
     clips = _audio_clips(layout)
-    blocks = [_block_snapshot(segment, clips) for segment in timeline.segments]
+    plan = build_assembly_plan(timeline, media_mapping=media_mapping)
+    blocks = [
+        _block_snapshot(segment, item, clips)
+        for segment, item in zip(timeline.segments, plan["items"], strict=True)
+    ]
     findings = _manifest_findings(blocks)
     return {
         "schema_version": ASSEMBLY_MANIFEST_SCHEMA_VERSION,
@@ -190,6 +208,7 @@ def build_assembly_manifest(
         "scenario_revision_id": "",
         "scenario_sha256": sha256_file(scenario_path),
         "timeline_sha256": sha256_file(timeline_path),
+        "plan_sha256": _plan_sha256(plan),
         "wav": {
             "path": str(audio_path),
             "size": audio_path.stat().st_size,
@@ -217,8 +236,11 @@ def attach_scenario_revision(manifest: dict[str, Any], scenario_path: Path) -> N
 def validate_assembly_manifest(
     manifest: dict[str, Any], *, timeline_path: Path, scenario_path: Path, audio_path: Path
 ) -> None:
-    if int(manifest.get("schema_version") or 0) != ASSEMBLY_MANIFEST_SCHEMA_VERSION:
+    version = int(manifest.get("schema_version") or 0)
+    if version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError("unsupported assembly manifest schema")
+    if version >= 2 and not str(manifest.get("plan_sha256") or ""):
+        raise ValueError("assembly manifest is missing plan_sha256")
     expected_wav = dict(manifest.get("wav") or {})
     checks = (
         ("scenario", str(manifest.get("scenario_sha256") or ""), scenario_path),
