@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -118,6 +119,70 @@ def _placeholder_unmapped_sources(data: dict, mapped_source_ids: set[str]) -> tu
         segment["source_out_sec"] = 0.0
         replaced += 1
     return result, replaced
+
+
+def _placeholder_report(
+    original: dict, exported: dict, *, require_card: bool = True
+) -> dict[str, object]:
+    """Count every placeholder the exported timeline contains, grouped by reason.
+
+    ``exported`` is the timeline handed to the XML builder (after unmapped sources were
+    replaced); ``original`` is the same timeline before that replacement, so segments that
+    only became placeholders because their source is unmapped get their own reason.
+    ``require_card`` mirrors the nested exporter, which emits a placeholder clip only for a
+    non-empty segment that carries a placeholder card.
+    """
+    breakdown: dict[str, dict[str, float]] = {}
+    originals = original.get("segments") if isinstance(original, dict) else None
+    exports = exported.get("segments") if isinstance(exported, dict) else None
+    originals = originals if isinstance(originals, list) else []
+    for index, segment in enumerate(exports if isinstance(exports, list) else []):
+        if not isinstance(segment, dict) or segment.get("type") not in {"snh", "host", "life"}:
+            continue
+        try:
+            duration = float(segment.get("duration_sec") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if require_card and (duration <= 0 or not segment.get("placeholder_path")):
+            continue
+        status = str(segment.get("match_status") or "")
+        if segment["type"] == "life":
+            reason = "life"
+        elif is_exportable_match(
+            segment.get("type"),
+            status,
+            segment.get("source_id"),
+            segment.get("source_in_sec"),
+            segment.get("source_out_sec"),
+        ):
+            continue
+        else:
+            before = originals[index] if index < len(originals) else None
+            if isinstance(before, dict) and is_exportable_match(
+                before.get("type"),
+                before.get("match_status"),
+                before.get("source_id"),
+                before.get("source_in_sec"),
+                before.get("source_out_sec"),
+            ):
+                reason = "unmapped_source"
+            elif status == "needs_review":
+                reason = "sync_needs_review"
+            else:
+                reason = "sync_not_found"
+        entry = breakdown.setdefault(reason, {"segments": 0, "duration_sec": 0.0})
+        entry["segments"] += 1
+        entry["duration_sec"] = round(entry["duration_sec"] + max(duration, 0.0), 6)
+    return {
+        "placeholder_segments": sum(int(item["segments"]) for item in breakdown.values()),
+        "placeholder_duration_sec": round(
+            sum(item["duration_sec"] for item in breakdown.values()), 6
+        ),
+        "placeholder_breakdown": breakdown,
+        "unmapped_source_placeholders": int(
+            breakdown.get("unmapped_source", {}).get("segments", 0)
+        ),
+    }
 
 
 def _mapping_summary(mapping) -> list[dict]:
@@ -451,7 +516,8 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         raise Stage3OperationError("full_timeline.json not found — run Build Timeline first", 404)
     if progress:
         progress(10, "Проверка собранного таймлайна")
-    timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+    timeline_bytes = timeline_path.read_bytes()
+    timeline_data = json.loads(timeline_bytes.decode("utf-8"))
     confirmed, _reason = services._confirmed_normalization(project)
     if not confirmed or not _timeline_is_current(timeline_data, confirmed):
         raise Stage3OperationError(
@@ -484,11 +550,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
             "audio_count": 0,
             "mapped_source_ids": [],
             "unmapped_source_ids": [],
-            "placeholder_segments": sum(
-                1
-                for segment in timeline_data.get("segments", [])
-                if isinstance(segment, dict) and segment.get("type") in {"snh", "host", "life"}
-            ),
+            **_placeholder_report(timeline_data, timeline_data, require_card=False),
             "source_mapping": [],
             "sync_summary": sync_summary,
         }
@@ -507,10 +569,12 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     mapping = map_catalog_to_timeline(timeline_data, {"sources": sync_sources}, host_catalog)
     _annotate_media_kinds(mapping, host_catalog)
     mapped_timeline_source_ids = set(mapping.catalog)
-    export_timeline, placeholder_count = _placeholder_unmapped_sources(
-        _host_timeline_paths(timeline_data, project=project, project_root=paths["root"]),
+    host_timeline = _host_timeline_paths(timeline_data, project=project, project_root=paths["root"])
+    export_timeline, _replaced = _placeholder_unmapped_sources(
+        host_timeline,
         mapped_timeline_source_ids,
     )
+    placeholder_report = _placeholder_report(host_timeline, export_timeline)
     export_catalog: dict[str, object] = {
         str(source["source_id"]): source
         for source in host_catalog.get("sources", [])
@@ -533,6 +597,10 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
     mapping_payload["normalization_revision"] = timeline_data.get("normalization_revision")
     mapping_payload["scenario_revision_id"] = str(timeline_data.get("scenario_revision_id") or "")
     mapping_payload["nested_timeline_filename"] = filename
+    mapping_payload["timeline_sha256"] = hashlib.sha256(timeline_bytes).hexdigest()
+    mapping_payload["sync_matches_fingerprint"] = str(
+        timeline_data.get("sync_matches_fingerprint") or ""
+    )
     atomic_write_json(paths["work"] / "stage3_source_mapping.json", mapping_payload)
     mapped = [
         source_id
@@ -552,7 +620,7 @@ def _perform_prepare(project: str, services: ModuleType, *, progress=None) -> di
         ),
         "mapped_source_ids": mapped,
         "unmapped_source_ids": list(mapping.unmapped_source_ids),
-        "placeholder_segments": placeholder_count,
+        **placeholder_report,
         "source_mapping": _mapping_summary(mapping),
         "sync_summary": sync_summary,
     }
@@ -913,12 +981,13 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error(str(exc), 400)
         timeline_path = paths["work"] / "full_timeline.json"
         try:
-            timeline_data = json.loads(timeline_path.read_text(encoding="utf-8"))
+            timeline_bytes = timeline_path.read_bytes()
+            timeline_data = json.loads(timeline_bytes.decode("utf-8"))
         except FileNotFoundError:
             return services._json_error(
                 "full_timeline.json not found — run Build Timeline first", 404
             )
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             return services._json_error(f"invalid full_timeline.json: {exc}", 500)
         confirmed, _reason = services._confirmed_normalization(project)
         if not confirmed or not _timeline_is_current(timeline_data, confirmed):
@@ -953,6 +1022,20 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         ):
             return services._json_error(
                 "stage3_rebuild_required: редакция изменилась после подготовки Stage 3",
+                409,
+            )
+        stored_fingerprint = str(mapping_data.get("sync_matches_fingerprint") or "")
+        stored_timeline_hash = str(mapping_data.get("timeline_sha256") or "")
+        if (
+            stored_fingerprint
+            and stored_fingerprint != str(timeline_data.get("sync_matches_fingerprint") or "")
+        ) or (
+            stored_timeline_hash
+            and stored_timeline_hash != hashlib.sha256(timeline_bytes).hexdigest()
+        ):
+            return services._json_error(
+                "stage3_rebuild_required: stale build — таймлайн изменился после "
+                "подготовки Stage 3, подготовьте XML заново",
                 409,
             )
         return send_from_directory(

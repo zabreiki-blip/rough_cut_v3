@@ -1134,3 +1134,197 @@ def test_prepare_result_reports_sync_summary_of_exported_timeline(client) -> Non
         "not_found": 1,
         "placeholders": 2,
     }
+
+
+def _nested_prepare_setup(client, segments, *, mapped=("v1",), fingerprint=None):
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    timeline = {
+        "project": "BRIK",
+        "fps": 25,
+        "normalization_revision": "norm-1",
+        "segments": segments,
+    }
+    if fingerprint:
+        timeline["sync_matches_fingerprint"] = fingerprint
+    (paths["work"] / "full_timeline.json").write_text(json.dumps(timeline), encoding="utf-8")
+    video = {
+        "source_id": "v1",
+        "path": "/media/v1.mp4",
+        "duration": 100.0,
+        "fps": 25,
+        "media_kind": "video",
+    }
+    monkeypatch.setattr(
+        api_stage3_routes, "_scan_project_media", lambda *_a, **_k: {"sources": [video]}
+    )
+    monkeypatch.setattr(api_stage3_routes, "_timeline_catalog", lambda catalog: catalog)
+    monkeypatch.setattr(api_stage3_routes, "_host_catalog", lambda catalog, **_k: catalog)
+    monkeypatch.setattr(
+        api_stage3_routes,
+        "map_catalog_to_timeline",
+        lambda *_a: SimpleNamespace(
+            catalog={sid: video for sid in mapped},
+            details={},
+            unmapped_source_ids=[],
+            to_dict=lambda: {},
+        ),
+    )
+    return http, paths
+
+
+def _segment(seg_id, kind, start, duration, **extra):
+    return {
+        "id": seg_id,
+        "type": kind,
+        "text": seg_id,
+        "start_sec": start,
+        "duration_sec": duration,
+        "placeholder_path": "/tmp/placeholder.png",
+        **extra,
+    }
+
+
+def test_prepare_placeholder_count_matches_generated_xml(client) -> None:
+    segments = [
+        _segment(
+            "m1", "snh", 0.0, 2.0,
+            match_status="confirmed", source_id="v1", source_in_sec=1.0, source_out_sec=3.0,
+        ),
+        _segment("r1", "snh", 2.0, 3.0, match_status="needs_review"),
+        _segment("n1", "host", 5.0, 2.0, match_status="not_found"),
+        _segment("l1", "life", 7.0, 4.0),
+        _segment("l2", "life", 11.0, 1.0),
+        _segment(
+            "u1", "snh", 12.0, 2.0,
+            match_status="auto_matched", source_id="v2", source_in_sec=1.0, source_out_sec=3.0,
+        ),
+        _segment("z1", "zk", 14.0, 2.0, wav_path="/tmp/zk.wav"),
+    ]
+    http, paths = _nested_prepare_setup(client, segments)
+
+    response = http.post("/stage3/timeline/prepare", json={"project": "BRIK"})
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    xml_text = (paths["work"] / result["filename"]).read_text(encoding="utf-8")
+    in_xml = len(re.findall(r'id="clip-final-\d+-placeholder"', xml_text))
+    assert in_xml == 5
+    assert result["placeholder_segments"] == in_xml
+    assert result["placeholder_duration_sec"] == pytest.approx(3.0 + 2.0 + 4.0 + 1.0 + 2.0)
+    assert result["placeholder_breakdown"] == {
+        "sync_needs_review": {"segments": 1, "duration_sec": pytest.approx(3.0)},
+        "sync_not_found": {"segments": 1, "duration_sec": pytest.approx(2.0)},
+        "life": {"segments": 2, "duration_sec": pytest.approx(5.0)},
+        "unmapped_source": {"segments": 1, "duration_sec": pytest.approx(2.0)},
+    }
+    assert result["unmapped_source_placeholders"] == 1
+    assert result["sync_summary"]["placeholders"] == 2  # excludes unmapped-source swaps
+
+
+def test_prepare_legacy_placeholder_breakdown_is_reported(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    segments = [
+        {"id": "a", "type": "snh", "match_status": "needs_review", "duration_sec": 2.0},
+        {"id": "b", "type": "life", "duration_sec": 3.0},
+    ]
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps({"project": "BRIK", "normalization_revision": "norm-1", "segments": segments}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api_stage3_routes, "scan_media_directory", lambda *_a, **_k: {"sources": []}
+    )
+
+    result = http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).get_json()["result"]
+
+    assert result["format"] == "legacy"
+    assert result["placeholder_segments"] == 2
+    assert result["placeholder_duration_sec"] == pytest.approx(5.0)
+    assert set(result["placeholder_breakdown"]) == {"sync_needs_review", "life"}
+    assert result["unmapped_source_placeholders"] == 0
+
+
+def test_stage3_download_is_refused_after_timeline_fingerprint_changes(client) -> None:
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    store = SyncMatchStore(paths["sync_matches"])
+
+    def match(out_sec: float) -> SyncMatch:
+        return SyncMatch(
+            segment_id="uid-1",
+            query_text="q",
+            source_id="v1",
+            source_in_sec=1.0,
+            source_out_sec=out_sec,
+            status="confirmed",
+            metadata={"normalization_revision": "norm-1"},
+        )
+
+    def write_timeline(current: SyncMatch) -> None:
+        store.replace_all([current])
+        segments = [
+            _segment(
+                "uid-1", "snh", 0.0, current.source_out_sec - 1.0,
+                match_status="confirmed", source_id="v1",
+                source_in_sec=1.0, source_out_sec=current.source_out_sec,
+            )
+        ]
+        (paths["work"] / "full_timeline.json").write_text(
+            json.dumps(
+                {
+                    "project": "BRIK",
+                    "fps": 25,
+                    "normalization_revision": "norm-1",
+                    "sync_matches_fingerprint": sync_matches_fingerprint([current]),
+                    "segments": segments,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    http, _paths = _nested_prepare_setup(client, [])
+    write_timeline(match(3.0))
+    builds = iter(["<xml>first</xml>", "<xml>second</xml>"])
+    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a: next(builds))
+
+    assert http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).status_code == 200
+    first = http.get("/stage3/export/xml?project=BRIK")
+    assert first.status_code == 200
+    assert first.data == b"<xml>first</xml>"
+
+    write_timeline(match(4.0))  # synced range edited, timeline rebuilt: new fingerprint
+    stale = http.get("/stage3/export/xml?project=BRIK")
+    assert stale.status_code == 409
+    error = stale.get_json()["error"]
+    assert "stage3_rebuild_required" in error
+    assert "stale" in error
+
+    assert http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).status_code == 200
+    fresh = http.get("/stage3/export/xml?project=BRIK")
+    assert fresh.status_code == 200
+    assert fresh.data == b"<xml>second</xml>"
+
+
+def test_stage3_download_is_refused_when_timeline_file_changes_without_fingerprint(client) -> None:
+    http, paths = _nested_prepare_setup(client, [_segment("l1", "life", 0.0, 2.0)])
+    _h, _a, monkeypatch = client
+    monkeypatch.setattr(api_stage3_routes, "build_nested_xml", lambda *_a: "<xml/>")
+    assert http.post("/stage3/timeline/prepare", json={"project": "BRIK"}).status_code == 200
+    assert http.get("/stage3/export/xml?project=BRIK").status_code == 200
+
+    timeline_path = paths["work"] / "full_timeline.json"
+    data = json.loads(timeline_path.read_text(encoding="utf-8"))
+    data["segments"].append(_segment("l2", "life", 2.0, 3.0))
+    timeline_path.write_text(json.dumps(data), encoding="utf-8")
+
+    stale = http.get("/stage3/export/xml?project=BRIK")
+    assert stale.status_code == 409
+    assert "stale" in stale.get_json()["error"]

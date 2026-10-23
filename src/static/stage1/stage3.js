@@ -152,6 +152,29 @@ function finishStage3Job() {
   updateActionAvailability();
 }
 
+const STAGE3_PLACEHOLDER_REASON_LABELS = {
+  sync_needs_review: "синхрон: проверить",
+  sync_not_found: "синхрон: не найден",
+  life: "LIFE",
+  unmapped_source: "источник не привязан",
+};
+
+export function describeStage3Placeholders(result) {
+  const total = Number(result.placeholder_segments || 0);
+  let text = `плейсхолдеров: ${total}`;
+  if (total > 0) {
+    text += ` (${Number(result.placeholder_duration_sec || 0).toFixed(1)} с)`;
+    const parts = Object.entries(result.placeholder_breakdown || {})
+      .filter(([, item]) => Number(item && item.segments) > 0)
+      .map(([reason, item]) =>
+        `${STAGE3_PLACEHOLDER_REASON_LABELS[reason] || reason}: ${Number(item.segments)}`
+        + ` / ${Number(item.duration_sec || 0).toFixed(1)} с`
+      );
+    if (parts.length) text += `: ${parts.join("; ")}`;
+  }
+  return text;
+}
+
 async function applyCompletedStage3Job(job, download) {
   const result = job.result || {};
   if (job.kind === "scan") {
@@ -168,7 +191,7 @@ async function applyCompletedStage3Job(job, download) {
   renderStage3SourceMapping(result.source_mapping || []);
   ids.stage3_media_message.textContent =
     `Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
-    + `плейсхолдеров: ${Number(result.placeholder_segments || 0)}.`;
+    + `${describeStage3Placeholders(result)}.`;
   appendLog(
     `Timeline XML (${result.format || "nested"}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
     + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
