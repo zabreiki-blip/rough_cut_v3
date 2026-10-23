@@ -262,3 +262,44 @@ def test_plan_to_report_counts_unmapped_sources() -> None:
 
     assert report["unmapped_source_placeholders"] == 2
     assert report["placeholder_duration_sec"] == 20.0
+
+
+def test_plan_reads_trim_into_padding_and_provenance() -> None:
+    trim = {
+        "with_segment_id": "snh2",
+        "rule": "speech_gap_midpoint",
+        "trimmed_head_sec": 0.4,
+        "trimmed_tail_sec": 0.8,
+        "reverse_jump": False,
+        "speech_overlap": False,
+        "overlap_kept_manual": False,
+    }
+    plan = build_assembly_plan(
+        {"segments": [_matched("snh1", trim=trim), _matched("snh2")], "edit_policy_version": 1},
+        media_mapping={"ivan_01"},
+    )
+    first, second = plan["items"]
+    assert plan["edit_policy_version"] == 1
+    assert first["provenance"]["trim"] == trim
+    assert first["padding"]["trimmed_head_sec"] == 0.4
+    assert first["padding"]["trimmed_tail_sec"] == 0.8
+    assert first["tasks"] == []
+    assert second["provenance"]["trim"] is None
+    assert second["padding"]["trimmed_head_sec"] == 0
+
+
+def test_plan_speech_overlap_adds_single_review_task() -> None:
+    overlap = {"trimmed_head_sec": 0.0, "trimmed_tail_sec": 0.0, "speech_overlap": True}
+    plan = build_assembly_plan(
+        {
+            "segments": [
+                _matched("snh1", trim=overlap),
+                _matched("snh2", trim=overlap, match_status="needs_review"),
+            ]
+        },
+        media_mapping={"ivan_01"},
+    )
+    ready, review = plan["items"]
+    assert ready["tasks"] == [{"kind": "review_match", "open": True, "reason": "speech_overlap"}]
+    assert review["tasks"] == [{"kind": "review_match", "open": True}]  # no duplicate
+    assert plan["summary"]["open_tasks"] == 2

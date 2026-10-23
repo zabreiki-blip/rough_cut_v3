@@ -13,6 +13,8 @@ from stage1.scenario_structure import (
     normalize_timecode_value,
 )
 
+from stage_common import is_exportable_match
+
 from .models import FullTimeline, TimelineSegment
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,101 @@ def _merge_adjacent_sync_fragments(segments: list[TimelineSegment]) -> list[Time
         else:
             merged.append(segment)
     return merged
+
+
+def _frame_snap(value: float, lo: float, hi: float, fps: int) -> float:
+    """Nearest frame boundary to ``value`` inside ``[lo, hi]``; ``value`` itself if none fits."""
+    if fps < 1:
+        return value
+    nearest = round(value * fps) / fps
+    for candidate in (nearest, int(value * fps) / fps, -(-value * fps // 1) / fps):
+        if lo - 1e-9 <= candidate <= hi + 1e-9:
+            return min(max(candidate, lo), hi)
+    return value
+
+
+def _trim_adjacent_padding(segments: list[TimelineSegment], fps: int = 25) -> None:
+    """Split the shared padding of neighbouring same-source fragments at the speech gap.
+
+    Only the edit range (``source_in/out_sec``) moves, and only to the midpoint between the
+    earlier fragment's speech end and the later fragment's speech start, so speech is never
+    cut.  Pairs are neighbours on the timeline only (zero-length and ``tech`` segments are
+    skipped; a ``zk`` or placeholder in between breaks adjacency).
+    """
+
+    def exportable(seg: TimelineSegment) -> bool:
+        return is_exportable_match(
+            seg.type, seg.match_status, seg.source_id, seg.source_in_sec, seg.source_out_sec
+        )
+
+    def trim_of(seg: TimelineSegment, other: TimelineSegment) -> dict[str, Any]:
+        if seg.trim is None:
+            seg.trim = {
+                "with_segment_id": other.id,
+                "with_segment_ids": [],
+                "rule": "speech_gap_midpoint",
+                "trimmed_head_sec": 0.0,
+                "trimmed_tail_sec": 0.0,
+                "reverse_jump": False,
+                "speech_overlap": False,
+                "overlap_kept_manual": False,
+            }
+        if other.id not in seg.trim["with_segment_ids"]:
+            seg.trim["with_segment_ids"].append(other.id)
+        return seg.trim
+
+    previous: TimelineSegment | None = None
+    for segment in segments:
+        if segment.type == "tech" or segment.duration_sec <= 0:
+            continue
+        first, previous = previous, segment
+        if first is None or not (exportable(first) and exportable(segment)):
+            continue
+        if first.source_id != segment.source_id:
+            continue
+        if not (
+            first.speech_out_sec > first.speech_in_sec
+            and segment.speech_out_sec > segment.speech_in_sec
+        ):
+            continue
+        reverse = segment.speech_in_sec < first.speech_in_sec
+        early, late = (segment, first) if reverse else (first, segment)
+        if early.source_out_sec <= late.source_in_sec:
+            continue
+        info_early = trim_of(early, late)
+        info_late = trim_of(late, early)
+        for info in (info_early, info_late):
+            info["reverse_jump"] = info["reverse_jump"] or reverse
+        if early.speech_out_sec > late.speech_in_sec:
+            info_early["speech_overlap"] = info_late["speech_overlap"] = True
+            continue
+        if early.manual_range and late.manual_range:
+            info_early["overlap_kept_manual"] = info_late["overlap_kept_manual"] = True
+            continue
+        lo = max(late.source_in_sec, early.speech_out_sec)
+        hi = min(early.source_out_sec, late.speech_in_sec)
+        if early.manual_range:
+            cut = hi
+        elif late.manual_range:
+            cut = lo
+        else:
+            mid = (early.speech_out_sec + late.speech_in_sec) / 2
+            cut = _frame_snap(min(max(mid, lo), hi), lo, hi, fps)
+        tail = 0.0 if early.manual_range else max(early.source_out_sec - cut, 0.0)
+        head = 0.0 if late.manual_range else max(cut - late.source_in_sec, 0.0)
+        if tail > 0:
+            early.source_out_sec = cut
+            early.duration_sec = early.source_out_sec - early.source_in_sec
+            info_early["trimmed_tail_sec"] = round(info_early["trimmed_tail_sec"] + tail, 6)
+        if head > 0:
+            late.source_in_sec = cut
+            late.duration_sec = late.source_out_sec - late.source_in_sec
+            info_late["trimmed_head_sec"] = round(info_late["trimmed_head_sec"] + head, 6)
+        if (
+            (early.manual_range or late.manual_range)
+            and early.source_out_sec > late.source_in_sec + 1e-9
+        ):
+            info_early["overlap_kept_manual"] = info_late["overlap_kept_manual"] = True
 
 
 def sync_fragment_id(block_uid: str, index: int, count: int) -> str:
@@ -718,6 +815,7 @@ def parse_normalized_timeline(
                 segment.placeholder_path = str(
                     Path(segment.placeholder_path).with_name(f"{segment.id}_placeholder.png")
                 )
+    _trim_adjacent_padding(segments, fps)
     cursor = 0.0
     for segment in segments:
         segment.start_sec = cursor

@@ -63,6 +63,10 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
     has_speech = is_sync and speech_out > speech_in
     ranged = is_sync and source_out > source_in
     task = _TASK_BY_REASON.get(reason or "")
+    trim = segment.get("trim") if isinstance(segment.get("trim"), dict) else None
+    tasks: list[dict[str, Any]] = [{"kind": task, "open": True}] if task else []
+    if trim and trim.get("speech_overlap") and not any(t["kind"] == "review_match" for t in tasks):
+        tasks.append({"kind": "review_match", "open": True, "reason": "speech_overlap"})
     return {
         "uid": str(segment.get("block_uid") or segment.get("id") or ""),
         "parent_uid": str(segment.get("parent_block_uid") or ""),
@@ -94,8 +98,8 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
         "padding": {
             "head_sec": round(speech_in - source_in, 6) if has_speech and ranged else 0.0,
             "tail_sec": round(source_out - speech_out, 6) if has_speech and ranged else 0.0,
-            "trimmed_head_sec": 0,
-            "trimmed_tail_sec": 0,
+            "trimmed_head_sec": round(_num(trim.get("trimmed_head_sec")), 6) if trim else 0,
+            "trimmed_tail_sec": round(_num(trim.get("trimmed_tail_sec")), 6) if trim else 0,
         },
         "wav": {
             "path": str(segment.get("wav_path") or ""),
@@ -108,10 +112,10 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
             "strategy": str(segment.get("match_strategy") or ""),
             "manual_range": bool(segment.get("manual_range")),
             "merged_from": list(segment.get("merged_from") or []),
-            "trim": None,
+            "trim": dict(trim) if trim else None,
             "revision_status": str(segment.get("revision_status") or ""),
         },
-        "tasks": [{"kind": task, "open": True}] if task else [],
+        "tasks": tasks,
     }
 
 

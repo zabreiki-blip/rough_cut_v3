@@ -5,6 +5,9 @@ from typing import Any, Literal
 
 SegmentType = Literal["zk", "snh", "host", "life", "tech"]
 TIMELINE_SCHEMA_VERSION = 1
+# 1: neighbouring same-source fragments no longer duplicate padding (see ``trim``).
+# Timelines built before the policy existed load as 0.
+EDIT_POLICY_VERSION = 1
 
 
 @dataclass
@@ -52,6 +55,10 @@ class TimelineSegment:
     # scenario text stays intact in ``text``; older timelines fall back to a
     # deterministic derivation in final_review.
     spoken_text: str = ""
+    # Padding de-duplication with a neighbouring same-source fragment:
+    # ``{with_segment_id, rule, trimmed_head_sec, trimmed_tail_sec, reverse_jump,
+    # speech_overlap, overlap_kept_manual}``; ``None`` when nothing was compared.
+    trim: dict[str, Any] | None = None
 
     @property
     def end_sec(self) -> float:
@@ -99,6 +106,7 @@ class FullTimeline:
     width: int = 1920
     height: int = 1080
     schema_version: int = TIMELINE_SCHEMA_VERSION
+    edit_policy_version: int = EDIT_POLICY_VERSION
 
     @property
     def total_duration_sec(self) -> float:
@@ -110,6 +118,7 @@ class FullTimeline:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
+            "edit_policy_version": self.edit_policy_version,
             "project": self.project,
             "fps": self.fps,
             "width": self.width,
@@ -125,6 +134,10 @@ class FullTimeline:
         version = int(value.get("schema_version", TIMELINE_SCHEMA_VERSION))
         if version < 1 or version > TIMELINE_SCHEMA_VERSION:
             raise ValueError(f"unsupported timeline schema_version: {version}")
+        try:
+            policy = int(value.get("edit_policy_version", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeline edit_policy_version must be an integer") from exc
         raw_segments = value.get("segments")
         if not isinstance(raw_segments, list):
             raise ValueError("timeline segments must be a list")
@@ -146,4 +159,5 @@ class FullTimeline:
             width=width,
             height=height,
             schema_version=version,
+            edit_policy_version=policy,
         )
