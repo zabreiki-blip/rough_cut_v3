@@ -134,8 +134,10 @@ from stage2.assembly_manifest import (
 )
 from stage2.cloud_asr import _probe_duration as probe_media_duration
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
+from voiceover.readiness import voiceover_readiness
 from stage_common import (
     _timeline_matches_are_current,
+    _timeline_voiceover_is_current,
     classify_sync_matches,
     placeholder_reason,
     timeline_sync_summary,
@@ -680,6 +682,8 @@ def _build_status(project: str) -> dict:
             block_id = str(item.get("id", "")).strip()
             if block_id and block_id not in existing:
                 missing_ids.append(block_id)
+    # A block is voiced by a recording range OR a TTS WAV; ``missing_ids`` stays the TTS view.
+    voiceover = voiceover_readiness(paths, normalization, active_speaker_dir)
 
     return {
         "project": project,
@@ -693,6 +697,8 @@ def _build_status(project: str) -> dict:
         "manifest_exists": manifest_path.exists(),
         "manifest_items_count": len(manifest_items) if isinstance(manifest_items, list) else 0,
         "missing_ids": missing_ids,
+        "voiceover": {key: value for key, value in voiceover.items() if key != "blocks"},
+        "voiceover_blocks": voiceover["blocks"],
         "normalization_exists": paths["normalized"].exists(),
         "normalization_status": str(normalization.get("status") or "missing"),
         "normalization_revision": normalization.get("revision"),
@@ -707,6 +713,7 @@ def _build_status(project: str) -> dict:
             and _timeline_matches_are_current(
                 timeline, confirmed_normalization, SyncMatchStore(paths["sync_matches"])
             )
+            and _timeline_voiceover_is_current(timeline, confirmed_normalization, paths)
         ),
         "timeline_sync_summary": timeline_sync_summary(timeline),
         "openrouter_usage": _openrouter_usage_summary(project),

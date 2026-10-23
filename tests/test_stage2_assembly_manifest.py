@@ -381,3 +381,28 @@ def test_manifest_v1_still_validates_and_unknown_schema_is_rejected(tmp_path: Pa
         validate_assembly_manifest(
             manifest, timeline_path=timeline_path, scenario_path=scenario_path, audio_path=wav_path
         )
+
+
+def test_manifest_contains_recorded_voiceover_ranges(tmp_path: Path) -> None:
+    timeline = FullTimeline(
+        project="FRISKE_001",
+        segments=[
+            TimelineSegment(
+                "zk1", "zk", "z", 5.0, block_uid="uid-zk1", voiceover_kind="recorded",
+                wav_path="/w/montage.wav", source_id="rec1", source_in_sec=10.0,
+                source_out_sec=15.0, speech_in_sec=10.5, speech_out_sec=14.5,
+                audio_source_duration_sec=120.0,
+            ),
+            TimelineSegment(
+                "zk2", "zk", "z", 2.0, start_sec=5.0, block_uid="uid-zk2", wav_path="/w/zk2.wav"
+            ),
+        ],
+    )
+    manifest = _manifest_for(tmp_path, timeline)
+    first, second = manifest["blocks"]
+    assert first["plan_status"] == "ready"
+    assert first["expected_source"]["source_id"] == "rec1"
+    assert (first["expected_source"]["source_in_sec"], first["expected_source"]["source_out_sec"]) == (10.0, 15.0)
+    assert first["voiceover_kind"] == "recorded"
+    assert second["voiceover_kind"] == "tts"
+    assert second["expected_source"]["source_in_sec"] is None

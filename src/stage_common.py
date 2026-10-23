@@ -17,6 +17,11 @@ TIMELINE_MATCHES_CHANGED_ERROR = (
 )
 
 
+TIMELINE_VOICEOVER_CHANGED_ERROR = (
+    "timeline_rebuild_required: опубликованный закадр изменился после сборки таймлайна"
+)
+
+
 def _scenario_revision_matches(stored: object, current: object) -> bool:
     """Compare scenario identities while accepting artifacts from legacy files.
 
@@ -230,6 +235,13 @@ def _timeline_matches_are_current(timeline: dict, normalization: dict, match_sto
     return stored == sync_matches_fingerprint(matches)
 
 
+def _timeline_voiceover_is_current(timeline: dict, normalization: dict, paths: Any) -> bool:
+    """False when the published recorded-voiceover map changed after the timeline was built."""
+    from voiceover.readiness import timeline_voiceover_is_current
+
+    return timeline_voiceover_is_current(timeline, paths, normalization)
+
+
 MATCHED_STATUSES = frozenset({"", "auto_matched", "confirmed"})
 
 
@@ -317,9 +329,9 @@ def _has_speaker(segment: dict) -> bool:
 def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str | None:
     """Single classifier: why a timeline segment is not (fully) assembled, or None if ready.
 
-    Reasons: ``missing_wav``, ``no_speaker``, ``no_file``, ``asr_failed``, ``not_found``,
-    ``needs_review``, ``unmapped_source`` (only when ``mapped`` is given) and
-    ``life_unassigned``.  ``tech`` segments never produce a reason.
+    Reasons: ``missing_wav``, ``missing_voiceover`` (no recording and no TTS), ``no_speaker``,
+    ``no_file``, ``asr_failed``, ``not_found``, ``needs_review``,
+    ``unmapped_source`` (only when ``mapped`` is given) and ``life_unassigned``.  ``tech`` segments never produce a reason.
     """
     segment_type = segment.get("type")
     if segment_type == "zk":
@@ -327,6 +339,23 @@ def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str 
             duration = _as_float(segment.get("duration_sec") or 0)
         except (TypeError, ValueError):
             duration = 0.0
+        kind = str(segment.get("voiceover_kind") or "tts")
+        if kind == "none":
+            return "missing_voiceover"
+        if kind == "recorded":
+            # Recorded: a range of the shared recording. File existence and the range
+            # against the recording duration are checked by validate_plan_complete.
+            try:
+                has_range = _as_float(segment.get("source_out_sec") or 0) > _as_float(
+                    segment.get("source_in_sec") or 0
+                ) >= 0
+            except (TypeError, ValueError):
+                has_range = False
+            return (
+                None
+                if segment.get("wav_path") and has_range and duration > 0
+                else "missing_voiceover"
+            )
         return None if segment.get("wav_path") and duration > 0 else "missing_wav"
     if segment_type not in {"snh", "host", "life"}:
         return None

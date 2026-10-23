@@ -495,3 +495,79 @@ def test_complete_life_without_speech_range_has_no_speech_blockers() -> None:
     catalog = {"ivan_01": {"path": "/m.mp4", "duration": 100.0}}
 
     assert validate_plan_complete(plan, catalog=catalog, path_exists=lambda _p: True) == []
+
+
+def _zk_recorded(seg_id: str = "zk1", **overrides) -> dict:
+    segment = {
+        "id": seg_id,
+        "type": "zk",
+        "text": "z",
+        "duration_sec": 5.0,
+        "block_uid": f"uid-{seg_id}",
+        "voiceover_kind": "recorded",
+        "wav_path": "/p/montage.wav",
+        "source_id": "rec1",
+        "source_in_sec": 10.0,
+        "source_out_sec": 15.0,
+        "speech_in_sec": 10.5,
+        "speech_out_sec": 14.5,
+        "audio_source_duration_sec": 120.0,
+        "audio_source_sha256": "f" * 64,
+    }
+    segment.update(overrides)
+    return segment
+
+
+@pytest.mark.parametrize(
+    ("segment", "expected"),
+    [
+        (_zk_recorded(), None),
+        (_zk_recorded(wav_path=""), "missing_voiceover"),
+        (_zk_recorded(source_out_sec=10.0), "missing_voiceover"),
+        (_zk_recorded(source_in_sec=-1.0), "missing_voiceover"),
+        (_zk_recorded(source_out_sec=130.0, duration_sec=120.0), None),  # validate checks it
+        ({"type": "zk", "voiceover_kind": "none", "wav_path": "", "duration_sec": 0.0}, "missing_voiceover"),
+        ({"type": "zk", "voiceover_kind": "tts", "wav_path": "", "duration_sec": 0.0}, "missing_wav"),
+        ({"type": "zk", "voiceover_kind": "tts", "wav_path": "/a.wav", "duration_sec": 2.0}, None),
+    ],
+)
+def test_placeholder_reason_for_recorded_voiceover(segment: dict, expected) -> None:
+    assert placeholder_reason(segment) == expected
+
+
+def test_recorded_zk_plan_item_has_range_and_ignores_media_mapping() -> None:
+    timeline = {"segments": [_zk_recorded(), {**_zk_recorded("zk2"), "voiceover_kind": "none", "wav_path": "", "duration_sec": 0.0}]}
+    plan = build_assembly_plan(timeline, media_mapping={"ivan_01"})
+    first, second = plan["items"]
+    assert (first["status"], first["reason"]) == ("ready", None)
+    assert first["source"]["media_status"] == "unchecked"
+    assert first["edit_range"] == {"in_sec": 10.0, "out_sec": 15.0}
+    assert first["wav"]["kind"] == "recorded"
+    assert first["wav"]["source_duration_sec"] == 120.0
+    assert (second["status"], second["reason"]) == ("skipped", "missing_voiceover")
+    assert plan["summary"]["placeholders"]["by_reason"]["missing_voiceover"]["segments"] == 1
+
+
+def test_validate_complete_recorded_voiceover_file_and_range() -> None:
+    def blockers(**overrides) -> list[str]:
+        plan = build_assembly_plan({"segments": [_zk_recorded(**overrides)]})
+        return [item["reason"] for item in validate_plan_complete(plan, path_exists=lambda p: p == "/p/montage.wav")]
+
+    assert blockers() == []
+    assert blockers(wav_path="/gone.wav") == ["missing_voiceover"]
+    assert blockers(source_out_sec=130.0, duration_sec=130.0) == ["recorded_beyond_source"]
+    assert blockers(source_in_sec=-1.0, duration_sec=16.0) == ["missing_voiceover"]
+    plan = build_assembly_plan({"segments": [{"id": "zk1", "type": "zk", "voiceover_kind": "none", "duration_sec": 0.0, "block_uid": "u"}]})
+    assert [b["reason"] for b in validate_plan_complete(plan, path_exists=lambda _p: True)] == ["missing_voiceover"]
+
+
+def test_validate_complete_mixed_voiceover_keeps_tts_blocks() -> None:
+    timeline = {
+        "segments": [
+            _zk_recorded("zk1"),
+            {"id": "zk2", "type": "zk", "voiceover_kind": "tts", "wav_path": "/p/zk2.wav", "duration_sec": 2.0, "block_uid": "u2"},
+        ]
+    }
+    plan = build_assembly_plan(timeline)
+    assert [item["status"] for item in plan["items"]] == ["ready", "ready"]
+    assert validate_plan_complete(plan, path_exists=lambda _p: True) == []

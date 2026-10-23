@@ -157,6 +157,8 @@ function finishStage3Job() {
 
 const STAGE3_PLACEHOLDER_REASON_LABELS = {
   missing_wav: "Нет WAV",
+  missing_voiceover: "Нет озвучки",
+  recorded_beyond_source: "Диапазон за пределами записи",
   no_speaker: "Не указан спикер",
   no_file: "Нет записи спикера",
   asr_failed: "Сбой распознавания",

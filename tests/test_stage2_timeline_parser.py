@@ -911,3 +911,196 @@ class TrimAdjacentPaddingCorruptedDataTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _vo_normalization(*texts: str, extra: list[dict] | None = None) -> dict:
+    """Confirmed normalization: voiceover blocks, optional blocks inserted by order."""
+    blocks = [
+        {
+            "uid": f"b{number}",
+            "order": number * 10,
+            "type": "voiceover",
+            "original_text": text,
+            "normalized_text": text,
+            "text_for_tts": text,
+        }
+        for number, text in enumerate(texts, start=1)
+    ]
+    blocks.extend(extra or [])
+    return {"status": "confirmed", "scenario_revision_id": "rev_1", "blocks": blocks}
+
+
+def _recorded_entry(block_uid: str, text: str, **overrides: object) -> dict:
+    from voiceover.alignment import _active_voiceover_blocks
+
+    sha = next(
+        item.sha256
+        for item in _active_voiceover_blocks(_vo_normalization(text))
+        if item.display_text == text
+    )
+    entry = {
+        "block_uid": block_uid,
+        "text_sha256": sha,
+        "voice_source": "recorded",
+        "origin": "auto",
+        "reason": "confirmed",
+        "recording_id": "rec1",
+        "source_in_sec": 10.0,
+        "source_out_sec": 15.0,
+        "speech_in_sec": 10.5,
+        "speech_out_sec": 14.5,
+        "selected_take": None,
+        "partial": False,
+        "take_count": 1,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _published(*entries: dict, duration: float = 120.0) -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "recorded_voiceover",
+        "scenario_revision_id": "rev_1",
+        "published_generation": 1,
+        "recordings": [
+            {
+                "id": "rec1",
+                "asset": "speaker/recordings/abc/montage.wav",
+                "sha256": "f" * 64,
+                "duration_sec": duration,
+            }
+        ],
+        "blocks": list(entries),
+    }
+
+
+class RecordedVoiceoverTimelineTest(unittest.TestCase):
+    TEXTS = ("Первый блок закадра.", "Второй блок закадра.", "Третий блок закадра.")
+
+    def _parse(self, tmp: str, normalization: dict, published: dict | None, *, file: bool = True):
+        from stage2.models import FullTimeline  # noqa: F401
+
+        root = Path(tmp)
+        speaker_dir = root / "speaker"
+        speaker_dir.mkdir()
+        recording = root / "montage.wav"
+        if file:
+            recording.write_bytes(b"RIFF")
+        return parse_normalized_timeline(
+            normalization,
+            speaker_dir,
+            root / "ph",
+            "TEST",
+            recorded_voiceover=published,
+            recording_files={"rec1": recording},
+        )
+
+    def test_one_file_serves_several_zk_with_snh_between_without_zk_wav(self) -> None:
+        sync = {
+            "uid": "s1",
+            "order": 15,
+            "type": "sync",
+            "speaker": "ИВАН",
+            "original_text": "Реплика.",
+            "normalized_text": "Реплика.",
+        }
+        normalization = _vo_normalization(*self.TEXTS[:2], extra=[sync])
+        published = _published(
+            _recorded_entry("b1", self.TEXTS[0]),
+            _recorded_entry(
+                "b2", self.TEXTS[1], source_in_sec=40.0, source_out_sec=47.0,
+                speech_in_sec=40.5, speech_out_sec=46.5,
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            tl = self._parse(tmp, normalization, published)
+        self.assertEqual([s.type for s in tl.segments], ["zk", "snh", "zk"])
+        first, _, second = tl.segments
+        for seg, (lo, hi) in ((first, (10.0, 15.0)), (second, (40.0, 47.0))):
+            self.assertEqual(seg.voiceover_kind, "recorded")
+            self.assertEqual(seg.source_id, "rec1")
+            self.assertTrue(seg.wav_path.endswith("montage.wav"))
+            self.assertEqual((seg.source_in_sec, seg.source_out_sec), (lo, hi))
+            self.assertAlmostEqual(seg.duration_sec, hi - lo)
+            self.assertEqual(seg.audio_source_duration_sec, 120.0)
+            self.assertEqual(seg.audio_source_sha256, "f" * 64)
+        self.assertEqual((first.speech_in_sec, first.speech_out_sec), (10.5, 14.5))
+        self.assertEqual(tl.recorded_voiceover_sha256, tl.to_dict()["recorded_voiceover_sha256"])
+        self.assertTrue(tl.recorded_voiceover_sha256)
+        self.assertAlmostEqual(second.start_sec, first.duration_sec + tl.segments[1].duration_sec)
+
+    def test_mixed_recorded_tts_none(self) -> None:
+        from stage1.gemini_tts import _write_silence_wav
+
+        normalization = _vo_normalization(*self.TEXTS)
+        published = _published(
+            _recorded_entry("b1", self.TEXTS[0]),
+            {**_recorded_entry("b2", self.TEXTS[1]), "voice_source": "tts", "reason": "manual_tts"},
+            {
+                **_recorded_entry("b3", self.TEXTS[2]),
+                "voice_source": "none",
+                "reason": "manual_none",
+                "origin": "manual",
+            },
+        )
+        with TemporaryDirectory() as tmp:
+            speaker_dir = Path(tmp) / "speaker"
+            speaker_dir.mkdir()
+            _write_silence_wav(speaker_dir / "zk2.wav", duration_ms=2000)
+            (Path(tmp) / "montage.wav").write_bytes(b"RIFF")
+            tl = parse_normalized_timeline(
+                normalization, speaker_dir, Path(tmp) / "ph", "TEST",
+                recorded_voiceover=published,
+                recording_files={"rec1": Path(tmp) / "montage.wav"},
+            )
+        kinds = [(s.voiceover_kind, bool(s.wav_path)) for s in tl.segments]
+        self.assertEqual(kinds, [("recorded", True), ("tts", True), ("none", False)])
+        self.assertEqual(tl.segments[1].source_in_sec, 0.0)
+        self.assertAlmostEqual(tl.segments[1].duration_sec, 2.0, places=2)
+        self.assertEqual(tl.segments[1].source_id, "")
+
+    def test_legacy_tts_without_map_is_unchanged(self) -> None:
+        from stage1.gemini_tts import _write_silence_wav
+
+        with TemporaryDirectory() as tmp:
+            speaker_dir = Path(tmp)
+            _write_silence_wav(speaker_dir / "zk1.wav", duration_ms=1000)
+            tl = parse_normalized_timeline(
+                _vo_normalization(self.TEXTS[0]), speaker_dir, speaker_dir, "TEST"
+            )
+        seg = tl.segments[0]
+        self.assertEqual(seg.voiceover_kind, "tts")
+        self.assertEqual((seg.source_id, seg.source_in_sec, seg.audio_source_sha256), ("", 0.0, ""))
+        self.assertTrue(seg.wav_path.endswith("zk1.wav"))
+        self.assertEqual(tl.recorded_voiceover_sha256, "")
+        with TemporaryDirectory() as tmp:
+            missing = parse_normalized_timeline(
+                _vo_normalization(self.TEXTS[0]), Path(tmp), Path(tmp), "TEST"
+            ).segments[0]
+        self.assertEqual((missing.voiceover_kind, missing.wav_path), ("tts", ""))
+
+    def test_missing_recording_file_or_range_beyond_duration_falls_back(self) -> None:
+        normalization = _vo_normalization(self.TEXTS[0])
+        published = _published(_recorded_entry("b1", self.TEXTS[0]))
+        with TemporaryDirectory() as tmp:
+            seg = self._parse(tmp, normalization, published, file=False).segments[0]
+        self.assertEqual((seg.voiceover_kind, seg.wav_path, seg.duration_sec), ("none", "", 0.0))
+        beyond = _published(_recorded_entry("b1", self.TEXTS[0], source_out_sec=130.0))
+        with TemporaryDirectory() as tmp:
+            seg = self._parse(tmp, normalization, beyond).segments[0]
+        self.assertEqual((seg.voiceover_kind, seg.wav_path), ("none", ""))
+
+    def test_changed_block_text_does_not_use_recorded_range(self) -> None:
+        published = _published(_recorded_entry("b1", "Совсем другой старый текст."))
+        with TemporaryDirectory() as tmp:
+            seg = self._parse(tmp, _vo_normalization(self.TEXTS[0]), published).segments[0]
+        self.assertEqual(seg.voiceover_kind, "none")
+        self.assertEqual((seg.source_id, seg.wav_path), ("", ""))
+
+    def test_foreign_revision_map_is_ignored(self) -> None:
+        published = {**_published(_recorded_entry("b1", self.TEXTS[0])), "scenario_revision_id": "rev_9"}
+        with TemporaryDirectory() as tmp:
+            tl = self._parse(tmp, _vo_normalization(self.TEXTS[0]), published)
+        self.assertEqual(tl.segments[0].voiceover_kind, "tts")
+        self.assertEqual(tl.recorded_voiceover_sha256, "")

@@ -49,6 +49,12 @@ class TimelineSegment:
     merged_from: list[str] = field(default_factory=list)
     # ZK-specific
     wav_path: str = ""
+    # Voiceover origin of a ZK block: ``tts`` (own zkN.wav, in=0), ``recorded`` (a range of a
+    # shared recording: ``wav_path`` is the montage WAV, ``source_id`` the recording id,
+    # ``source_*``/``speech_*`` the range) or ``none`` (published map: no recording, no TTS).
+    voiceover_kind: str = "tts"
+    audio_source_duration_sec: float = 0.0
+    audio_source_sha256: str = ""
     # placeholder PNG (generated for SNH)
     placeholder_path: str = ""
     # Text that is actually expected in speech recognition. The canonical
@@ -89,6 +95,7 @@ class TimelineSegment:
             "speech_in_sec",
             "speech_out_sec",
             "match_confidence",
+            "audio_source_duration_sec",
         ):
             if key in kwargs:
                 try:
@@ -107,6 +114,9 @@ class FullTimeline:
     height: int = 1080
     schema_version: int = TIMELINE_SCHEMA_VERSION
     edit_policy_version: int = EDIT_POLICY_VERSION
+    # Fingerprint of the published recorded-voiceover map the timeline was built from
+    # (empty: built without a map).  A different map makes the timeline stale.
+    recorded_voiceover_sha256: str = ""
 
     @property
     def total_duration_sec(self) -> float:
@@ -119,6 +129,7 @@ class FullTimeline:
         return {
             "schema_version": self.schema_version,
             "edit_policy_version": self.edit_policy_version,
+            "recorded_voiceover_sha256": self.recorded_voiceover_sha256,
             "project": self.project,
             "fps": self.fps,
             "width": self.width,
@@ -160,4 +171,5 @@ class FullTimeline:
             height=height,
             schema_version=version,
             edit_policy_version=policy,
+            recorded_voiceover_sha256=str(value.get("recorded_voiceover_sha256") or ""),
         )

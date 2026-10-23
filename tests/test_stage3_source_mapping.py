@@ -290,3 +290,41 @@ def test_source_label_falls_back_to_media_basename() -> None:
     )
 
     assert result.details["s"]["source_label"] == "Файл.wav"
+
+
+def test_recorded_voiceover_source_is_not_mapped_as_sync_source() -> None:
+    timeline = FullTimeline(
+        project="P",
+        segments=[
+            TimelineSegment(
+                id="zk1",
+                type="zk",
+                text="ЗК",
+                duration_sec=5,
+                voiceover_kind="recorded",
+                source_id="rec1",
+                source_in_sec=10,
+                source_out_sec=15,
+                wav_path="/p/montage.wav",
+            ),
+            TimelineSegment(
+                id="snh1",
+                type="snh",
+                text="СНХ",
+                duration_sec=2,
+                start_sec=5,
+                source_id="src1",
+                source_in_sec=100,
+                source_out_sec=102,
+                match_status="confirmed",
+            ),
+        ],
+    )
+    # The recording id is in neither the sync sources nor the media catalog; it must not
+    # take part in mapping (and must not widen any media range requirement).
+    result = map_catalog_to_timeline(
+        timeline, [_source("src1", "Брик")], [_media("m1", "Брик.mp4")]
+    )
+    assert "rec1" not in result.details
+    assert "rec1" not in result.unmapped_source_ids
+    assert set(result.details) == {"src1"}

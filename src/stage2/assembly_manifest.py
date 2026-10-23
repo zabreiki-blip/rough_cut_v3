@@ -95,6 +95,7 @@ def _block_snapshot(
         "type": segment.type,
         "eligible_for_review": eligible,
         "match_status": segment.match_status,
+        "voiceover_kind": segment.voiceover_kind if segment.type == "zk" else None,
         "plan_status": item.get("status"),
         "plan_reason": item.get("reason"),
         "timeline_in_sec": segment.start_sec,
@@ -102,6 +103,7 @@ def _block_snapshot(
         "duration_sec": segment.duration_sec,
         "expected_source": {
             "source_id": plan_source.get("source_id", ""),
+            "source_sha256": (item.get("wav") or {}).get("source_sha256"),
             "sequence_id": plan_source.get("sequence_id", ""),
             "sequence_name": plan_source.get("sequence_name", ""),
             "source_in_sec": edit_range.get("in_sec"),

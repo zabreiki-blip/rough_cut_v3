@@ -606,8 +606,22 @@ def parse_normalized_timeline(
     fps: int = 25,
     sync_matches: dict[str, object] | None = None,
     sync_sources: dict[str, object] | None = None,
+    recorded_voiceover: dict[str, Any] | None = None,
+    recording_files: dict[str, Path] | None = None,
 ) -> FullTimeline:
-    """Build a timeline directly from a confirmed canonical normalization."""
+    """Build a timeline directly from a confirmed canonical normalization.
+
+    ``recorded_voiceover`` is the published recorded-voiceover map and ``recording_files``
+    maps its recording ids to the shared montage WAVs.  Without a map every ZK is TTS
+    (``speaker_dir/zkN.wav``) exactly as before.
+    """
+    from voiceover.readiness import (
+        active_published_map,
+        published_fingerprint,
+        resolve_voiceover,
+        spoken_text_sha256,
+    )
+
     if str(normalization.get("status", "")).lower() != "confirmed":
         raise ValueError("normalized scenario must be confirmed")
 
@@ -619,6 +633,8 @@ def parse_normalized_timeline(
     )
     matches = sync_matches or {}
     sources = sync_sources or {}
+    published = active_published_map(recorded_voiceover, normalization)
+    files = recording_files or {}
 
     def field(item: object | None, name: str, default: Any = "") -> Any:
         if item is None:
@@ -642,20 +658,50 @@ def parse_normalized_timeline(
             counters["voiceover"] += 1
             seg_id = f"zk{counters['voiceover']}"
             wav_path = speaker_dir / f"{seg_id}.wav"
-            segments.append(
-                TimelineSegment(
-                    id=seg_id,
-                    type="zk",
-                    text=text,
-                    duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
-                    block_uid=block_uid,
-                    revision_status=revision_status,
-                    wav_path=str(wav_path) if wav_path.exists() else "",
-                    spoken_text=_spoken_text(
-                        str(block.get("text_for_tts") or text), block_type=block_type
-                    ),
-                )
+            spoken = _spoken_text(str(block.get("text_for_tts") or text), block_type=block_type)
+            choice = resolve_voiceover(
+                published,
+                block_uid,
+                spoken_text_sha256(spoken),
+                files=files,
+                has_tts=wav_path.exists(),
             )
+            common: dict[str, Any] = {
+                "id": seg_id,
+                "type": "zk",
+                "text": text,
+                "block_uid": block_uid,
+                "revision_status": revision_status,
+                "spoken_text": spoken,
+            }
+            if choice.kind == "recorded" and choice.path is not None:
+                segments.append(
+                    TimelineSegment(
+                        **common,
+                        duration_sec=choice.source_out_sec - choice.source_in_sec,
+                        wav_path=str(choice.path),
+                        voiceover_kind="recorded",
+                        source_id=choice.recording_id,
+                        source_in_sec=choice.source_in_sec,
+                        source_out_sec=choice.source_out_sec,
+                        speech_in_sec=choice.speech_in_sec,
+                        speech_out_sec=choice.speech_out_sec,
+                        audio_source_duration_sec=choice.audio_source_duration_sec,
+                        audio_source_sha256=choice.audio_source_sha256,
+                    )
+                )
+            elif choice.kind == "none":
+                segments.append(
+                    TimelineSegment(**common, duration_sec=0.0, voiceover_kind="none")
+                )
+            else:
+                segments.append(
+                    TimelineSegment(
+                        **common,
+                        duration_sec=_wav_duration(wav_path) if wav_path.exists() else 0.0,
+                        wav_path=str(wav_path) if wav_path.exists() else "",
+                    )
+                )
             continue
 
         if is_label_only_sync(block):
@@ -862,4 +908,9 @@ def parse_normalized_timeline(
         segment.start_sec = cursor
         if segment.type != "tech":
             cursor += segment.duration_sec
-    return FullTimeline(project=project, segments=segments, fps=fps)
+    return FullTimeline(
+        project=project,
+        segments=segments,
+        fps=fps,
+        recorded_voiceover_sha256=published_fingerprint(published),
+    )

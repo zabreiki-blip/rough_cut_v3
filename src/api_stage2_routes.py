@@ -27,10 +27,13 @@ from stage2.cloud_asr import (
 from sync_asr_phase import _cloud_index_is_outdated, index_coverage_report
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage2.assembly_plan import build_assembly_plan
+from voiceover.readiness import load_active_published, recording_files
 from stage_common import (
     TIMELINE_MATCHES_CHANGED_ERROR,
     _timeline_is_current,
     _timeline_matches_are_current,
+    _timeline_voiceover_is_current,
+    TIMELINE_VOICEOVER_CHANGED_ERROR,
     classify_sync_matches,
     current_sync_matches,
     is_life_match,
@@ -851,6 +854,8 @@ def _stage2_timeline(services: ModuleType):
     _source_store, match_store = services._sync_stores(paths)
     if not _timeline_matches_are_current(timeline, confirmed, match_store):
         return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
+    if not _timeline_voiceover_is_current(timeline, confirmed, paths):
+        return services._json_error(TIMELINE_VOICEOVER_CHANGED_ERROR, 409)
     return jsonify({"ok": True, "result": timeline})
 
 
@@ -914,6 +919,7 @@ def _stage2_build(services: ModuleType):
         sources = source_store.list()
         stored_matches = match_store.list()
         current_matches, stale_match_ids = current_sync_matches(stored_matches, normalization)
+        published_voiceover = load_active_published(paths, normalization)
         timeline = services.parse_normalized_timeline(
             normalization=normalization,
             speaker_dir=speaker_dir,
@@ -922,6 +928,8 @@ def _stage2_build(services: ModuleType):
             fps=fps,
             sync_matches={item.segment_id: item for item in current_matches},
             sync_sources={item.id: item for item in sources},
+            recorded_voiceover=published_voiceover,
+            recording_files=recording_files(paths, published_voiceover),
         )
     except ValueError as exc:
         return services._json_error(str(exc), 400)
@@ -1065,6 +1073,8 @@ def _stage2_export_xml(services: ModuleType):
     _source_store, match_store = services._sync_stores(paths)
     if not _timeline_matches_are_current(data, confirmed, match_store):
         return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
+    if not _timeline_voiceover_is_current(data, confirmed, paths):
+        return services._json_error(TIMELINE_VOICEOVER_CHANGED_ERROR, 409)
 
     from stage2.models import FullTimeline
 

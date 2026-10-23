@@ -310,7 +310,8 @@ def map_catalog_to_timeline(
     timeline_speakers: dict[str, set[str]] = {}
     max_source_out: dict[str, float] = {}
     for segment in full_timeline.segments:
-        if not segment.source_id:
+        # A recorded ZK carries a recording id, not a sync source: never mapped to media.
+        if not segment.source_id or segment.type == "zk":
             continue
         sequences = timeline_sequences.setdefault(segment.source_id, set())
         speakers = timeline_speakers.setdefault(segment.source_id, set())

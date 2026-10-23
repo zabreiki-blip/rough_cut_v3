@@ -18,6 +18,8 @@ from .models import FullTimeline
 
 PLAN_SCHEMA_VERSION = 1
 _REQUIRED_TYPES = {"zk", "snh", "host", "life"}
+# ZK without a usable voiceover is not exported at all (no clip, no placeholder).
+_SKIPPED_REASONS = {"missing_wav", "missing_voiceover"}
 _TASK_BY_REASON = {
     "life_unassigned": "assign_life_material",
     "needs_review": "review_match",
@@ -43,7 +45,7 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
     reason = placeholder_reason(segment, mapped=media_mapping)
     duration = max(_num(segment.get("duration_sec")), 0.0)
     start = _num(segment.get("start_sec"))
-    if seg_type == "tech" or reason == "missing_wav" or (reason and duration <= 0):
+    if seg_type == "tech" or reason in _SKIPPED_REASONS or (reason and duration <= 0):
         status = "skipped"
     elif reason:
         status = "placeholder"
@@ -52,7 +54,10 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
 
     is_sync = seg_type in {"snh", "host", "life"}
     source_id = str(segment.get("source_id") or "")
-    if source_id and media_mapping is not None:
+    if seg_type == "zk":
+        # A recorded ZK names a recording, not a sync sequence: it never needs a media mapping.
+        media_status = "unchecked"
+    elif source_id and media_mapping is not None:
         media_status = "mapped" if source_id in media_mapping else "unmapped"
     else:
         media_status = "unchecked"
@@ -61,8 +66,9 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
     source_out = _num(segment.get("source_out_sec"))
     speech_in = _num(segment.get("speech_in_sec"))
     speech_out = _num(segment.get("speech_out_sec"))
-    has_speech = is_sync and speech_out > speech_in
-    ranged = is_sync and source_out > source_in
+    recorded = seg_type == "zk" and segment.get("voiceover_kind") == "recorded"
+    ranged = (is_sync or recorded) and source_out > source_in
+    has_speech = (is_sync or recorded) and speech_out > speech_in
     task = _TASK_BY_REASON.get(reason or "")
     trim = segment.get("trim") if isinstance(segment.get("trim"), dict) else None
     tasks: list[dict[str, Any]] = [{"kind": task, "open": True}] if task else []
@@ -105,6 +111,11 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
         "wav": {
             "path": str(segment.get("wav_path") or ""),
             "duration_sec": round(duration, 6) if seg_type == "zk" else None,
+            "kind": str(segment.get("voiceover_kind") or "tts") if seg_type == "zk" else None,
+            "source_duration_sec": round(_num(segment.get("audio_source_duration_sec")), 6)
+            if recorded
+            else None,
+            "source_sha256": str(segment.get("audio_source_sha256") or "") if recorded else None,
         },
         "placeholder": {"path": str(segment.get("placeholder_path") or "")},
         "provenance": {
@@ -138,7 +149,7 @@ def build_assembly_plan(
         if item["status"] == "placeholder":
             placeholders += 1
             placeholder_duration += duration
-        if item["status"] == "placeholder" or reason == "missing_wav":
+        if item["status"] == "placeholder" or reason in _SKIPPED_REASONS:
             entry = by_reason.setdefault(reason, {"segments": 0, "duration_sec": 0.0})
             entry["segments"] += 1
             entry["duration_sec"] = round(entry["duration_sec"] + duration, 6)
@@ -237,6 +248,27 @@ def validate_plan_complete(
     return blockers
 
 
+def _recorded_voiceover_problems(
+    item: dict, wav: dict, wav_path: str, path_exists: Callable[[str], bool]
+) -> list[tuple[str, str]]:
+    """Recorded ZK: the shared recording exists and its range lies inside the recording."""
+    if not wav_path or not path_exists(wav_path):
+        return [("missing_voiceover", f"recording file not found: {wav_path}")]
+    edit = item.get("edit_range") if isinstance(item.get("edit_range"), dict) else {}
+    edit_in, edit_out = edit.get("in_sec"), edit.get("out_sec")
+    if edit_in is None or edit_out is None or not 0 <= edit_in < edit_out:
+        return [("missing_voiceover", f"recorded range={edit_in}..{edit_out}")]
+    duration = _num(wav.get("source_duration_sec"))
+    if duration > 0 and edit_out > duration + _RANGE_EPS:
+        return [
+            (
+                "recorded_beyond_source",
+                f"recorded out {edit_out} exceeds recording duration {duration}",
+            )
+        ]
+    return []
+
+
 def _ready_item_problems(
     item: dict,
     item_type: str,
@@ -247,6 +279,8 @@ def _ready_item_problems(
     if item_type == "zk":
         wav = item.get("wav") if isinstance(item.get("wav"), dict) else {}
         wav_path = str(wav.get("path") or "")
+        if wav.get("kind") == "recorded":
+            return _recorded_voiceover_problems(item, wav, wav_path, path_exists)
         if not wav_path or _num(wav.get("duration_sec")) <= 0:
             problems.append(("missing_wav", "wav path or duration is empty"))
         elif not path_exists(wav_path):

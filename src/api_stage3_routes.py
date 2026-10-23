@@ -28,6 +28,8 @@ from stage_common import (
     _scenario_revision_matches,
     _timeline_is_current,
     _timeline_matches_are_current,
+    _timeline_voiceover_is_current,
+    TIMELINE_VOICEOVER_CHANGED_ERROR,
     timeline_sync_summary,
 )
 
@@ -466,6 +468,8 @@ def _load_current_timeline(project: str, services: ModuleType, paths: dict) -> t
     _source_store, match_store = services._sync_stores(paths)
     if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
         raise Stage3OperationError(TIMELINE_MATCHES_CHANGED_ERROR, 409)
+    if not _timeline_voiceover_is_current(timeline_data, confirmed, paths):
+        raise Stage3OperationError(TIMELINE_VOICEOVER_CHANGED_ERROR, 409)
     return timeline_bytes, timeline_data
 
 
@@ -944,6 +948,8 @@ def _current_timeline_inputs(project: str, services: ModuleType, paths: dict) ->
         _source_store, match_store = services._sync_stores(paths)
         if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
             return None
+        if not _timeline_voiceover_is_current(timeline_data, confirmed, paths):
+            return None
     except (OSError, ValueError, AttributeError):
         return None
     return {
@@ -1182,6 +1188,8 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         _source_store, match_store = services._sync_stores(paths)
         if not _timeline_matches_are_current(timeline_data, confirmed, match_store):
             return services._json_error(TIMELINE_MATCHES_CHANGED_ERROR, 409)
+        if not _timeline_voiceover_is_current(timeline_data, confirmed, paths):
+            return services._json_error(TIMELINE_VOICEOVER_CHANGED_ERROR, 409)
         try:
             latest_id = stage3_builds.load_latest_id(builds_dir)
         except ValueError as exc:
