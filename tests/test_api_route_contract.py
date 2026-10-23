@@ -195,6 +195,9 @@ def test_empty_stage_responses_keep_public_envelopes(client) -> None:
             "review": 0,
             "unmatched": 0,
             "no_source": 0,
+            "no_speaker": 0,
+            "no_file": 0,
+            "asr_failed": 0,
         },
     }
 

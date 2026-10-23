@@ -662,6 +662,21 @@
               <strong id="sync_count_no_source">0</strong>
               <span>Нет записи</span>
             </div>
+            <div class="sync-stat" id="sync_stat_asr_failed" data-state="unmatched" hidden
+                 title="Распознавание записи спикера не удалось — повторите сопоставление">
+              <strong id="sync_count_asr_failed">0</strong>
+              <span>Сбой ASR</span>
+            </div>
+            <div class="sync-stat" id="sync_stat_no_speaker" data-state="no-source" hidden
+                 title="В реплике не указан спикер — записи не из чего выбирать">
+              <strong id="sync_count_no_speaker">0</strong>
+              <span>Нет спикера</span>
+            </div>
+            <div class="sync-stat" id="sync_stat_no_file" data-state="no-source" hidden
+                 title="Спикер указан, но файла записи для него нет">
+              <strong id="sync_count_no_file">0</strong>
+              <span>Нет файла</span>
+            </div>
           </div>
 
           <div class="sync-review">

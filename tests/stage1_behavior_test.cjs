@@ -748,6 +748,48 @@ async function testSyncRetimePendingReviewQueue({ state, sync }) {
   }
 }
 
+// Step 1d: sync summary shows asr_failed / no_speaker / no_file only when > 0.
+async function testSyncSummaryReasonCounters({ state, sync }) {
+  const { ids, appState } = state;
+  const originalFetch = globalThis.fetch;
+  const originalSyncFeatureAvailable = appState.syncFeatureAvailable;
+  const originalSyncSources = appState.syncSources;
+  const jsonResponse = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  const load = async (summary) => {
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      if (target.includes("/sync-sources")) return jsonResponse({ ok: true, result: { items: [] } });
+      if (target.includes("/sync-matches")) return jsonResponse({ ok: true, result: { items: [], summary } });
+      if (target.includes("/sync-jobs/status")) return { ok: false, status: 404, text: async () => "" };
+      throw new Error(`testSyncSummaryReasonCounters: unexpected fetch ${target}`);
+    };
+    await sync.loadSyncWorkspace(true);
+  };
+  try {
+    await load({
+      auto_matched: 1, confirmed: 0, needs_review: 0, unmatched: 6, no_source: 3,
+      asr_failed: 4, no_speaker: 1, no_file: 2,
+    });
+    assert.strictEqual(ids.sync_count_unmatched.textContent, "2", "asr_failed is not double-counted in unmatched");
+    assert.strictEqual(ids.sync_count_asr_failed.textContent, "4");
+    assert.strictEqual(ids.sync_count_no_speaker.textContent, "1");
+    assert.strictEqual(ids.sync_count_no_file.textContent, "2");
+    assert.strictEqual(ids.sync_count_no_source.textContent, "3", "no_source stays the sum of no_speaker and no_file");
+    assert.strictEqual(ids.sync_stat_asr_failed.hidden, false);
+    assert.strictEqual(ids.sync_stat_no_speaker.hidden, false);
+    assert.strictEqual(ids.sync_stat_no_file.hidden, false);
+
+    await load({ auto_matched: 1, unmatched: 0, no_source: 0, asr_failed: 0, no_speaker: 0, no_file: 0 });
+    assert.strictEqual(ids.sync_stat_asr_failed.hidden, true, "zero counters stay hidden");
+    assert.strictEqual(ids.sync_stat_no_speaker.hidden, true);
+    assert.strictEqual(ids.sync_stat_no_file.hidden, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.syncFeatureAvailable = originalSyncFeatureAvailable;
+    appState.syncSources = originalSyncSources;
+  }
+}
+
 // Card 6: the editable sync-sources list added to the web panel so an
 // operator no longer has to reopen the CEP panel in Premiere to fix a
 // source's speaker names or "all speakers" flag - a wrong/missing speaker
@@ -2020,6 +2062,7 @@ async function main() {
     ["testConfirmDialog", () => testConfirmDialog(modules)],
     ["testSyncMatchSpeakerFilterHint", () => testSyncMatchSpeakerFilterHint(modules)],
     ["testSyncRetimePendingReviewQueue", () => testSyncRetimePendingReviewQueue(modules)],
+    ["testSyncSummaryReasonCounters", () => testSyncSummaryReasonCounters(modules)],
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],
     ["testRevisionsInbox", () => testRevisionsInbox(modules)],
     ["testRevisionImportTimeout", () => testRevisionImportTimeout(modules)],

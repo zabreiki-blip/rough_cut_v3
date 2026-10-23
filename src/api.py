@@ -128,7 +128,11 @@ from stage2.assembly_manifest import (
     validate_assembly_manifest,
 )
 from stage2.sync_storage import SyncMatchStore, SyncSourceStore
-from stage_common import _timeline_matches_are_current, timeline_sync_summary
+from stage_common import (
+    _timeline_matches_are_current,
+    placeholder_reason,
+    timeline_sync_summary,
+)
 from stage2.sync_transcript import (
     ingest_word_index,
     load_word_index,
@@ -1545,12 +1549,31 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
         item.status == "needs_review" or (item.status == "confirmed" and flagged)
         for item, flagged in zip(matches, pending)
     )
-    not_found = sum(item.status == "not_found" for item in matches)
-    # Speaker has no recording yet: the quote is expected to match once it is loaded.
-    no_source = sum(
-        item.status == "not_found" and item.metadata.get("unmatched_reason") == "no_eligible_source"
+    # Not-found reasons come from the single stage_common classifier so the sync panel and
+    # the assembly plan agree: asr_failed, no_speaker and no_file are counted separately.
+    reasons = [
+        placeholder_reason(
+            {
+                "type": "snh",
+                "match_status": item.status,
+                "source_id": item.source_id,
+                "source_in_sec": item.source_in_sec,
+                "source_out_sec": item.source_out_sec,
+                "unmatched_reason": item.metadata.get("unmatched_reason"),
+                "speaker": item.speaker,
+            }
+        )
         for item in matches
-    )
+        if item.status == "not_found"
+    ]
+    not_found = len(reasons)
+    asr_failed = reasons.count("asr_failed")
+    no_speaker = reasons.count("no_speaker")
+    no_file = reasons.count("no_file")
+    # Speaker has no recording yet: the quote is expected to match once it is loaded.
+    # asr_failed is a failure, not a wait: it stays in ``unmatched`` (and is also reported
+    # separately as ``asr_failed``) but never in ``no_source``.
+    no_source = no_file + no_speaker
     return {
         "auto_matched": auto_matched,
         "confirmed": confirmed,
@@ -1560,6 +1583,9 @@ def _sync_summary(matches: list[SyncMatch]) -> dict[str, int]:
         "review": needs_review,
         "unmatched": not_found - no_source,
         "no_source": no_source,
+        "no_speaker": no_speaker,
+        "no_file": no_file,
+        "asr_failed": asr_failed,
     }
 
 
@@ -1866,6 +1892,9 @@ def _create_sync_job(project: str) -> dict:
         "review": 0,
         "unmatched": 0,
         "no_source": 0,
+        "no_speaker": 0,
+        "no_file": 0,
+        "asr_failed": 0,
         "segment_failures": [],
         "llm_reviewed": 0,
         "llm_review_failures": [],

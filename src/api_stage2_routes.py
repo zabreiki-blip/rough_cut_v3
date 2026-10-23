@@ -26,6 +26,7 @@ from stage2.cloud_asr import (
 )
 from sync_asr_phase import _cloud_index_is_outdated, index_coverage_report
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
+from stage2.assembly_plan import build_assembly_plan
 from stage_common import (
     TIMELINE_MATCHES_CHANGED_ERROR,
     _scenario_revision_matches,
@@ -945,13 +946,17 @@ def _stage2_build(services: ModuleType):
     life_count = sum(1 for s in timeline.segments if s.type == "life")
     tech_count = sum(1 for s in timeline.segments if s.type == "tech")
     zk_missing_wav = [s.id for s in timeline.segments if s.type == "zk" and not s.wav_path]
-    sync_segments = [s for s in timeline.segments if s.type in {"snh", "host"}]
-    matched_count = sum(
-        s.match_status in {"auto_matched", "confirmed"} and s.source_out_sec > s.source_in_sec
-        for s in sync_segments
-    )
-    review_count = sum(s.match_status == "needs_review" for s in sync_segments)
-    unmatched_count = len(sync_segments) - matched_count - review_count
+    # Counters derive from the assembly plan so the build response, the plan and the
+    # placeholder report share one classifier (stage_common.placeholder_reason).
+    plan_summary = build_assembly_plan(timeline_payload, media_mapping=None)["summary"]
+    by_reason = plan_summary["placeholders"]["by_reason"]
+
+    def _reason_segments(*reasons: str) -> int:
+        return sum(int(by_reason.get(reason, {}).get("segments", 0)) for reason in reasons)
+
+    review_count = _reason_segments("needs_review")
+    unmatched_count = _reason_segments("not_found", "asr_failed", "no_speaker", "no_file")
+    matched_count = max(0, snh_count + host_count - review_count - unmatched_count)
 
     return jsonify(
         {
@@ -970,6 +975,7 @@ def _stage2_build(services: ModuleType):
                 "matched": matched_count,
                 "review": review_count,
                 "unmatched": unmatched_count,
+                "plan_summary": plan_summary,
                 "sync_summary": {
                     "matched": matched_count,
                     "review": review_count,

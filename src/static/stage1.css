@@ -1338,9 +1338,11 @@ select { cursor: pointer; }
 
 .sync-stats {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 8px;
 }
+
+.sync-stat[hidden] { display: none; }
 
 .sync-stat {
   padding: 12px;

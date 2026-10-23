@@ -230,14 +230,21 @@ function syncCounts(document) {
     review: summary.needs_review ?? summary.review ?? document?.needs_review,
     unmatched: summary.unmatched ?? document?.unmatched,
     noSource: summary.no_source ?? document?.no_source,
+    asrFailed: summary.asr_failed ?? document?.asr_failed,
+    noSpeaker: summary.no_speaker ?? document?.no_speaker,
+    noFile: summary.no_file ?? document?.no_file,
   };
   if (Object.values(explicit).some((value) => value !== undefined)) {
     return {
       auto: Number(explicit.auto || 0),
       confirmed: Number(explicit.confirmed || 0),
       review: Number(explicit.review || 0),
-      unmatched: Number(explicit.unmatched || 0),
+      // ``unmatched`` from the server also includes asr_failed, which has its own counter.
+      unmatched: Math.max(0, Number(explicit.unmatched || 0) - Number(explicit.asrFailed || 0)),
       noSource: Number(explicit.noSource || 0),
+      asrFailed: Number(explicit.asrFailed || 0),
+      noSpeaker: Number(explicit.noSpeaker || 0),
+      noFile: Number(explicit.noFile || 0),
     };
   }
   return syncMatches.reduce((counts, match) => {
@@ -246,10 +253,16 @@ function syncCounts(document) {
     else if (retimePendingReview(match)) counts.review += 1;
     else if (status === "confirmed") counts.confirmed += 1;
     else if (status === "needs_review") counts.review += 1;
-    else if (match.metadata?.unmatched_reason === "no_eligible_source") counts.noSource += 1;
-    else counts.unmatched += 1;
+    else if (match.metadata?.unmatched_reason === "asr_failed") counts.asrFailed += 1;
+    else if (match.metadata?.unmatched_reason === "no_eligible_source") {
+      counts.noSource += 1;
+      if (String(match.speaker || "").trim()) counts.noFile += 1;
+      else counts.noSpeaker += 1;
+    } else counts.unmatched += 1;
     return counts;
-  }, { auto: 0, confirmed: 0, review: 0, unmatched: 0, noSource: 0 });
+  }, {
+    auto: 0, confirmed: 0, review: 0, unmatched: 0, noSource: 0, asrFailed: 0, noSpeaker: 0, noFile: 0,
+  });
 }
 
 function updateSyncAsrControls() {
@@ -280,6 +293,15 @@ function renderSyncMatches(document) {
   ids.sync_count_review.textContent = String(counts.review);
   ids.sync_count_unmatched.textContent = String(counts.unmatched);
   ids.sync_count_no_source.textContent = String(counts.noSource);
+  // Detailed not-found reasons are shown only when present.
+  for (const [stat, count, value] of [
+    [ids.sync_stat_asr_failed, ids.sync_count_asr_failed, counts.asrFailed],
+    [ids.sync_stat_no_speaker, ids.sync_count_no_speaker, counts.noSpeaker],
+    [ids.sync_stat_no_file, ids.sync_count_no_file, counts.noFile],
+  ]) {
+    if (count) count.textContent = String(value);
+    if (stat) stat.hidden = !(value > 0);
+  }
 
   const reviewItems = syncMatches.filter((match) => {
     const status = normalizedMatchStatus(match.status);
