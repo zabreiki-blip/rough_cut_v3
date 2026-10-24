@@ -291,6 +291,7 @@ const MATCH_REVIEW_REASON_LABELS = {
   local_text_mismatch: "На этом месте локальная расшифровка содержит другой текст",
   timing_unreliable: "Таймкоды ненадёжны — проверьте границы",
   timing_unrefined: "Таймкоды ещё не уточнены — проверьте границы",
+  timecode_only: "Только таймкод — проверьте границы",
   audio_mismatch: "По звуку не совпадает",
   audio_partial: "По звуку — частично",
   audio_match_wide_range: "Звучит, но диапазон слишком широкий",
@@ -521,6 +522,7 @@ function renderSyncMatches(document) {
       asr_failed: "Распознавание записи спикера не удалось — повторите запуск сопоставления.",
       no_candidate: "В доступной расшифровке подходящая фраза не найдена.",
       below_review_threshold: "Есть только слабые совпадения; проверьте запись вручную.",
+      timecode_out_of_range: "Таймкод сценария выходит за длительность записи спикера.",
     };
     const unmatchedReason = unmatchedReasons[match.metadata?.unmatched_reason] || "";
     const sourceIn = Number(candidate.source_in_sec);

@@ -310,6 +310,9 @@ class AlignmentRequest:
     approximate_timecode: str | float | None = None
     source_ids: tuple[str, ...] = ()
     timecode_mode: TimecodeMode = "relative"
+    # Media file / sequence name the scenario credits ("... — ZOOM0007_Tr1 (1).WAV 00:05:42").
+    # Only used to prefer a source for a timecode-only block.
+    source_hint: str = ""
 
     def __post_init__(self) -> None:
         if not self.segment_id.strip():

@@ -322,6 +322,14 @@ def _is_manual_match(match: Any) -> bool:
     return match.status == "confirmed" or bool(metadata.get("manual_updated_at"))
 
 
+def _unit_source_hint(unit: Mapping[str, Any]) -> str:
+    """Media file / sequence the scenario credits for the block (used for timecode-only)."""
+    block = unit.get("block")
+    if not isinstance(block, Mapping):
+        return ""
+    return str(block.get("source_description") or "").strip()
+
+
 def _review_match(
     ctx: SyncMatchContext,
     state: _ReviewState,
@@ -763,6 +771,7 @@ def run_match_phase(
                     speaker=str(unit.get("speaker") or ""),
                     approximate_timecode=unit.get("timecode_start"),
                     timecode_mode=ctx.timecode_mode,
+                    source_hint=_unit_source_hint(unit),
                 )
             )
             # A match whose review is deferred must not look finished: the fingerprint
@@ -875,6 +884,7 @@ def run_match_phase(
             llm_review_failures=list(review.failures),
             **cost_tracker.llm_cost_fields(),
         )
+
     def checkpoint_refined(touched_ids: list[str]) -> None:
         # Reused matches were not rematched: keep the refined copies over the persisted ones.
         if touched_ids:

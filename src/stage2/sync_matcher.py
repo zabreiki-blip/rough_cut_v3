@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from math import isfinite
+from pathlib import Path
 from typing import Any, Iterable
 
 from .sync_models import (
@@ -605,6 +606,42 @@ def parse_timecode(value: str | float | int | None, fps: float = 25.0) -> float 
             raise ValueError(f"invalid timecode: {value!r}")
         return hours * 3600 + minutes * 60 + seconds + frames / fps
     raise ValueError(f"invalid timecode: {value!r}")
+
+
+TIMECODE_ONLY_STRATEGY = "timecode_only"
+TIMECODE_ONLY_REASON = "timecode_only"
+# A bare ``00:05:42`` / ``[1:05:42]`` / ``12:30.05`` block text: the scenario gives only a
+# position in the source and no quote to compare.
+_TIMECODE_ONLY_TEXT = re.compile(r"^\d{1,2}[:.]\d{2}(?:[:.]\d{2}){0,2}$")
+_SENTENCE_END = re.compile(r"[.!?…]+[\"»”)\]]*$")
+TIMECODE_ONLY_FIXED_SEC = 10.0
+TIMECODE_ONLY_MAX_SEC = 30.0
+TIMECODE_ONLY_PAUSE_SEC = 0.7
+TIMECODE_ONLY_MAX_WORD_LEAD_SEC = 5.0
+
+
+def is_timecode_only_text(text: str) -> bool:
+    """True when the whole block text is one timecode (no quote to match)."""
+    return bool(_TIMECODE_ONLY_TEXT.match(str(text or "").strip(" \t[]()—–-")))
+
+
+def _name_keys(value: object) -> set[str]:
+    name = Path(str(value or "").strip().replace("\\", "/")).name.casefold()
+    if not name:
+        return set()
+    return {name, Path(name).stem} if "." in name else {name}
+
+
+def _source_name_keys(source: SyncSource) -> set[str]:
+    values = [
+        source.media_path,
+        source.guide_audio,
+        source.premiere_sequence,
+        source.proxy_sequence_name,
+        source.metadata.get("media_name"),
+        source.metadata.get("audio_guide_name"),
+    ]
+    return set().union(*(_name_keys(value) for value in values))
 
 
 DEFAULT_MAX_INTERNAL_GAP_SEC = 5.0
@@ -1707,6 +1744,8 @@ class SyncMatcher:
         return selected, filtered
 
     def match(self, request: AlignmentRequest) -> SyncMatch:
+        if is_timecode_only_text(request.text):
+            return self._timecode_only_match(request)
         result = self._search_match(request)
         if (
             result.status == "not_found"
@@ -1716,6 +1755,127 @@ class SyncMatcher:
         ):
             return self._local_fallback(request, result)
         return result
+
+    def _timecode_only_range(
+        self, request: AlignmentRequest, source: SyncSource
+    ) -> dict[str, Any] | None:
+        """Candidate range at the scenario timecode, or None when it is outside the source."""
+        position = _approx_for_source(request, source)
+        if position is None:
+            return None
+        offset = source.guide_offset_sec
+        guide = position - offset
+        words = sorted(self.indexes[source.id].words, key=lambda word: word.start)
+        last_end = words[-1].end if words else 0.0
+        if source.duration_sec > 0:
+            if position >= source.duration_sec:
+                return None
+        elif words and guide > last_end + TIMECODE_ONLY_MAX_WORD_LEAD_SEC:
+            return None
+        first = next((i for i, word in enumerate(words) if word.start >= guide - 0.05), None)
+        picked: list[WordTimestamp] = []
+        if first is not None and words[first].start - guide <= TIMECODE_ONLY_MAX_WORD_LEAD_SEC:
+            picked = [words[first]]
+            for word in words[first + 1 :]:
+                previous = picked[-1]
+                if (
+                    _SENTENCE_END.search(previous.word.strip())
+                    or word.start - previous.end > TIMECODE_ONLY_PAUSE_SEC
+                    or word.end - picked[0].start > TIMECODE_ONLY_MAX_SEC
+                ):
+                    break
+                picked.append(word)
+        if picked:
+            speech_in = picked[0].start + offset
+            speech_out = min(picked[-1].end + offset, speech_in + TIMECODE_ONLY_MAX_SEC)
+        else:
+            speech_in = position
+            speech_out = position + TIMECODE_ONLY_FIXED_SEC
+        start = max(0.0, position - self.config.head_padding_sec)
+        end = speech_out + self.config.tail_padding_sec
+        if source.duration_sec > 0:
+            start = min(source.duration_sec, start)
+            end = min(source.duration_sec, end)
+            speech_out = min(source.duration_sec, speech_out)
+        return {
+            "source_id": source.id,
+            "in": start,
+            "out": max(start, end),
+            "speech_in": min(speech_in, speech_out),
+            "speech_out": speech_out,
+            "text": " ".join(word.word for word in picked),
+            "words": len(picked),
+        }
+
+    def _timecode_only_match(self, request: AlignmentRequest) -> SyncMatch:
+        """A block with a timecode instead of a quote: a review candidate right on that timecode."""
+        if request.approximate_timecode in (None, ""):
+            request = replace(request, approximate_timecode=request.text.strip(" \t[]()—–-"))
+        speaker_filtered: list[dict[str, Any]] = []
+        available = [source for source in self.sources.values() if source.id in self.indexes]
+        if request.source_ids:
+            available = [source for source in available if source.id in request.source_ids]
+        hint_keys = _name_keys(request.source_hint)
+        named = [source for source in available if hint_keys & _source_name_keys(source)]
+        if named:
+            sources = named
+        else:
+            sources, speaker_filtered = self._eligible_sources(request)
+
+        def unmatched(reason: str) -> SyncMatch:
+            metadata: dict[str, Any] = {"unmatched_reason": reason}
+            if speaker_filtered:
+                metadata["speaker_filtered_sources"] = speaker_filtered
+            return SyncMatch(
+                segment_id=request.segment_id,
+                query_text=request.text,
+                speaker=request.speaker,
+                approximate_timecode=str(request.approximate_timecode or ""),
+                status="not_found",
+                strategy=TIMECODE_ONLY_STRATEGY,
+                metadata=metadata,
+            )
+
+        if not sources:
+            return unmatched("no_eligible_source")
+        ranges = [
+            item for source in sources if (item := self._timecode_only_range(request, source))
+        ]
+        if not ranges:
+            return unmatched("timecode_out_of_range")
+        best, rest = ranges[0], ranges[1:]
+        alternatives = [
+            SyncAlternative(item["source_id"], item["in"], item["out"], 0.0, item["text"])
+            for item in rest[: self.config.max_alternatives]
+        ]
+        metadata = {
+            "review_reason": TIMECODE_ONLY_REASON,
+            "timecode_mode": request.timecode_mode,
+            "source_hint": request.source_hint,
+            "source_matched_by_name": bool(named),
+            "speech_in_sec": round(best["speech_in"], 4),
+            "speech_out_sec": round(best["speech_out"], 4),
+            "head_padding_sec": self.config.head_padding_sec,
+            "tail_padding_sec": self.config.tail_padding_sec,
+            "range_from_words": bool(best["words"]),
+        }
+        if speaker_filtered:
+            metadata["speaker_filtered_sources"] = speaker_filtered
+        return SyncMatch(
+            segment_id=request.segment_id,
+            query_text=request.text,
+            speaker=request.speaker,
+            approximate_timecode=str(request.approximate_timecode or ""),
+            source_id=best["source_id"],
+            source_in_sec=best["in"],
+            source_out_sec=best["out"],
+            confidence=0.0,
+            status="needs_review",
+            matched_text=best["text"],
+            strategy=TIMECODE_ONLY_STRATEGY,
+            alternatives=alternatives,
+            metadata=metadata,
+        )
 
     def _local_fallback(self, request: AlignmentRequest, primary: SyncMatch) -> SyncMatch:
         """Retry a weak/absent primary result against the local-Whisper index."""

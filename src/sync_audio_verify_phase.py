@@ -112,6 +112,14 @@ def audio_workers(environ: Mapping[str, str]) -> int:
         return DEFAULT_WORKERS
 
 
+def _is_timecode_only(match: Any) -> bool:
+    """No quote to compare against: the candidate sits on a bare scenario timecode."""
+    return (
+        getattr(match, "strategy", "") == "timecode_only"
+        or match.metadata.get("review_reason") == "timecode_only"
+    )
+
+
 def _has_range(match: Any) -> bool:
     return (
         bool(match.source_id)
@@ -135,7 +143,7 @@ def select_candidates(
     for match in matches:
         if match.status not in {"auto_matched", "needs_review"} or not _has_range(match):
             continue
-        if _is_manual_match(match):
+        if _is_manual_match(match) or _is_timecode_only(match):
             continue
         if match.metadata.get("block_type") == "life":
             continue
@@ -182,6 +190,8 @@ def apply_verdict(
         return "error"
     match.metadata["audio_verified"] = record
     if verdict.verdict == "match":
+        if _is_timecode_only(match):
+            return "kept"  # nothing to compare the sound with: an editor sets the bounds
         if (
             verdict.coverage >= PROMOTE_MIN_COVERAGE
             and verdict.confidence >= PROMOTE_MIN_CONFIDENCE
