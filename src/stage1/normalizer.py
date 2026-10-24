@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from difflib import SequenceMatcher
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict, deque
-from hashlib import sha256
 import json
 import logging
-from pathlib import Path
 import re
 import threading
 import time
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from functools import lru_cache
+from hashlib import sha256
+from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -22,18 +22,28 @@ from openrouter_limits import raise_if_truncated, resolve_max_tokens
 from openrouter_usage import report_json_usage
 
 from .config import get_settings
+from .confirmation_checks import (
+    ConfirmationIssue,
+    check_speaker_not_a_person,
+    has_speaker_name,
+    is_non_person_word,
+    looks_like_caps_source_note,
+    role_is_prose,
+    structural_checks,
+)
 from .io_utils import extract_paragraphs, read_json
 from .normalization_memory import DEFAULT_MEMORY_PATH, NormalizationMemory, normalize_marker
 from .normalization_models import (
+    VALID_BLOCK_TYPES,
+    VALID_DECISION_SOURCES,
     BlockType,
     DecisionSource,
     NormalizationStatus,
     NormalizedBlock,
     NormalizedScenario,
     SyncFragment,
-    VALID_BLOCK_TYPES,
-    VALID_DECISION_SOURCES,
 )
+from .presenter_cues import parse_presenter_parts
 from .scenario_context import (
     AMBIGUOUS_CAPS_WARNING,
     SCENE_CONTEXT_VERSION,
@@ -48,13 +58,6 @@ from .scenario_context import (
     neighbour_context,
     plan_scene_context,
 )
-from .confirmation_checks import (
-    ConfirmationIssue,
-    has_speaker_name,
-    looks_like_caps_source_note,
-    structural_checks,
-)
-from .presenter_cues import parse_presenter_parts
 from .scenario_structure import (
     LEAD_IN_WARNING,
     STANDUP_WARNING,
@@ -309,7 +312,7 @@ _BARE_SPEAKER_PREFIX = re.compile(
 )
 _CLEAR_SPEAKER_CREDIT = re.compile(
     r"^\s*(?P<speaker>[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)"
-    r"(?:,\s*[а-яё][а-яё,\s-]{2,80})?"
+    r"(?:,\s*(?P<role>[а-яё][а-яё,\s-]{2,80}))?"
     r"(?P<separator>[:.]\s*(?:[-–—]\s*)?)"
     r"(?P<content>.+)$",
     re.DOTALL,
@@ -634,8 +637,13 @@ def _generate_normalization_unlocked(
         # Computed once per run (not per block): building it requires a
         # memory query, and the seed keyword list rarely changes mid-run.
         video_cue_re = _video_cue_keyword_pattern(memory)
+        known_by_paragraph = _known_speaker_tokens(paragraphs)
         for order, original in enumerate(paragraphs, start=1):
-            label, content = _split_label(original)
+            known_speakers = known_by_paragraph[order - 1]
+            # The line right after a label-only ``ЗК1.7`` is narration unless it
+            # carries an explicit sync label or a timecode.
+            after_zk = bool(blocks) and blocks[-1].notes == "section_marker_for=voiceover"
+            label, content = _split_label(original, known_speakers, after_zk)
             block = NormalizedBlock(
                 uid=f"block-{order}-{uuid4().hex[:8]}",
                 order=order,
@@ -650,7 +658,7 @@ def _generate_normalization_unlocked(
                 BlockType.LIFE.value,
                 BlockType.SYNC.value,
             )
-            _classify_by_rules(block, memory, video_cue_re, in_scene)
+            _classify_by_rules(block, memory, video_cue_re, in_scene, known_speakers, after_zk)
             for warning in (
                 *_paragraph_structure(original).warnings,
                 *timecode_warnings(original),
@@ -1554,6 +1562,8 @@ def validate_for_confirmation_detailed(
                         )
         for code, message, severity in structural_checks(block, _paragraph_structure):
             add(code, block, message, severity)
+        for code, message, severity in check_speaker_not_a_person(block, value.blocks):
+            add(code, block, message, severity)
         for message in block.warnings:
             add(_warning_code(message), block, message, "warning")
         if (
@@ -2278,6 +2288,54 @@ def _looks_like_plausible_sync_credit(candidate: str) -> bool:
     return not first_word or first_word[0].casefold() not in _SYNC_CANDIDATE_STOPWORDS
 
 
+def _is_plausible_clear_speaker(speaker: str, role: str, known_speakers: frozenset[str]) -> bool:
+    """``Слово, ...`` opens with a person, not with a discourse word or a clause.
+
+    A speaker already named elsewhere in the scenario always qualifies.
+    Otherwise none of its words may be a discourse word / verb form
+    (``Кстати``, ``Кажется``) and the text after the comma must read as a
+    role (``искусствовед``), not as the continuation of a sentence
+    (``что контроль ...``, ``можно ли ...``, ``в нашей стране ...``).
+    """
+    words = [word.casefold().replace("ё", "е") for word in speaker.split()]
+    if any(word in known_speakers for word in words):
+        return True
+    if any(is_non_person_word(word) for word in speaker.split()):
+        return False
+    first_word = speaker.split(" ", 1)[0].casefold()
+    if first_word in _SYNC_CANDIDATE_STOPWORDS or first_word in _DOT_CREDIT_STOPWORDS:
+        return False
+    return not (role and role_is_prose(role))
+
+
+def _speaker_tokens(text: str) -> set[str]:
+    return {
+        token.casefold().replace("ё", "е")
+        for token in re.findall(r"[^\W\d_]{3,}", text)
+        if not is_non_person_word(token)
+    }
+
+
+def _known_speaker_tokens(paragraphs: list[str]) -> list[frozenset[str]]:
+    """Per paragraph: name tokens of the speakers credited in the *other* paragraphs."""
+    own: list[set[str]] = []
+    for paragraph in paragraphs:
+        tokens: set[str] = set()
+        credit = _parse_snh_dash_credit(paragraph)
+        if credit and credit["speaker"]:
+            tokens |= _speaker_tokens(credit["speaker"])
+        label, _content = _split_label(paragraph, known_speakers=frozenset())
+        marker = normalize_marker(label)
+        if label and marker not in _BUILTIN_MARKERS and marker not in _TECH_MARKERS:
+            tokens |= _speaker_tokens(label)
+        own.append(tokens)
+    counts: Counter[str] = Counter(token for tokens in own for token in tokens)
+    return [
+        frozenset(token for token, count in counts.items() if count - (token in tokens) > 0)
+        for tokens in own
+    ]
+
+
 # ``СНХ. <кредит>: речь``: after a full stop the text before the colon is a
 # credit only when it looks like a short name or role.  Finite-verb endings are
 # the unambiguous ones (past tense, 3pl, 2nd person); the ambiguous ``-л/-ла/
@@ -2629,7 +2687,19 @@ def _merge_snh_credit_headers(paragraphs: list[str]) -> list[str]:
     return merged
 
 
-def _split_label(text: str) -> tuple[str, str]:
+def _split_label(
+    text: str,
+    known_speakers: frozenset[str] | None = None,
+    after_zk: bool = False,
+) -> tuple[str, str]:
+    """Split ``Метка: текст`` into ``(label, content)``.
+
+    ``known_speakers`` (casefolded name tokens of the scenario's speakers) switches
+    on the person check for ``Слово, ...`` credits; ``None`` keeps the label as
+    found (for re-splitting a block whose label is already decided).  ``after_zk``
+    marks a paragraph that directly follows a label-only ``ЗК`` line: without a
+    timecode, a colon or a dash it is narration, not a credited quote.
+    """
     # Timecodes are located first: a colon inside ``(00:42:32)`` must never be
     # taken for a label/description separator.
     text = _structural_text(text)
@@ -2693,6 +2763,21 @@ def _split_label(text: str) -> tuple[str, str]:
     ):
         content = clear_speaker.group("content").strip()
         credit = clear_speaker.group("speaker").strip()
+        separator = clear_speaker.group("separator")
+        if known_speakers is not None and not _is_plausible_clear_speaker(
+            credit, clear_speaker.group("role") or "", known_speakers
+        ):
+            content = ""
+        elif (
+            after_zk
+            and not _TIMECODE.search(text)
+            and not re.search(r"[:\-–—]", separator)
+            and not any(
+                word.casefold().replace("ё", "е") in (known_speakers or frozenset())
+                for word in credit.split()
+            )
+        ):
+            content = ""
         if len(content) >= 35 and (
             "," in text[: clear_speaker.start("content")]
             or _TIMECODE.search(content)
@@ -2764,6 +2849,8 @@ def _classify_by_rules(
     memory: NormalizationMemory,
     video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
     in_scene: bool = False,
+    known_speakers: frozenset[str] | None = None,
+    after_zk: bool = False,
 ) -> None:
     marker = normalize_marker(block.original_label)
     stripped = _structural_text(block.original_text).strip()
@@ -2884,7 +2971,7 @@ def _classify_by_rules(
             if stripped.endswith(".") or _CAPS_CUE_VERB_RE.search(stripped):
                 block.warnings.append(EDITORIAL_CUE_CAPS_WARNING)
         return
-    _label, content = _split_label(block.original_text)
+    _label, content = _split_label(block.original_text, known_speakers, after_zk)
     sync_content = _SYNC_CONTINUATION_NOTE.sub("", content)
     if _EXPLICIT_SYNC_LABEL.match(block.original_label):
         _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
@@ -2928,9 +3015,8 @@ def _classify_by_rules(
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
     elif _looks_like_section_heading(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.9)
-    elif (
-        _SYNC_SERVICE_LABEL.match(block.original_label.strip())
-        and looks_like_caps_source_note(content)
+    elif _SYNC_SERVICE_LABEL.match(block.original_label.strip()) and looks_like_caps_source_note(
+        content
     ):
         # ``СИНХ ЭРНСТА – ИЗ ФАЙЛОВ, КОТОРЫЙ ДАЛ ПЕРВЫЙ КАНАЛ – ...``: the label is a
         # sync service word, not a name, and the rest is a remark about the source.

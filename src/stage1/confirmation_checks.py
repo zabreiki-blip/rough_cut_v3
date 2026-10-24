@@ -9,8 +9,8 @@ needs concrete evidence in the block itself, so correct data never trips them.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import re
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from .scenario_structure import (
@@ -32,6 +32,7 @@ LOST_SPLICE = "lost_splice"
 UNMATCHED_SPEECH = "unmatched_speech"
 MONTAGE_NOTE_IN_TTS = "montage_note_in_tts"
 SYNC_SOURCE_NOTE = "sync_source_note"
+SPEAKER_NOT_A_PERSON = "speaker_not_a_person"
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,122 @@ def has_speaker_name(speaker: str) -> bool:
         if _fold(token) not in _SPEAKER_SERVICE_WORDS:
             return True
     return False
+
+
+# Discourse / introductory words and sentence connectives that open a sentence
+# ("Кстати, в нашей стране ...") and are never a person's name.  Verbs are
+# recognised by form (``_NON_NAME_VERB_RE``) instead of being listed.
+_DISCOURSE_WORDS = frozenset(
+    _fold(word)
+    for word in {
+        "итак", "впрочем", "однако", "конечно", "кстати", "например", "допустим",
+        "значит", "возможно", "наверное", "пожалуй", "вообще", "словом", "поэтому",
+        "тогда", "потом", "теперь", "затем", "далее", "сначала", "также", "тоже",
+        "зато", "ведь", "вот", "ну", "хорошо", "ладно", "понятно", "ясно", "сегодня",
+        "вчера", "завтра", "здесь", "потому", "когда", "если", "почему", "как",
+        "оказывается", "получается", "скажем", "правда", "причём", "притом",
+        "то", "это", "эти", "этот", "она", "он", "они", "мы", "вы", "я", "но", "и",
+        "а", "да", "нет", "там", "тут", "так", "кто", "что", "его", "её", "их",
+        "тот", "та", "те", "все", "всё",
+    }
+)  # fmt: skip
+# Reflexive (``Обратимся``, ``Кажется``) and imperative-plural (``Представьте``) verbs.
+_NON_NAME_VERB_RE = re.compile(r"^[а-яё]{3,}(?:ется|ится|ются|ятся|ьте|йте|ся|сь)$", re.IGNORECASE)
+# First words that open a sentence, never a role noun phrase.
+_PROSE_STARTERS = _DISCOURSE_WORDS | frozenset(
+    _fold(word)
+    for word in {
+        "чтобы", "можно", "нужно", "надо", "ли", "бы", "не", "же", "в", "во", "на", "из",
+        "к", "ко", "по", "с", "со", "о", "об", "от", "за", "для", "при", "до", "у", "над",
+        "под", "про", "без", "через", "между", "ещё", "еще", "уже", "есть", "был", "была",
+        "было", "были", "будет", "наш", "наша", "наше", "наши", "свой", "своя", "свои",
+    }
+)  # fmt: skip
+_ROLE_MAX_WORDS = 6
+_ROLE_FINITE_VERB_RE = re.compile(
+    r"^[а-яё]{3,}(?:лся|лась|лись|ется|ится|ются|ятся|ете|ешь|ишь|ют)$", re.IGNORECASE
+)
+
+
+def is_non_person_word(word: str) -> bool:
+    """A discourse word or a verb form that opens a sentence, never a person's name."""
+    core = str(word or "").strip(" \t«»\"“”'-–—.,:;")
+    folded = _fold(core)
+    return bool(folded) and (folded in _DISCOURSE_WORDS or bool(_NON_NAME_VERB_RE.match(folded)))
+
+
+def role_is_prose(role: str) -> bool:
+    """True if the text after ``Слово,`` continues a sentence instead of naming a role.
+
+    A credit role is a short noun phrase (``искусствовед``, ``военный
+    обозреватель, полковник в отставке``); a clause (``что контроль ...``,
+    ``можно ли найти ...``, ``в нашей стране ...``) is prose.
+    """
+    words = re.findall(r"[а-яё]+(?:-[а-яё]+)*", str(role or "").casefold().replace("ё", "е"))
+    if not words:
+        return False
+    first = _fold(str(role or "")).strip(" ,;:-–—")
+    first_word = re.findall(r"[а-яё]+", first)[:1]
+    if first_word and first_word[0] in _PROSE_STARTERS:
+        return True
+    return len(words) > _ROLE_MAX_WORDS or any(_ROLE_FINITE_VERB_RE.match(w) for w in words)
+
+
+def _name_tokens(text: str) -> set[str]:
+    return {
+        _fold(token)
+        for token in re.findall(r"[^\W\d_]{3,}", str(text or ""))
+        if not is_non_person_word(token)
+    }
+
+
+_LEADING_WORD_COMMA = re.compile(r"^\s*([^\W\d_]+)\s*,\s*(.+)$", re.DOTALL)
+
+
+def check_speaker_not_a_person(block: Any, other_blocks: Any) -> list[tuple[str, str, str]]:
+    """A sync speaker that is one discourse word or one word glued to a clause.
+
+    ``Кстати`` / ``Проверим`` (or ``Иванов`` in ``Иванов, он сказал, что ...``)
+    names nobody unless the same word is a speaker or source in another block.
+    """
+    if block.type != "sync" or block.absorbed_by_uid or getattr(block, "label_only", False):
+        return []
+    speaker = str(block.speaker or "").strip()
+    tokens = re.findall(r"[^\W\d_]+", speaker)
+    if len(tokens) != 1 or "speaker" in set(getattr(block, "manual_fields", None) or []):
+        return []
+    token = tokens[0]
+    reason = ""
+    if is_non_person_word(token):
+        reason = "a discourse word or verb"
+    else:
+        head = _LEADING_WORD_COMMA.match(str(block.original_text or ""))
+        if head and _fold(head.group(1)) == _fold(token):
+            rest = head.group(2)
+            # Only a plain lowercase continuation: "Иванов, он сказал ..." but not
+            # "Иванов, Иван Петрович:" or a credit with a timecode.
+            if rest[:1].islower() and not find_structural_timecodes(rest):
+                clause = re.split(r"[.…!?:]", rest, maxsplit=1)[0]
+                if role_is_prose(clause):
+                    reason = "followed by a sentence continuation"
+    if not reason:
+        return []
+    known: set[str] = set()
+    for other in other_blocks:
+        if other is block or other.type != "sync":
+            continue
+        known |= _name_tokens(other.speaker) | _name_tokens(
+            getattr(other, "source_description", "")
+        )
+    if _fold(token) in known:
+        return []
+    return [
+        (
+            SPEAKER_NOT_A_PERSON,
+            f"Sync block {block.order} speaker '{speaker}' is not a person ({reason})",
+            ERROR,
+        )
+    ]
 
 
 _SOURCE_NOTE_MIN_CAPS_WORDS = 3
