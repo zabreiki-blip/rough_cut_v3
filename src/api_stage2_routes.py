@@ -27,6 +27,7 @@ from stage2.cloud_asr import (
 from sync_asr_phase import _cloud_index_is_outdated, index_coverage_report
 from stage2.whisper_runner import WhisperUnavailableError, resolve_backend
 from stage2.assembly_plan import build_assembly_plan
+from stage2.timeline_parser import is_host_standup
 from voiceover.readiness import load_active_published, recording_files
 from stage_common import (
     TIMELINE_MATCHES_CHANGED_ERROR,
@@ -667,6 +668,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                         preserve_whole_uids=_confirmed_parent_ids(
                             matches, normalization_document, source_ids
                         ),
+                        include_host_standup=True,
                     )
                     if str(unit.get("segment_id") or "")
                 }
@@ -718,6 +720,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 preserve_whole_uids=_confirmed_parent_ids(
                     stored_matches, confirmed, {item.id for item in source_store.list()}
                 ),
+                include_host_standup=True,
             )
             if str(unit.get("segment_id") or "")
         }
@@ -759,7 +762,10 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 metadata["normalization_revision"] = revision
                 metadata["scenario_revision_id"] = scenario_revision_id
                 unit = valid_units[segment_id]
-                is_life_unit = str(unit["block"].get("type") or "").lower() == "life"
+                # A host stand-up stub is assigned by hand exactly like a LIFE insert.
+                is_life_unit = str(
+                    unit["block"].get("type") or ""
+                ).lower() == "life" or is_host_standup(unit["block"])
                 # The server owns block_type: it follows the unit, never the client.
                 metadata.pop("block_type", None)
                 metadata.pop("life_text_sha256", None)

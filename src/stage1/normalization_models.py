@@ -94,6 +94,11 @@ class NormalizedBlock:
     # It only announces the interviewee for the next paragraph and must not
     # become a timeline segment / search unit of its own.
     label_only: bool = False
+    # ``ВЕДУЩИЙ № 3``: a host stand-up that carries no text -- only a number
+    # (``"№ 3"``) and maybe a remark (kept in ``source_description``).  It is a
+    # placeholder card on the timeline, never a quote to search for.  Older
+    # JSON without the key reads with the default.
+    host_standup: str = ""
     # UID of the block that opened the LIFE/SYNC/HOST scene this block belongs
     # to (dialogue replies, ``+`` splices, continuations).  Empty for the
     # opening block itself and for blocks outside a scene.  Optional: older

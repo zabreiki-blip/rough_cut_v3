@@ -279,6 +279,7 @@ class SyncWorkerServices(Protocol):
         *,
         source_speakers: set[tuple[str, ...]] | None = None,
         preserve_whole_uids: set[str] | None = None,
+        include_host_standup: bool = False,
     ) -> list[JsonDict]: ...
 
     def get_settings(self) -> Any: ...

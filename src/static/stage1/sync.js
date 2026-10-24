@@ -345,8 +345,25 @@ export function lifeUnits() {
   return units;
 }
 
+// A text-less host stand-up (``ВЕДУЩИЙ № N``) is never auto-matched either: the same manual
+// card as LIFE, the unit id is the block ``uid``, the text is the remark.
+export function standupUnits() {
+  const blocks = appState.normalization?.blocks;
+  if (!Array.isArray(blocks)) return [];
+  return blocks
+    .filter((block) => String(block.type || "").toLowerCase() === "host"
+      && String(block.host_standup || "").trim() && String(block.uid || "") && !block.absorbed_by_uid)
+    .map((block) => ({
+      id: String(block.uid),
+      standup: String(block.host_standup).trim(),
+      text: String(block.source_description || block.notes || ""),
+      timecode: "",
+      description: "",
+    }));
+}
+
 function renderLifeCards() {
-  const units = lifeUnits();
+  const units = [...lifeUnits(), ...standupUnits()];
   if (!units.length) return "";
   const sources = Array.isArray(appState.syncSources) ? appState.syncSources : [];
   const cards = units.map((unit) => {
@@ -366,12 +383,12 @@ function renderLifeCards() {
       <article class="sync-match-card sync-life-card" data-status="${assigned ? "confirmed" : "unmatched"}"
         data-life-id="${escaped(unit.id)}" data-match-id="${escaped(unit.id)}">
         <div class="sync-match-head">
-          <div class="sync-match-title">ЛАЙФ${unit.timecode ? ` · ${escaped(unit.timecode)}` : ""}${
+          <div class="sync-match-title">${unit.standup ? `ВЕДУЩИЙ ${escaped(unit.standup)} · стендап` : "ЛАЙФ"}${unit.timecode ? ` · ${escaped(unit.timecode)}` : ""}${
             unit.description ? ` · ${escaped(unit.description)}` : ""}</div>
           <span class="sync-match-status">${assigned ? "материал назначен" : "материал не назначен"}</span>
         </div>
         ${stale ? '<div class="sync-match-note" data-life-stale>назначение устарело: текст LIFE изменился</div>' : ""}
-        <p class="sync-match-text">${escaped(unit.text || "Текст сценария отсутствует")}</p>
+        <p class="sync-match-text">${escaped(unit.text || (unit.standup ? "Без текста" : "Текст сценария отсутствует"))}</p>
         <div class="sync-review-controls">
           <label class="sync-match-field">
             <span>Источник</span>
@@ -391,14 +408,17 @@ function renderLifeCards() {
         <div class="sync-match-actions">
           <button class="btn btn-sm btn-accent" type="button" data-action="assign-life-material"
             data-match-id="${escaped(unit.id)}"${sources.length ? "" : " disabled"}>
-            ${assigned ? "Изменить материал" : "Назначить материал"}
+            ${unit.standup ? (assigned ? "Изменить дубль" : "Назначить дубль")
+              : (assigned ? "Изменить материал" : "Назначить материал")}
           </button>${assigned ? `
           <button class="btn btn-sm" type="button" data-action="unassign-life-material"
             data-match-id="${escaped(unit.id)}">Снять материал</button>` : ""}
         </div>
       </article>`;
   }).join("");
-  return `<div class="sync-match-text sync-life-title">ЛАЙФ: материал назначается вручную</div>${cards}`;
+  return `<div class="sync-match-text sync-life-title">${units.some((unit) => unit.standup)
+    ? "ЛАЙФ / стендап ведущего: материал назначается вручную"
+    : "ЛАЙФ: материал назначается вручную"}</div>${cards}`;
 }
 
 function renderSyncMatches(document) {

@@ -52,6 +52,8 @@ _SPACED_NUMBER_STRIPPABLE_PREFIXES = _GLUED_NUMBER_STRIPPABLE_PREFIXES | frozens
     {
         "narrator",
         "подводка",
+        "озв",
+        "озвучка",
         "з к",
         "закадр",
         "закадровый текст",

@@ -166,6 +166,7 @@ const STAGE3_PLACEHOLDER_REASON_LABELS = {
   needs_review: "Нужна проверка",
   unmapped_source: "Источник не подключён",
   life_unassigned: "LIFE: материал не назначен",
+  host_standup: "Стендап ведущего: дубль не назначен",
 };
 
 // Extra blocker reasons produced by the "assembly without gaps" validation.

@@ -71,6 +71,8 @@ def normalization_unit_texts(
     """
     from stage2.sync_quote import _sync_quote, life_unit_fragments
     from stage2.timeline_parser import (
+        host_standup_remark,
+        is_host_standup,
         is_label_only_sync,
         normalized_sync_fragments,
         sync_fragment_id,
@@ -84,6 +86,9 @@ def normalization_unit_texts(
         block_type = str(block.get("type") or "").lower()
         uid = str(block.get("uid") or "").strip()
         if block_type not in types or not uid:
+            continue
+        if is_host_standup(block):
+            texts[uid] = host_standup_remark(block)
             continue
         if block_type == "sync":
             if is_label_only_sync(block):
@@ -331,7 +336,9 @@ def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str 
 
     Reasons: ``missing_wav``, ``missing_voiceover`` (no recording and no TTS), ``no_speaker``,
     ``no_file``, ``asr_failed``, ``not_found``, ``needs_review``,
-    ``unmapped_source`` (only when ``mapped`` is given) and ``life_unassigned``.  ``tech`` segments never produce a reason.
+    ``unmapped_source`` (only when ``mapped`` is given), ``life_unassigned`` and
+    ``host_standup`` (a text-less ``ВЕДУЩИЙ № N`` stub without an assigned take).  ``tech``
+    segments never produce a reason.
     """
     segment_type = segment.get("type")
     if segment_type == "zk":
@@ -361,8 +368,10 @@ def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str 
         return None
 
     status = str(segment.get("match_status") or "")
-    if segment_type == "life":
-        # LIFE is assigned by hand only: a confirmed match with a range, or the placeholder.
+    standup = segment_type == "host" and bool(str(segment.get("host_standup") or "").strip())
+    if segment_type == "life" or standup:
+        # LIFE and a host stand-up stub are assigned by hand only: a confirmed match with a
+        # range, or the placeholder.
         source_id = str(segment.get("source_id") or "")
         if status == "confirmed" and is_exportable_match(
             segment_type,
@@ -372,7 +381,7 @@ def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str 
             segment.get("source_out_sec"),
         ):
             return "unmapped_source" if mapped is not None and source_id not in mapped else None
-        return "life_unassigned"
+        return "host_standup" if standup else "life_unassigned"
     if status == "needs_review" or (status == "confirmed" and segment.get("retime_pending_review")):
         return "needs_review"
     source_id = str(segment.get("source_id") or "")

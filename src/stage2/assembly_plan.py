@@ -22,6 +22,7 @@ _REQUIRED_TYPES = {"zk", "snh", "host", "life"}
 _SKIPPED_REASONS = {"missing_wav", "missing_voiceover"}
 _TASK_BY_REASON = {
     "life_unassigned": "assign_life_material",
+    "host_standup": "assign_host_take",
     "needs_review": "review_match",
     "unmapped_source": "load_source",
     "no_file": "load_source",

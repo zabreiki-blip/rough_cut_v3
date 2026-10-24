@@ -108,6 +108,8 @@ from stage1.normalizer import (
 from stage1.scenario_structure import find_timecodes, normalize_timecode_value
 from stage1.validator import validate_stage1
 from stage2.timeline_parser import (
+    host_standup_remark,
+    is_host_standup,
     is_label_only_sync,
     life_parts,
     normalized_sync_fragments,
@@ -1488,8 +1490,14 @@ def _sync_alignment_units(
     *,
     source_speakers: set[tuple[str, ...]] | None = None,
     preserve_whole_uids: set[str] | None = None,
+    include_host_standup: bool = False,
 ) -> list[dict[str, object]]:
-    """Expand a canonical speaker block into independently matchable pieces."""
+    """Expand a canonical speaker block into independently matchable pieces.
+
+    A text-less host stand-up (``ВЕДУЩИЙ № N``) has nothing to search for, so it yields no
+    unit -- unless ``include_host_standup`` asks for the storable (manually assigned,
+    never auto-matched) unit, like a LIFE one.
+    """
     units: list[dict[str, object]] = []
     last_speaker = {"sync": "", "host": ""}
     for block in blocks:
@@ -1508,6 +1516,21 @@ def _sync_alignment_units(
             if speaker:
                 last_speaker[block_type] = speaker
         if block_type == "sync" and is_label_only_sync(block):
+            continue
+        if is_host_standup(block):
+            if include_host_standup:
+                units.append(
+                    {
+                        "segment_id": parent_uid,
+                        "parent_block_uid": parent_uid,
+                        "fragment_index": 0,
+                        "fragment_count": 1,
+                        "text": host_standup_remark(block),
+                        "timecode_start": "",
+                        "speaker": "",
+                        "block": block,
+                    }
+                )
             continue
         if block_type == "sync":
             fragments = normalized_sync_fragments(
@@ -1626,6 +1649,7 @@ def _sync_job_with_live_summary(job: dict) -> dict:
                     if str(block.get("type") or "").lower() in {"sync", "host", "life"}
                 ],
                 preserve_whole_uids=confirmed_uids,
+                include_host_standup=True,
             )
         }
         matches = [item for item in matches if item.segment_id in valid_ids]

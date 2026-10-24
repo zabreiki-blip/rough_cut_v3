@@ -63,7 +63,7 @@ from .normalization_memory import normalize_marker
 # Bump whenever the structural parse (labels, author numbers, timecodes,
 # technical cues) changes behaviour.  It is part of the LLM cache fingerprint,
 # so a cached answer produced for an older, wrong parse is never reused.
-STRUCTURE_PARSER_VERSION = 2
+STRUCTURE_PARSER_VERSION = 3
 
 # Core label -> block type candidates.  ``normalizer`` passes its own, wider
 # table (``_BUILTIN_MARKERS`` + ``_TECH_MARKERS``); this one covers the
@@ -84,6 +84,9 @@ DEFAULT_MARKER_TYPES: Mapping[str, str] = {
     "стендап": "sync",
     "подводка": "sync",
     "диктор": "voiceover",
+    # ``ОЗВ: 00.10`` -- a voice-over/dub label above somebody else's clip.
+    "озв": "voiceover",
+    "озвучка": "voiceover",
 }
 
 # Normalised marker -> canonical label shown in ``ParagraphStructure.label``.
@@ -102,6 +105,8 @@ _CANONICAL_LABELS: Mapping[str, str] = {
     "life": "ЛАЙФ",
     "стендап": "СТЕНДАП",
     "подводка": "ПОДВОДКА",
+    "озв": "ОЗВ",
+    "озвучка": "ОЗВ",
 }
 
 # Labels that announce a presenter/host without naming them.  They are never a

@@ -143,6 +143,10 @@ _BUILTIN_MARKERS = {
     "закадровый текст": BlockType.VOICEOVER.value,
     "диктор": BlockType.VOICEOVER.value,
     "голос диктора": BlockType.VOICEOVER.value,
+    # ``ОЗВ: 00.10`` / ``ОЗВУЧКА``: a dub over someone else's clip is voiceover.
+    # The verb remark ``ОЗВУЧИТЬ ...`` is a different word and stays a cue.
+    "озв": BlockType.VOICEOVER.value,
+    "озвучка": BlockType.VOICEOVER.value,
     "снх": BlockType.SYNC.value,
     "синхр": BlockType.SYNC.value,
     "синхрон": BlockType.SYNC.value,
@@ -829,6 +833,7 @@ def _generate_normalization_unlocked(
             # (``_split_label`` / LLM boundary); never strip a second time, or
             # speech such as ``ЗК РФ запрещает это.`` loses its first word.
             block.text_for_tts = clean_voiceover_tts_text(block.text_for_tts, strip_zk=False)
+            _strip_dub_timecode(block)
     _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
         source=str(input_path),
@@ -3076,7 +3081,66 @@ def _extract_block_metadata(block: NormalizedBlock) -> None:
         block.speaker = ""
 
 
+_HOST_STANDUP = re.compile(
+    r"^\s*ведущ(?:ий|ая)\s*[-–—]?\s*(?:№|#|N|No\.?)?\s*(?P<number>\d{1,3})(?!\d)(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_HOST_STANDUP_REMARK = re.compile(
+    r"^(?:реквизит|ремарка|примечание|пояснение|съ[её]мка)\s*:", re.IGNORECASE
+)
+_VOICE_DUB_LABELS = frozenset({"озв", "озвучка"})
+_LEADING_TIMECODE = re.compile(
+    rf"^\s*[(\[]?\s*{_TIMECODE_TOKEN}(?:\s*[-–—]\s*{_TIMECODE_TOKEN})?\s*[)\]]?\s*[-–—:.,;]*\s*"
+)
+
+
+def _host_standup_parts(text: str) -> tuple[str, str] | None:
+    """``("№ 3", remark)`` for a host block with only a number (and a remark), else ``None``."""
+    match = _HOST_STANDUP.match(_structural_text(text))
+    if not match:
+        return None
+    rest = match.group("rest").strip()
+    tail = rest.lstrip(":.–—- \t").strip()
+    if tail and not (
+        (tail[0] in "([" and tail[-1] in ")]") or _HOST_STANDUP_REMARK.match(tail)
+    ):
+        return None
+    remark = tail[1:-1].strip() if tail and tail[0] in "([" else tail
+    return f"№ {match.group('number')}", remark
+
+
+def _strip_dub_timecode(block: NormalizedBlock) -> None:
+    """``ОЗВ: 00.10 Текст``: the dub's timecode stays in the metadata, not in the text.
+
+    ``timecode_start`` already holds it; the text to voice starts after it.  An empty
+    rest is reported by the confirmation check ``empty_tts``.
+    """
+    if normalize_marker(block.original_label) not in _VOICE_DUB_LABELS:
+        return
+    head = _LEADING_TIMECODE.match(block.text_for_tts)
+    if not head:
+        return
+    stamp = head.group(0).strip(" \t-–—:.,;")
+    block.text_for_tts = block.text_for_tts[head.end() :].strip()
+    normalized_head = _LEADING_TIMECODE.match(block.normalized_text)
+    if normalized_head:
+        block.normalized_text = block.normalized_text[normalized_head.end() :].strip()
+    if stamp and not block.notes:
+        block.notes = f"ОЗВ {stamp}"
+
+
 def _extract_block_metadata_fields(block: NormalizedBlock) -> None:
+    standup = (
+        _host_standup_parts(block.original_text) if block.type == BlockType.HOST.value else None
+    )
+    if standup:
+        # No text for TTS and no quote to search: a stub card "ВЕДУЩИЙ № N".
+        block.host_standup, remark = standup
+        block.text_for_tts = ""
+        if remark:
+            block.source_description = remark
+    else:
+        block.host_standup = ""
     if block.type == BlockType.LIFE.value:
         life = _LIFE_PREFIX.match(_structural_text(block.original_text))
         block.speaker = ""

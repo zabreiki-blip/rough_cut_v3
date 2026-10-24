@@ -254,6 +254,20 @@ def is_label_only_sync(block: dict) -> bool:
     )
 
 
+def is_host_standup(block: dict) -> bool:
+    """True for a host block that is only ``ВЕДУЩИЙ № N`` (+ remark): a stub, not a quote."""
+    return (
+        str(block.get("type") or "").lower() == "host"
+        and bool(str(block.get("host_standup") or "").strip())
+        and not block.get("absorbed_by_uid")
+    )
+
+
+def host_standup_remark(block: dict) -> str:
+    """Remark of a host stand-up (``Реквизит: ...``, ``смотрит видеохронику``): the card text."""
+    return str(block.get("source_description") or block.get("notes") or "").strip()
+
+
 def normalized_sync_fragments(block: dict, *, preserve_whole: bool = False) -> list[dict[str, str]]:
     """Read canonical fragments and split unconfirmed composite quotes."""
     raw_fragments = block.get("sync_fragments")
@@ -708,6 +722,61 @@ def parse_normalized_timeline(
         if is_label_only_sync(block):
             # Speaker context for the next quote, not a clip: no segment, no
             # placeholder.
+            continue
+
+        if is_host_standup(block):
+            # Text-less stand-up: a stub card "ВЕДУЩИЙ № N" (+ remark) until a take is
+            # assigned by hand (a confirmed match with a range, like LIFE).
+            counters["host"] += 1
+            seg_id = f"host{counters['host']}"
+            match = matches.get(block_uid)
+            match_metadata = field(match, "metadata", {})
+            if not isinstance(match_metadata, dict):
+                match_metadata = {}
+            source_id = str(field(match, "source_id", "") or "")
+            source = sources.get(source_id)
+            source_in = float(field(match, "source_in_sec", 0.0) or 0.0)
+            source_out = float(field(match, "source_out_sec", 0.0) or 0.0)
+            assigned = (
+                str(field(match, "status", "") or "") == "confirmed"
+                and bool(source_id)
+                and source_out > source_in >= 0
+            )
+            number = str(block.get("host_standup") or "").strip()
+            segments.append(
+                TimelineSegment(
+                    id=seg_id,
+                    type="host",
+                    text=host_standup_remark(block),
+                    duration_sec=source_out - source_in if assigned else SNH_PLACEHOLDER_DURATION,
+                    block_uid=block_uid,
+                    revision_status=revision_status,
+                    speaker=f"ВЕДУЩИЙ {number}",
+                    role="СТЕНДАП",
+                    host_standup=number,
+                    source_id=source_id if assigned else "",
+                    sequence_name=(
+                        str(
+                            field(source, "premiere_sequence", field(source, "sequence_name", ""))
+                            or ""
+                        )
+                        if assigned
+                        else ""
+                    ),
+                    sequence_id=str(field(source, "sequence_id", "") or "") if assigned else "",
+                    source_in_sec=source_in if assigned else 0.0,
+                    source_out_sec=source_out if assigned else 0.0,
+                    speech_in_sec=source_in if assigned else 0.0,
+                    speech_out_sec=source_out if assigned else 0.0,
+                    match_status="confirmed" if assigned else "",
+                    match_confidence=float(field(match, "confidence", 0.0) or 0.0)
+                    if assigned
+                    else 0.0,
+                    manual_range=bool(assigned and match_metadata.get("manual_updated_at")),
+                    placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
+                    spoken_text="",
+                )
+            )
             continue
 
         if block_type in {"sync", "host"}:

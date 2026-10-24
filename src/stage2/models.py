@@ -60,6 +60,9 @@ class TimelineSegment:
     voiceover_problem: str = ""
     # placeholder PNG (generated for SNH)
     placeholder_path: str = ""
+    # ``"№ 3"`` for a host stand-up stub (``ВЕДУЩИЙ № 3`` without text): the segment is a
+    # placeholder card until a take is assigned by hand.  Empty for every other segment.
+    host_standup: str = ""
     # Text that is actually expected in speech recognition. The canonical
     # scenario text stays intact in ``text``; older timelines fall back to a
     # deterministic derivation in final_review.
