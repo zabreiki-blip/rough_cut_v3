@@ -457,3 +457,163 @@ def test_unmarked_speech_of_a_skipped_block_is_not_padded_into_neighbour() -> No
             if w not in own and item.source_in_sec < w.end and w.start < item.source_out_sec
         ]
         assert not foreign, (item.block_uid, spans)
+
+
+def test_spelled_numbers_match_digits_in_asr() -> None:
+    text = "В две тысячи пятом году в шестидесятые годы было двадцать пять случаев"
+    doc = scenario(
+        ("voiceover", SENTENCES[0]),
+        ("voiceover", text),
+        ("voiceover", SENTENCES[1]),
+    )
+    rec = Recording()
+    rec.say(SENTENCES[0])
+    start, end = rec.say("В 2005 году в 60 -е годы было 25 случаев")
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "needs_review"
+    assert ranges["b2"].speech_in_sec == pytest.approx(start, abs=0.01)
+    assert ranges["b2"].speech_out_sec == pytest.approx(end, abs=0.01)
+    assert ranges["b3"].speech_in_sec > ranges["b2"].speech_out_sec
+
+
+def test_block_with_unrecognized_head_is_found_by_its_later_words() -> None:
+    text = "Март 2005 года. Авиабаза Уоррен в Вайоминге одна из главных баз ракет"
+    doc = scenario(
+        ("voiceover", SENTENCES[0]),
+        ("voiceover", text),
+        ("voiceover", SENTENCES[1]),
+    )
+    rec = Recording()
+    rec.say(SENTENCES[0])
+    start, end = rec.say("авиабазу Уоррен в Вайоминге одна из главных баз ракет")
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "needs_review"
+    assert ranges["b2"].speech_in_sec == pytest.approx(start, abs=0.01)
+    assert ranges["b2"].speech_out_sec == pytest.approx(end, abs=0.01)
+    assert ranges["b3"].status == "needs_review"
+    assert ranges["b3"].speech_in_sec > ranges["b2"].speech_out_sec
+
+
+def test_unread_tail_does_not_stretch_over_next_block_words() -> None:
+    first = (
+        "В шестидесятые годы на Тайване была программа по созданию ядерного оружия. "
+        "Так что двадцать лет спустя тайваньским инженерам эти устройства без надобности"
+    )
+    second = (
+        "Но что если Тайвань был перевалочным пунктом. Ведь за полтора года груз "
+        "можно доставить куда угодно. Что могли узнать иностранные инженеры, изучив так устройства"
+    )
+    doc = scenario(("voiceover", first), ("voiceover", second), ("voiceover", SENTENCES[1]))
+    rec = Recording()
+    a_start, a_end = rec.say(
+        "В 60 -е годы на Тайване была программа по созданию ядерного оружия", pause=1.0
+    )
+    b_start, b_end = rec.say(second, pause=0.3)
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "needs_review"
+    assert ranges["b2"].speech_in_sec == pytest.approx(b_start, abs=0.01)
+    assert ranges["b1"].speech_out_sec <= ranges["b2"].speech_in_sec
+    assert ranges["b1"].speech_out_sec == pytest.approx(a_end, abs=0.5)
+    assert "частичный дубль" not in ranges["b1"].note
+    assert ranges["b3"].status == "needs_review"
+
+
+def test_rereading_before_the_next_block_keeps_the_last_reading() -> None:
+    first = " ".join(["Интересно как раз в нулевые обвиняют то одну то другую страну"] * 2)
+    second = (
+        "Взрыватели с Тайваня вернули. С другими стрелами повезло меньше. Ядерное оружие исчезло"
+    )
+    doc = scenario(("voiceover", first), ("voiceover", second), ("voiceover", SENTENCES[1]))
+    rec = Recording()
+    rec.say("Интересно как раз в нулевые обвиняют то одну то другую страну", pause=1.0)
+    _, a_end = rec.say("Интересно как раз в нулевые обвиняют то одну то другую страну", pause=0.1)
+    b_start, _ = rec.say(second, pause=1.0)
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "needs_review"
+    assert ranges["b2"].speech_in_sec == pytest.approx(b_start, abs=0.01)
+    assert ranges["b1"].speech_out_sec <= ranges["b2"].speech_in_sec
+
+
+def test_partial_duplicate_never_reaches_words_of_the_next_block() -> None:
+    first = (
+        "Ночью над рекой плывёт густой туман и ветер. "
+        "Утром туман рассеивается над старым каменным мостом"
+    )
+    second = "Утром туман рассеивается над старым каменным мостом. Потом звонят колокола"
+    doc = scenario(("voiceover", first), ("voiceover", second), ("voiceover", SENTENCES[1]))
+    rec = Recording()
+    _, a_end = rec.say("Ночью над рекой плывёт густой густой туман и ветер", pause=1.0)
+    b_start, _ = rec.say(second, pause=0.3)
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "needs_review"
+    assert ranges["b2"].speech_in_sec == pytest.approx(b_start, abs=0.01)
+    assert ranges["b1"].speech_out_sec <= ranges["b2"].speech_in_sec
+
+
+def test_block_read_only_from_its_start_is_found_with_a_note() -> None:
+    text = (
+        "Двадцать пятого марта в Вашингтоне история с ядерными взрывателями утекает в прессу "
+        "и сразу становится сенсацией. Журналисты не стесняются в выражениях и откровенно "
+        "издеваются над генералами: заголовок телеканала начинается со слова упс "
+        "и потом долго обсуждают это в студии и в газетах"
+    )
+    doc = scenario(("voiceover", SENTENCES[0]), ("voiceover", text), ("voiceover", SENTENCES[1]))
+    rec = Recording()
+    rec.say(SENTENCES[0])
+    start, _ = rec.say(
+        "25 марта в Вашингтоне история с ядерными взрывателями утекает в прессу "
+        "и сразу становится сенсацией"
+    )
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "needs_review"
+    assert ranges["b2"].speech_in_sec == pytest.approx(start, abs=0.01)
+    assert "прочитан не полностью" in ranges["b2"].note
+
+
+def test_quote_repeated_from_the_middle_of_a_block_is_not_a_found_block() -> None:
+    text = (
+        "Мне наплевать что она там сказала. Я уверен что они близки к созданию бомбы. "
+        "Иран не может иметь никакого ядерного оружия. Всё очень просто"
+    )
+    doc = scenario(("voiceover", SENTENCES[0]), ("voiceover", text), ("voiceover", SENTENCES[1]))
+    rec = Recording()
+    rec.say(SENTENCES[0])
+    rec.say("Иран не может иметь никакого ядерного оружия. Всё очень просто")
+    rec.say(SENTENCES[1])
+
+    ranges = by_uid(
+        align_voiceover(doc, rec.index(), recording_id="rec_a", duration_sec=rec.duration)
+    )
+
+    assert ranges["b2"].status == "missing"
+    assert ranges["b3"].status == "needs_review"

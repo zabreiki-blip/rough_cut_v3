@@ -33,7 +33,16 @@ import math
 from typing import Any, Mapping, Sequence
 import unicodedata
 
-from stage2.sync_matcher import _STOPWORDS, MatcherConfig, normalize_text
+from stage2.sync_matcher import (
+    _NUMBER_HUNDREDS,
+    _NUMBER_SCALES,
+    _NUMBER_TEENS,
+    _NUMBER_TENS,
+    _NUMBER_UNITS,
+    _STOPWORDS,
+    MatcherConfig,
+    normalize_text,
+)
 from stage2.sync_matcher import _score as phrase_score
 from stage2.sync_models import WordIndex
 from stage2.timeline_parser import _spoken_text
@@ -44,6 +53,9 @@ WIDE_MIN_COVERAGE = 0.8  # after several unread blocks the search window is wide
 DUPLICATE_MIN_COVERAGE = 0.85
 LOW_CONFIDENCE = 0.8
 MAX_CANDIDATES = 25
+PARTIAL_MIN_COVERAGE = 0.35  # a block read only in part: needs a long exact run (below)
+PARTIAL_MIN_RUN = 10  # tokens of one uninterrupted match that prove the block was read
+DEEP_KEYS = 6  # rarest content tokens used to find a block whose head was not recognized
 MIN_SPEECH_SEC = 0.02
 
 
@@ -81,6 +93,8 @@ class _Reading:
     coverage: float
     partial: bool
     prefix: tuple[int, int] | None = None  # false start before the reading (inclusive)
+    run: int = 0  # longest uninterrupted run of matching tokens
+    run_head: bool = False  # that run starts at the beginning of the block
 
 
 @dataclass
@@ -89,6 +103,76 @@ class _Found:
     prefix: tuple[int, int] | None
     ambiguous: bool
     confidence: float
+
+
+_ORDINAL_SUFFIXES = frozenset({"е", "й", "го", "я", "ю", "х", "му", "м", "ми", "ом", "ых", "ым"})
+
+
+def _number_level(token: str) -> tuple[int, int] | None:
+    """(value, place level) of a numeral word stem; ``None`` for other tokens."""
+
+    if token in _NUMBER_UNITS:
+        return _NUMBER_UNITS[token], 1
+    if token in _NUMBER_TEENS:
+        return _NUMBER_TEENS[token], 2
+    if token in _NUMBER_TENS:
+        return _NUMBER_TENS[token], 2
+    if token in _NUMBER_HUNDREDS:
+        return _NUMBER_HUNDREDS[token], 3
+    return None
+
+
+def _merge_numbers(tokens: Sequence[str]) -> list[tuple[str, int, int]]:
+    """Numbers as digits: ``шестидесят`` == ``60``, ``две тысяч пят`` == ``2005``.
+
+    Returns ``(token, first source index, last source index)`` items. A digit token
+    swallows the ordinal ending ASR splits off (``60 -е``, ``2007 го``).
+    """
+
+    result: list[tuple[str, int, int]] = []
+    group = 0
+    first = -1
+    last_level = 0
+    last_index = -1
+
+    def flush() -> None:
+        nonlocal group, first, last_level
+        if first >= 0:
+            result.append((str(group), first, last_index))
+        group, first, last_level = 0, -1, 0
+
+    for index, token in enumerate(tokens):
+        if token.isdigit():
+            flush()
+            result.append((token.lstrip("0") or "0", index, index))
+            continue
+        if token in _ORDINAL_SUFFIXES and result and result[-1][2] == index - 1 and first < 0:
+            if result[-1][0].isdigit():
+                result[-1] = (result[-1][0], result[-1][1], index)
+                continue
+        level = _number_level(token)
+        if level is not None:
+            value, place = level
+            if first >= 0 and place >= last_level:
+                flush()
+            group += value
+            if first < 0:
+                first = index
+            last_level, last_index = place, index
+        elif token in _NUMBER_SCALES:
+            group = (group if first >= 0 else 1) * _NUMBER_SCALES[token]
+            if first < 0:
+                first = index
+            last_level, last_index = 4, index
+        else:
+            flush()
+            result.append((token, index, index))
+    flush()
+    return result
+
+
+def _spoken_tokens(text: str) -> tuple[str, ...]:
+    return tuple(token for token, _, _ in _merge_numbers(normalize_text(text)))
 
 
 def _spoken_hash(text: str) -> str:
@@ -111,7 +195,7 @@ def _active_voiceover_blocks(normalization: Mapping[str, Any]) -> list[_Block]:
         result.append(
             _Block(
                 uid=uid,
-                tokens=tuple(normalize_text(spoken)),
+                tokens=_spoken_tokens(spoken),
                 sha256=_spoken_hash(spoken),
                 display_text=display,
             )
@@ -141,17 +225,21 @@ def _build_stream(part: PartIndex, vocabulary: dict[str, list[str]]) -> _Stream:
         cache[token] = result
         return result
 
+    words: list[tuple[str, float, float]] = []
+    for word in part.index.words:
+        for token in normalize_text(word.word):
+            words.append((token, word.start, word.end))
     canon: list[str] = []
     starts: list[float] = []
     ends: list[float] = []
     positions: dict[str, list[int]] = {}
-    for word in part.index.words:
-        for token in normalize_text(word.word):
+    for token, first, last in _merge_numbers([item[0] for item in words]):
+        if not token.isdigit():
             token = canonical(token)
-            positions.setdefault(token, []).append(len(canon))
-            canon.append(token)
-            starts.append(word.start)
-            ends.append(word.end)
+        positions.setdefault(token, []).append(len(canon))
+        canon.append(token)
+        starts.append(words[first][1])
+        ends.append(words[last][2])
     return _Stream(part.recording_id, part.duration_sec, canon, starts, ends, positions)
 
 
@@ -168,28 +256,74 @@ def _is_weak(tokens: Sequence[str]) -> bool:
     return all(len(token) < 3 or token in _STOPWORDS for token in tokens)
 
 
-def _evaluate(tokens: Sequence[str], stream: _Stream, start: int) -> _Reading | None:
-    """Match ``tokens`` against the ASR window starting at ``start``."""
+def _cluster_end(blocks: Sequence[Any], start: int, step: int) -> int:
+    """Index of the last matching block (walking by ``step``) of the cluster at ``start``."""
+
+    end = start
+    while 0 <= end + step < len(blocks):
+        near, far = (blocks[end], blocks[end + step])
+        if step < 0:
+            near, far = far, near
+        if far.b - (near.b + near.size) > 3:
+            break
+        end += step
+    return end
+
+
+def _trim_outer_fragments(
+    tokens: Sequence[str], window: Sequence[str], blocks: list[Any]
+) -> list[Any]:
+    """Drop tiny matched fragments far from the rest: they only stretch the span.
+
+    A fragment is a cluster (matches at most 3 ASR tokens apart) of at most two
+    tokens: stop words, or any words when the ASR gap to the rest exceeds 5 tokens
+    (the words of the next block that happen to occur in this one). A gap made of
+    this block's own words is a re-reading, not a foreign stretch: the fragment stays.
+    """
+
+    while len(blocks) > 1:
+        for step, start in ((1, 0), (-1, len(blocks) - 1)):
+            end = _cluster_end(blocks, start, step)
+            if end + step < 0 or end + step >= len(blocks):
+                continue  # one cluster only
+            members = blocks[min(start, end) : max(start, end) + 1]
+            size = sum(item.size for item in members)
+            if size > 2:
+                continue
+            neighbour = blocks[end + step]
+            if step > 0:
+                first_gap = members[-1].b + members[-1].size
+                gap = neighbour.b - first_gap
+            else:
+                first_gap = neighbour.b + neighbour.size
+                gap = members[0].b - first_gap
+            own = sum(
+                1
+                for word in window[first_gap : first_gap + gap]
+                if len(word) >= 3 and word in tokens
+            )
+            weak = all(_is_weak(tokens[item.a : item.a + item.size]) for item in members)
+            if (weak and gap > 3) or (gap > 5 and own * 2 < gap):
+                del blocks[min(start, end) : max(start, end) + 1]
+                break
+        else:
+            return blocks
+    return blocks
+
+
+def _evaluate(
+    tokens: Sequence[str], stream: _Stream, start: int, limit: int | None = None
+) -> _Reading | None:
+    """Match ``tokens`` against the ASR window starting at ``start`` (up to ``limit``)."""
 
     size = len(tokens)
-    window = stream.canon[start : start + math.ceil(size * 1.35) + 6]
+    stop = start + math.ceil(size * 1.35) + 6
+    window = stream.canon[start : stop if limit is None else min(stop, limit)]
     if not window:
         return None
     matcher = SequenceMatcher(None, tokens, window, autojunk=False)
     blocks = [block for block in matcher.get_matching_blocks() if block.size]
-    # An isolated stop-word fragment far from the rest must not stretch the span.
-    while len(blocks) > 1:
-        first, second = blocks[0], blocks[1]
-        gap = second.b - (first.b + first.size)
-        if first.size <= 2 and _is_weak(tokens[first.a : first.a + first.size]) and gap > 3:
-            blocks.pop(0)
-            continue
-        last, before = blocks[-1], blocks[-2]
-        gap = last.b - (before.b + before.size)
-        if last.size <= 2 and _is_weak(tokens[last.a : last.a + last.size]) and gap > 3:
-            blocks.pop()
-            continue
-        break
+    blocks = _trim_outer_fragments(tokens, window, blocks)
     if not blocks:
         return None
     matched_positions = {block.b + offset for block in blocks for offset in range(block.size)}
@@ -208,20 +342,50 @@ def _evaluate(tokens: Sequence[str], stream: _Stream, start: int) -> _Reading | 
         end=start + last_index,
         coverage=matched / size,
         partial=repeats > 0,
+        run=max(block.size for block in blocks),
+        run_head=any(block.size >= PARTIAL_MIN_RUN and block.a <= 2 for block in blocks),
     )
 
 
-def _candidate_starts(tokens: Sequence[str], stream: _Stream, low: int, high: int) -> list[int]:
+def _candidate_starts(
+    tokens: Sequence[str], stream: _Stream, low: int, high: int, *, deep: bool = False
+) -> list[int]:
+    """Where a reading of ``tokens`` may begin.
+
+    The first content tokens anchor the block; when its head was not recognized
+    (``deep``) the rarest content tokens of the whole block anchor it instead.
+    """
+
+    if deep:
+        keys = _deep_keys(tokens, stream, low, high)
+    else:
+        keys = _key_tokens(tokens)
     starts: set[int] = set()
-    for offset, token in _key_tokens(tokens):
+    for offset, token in keys:
         places = stream.positions.get(token)
         if not places:
             continue
-        left = bisect.bisect_left(places, low + offset)
+        # a deep key may stand in a block whose earlier words were not recognized
+        left = bisect.bisect_left(places, low if deep else low + offset)
         right = bisect.bisect_left(places, high + offset)
         for position in places[left:right]:
             starts.add(max(low, position - offset))
-    return sorted(starts)[:MAX_CANDIDATES]
+    return sorted(starts)[: MAX_CANDIDATES * (2 if deep else 1)]
+
+
+def _deep_keys(
+    tokens: Sequence[str], stream: _Stream, low: int, high: int
+) -> list[tuple[int, str]]:
+    rarity: dict[str, tuple[int, int]] = {}
+    for offset, token in enumerate(tokens):
+        if len(token) < 4 or token in _STOPWORDS or token in rarity:
+            continue
+        places = stream.positions.get(token, ())
+        count = bisect.bisect_left(places, high) - bisect.bisect_left(places, low)
+        if count:
+            rarity[token] = (count, offset)
+    ranked = sorted(rarity.items(), key=lambda item: item[1])[:DEEP_KEYS]
+    return [(offset, token) for token, (_, offset) in ranked]
 
 
 def _find(
@@ -232,25 +396,49 @@ def _find(
     *,
     margin: float,
     minimum: float,
+    allow_partial_run: bool = False,
 ) -> tuple[_Reading | None, list[_Reading]]:
-    """Earliest reading within ``margin`` of the best coverage (sequential preference)."""
+    """Earliest reading within ``margin`` of the best coverage (sequential preference).
+
+    ``allow_partial_run`` also accepts a block read only in part: low coverage but a
+    long uninterrupted run of matching tokens that starts at the block's beginning
+    (a quote or tail alone may be the same words repeated elsewhere).
+    """
 
     readings: list[_Reading] = []
     seen: set[tuple[int, int]] = set()
-    for start in _candidate_starts(tokens, stream, low, high):
-        reading = _evaluate(tokens, stream, start)
-        if reading is None or (reading.start, reading.end) in seen:
-            continue
-        seen.add((reading.start, reading.end))
-        readings.append(reading)
-    if not readings:
-        return None, []
-    top = max(item.coverage for item in readings)
-    if top < minimum:
+
+    def collect(deep: bool) -> None:
+        for start in _candidate_starts(tokens, stream, low, high, deep=deep):
+            reading = _evaluate(tokens, stream, start)
+            if reading is None or (reading.start, reading.end) in seen:
+                continue
+            seen.add((reading.start, reading.end))
+            readings.append(reading)
+
+    def accepted() -> list[_Reading]:
+        return [
+            item
+            for item in readings
+            if item.coverage >= minimum
+            or (
+                allow_partial_run
+                and item.coverage >= PARTIAL_MIN_COVERAGE
+                and item.run >= PARTIAL_MIN_RUN
+                and item.run_head
+            )
+        ]
+
+    collect(False)
+    if not accepted():
+        collect(True)  # the head of the block may be missing in the recording
+    good = accepted()
+    if not good:
         return None, readings
-    readings.sort(key=lambda item: item.start)
-    chosen = next(item for item in readings if item.coverage >= top - margin)
-    return chosen, readings
+    top = max(item.coverage for item in good)
+    good.sort(key=lambda item: item.start)
+    chosen = next(item for item in good if item.coverage >= top - margin)
+    return chosen, sorted(readings, key=lambda item: item.start)
 
 
 def _restart_prefix(
@@ -296,6 +484,37 @@ def _gap_belongs_to_next_blocks(
     return False
 
 
+def _clip_partial(
+    blocks: Sequence[_Block], position: int, stream: _Stream, reading: _Reading
+) -> _Reading:
+    """A partial reading never reaches words that fit a following block better."""
+
+    if not reading.partial:
+        return reading
+    tokens = blocks[position].tokens
+    cut = reading.end + 1
+    for follower in blocks[position + 1 : position + 4]:
+        if not follower.tokens:
+            continue
+        found, _ = _find(
+            follower.tokens,
+            stream,
+            reading.start + 1,
+            cut,
+            margin=0.0,
+            minimum=FOUND_MIN_COVERAGE,
+        )
+        if found is None or found.start >= cut:
+            continue
+        own = _evaluate(tokens, stream, found.start)
+        if own is not None and own.coverage >= found.coverage:
+            continue  # the text really is this block's own (a repeated phrase)
+        cut = found.start
+    if cut == reading.end + 1:
+        return reading
+    return _evaluate(tokens, stream, reading.start, cut) or reading
+
+
 def _align_part(
     blocks: Sequence[_Block],
     first_block: int,
@@ -322,12 +541,14 @@ def _align_part(
             high,
             margin=config.ambiguity_margin,
             minimum=WIDE_MIN_COVERAGE if wide else FOUND_MIN_COVERAGE,
+            allow_partial_run=not wide,
         )
         if best is None:
             results[position] = None
             misses += 1
             continue
         misses = 0
+        best = _clip_partial(blocks, position, stream, best)
         following = blocks[position + 1] if position + 1 < len(blocks) else None
         prefix = _restart_prefix(tokens, stream, best, cursor)
         readings = [best]
@@ -358,7 +579,7 @@ def _align_part(
                         break  # this reading fits the next block, not a duplicate
                 if _gap_belongs_to_next_blocks(blocks, position, stream, last, again):
                     break  # the tokens in between are the following block(s)
-                readings.append(again)
+                readings.append(_clip_partial(blocks, position, stream, again))
         end = readings[-1].end
         ambiguous = any(
             item.start > end
@@ -588,6 +809,8 @@ def align_voiceover(
             notes.append("неоднозначное совпадение")
         if any(item.near_foreign for item in reading_items):
             notes.append("рядом нераспознанная речь")
+        if any(item.coverage < FOUND_MIN_COVERAGE for item in readings):
+            notes.append("прочитан не полностью")
         if result.confidence < LOW_CONFIDENCE:
             notes.append("низкая уверенность")
         takes: list[Take] = []
