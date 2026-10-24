@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -90,6 +91,30 @@ def _host_path(path: str, *, project: str, project_root: Path) -> str:
     configured = os.getenv("ROUGH_CUT_HOST_PROJECTS_ROOT", "").strip()
     host_projects_root = Path(configured) if configured else project_root.parent
     return str(host_projects_root / project / relative)
+
+
+def _container_path(path: str, *, project: str, project_root: Path) -> str:
+    """Inverse of `_host_path`: host ``<host_root>/<project>/...`` back to ``project_root/...``.
+
+    Only the exact project prefix is translated; every other path is returned unchanged.
+    """
+
+    configured = os.getenv("ROUGH_CUT_HOST_PROJECTS_ROOT", "").strip()
+    if not configured or not path:
+        return path
+    try:
+        relative = Path(path).relative_to(Path(configured) / project)
+    except ValueError:
+        return path
+    if ".." in relative.parts:
+        return path
+    return str(project_root / relative)
+
+
+def _container_resolver(project: str, project_root: Path) -> Callable[[str], str]:
+    """Resolver for filesystem checks on paths that were translated to host paths."""
+
+    return lambda path: _container_path(path, project=project, project_root=project_root)
 
 
 def _host_catalog(catalog: dict, *, project: str, project_root: Path) -> dict:
@@ -517,7 +542,10 @@ def _perform_prepare(
             timeline_data, project=project, project_root=paths["root"]
         )
         unmapped_plan = build_assembly_plan(host_timeline, media_mapping=set())
-        blockers = validate_plan_complete(unmapped_plan)
+        resolve = _container_resolver(project, paths["root"])
+        blockers = validate_plan_complete(
+            unmapped_plan, path_exists=lambda p: os.path.exists(resolve(p))
+        )
         if mode == "complete" and blockers:
             raise AssemblyIncompleteError(blockers, unmapped_plan["summary"])
         return {
@@ -549,7 +577,10 @@ def _perform_prepare(
     mapping, host_catalog, host_timeline, plan = _plan_with_mapping(
         project, services, paths, timeline_data, logical_catalog
     )
-    blockers = validate_plan_complete(plan, catalog=mapping.catalog)
+    resolve = _container_resolver(project, paths["root"])
+    blockers = validate_plan_complete(
+        plan, catalog=mapping.catalog, path_exists=lambda p: os.path.exists(resolve(p))
+    )
     if mode == "complete" and blockers:
         # Fail closed before anything is published: no XML, no mapping and no assembly_plan.json,
         # so the files on disk keep describing the last successful prepare.  The rejected plan is
@@ -564,7 +595,7 @@ def _perform_prepare(
     export_catalog.update(mapping.catalog)
     if progress:
         progress(80, "Генерация nested XML")
-    xml_text = build_nested_xml(host_timeline, export_catalog, plan=plan)
+    xml_text = build_nested_xml(host_timeline, export_catalog, plan=plan, path_resolver=resolve)
     timeline_sha256 = hashlib.sha256(timeline_bytes).hexdigest()
     inputs = stage3_builds.collect_inputs(
         timeline_data=timeline_data,
@@ -574,6 +605,7 @@ def _perform_prepare(
         unmapped_source_ids=mapping.unmapped_source_ids,
         project_root=paths["root"],
         progress=progress,
+        path_resolver=resolve,
     )
     build_id = stage3_builds.compute_build_id(inputs, mode)
     filename = _nested_timeline_filename(project, timeline_data.get("scenario_revision_id"))
@@ -657,13 +689,17 @@ def _perform_plan_check(project: str, services: ModuleType) -> dict:
         mapping, _host_catalog_, _host_timeline, plan = _plan_with_mapping(
             project, services, paths, timeline_data, logical_catalog
         )
-        blockers = validate_plan_complete(plan, catalog=mapping.catalog)
+        resolve = _container_resolver(project, paths["root"])
+        blockers = validate_plan_complete(
+            plan, catalog=mapping.catalog, path_exists=lambda p: os.path.exists(resolve(p))
+        )
     else:
         host_timeline = _host_timeline_paths(
             timeline_data, project=project, project_root=paths["root"]
         )
         plan = build_assembly_plan(host_timeline, media_mapping=set())
-        blockers = validate_plan_complete(plan)
+        resolve = _container_resolver(project, paths["root"])
+        blockers = validate_plan_complete(plan, path_exists=lambda p: os.path.exists(resolve(p)))
     return {
         "project": project,
         "summary": plan["summary"],

@@ -67,22 +67,26 @@ def compute_build_id(inputs: dict, mode: str) -> str:
     return sha256_text(canonical_json(inputs) + mode)[:16]
 
 
-def _stat(path: str) -> tuple[int | None, int | None]:
+def _stat(
+    path: str, path_resolver: Callable[[str], str] | None = None
+) -> tuple[int | None, int | None]:
     try:
-        stat = Path(path).stat()
+        stat = Path(path_resolver(path) if path_resolver else path).stat()
     except OSError:
         return None, None
     return stat.st_size, stat.st_mtime_ns
 
 
-def _cached_wav_sha256(path: str, size: int, mtime_ns: int) -> str | None:
+def _cached_wav_sha256(
+    path: str, size: int, mtime_ns: int, path_resolver: Callable[[str], str] | None = None
+) -> str | None:
     key = (path, size, mtime_ns)
     with _wav_hash_lock:
         cached = _wav_hash_cache.get(key)
     if cached is not None:
         return cached
     try:
-        digest = sha256_file(Path(path))
+        digest = sha256_file(Path(path_resolver(path) if path_resolver else path))
     except OSError:
         return None
     with _wav_hash_lock:
@@ -106,6 +110,7 @@ def wav_inputs(
     *,
     project_root: Path | None = None,
     progress: Callable[[int, str], None] | None = None,
+    path_resolver: Callable[[str], str] | None = None,
 ) -> list[dict]:
     """Full-content identity of every WAV the plan references (missing files get nulls)."""
 
@@ -117,9 +122,9 @@ def wav_inputs(
     wav_items = [(item, path) for item, path in wav_items if path]
     result: list[dict] = []
     for index, (item, path) in enumerate(wav_items, start=1):
-        size, mtime_ns = _stat(path)
+        size, mtime_ns = _stat(path, path_resolver)
         digest = (
-            _cached_wav_sha256(path, size, mtime_ns)
+            _cached_wav_sha256(path, size, mtime_ns, path_resolver)
             if size is not None and mtime_ns is not None
             else None
         )
@@ -168,14 +173,19 @@ def _xml_fields_sha256(source_id: str, entry: object, project_root: Path | None)
     return sha256_text(canonical_json(fields))
 
 
-def source_inputs(catalog: dict, *, project_root: Path | None = None) -> list[dict]:
+def source_inputs(
+    catalog: dict,
+    *,
+    project_root: Path | None = None,
+    path_resolver: Callable[[str], str] | None = None,
+) -> list[dict]:
     """Identity of every catalog source that reaches the XML (size + mtime + XML fields)."""
 
     result: list[dict] = []
     for source_id in sorted(catalog):
         entry = catalog[source_id]
         path = str(_entry_value(entry, "path", "container_path", "media_path") or "")
-        size, mtime_ns = _stat(path) if path else (None, None)
+        size, mtime_ns = _stat(path, path_resolver) if path else (None, None)
         result.append(
             {
                 "source_id": str(source_id),
@@ -197,10 +207,11 @@ def collect_inputs(
     unmapped_source_ids: Iterable[str],
     project_root: Path | None = None,
     progress: Callable[[int, str], None] | None = None,
+    path_resolver: Callable[[str], str] | None = None,
 ) -> dict:
     """Build inputs; ``export_catalog`` is the exact catalog the XML is generated from."""
 
-    sources = source_inputs(export_catalog, project_root=project_root)
+    sources = source_inputs(export_catalog, project_root=project_root, path_resolver=path_resolver)
     settings = {
         "fps": timeline_data.get("fps"),
         "width": timeline_data.get("width"),
@@ -218,7 +229,9 @@ def collect_inputs(
         "timeline_sha256": timeline_sha256,
         "sync_matches_fingerprint": str(timeline_data.get("sync_matches_fingerprint") or ""),
         "settings_sha256": sha256_text(canonical_json(settings)),
-        "wav": wav_inputs(plan, project_root=project_root, progress=progress),
+        "wav": wav_inputs(
+            plan, project_root=project_root, progress=progress, path_resolver=path_resolver
+        ),
         "sources": sources,
         "media_mapping_sha256": sha256_text(canonical_json(media_mapping)),
     }

@@ -8,6 +8,7 @@ be done once without rebuilding the rough cut.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 import math
@@ -146,7 +147,12 @@ def _display_token(value: str) -> str:
     return token or "SOURCE"
 
 
-def _wav_params(path: str) -> tuple[int, int, int]:
+def _wav_params(
+    path: str, path_resolver: Callable[[str], str] | None = None
+) -> tuple[int, int, int]:
+    if path_resolver is not None:
+        # The XML keeps the host path; the file itself is read at its container location.
+        path = path_resolver(path)
     if not Path(path).is_file():
         # In Docker the XMEML path intentionally points at the macOS host and
         # cannot be opened from the container. Stage 1 TTS defaults are stable.
@@ -510,6 +516,7 @@ def _voiceover_clip(
     clip_id: str,
     fps: int,
     recorded_files: dict[str, str] | None = None,
+    path_resolver: Callable[[str], str] | None = None,
 ) -> None:
     start = _frames(segment.start_sec, fps)
     end = max(_frames(segment.end_sec, fps), start + 1)
@@ -555,7 +562,7 @@ def _voiceover_clip(
         _sub(file_element, "pathurl", _path_url(segment.wav_path))
         _rate(file_element, fps)
         _sub(file_element, "duration", file_duration)
-        sample_rate, depth, channels = _wav_params(segment.wav_path)
+        sample_rate, depth, channels = _wav_params(segment.wav_path, path_resolver)
         media = _sub(file_element, "media")
         audio = _sub(media, "audio")
         characteristics = _sub(audio, "samplecharacteristics")
@@ -572,12 +579,15 @@ def build_nested_xml(
     catalog: Mapping[str, object] | Sequence[object],
     *,
     plan: Mapping[str, Any] | None = None,
+    path_resolver: Callable[[str], str] | None = None,
 ) -> str:
     """Return an XMEML v5 project containing viewing and final sequences.
 
     ``plan`` is the assembly plan (``stage2.assembly_plan.build_assembly_plan``) that decides
     whether each segment becomes a nested clip, a placeholder or nothing.  Without it the plan
-    is built from the timeline alone, i.e. without a media mapping.
+    is built from the timeline alone, i.e. without a media mapping.  ``path_resolver`` maps a
+    path written into the XML (host path) to the path readable by this process; it only affects
+    WAV parameter probing, never the emitted ``pathurl``.
     """
 
     full_timeline = _coerce_timeline(timeline)
@@ -721,6 +731,7 @@ def build_nested_xml(
                 clip_id=f"clip-final-{clip_number}-zk",
                 fps=full_timeline.fps,
                 recorded_files=recorded_files,
+                path_resolver=path_resolver,
             )
 
     ET.indent(root, space="  ")
