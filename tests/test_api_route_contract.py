@@ -95,6 +95,7 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage3/jobs/status": {"GET"},
         "/stage3/export/xml": {"GET"},
         "/stage3/plan": {"GET"},
+        "/stage3/status": {"GET"},
         "/stage3/builds": {"GET"},
         "/stage4/revisions": {"GET"},
         "/stage4/inbox": {"GET"},

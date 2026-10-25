@@ -476,15 +476,23 @@ def _perform_scan(
     return {"project": project, **catalog}
 
 
-def _load_current_timeline(project: str, services: ModuleType, paths: dict) -> tuple[bytes, dict]:
-    """Read full_timeline.json and refuse it when normalization or sync matches moved on."""
+def _load_current_timeline(
+    project: str, services: ModuleType, paths: dict, *, confirmed_state: tuple | None = None
+) -> tuple[bytes, dict]:
+    """Read full_timeline.json and refuse it when normalization or sync matches moved on.
+
+    ``confirmed_state`` is an already fetched ``_confirmed_normalization`` result (read-only
+    callers that need the confirmed normalization themselves pass it to avoid a second load).
+    """
 
     timeline_path = paths["work"] / "full_timeline.json"
     if not timeline_path.is_file():
         raise Stage3OperationError("full_timeline.json not found — run Build Timeline first", 404)
     timeline_bytes = timeline_path.read_bytes()
     timeline_data = json.loads(timeline_bytes.decode("utf-8"))
-    confirmed, _reason = services._confirmed_normalization(project)
+    if confirmed_state is None:
+        confirmed_state = services._confirmed_normalization(project)
+    confirmed, _reason = confirmed_state
     if not confirmed or not _timeline_is_current(timeline_data, confirmed):
         raise Stage3OperationError(
             "timeline_rebuild_required: нормализация изменилась после сборки таймлайна",
@@ -552,6 +560,7 @@ def _perform_prepare(
             "project": project,
             "format": "legacy",
             "build_id": None,
+            "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
             "mode": mode,
             "complete": not blockers,
             "blocker_count": len(blockers),
@@ -656,6 +665,7 @@ def _perform_prepare(
         "project": project,
         "format": "nested",
         "build_id": build_id,
+        "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
         "mode": mode,
         "complete": not blockers,
         "blocker_count": len(blockers),
@@ -675,15 +685,15 @@ def _perform_prepare(
     }
 
 
-def _perform_plan_check(project: str, services: ModuleType) -> dict:
-    """Read-only completeness check of the current timeline (no XML, no plan file).
+def _compute_plan(
+    project: str, services: ModuleType, paths: dict, timeline_data: dict
+) -> tuple[dict, list[dict]]:
+    """Assembly plan and completeness blockers of ``timeline_data`` (writes nothing).
 
     It reuses the prepare mapping on the cached ffprobe catalog and skips only the audio
     placeholder cards, which are PNG side effects that do not influence the mapping.
     """
 
-    paths = services._ensure_project(project)
-    _timeline_bytes, timeline_data = _load_current_timeline(project, services, paths)
     logical_catalog = _timeline_catalog(_scan_project_media(project, paths, services))
     if logical_catalog.get("sources"):
         mapping, _host_catalog_, _host_timeline, plan = _plan_with_mapping(
@@ -700,6 +710,15 @@ def _perform_plan_check(project: str, services: ModuleType) -> dict:
         plan = build_assembly_plan(host_timeline, media_mapping=set())
         resolve = _container_resolver(project, paths["root"])
         blockers = validate_plan_complete(plan, path_exists=lambda p: os.path.exists(resolve(p)))
+    return plan, blockers
+
+
+def _perform_plan_check(project: str, services: ModuleType) -> dict:
+    """Read-only completeness check of the current timeline (no XML, no plan file)."""
+
+    paths = services._ensure_project(project)
+    _timeline_bytes, timeline_data = _load_current_timeline(project, services, paths)
+    plan, blockers = _compute_plan(project, services, paths, timeline_data)
     return {
         "project": project,
         "summary": plan["summary"],
@@ -764,6 +783,54 @@ def _trim_jobs_locked(jobs: dict) -> None:
     )
 
 
+def _parse_iso(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _job_build_id(job: dict) -> str:
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    return str(job.get("build_id") or result.get("build_id") or "")
+
+
+def _job_is_superseded(job: dict, builds_dir: Path) -> bool:
+    """True when a finished prepare job no longer describes the latest build.
+
+    A job that created a build is superseded once ``latest`` points elsewhere.  A job without a
+    build (failed, interrupted, legacy export) is superseded when a newer build was published
+    after it finished.  Scan jobs are unrelated to builds.
+    """
+
+    if job.get("kind") != "prepare" or job.get("status") not in _STAGE3_TERMINAL_STATUSES:
+        return False
+    try:
+        latest_id = stage3_builds.load_latest_id(builds_dir)
+    except ValueError:
+        return False
+    if not latest_id:
+        return False
+    job_build_id = _job_build_id(job)
+    if job_build_id:
+        return job_build_id != latest_id
+    latest = stage3_builds.load_build(builds_dir, latest_id)
+    latest_created = _parse_iso((latest or {}).get("created_at"))
+    finished = _parse_iso(job.get("finished_at") or job.get("created_at"))
+    return bool(latest_created and finished and finished < latest_created)
+
+
+def _with_superseded(job: dict, services: ModuleType) -> dict:
+    """Copy of ``job`` with the read-time ``superseded`` flag (never persisted)."""
+
+    annotated = dict(job)
+    annotated["superseded"] = _job_is_superseded(
+        job, _builds_dir(services._project_paths(str(job.get("project") or "")))
+    )
+    return annotated
+
+
 def _update_job(job_id: str, jobs: dict, jobs_lock, services: ModuleType, **updates) -> dict | None:
     with jobs_lock:
         job = jobs.get(job_id)
@@ -786,6 +853,8 @@ def _create_job(project: str, kind: str, jobs: dict, jobs_lock, services: Module
         "message": "Задача поставлена в очередь",
         "result": None,
         "error": "",
+        "build_id": None,
+        "scenario_revision_id": None,
         "created_at": _now_iso(),
         "started_at": None,
         "finished_at": None,
@@ -835,6 +904,8 @@ def _run_job(
             progress=100,
             message=("Просмотровки обновлены" if kind == "scan" else "XML готов"),
             result=result,
+            build_id=result.get("build_id"),
+            scenario_revision_id=result.get("scenario_revision_id"),
             finished_at=_now_iso(),
         )
     except AssemblyIncompleteError as exc:
@@ -996,6 +1067,203 @@ def _current_timeline_inputs(project: str, services: ModuleType, paths: dict) ->
     }
 
 
+def _timeline_issue(exc: Exception, *, confirmed: object = True) -> dict:
+    """Machine-readable reason (and the original message) why the live timeline is unusable."""
+
+    message = str(exc)
+    if isinstance(exc, Stage3OperationError) and exc.status_code == 404:
+        return {"reason": "timeline_missing", "message": message}
+    if isinstance(exc, Stage3OperationError):
+        reason = message.split(":", 1)[0].strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", reason):
+            reason = "timeline_rebuild_required"
+        if not confirmed and reason == "timeline_rebuild_required":
+            reason = "normalization_confirmation_required"
+        return {"reason": reason, "message": message}
+    return {"reason": "timeline_invalid", "message": f"invalid full_timeline.json: {message}"}
+
+
+def _timeline_inputs(timeline_bytes: bytes, timeline_data: dict) -> dict:
+    return {
+        "scenario_revision_id": str(timeline_data.get("scenario_revision_id") or ""),
+        "normalization_revision": timeline_data.get("normalization_revision"),
+        "timeline_sha256": hashlib.sha256(timeline_bytes).hexdigest(),
+        "sync_matches_fingerprint": str(timeline_data.get("sync_matches_fingerprint") or ""),
+    }
+
+
+def _live_timeline(
+    project: str, services: ModuleType, paths: dict, *, confirmed_state: tuple | None = None
+) -> tuple[dict | None, dict | None]:
+    """({data, inputs}, None) for a current timeline, else (None, issue); never raises on that."""
+
+    if confirmed_state is None:
+        confirmed_state = services._confirmed_normalization(project)
+    try:
+        timeline_bytes, data = _load_current_timeline(
+            project, services, paths, confirmed_state=confirmed_state
+        )
+    except (Stage3OperationError, OSError, ValueError) as exc:
+        return None, _timeline_issue(exc, confirmed=confirmed_state[0])
+    return {"data": data, "inputs": _timeline_inputs(timeline_bytes, data)}, None
+
+
+def _latest_build_view(
+    builds_dir: Path, latest_id: str, live: dict | None, issue: dict | None
+) -> dict:
+    """Latest build with its freshness against the live timeline inputs."""
+
+    build = stage3_builds.load_build(builds_dir, latest_id)
+    if build is None:
+        return {
+            "build_id": latest_id,
+            "mode": None,
+            "complete": False,
+            "created_at": None,
+            "summary": None,
+            "is_current": False,
+            "stale_reasons": ["build_missing"],
+        }
+    if live is None:
+        reasons = [(issue or {}).get("reason") or "timeline_rebuild_required"]
+    else:
+        reasons = stage3_builds.build_stale_reasons(build, live["inputs"])
+    return {
+        "build_id": build["build_id"],
+        "mode": build.get("mode"),
+        "complete": bool(build.get("complete")),
+        "created_at": build.get("created_at"),
+        "summary": build.get("summary"),
+        "is_current": not reasons,
+        "stale_reasons": reasons,
+    }
+
+
+def _latest_build_id(builds_dir: Path) -> str | None:
+    try:
+        return stage3_builds.load_latest_id(builds_dir)
+    except ValueError:
+        return None
+
+
+def _latest_job(project: str, jobs: dict, jobs_lock, services: ModuleType) -> dict | None:
+    """Most recently created Stage 3 job (live registry plus persisted files); read-only."""
+
+    with jobs_lock:
+        candidates = {
+            job_id: dict(job) for job_id, job in jobs.items() if job.get("project") == project
+        }
+    for kind in _STAGE3_JOB_KINDS:
+        for persisted in _read_persisted_jobs(project, kind, services):
+            job_id = str(persisted.get("id") or "")
+            if job_id and job_id not in candidates:
+                if persisted.get("status") in {"queued", "running"}:
+                    persisted = {
+                        **persisted,
+                        "status": "interrupted",
+                        "message": "Stage 3 был прерван перезапуском сервера",
+                    }
+                candidates[job_id] = persisted
+    if not candidates:
+        return None
+    return max(candidates.values(), key=lambda item: str(item.get("created_at") or ""))
+
+
+def _processing_view(job: dict | None, active_revision_id: str, builds_dir: Path) -> dict:
+    if job is None:
+        return {
+            "status": "idle",
+            "job_id": None,
+            "kind": None,
+            "progress": 0,
+            "message": "",
+            "error": "",
+            "error_code": None,
+            "created_at": None,
+            "started_at": None,
+            "finished_at": None,
+            "build_id": None,
+            "scenario_revision_id": None,
+            "superseded": False,
+            "stale_revision": False,
+        }
+    job_revision = str(job.get("scenario_revision_id") or "")
+    stale_revision = bool(job_revision) and not _scenario_revision_matches(
+        job_revision, active_revision_id
+    )
+    return {
+        "status": job.get("status") or "idle",
+        "job_id": job.get("id"),
+        "kind": job.get("kind"),
+        "progress": job.get("progress") or 0,
+        "message": job.get("message") or "",
+        "error": job.get("error") or "",
+        "error_code": job.get("error_code"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "build_id": _job_build_id(job) or None,
+        "scenario_revision_id": job_revision or None,
+        "superseded": _job_is_superseded(job, builds_dir) or stale_revision,
+        "stale_revision": stale_revision,
+    }
+
+
+def _assembly_view(plan: dict, blockers: list[dict]) -> dict:
+    by_reason: dict[str, int] = {}
+    for blocker in blockers:
+        reason = str(blocker.get("reason") or "")
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    summary = plan.get("summary") or {}
+    return {
+        "level": "draft" if blockers else "complete_ready",
+        "blocker_count": len(blockers),
+        "blockers_by_reason": {key: by_reason[key] for key in sorted(by_reason)},
+        "blockers": blockers,
+        "placeholders": summary.get("placeholders"),
+        "open_tasks": summary.get("open_tasks", 0),
+    }
+
+
+def _perform_status(project: str, jobs: dict, jobs_lock, services: ModuleType) -> dict:
+    """Three independent readiness dimensions of Stage 3; reads only, writes nothing."""
+
+    paths = services._project_paths(project)
+    builds_dir = _builds_dir(paths)
+    confirmed_state = services._confirmed_normalization(project)
+    active_revision_id = str((confirmed_state[0] or {}).get("scenario_revision_id") or "")
+
+    live, issue = _live_timeline(project, services, paths, confirmed_state=confirmed_state)
+    if live is None:
+        assembly = {"level": "no_timeline", **(issue or {})}
+    else:
+        plan, blockers = _compute_plan(project, services, paths, live["data"])
+        assembly = _assembly_view(plan, blockers)
+
+    latest_id = _latest_build_id(builds_dir)
+    if latest_id:
+        build = _latest_build_view(builds_dir, latest_id, live, issue)
+    else:
+        build = {
+            "build_id": None,
+            "mode": None,
+            "complete": False,
+            "created_at": None,
+            "summary": None,
+            "is_current": False,
+            "stale_reasons": [],
+        }
+    return {
+        "project": project,
+        "active_revision_id": active_revision_id,
+        "processing": _processing_view(
+            _latest_job(project, jobs, jobs_lock, services), active_revision_id, builds_dir
+        ),
+        "build": build,
+        "assembly": assembly,
+    }
+
+
 def _send_build_xml(builds_dir: Path, build: dict, services: ModuleType, *, stale: bool):
     """Serve builds/<id>/timeline.xml after verifying it against build.json."""
 
@@ -1052,7 +1320,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
                     break
         if job is None:
             return services._json_error("job not found", 404)
-        return jsonify({"ok": True, "result": job})
+        return jsonify({"ok": True, "result": _with_superseded(job, services)})
 
     @app.get("/stage3/jobs/status")
     def stage3_job_status_alias():
@@ -1071,7 +1339,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             ]
         if candidates:
             latest = max(candidates, key=lambda item: str(item.get("created_at") or ""))
-            return jsonify({"ok": True, "result": latest})
+            return jsonify({"ok": True, "result": _with_superseded(latest, services)})
         restored_jobs = [
             restored
             for current_kind in ([kind] if kind else _STAGE3_JOB_KINDS)
@@ -1081,7 +1349,7 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error("job not found", 404)
         restored = max(restored_jobs, key=lambda item: str(item.get("created_at") or ""))
         _mark_interrupted(restored, services)
-        return jsonify({"ok": True, "result": restored})
+        return jsonify({"ok": True, "result": _with_superseded(restored, services)})
 
     @app.post("/stage3/media/scan")
     def stage3_media_scan():
@@ -1163,15 +1431,30 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
         # top level for clients that read {summary, complete_ready, blockers} directly.
         return jsonify({"ok": True, "result": result, **result})
 
+    @app.get("/stage3/status")
+    def stage3_status():
+        try:
+            project = services._resolve_project_name(request.args.get("project"))
+            result = _perform_status(project, jobs, jobs_lock, services)
+        except Stage3OperationError as exc:
+            return services._json_error(str(exc), exc.status_code)
+        except (MediaCatalogError, TypeError, ValueError) as exc:
+            return services._json_error(str(exc), 400)
+        except Exception as exc:
+            return services._internal_error(exc)
+        return jsonify({"ok": True, "result": result, **result})
+
     @app.get("/stage3/builds")
     def stage3_builds_history():
         try:
             project = services._resolve_project_name(request.args.get("project"))
-            builds_dir = _builds_dir(services._project_paths(project))
-            try:
-                latest_id = stage3_builds.load_latest_id(builds_dir)
-            except ValueError:
-                latest_id = None
+            paths = services._project_paths(project)
+            builds_dir = _builds_dir(paths)
+            latest_id = _latest_build_id(builds_dir)
+            latest_view = None
+            if latest_id:
+                live, issue = _live_timeline(project, services, paths)
+                latest_view = _latest_build_view(builds_dir, latest_id, live, issue)
             history = [
                 {
                     "build_id": build["build_id"],
@@ -1186,7 +1469,12 @@ def register_stage3_routes(app: Flask, services: ModuleType) -> None:
             return services._json_error(str(exc), 400)
         except Exception as exc:
             return services._internal_error(exc)
-        result = {"project": project, "latest_build_id": latest_id, "builds": history}
+        result = {
+            "project": project,
+            "latest_build_id": latest_id,
+            "latest": latest_view,
+            "builds": history,
+        }
         return jsonify({"ok": True, "result": result, **result})
 
     @app.get("/stage3/export/xml")
