@@ -261,3 +261,63 @@ def test_alignment_units_skip_header_labels(tmp_path: Path) -> None:
     assert [u["block"]["host_standup"] for u in standups] == ["№ 5"]
     texts = normalization_unit_texts(result)
     assert not any(str(t).startswith("№") for t in texts.values())
+
+
+def _save(document: dict, tmp_path: Path) -> dict:
+    """Save a reviewer's edit of ``document`` over the generated file on disk."""
+    return save_normalization(
+        tmp_path / "normalized.json", document, expected_revision=document["revision"]
+    )
+
+
+def test_header_retyped_to_sync_is_a_timeline_segment_again(tmp_path: Path) -> None:
+    generated = copy.deepcopy(_normalize(tmp_path))
+    header = _by_text(generated, "ВЕДУЩИЙ № 1")
+    assert header["label_only"] is True
+    header["type"] = "sync"
+
+    saved = _save(generated, tmp_path)
+
+    header = _by_text(saved, "ВЕДУЩИЙ № 1")
+    assert header["type"] == "sync"
+    assert header["label_only"] is False
+    timeline = _timeline(saved, tmp_path)
+    assert header["uid"] in {s.block_uid for s in timeline.segments}
+
+
+def test_real_sync_label_header_stays_label_only(tmp_path: Path) -> None:
+    generated = _normalize(tmp_path, ["Синх Сторожевой", "Текст интервью."])
+    header = _by_text(generated, "Синх Сторожевой")
+    assert header["label_only"] is True
+
+    saved = _save(generated, tmp_path)
+
+    assert _by_text(saved, "Синх Сторожевой")["label_only"] is True
+
+
+def test_text_retyped_back_to_voiceover_restores_the_placeholder(tmp_path: Path) -> None:
+    generated = copy.deepcopy(_normalize(tmp_path))
+    text = _by_text(generated, "Эта скандальная")
+    text["type"] = "voiceover"
+
+    saved = _save(generated, tmp_path)
+
+    text = _by_text(saved, "Эта скандальная")
+    assert text["type"] == "voiceover" and text["source"] == "manual"
+    header = _by_text(saved, "ВЕДУЩИЙ № 1")
+    assert header["label_only"] is False
+    assert header["host_standup"] == "№ 1"
+    timeline = _timeline(saved, tmp_path)
+    assert "№ 1" in [s.host_standup for s in timeline.segments if s.type == "host"]
+
+
+def test_absorbed_text_restores_the_placeholder(tmp_path: Path) -> None:
+    generated = copy.deepcopy(_normalize(tmp_path))
+    header = _by_text(generated, "ВЕДУЩИЙ № 1")
+    text = _by_text(generated, "Эта скандальная")
+    text["absorbed_by_uid"] = _by_text(generated, "ЗК1.1")["uid"]
+
+    saved = _save(generated, tmp_path)
+
+    assert _by_text(saved, "ВЕДУЩИЙ № 1")["label_only"] is False
+    assert header["uid"] == _by_text(saved, "ВЕДУЩИЙ № 1")["uid"]

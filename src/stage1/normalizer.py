@@ -3185,6 +3185,17 @@ def _apply_host_standup_text(
     Returns the UIDs of the blocks that changed.
     """
     changed: list[str] = []
+    for header in blocks:
+        # A header the reviewer retyped (e.g. to ``sync``) is no stand-up label any more:
+        # ``label_only`` set by this rule would hide it from the timeline and the checks.
+        # A real ``Синх <Имя>`` header has neither ``host_standup`` nor a stand-up text.
+        if (
+            header.label_only
+            and header.type != BlockType.HOST.value
+            and (header.host_standup.strip() or _host_standup_parts(header.original_text))
+        ):
+            header.label_only = False
+            changed.append(header.uid)
     for index, header in enumerate(blocks):
         if not _is_standup_header(header):
             continue
