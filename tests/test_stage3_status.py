@@ -147,6 +147,7 @@ def test_status_complete_build_is_current(client) -> None:
     assert build["complete"] is True
     assert build["is_current"] is True
     assert build["stale_reasons"] == []
+    assert build["live_timeline_unavailable_reason"] is None
     assert build["created_at"]
 
 
@@ -248,7 +249,8 @@ def test_status_build_is_not_current_when_live_timeline_is_stale(client) -> None
     result = _status(http)
 
     assert result["build"]["is_current"] is False
-    assert result["build"]["stale_reasons"] == ["timeline_rebuild_required"]
+    assert result["build"]["stale_reasons"] == []
+    assert result["build"]["live_timeline_unavailable_reason"] == "timeline_rebuild_required"
     assert result["assembly"]["level"] == "no_timeline"
 
 
@@ -275,15 +277,93 @@ def test_status_processing_reports_completed_job_with_build(client) -> None:
 
 
 def test_status_processing_failed_job_without_any_build_is_not_superseded(client) -> None:
-    http, _paths = _complete_setup(client, extra=NEEDS_REVIEW)
+    http, paths = _complete_setup(client, extra=NEEDS_REVIEW)
     client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    _rewrite_timeline(paths, scenario_revision_id="rev_0001")
+    _confirm(client, scenario_revision_id="rev_0001")
 
-    http.post("/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "complete"})
+    started = http.post(
+        "/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "complete"}
+    ).get_json()["result"]
     processing = _status(http)["processing"]
 
     assert processing["status"] == "failed"
-    assert processing["superseded"] is False
+    assert processing["superseded"] is False  # same revision and timeline as now
     assert processing["error"] == "assembly_incomplete"
+    assert processing["scenario_revision_id"] == "rev_0001"  # recorded at job start
+    job = http.get(started["status_url"]).get_json()["result"]
+    assert job["scenario_revision_id"] == "rev_0001"
+    assert job["timeline_sha256"]
+    assert job["superseded"] is False
+
+
+def test_failed_job_of_another_revision_is_superseded(client) -> None:
+    http, paths = _complete_setup(client, extra=NEEDS_REVIEW)
+    client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    _rewrite_timeline(paths, scenario_revision_id="rev_0001")
+    _confirm(client, scenario_revision_id="rev_0001")
+    started = http.post(
+        "/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "complete"}
+    ).get_json()["result"]
+    _rewrite_timeline(paths, scenario_revision_id="rev_0002")
+    _confirm(client, scenario_revision_id="rev_0002")
+
+    processing = _status(http)["processing"]
+    job = http.get(started["status_url"]).get_json()["result"]
+
+    assert processing["status"] == "failed"
+    assert processing["stale_revision"] is True
+    assert processing["superseded"] is True
+    assert job["superseded"] is True
+    assert job["stale_revision"] is True
+
+
+def test_failed_job_of_an_older_timeline_is_superseded(client) -> None:
+    http, paths = _complete_setup(client, extra=NEEDS_REVIEW)
+    client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    started = http.post(
+        "/stage3/jobs/prepare/start", json={"project": "BRIK", "mode": "complete"}
+    ).get_json()["result"]
+    _append_life(paths, "l9", 10.0)
+
+    job = http.get(started["status_url"]).get_json()["result"]
+
+    assert job["status"] == "failed"
+    assert job["superseded"] is True
+    assert _status(http)["processing"]["superseded"] is True
+
+
+def _persist_running_prepare_job(paths, *, created_at: str) -> None:
+    job = {
+        "id": "oldjob",
+        "project": "BRIK",
+        "kind": "prepare",
+        "status": "running",
+        "progress": 40,
+        "message": "x",
+        "result": None,
+        "error": "",
+        "created_at": created_at,
+        "started_at": created_at,
+        "finished_at": None,
+    }
+    (paths["work"] / "stage3_prepare_job_status.json").write_text(json.dumps(job), encoding="utf-8")
+
+
+def test_interrupted_job_superseded_is_the_same_on_both_read_paths(client) -> None:
+    http, paths = _complete_setup(client)
+    _persist_running_prepare_job(paths, created_at="2020-01-01T00:00:00+00:00")
+    assert _prepare(http).status_code == 200  # a build published after the job was created
+
+    via_status = _status(http)["processing"]
+    via_alias = http.get("/stage3/jobs/status?project=BRIK&kind=prepare").get_json()["result"]
+    via_status_after = _status(http)["processing"]  # alias persisted the interrupted state
+
+    assert via_status["status"] == "interrupted"
+    assert via_alias["status"] == "interrupted"
+    assert via_status["superseded"] is True
+    assert via_alias["superseded"] is True
+    assert via_status_after["superseded"] is True
 
 
 def test_failed_job_older_than_latest_build_is_superseded(client) -> None:
@@ -349,3 +429,202 @@ def test_scan_job_is_never_superseded_by_a_build(client) -> None:
 
     assert job["kind"] == "scan"
     assert job["superseded"] is False
+
+
+# --- invalid / failing timeline (M1, M2) ---------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", '"text"', "5", "{broken"])
+def test_status_invalid_timeline_is_no_timeline_not_500(client, raw) -> None:
+    http, paths = _complete_setup(client)
+    _prepare(http, "complete")
+    (paths["work"] / "full_timeline.json").write_text(raw, encoding="utf-8")
+
+    result = _status(http)
+
+    assert result["assembly"]["level"] == "no_timeline"
+    assert result["assembly"]["reason"] == "timeline_invalid"
+    assert result["build"]["live_timeline_unavailable_reason"] == "timeline_invalid"
+    assert result["build"]["is_current"] is False
+    builds = http.get("/stage3/builds?project=BRIK")
+    assert builds.status_code == 200
+    assert builds.get_json()["result"]["latest"]["is_current"] is False
+
+
+def test_status_does_not_mask_unexpected_timeline_errors(client) -> None:
+    http, _paths = _complete_setup(client)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("unexpected")
+
+    client[2].setattr(api_stage3_routes, "_load_current_timeline", boom)
+
+    assert http.get("/stage3/status?project=BRIK").status_code == 500
+
+
+def test_status_plan_failure_is_level_error_with_processing_and_build(client) -> None:
+    http, _paths = _complete_setup(client)
+    _prepare(http, "complete")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("plan exploded")
+
+    client[2].setattr(api_stage3_routes, "_compute_plan", boom)
+
+    response = http.get("/stage3/status?project=BRIK")
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    assert result["assembly"]["level"] == "error"
+    assert result["assembly"]["reason"] == "plan_failed"
+    assert "plan exploded" in result["assembly"]["message"]
+    assert result["processing"]["status"] == "idle"
+    assert result["build"]["mode"] == "complete"
+    assert result["build"]["is_current"] is True
+
+
+# --- read-only guarantees (B1) -------------------------------------------------------------
+
+
+def _tree_snapshot(root) -> dict:
+    snapshot = {}
+    for item in sorted(root.rglob("*")):
+        stat = item.stat()
+        snapshot[item.relative_to(root).as_posix()] = (
+            item.is_dir(),
+            0 if item.is_dir() else stat.st_size,
+            0 if item.is_dir() else stat.st_mtime_ns,
+        )
+    return snapshot
+
+
+def _real_scan_setup(client):
+    """Timeline plus two review files on disk, one with a cached ffprobe entry, one without."""
+    from stage3 import media_catalog
+
+    http, app, monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    paths = services._ensure_project("BRIK")
+    reviews = paths["root"] / "media" / "reviews"
+    reviews.mkdir(parents=True)
+    paths["work"].mkdir(parents=True, exist_ok=True)
+    (reviews / "cached.mp4").write_bytes(b"aaa")
+    metadata = {
+        "duration_sec": 10.0,
+        "fps": 25.0,
+        "width": 1920,
+        "height": 1080,
+        "media_kind": "video",
+        "has_audio": True,
+    }
+    monkeypatch.setattr(media_catalog, "probe_media", lambda *_a, **_k: dict(metadata))
+    media_catalog.scan_media_directory(str(reviews), media_root=paths["root"])  # fills the cache
+    (reviews / "fresh.mp4").write_bytes(b"bbb")  # never probed
+    (paths["work"] / "full_timeline.json").write_text(
+        json.dumps(
+            {
+                "project": "BRIK",
+                "fps": 25,
+                "normalization_revision": "norm-1",
+                "segments": [_segment("l1", "life", 0.0, 2.0)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def counting_probe(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("GET /stage3/status must not run ffprobe")
+
+    monkeypatch.setattr(media_catalog, "probe_media", counting_probe)
+    return http, paths, calls
+
+
+def test_status_is_read_only_and_never_probes_media(client) -> None:
+    http, paths, calls = _real_scan_setup(client)
+    services = client[1].config["TEST_STAGE3_SERVICES"]
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("status must not call _ensure_project")
+
+    services._ensure_project = forbidden
+    before = _tree_snapshot(paths["root"])
+
+    result = _status(http)
+
+    assert calls == []
+    assert _tree_snapshot(paths["root"]) == before
+    assert result["assembly"]["catalog_incomplete"] is True
+    assert result["assembly"]["uncached_media_files"] == 1
+    assert result["assembly"]["level"] in {"draft", "complete_ready"}
+
+
+def test_status_without_ffprobe_cache_file_creates_nothing(client) -> None:
+    http, paths, calls = _real_scan_setup(client)
+    (paths["work"] / "stage3_ffprobe_cache.json").unlink()
+    before = _tree_snapshot(paths["root"])
+
+    result = _status(http)
+
+    assert calls == []
+    assert _tree_snapshot(paths["root"]) == before
+    assert result["assembly"]["uncached_media_files"] == 2
+
+
+def test_status_for_missing_project_is_404_and_creates_nothing(client, tmp_path) -> None:
+    http, app, _monkeypatch = client
+    services = app.config["TEST_STAGE3_SERVICES"]
+    ghost = {
+        "root": tmp_path / "projects" / "GHOST",
+        "work": tmp_path / "projects" / "GHOST" / "work",
+    }
+    services._project_paths = lambda _project: ghost
+    services._ensure_project = lambda _project: (_ for _ in ()).throw(AssertionError("mkdir"))
+
+    response = http.get("/stage3/status?project=GHOST")
+
+    assert response.status_code == 404
+    assert not ghost["root"].exists()
+
+
+def test_scan_media_directory_cache_only_neither_probes_nor_writes(tmp_path, monkeypatch) -> None:
+    from stage3 import media_catalog
+
+    root = tmp_path / "proj"
+    reviews = root / "media"
+    reviews.mkdir(parents=True)
+    (reviews / "a.mp4").write_bytes(b"a")
+    monkeypatch.setattr(
+        media_catalog, "probe_media", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError)
+    )
+
+    catalog = media_catalog.scan_media_directory(str(reviews), media_root=root, cache_only=True)
+
+    assert catalog["sources"] == []
+    assert catalog["uncached_files"] == 1
+    assert not (root / "work").exists()
+
+
+def test_confirmed_normalization_read_only_skips_activation_recovery(tmp_path, monkeypatch) -> None:
+    import api
+    from stage4 import versioning
+    from test_stage2_sync_api import _write_confirmed_normalization
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    monkeypatch.setattr(api, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(api, "ROOT_DIR", tmp_path)
+    _write_confirmed_normalization(projects)
+
+    def forbidden(_paths):
+        raise AssertionError("read-only normalization lookup must not recover activations")
+
+    monkeypatch.setattr(versioning, "recover_interrupted_activation", forbidden)
+
+    document, reason = api._confirmed_normalization_read_only("demo")
+
+    assert reason in {"confirmed", "source_changed"}
+    assert reason != "revision_state_conflict"
+    with pytest.raises(AssertionError):
+        api._confirmed_normalization("demo")  # the regular lookup still recovers

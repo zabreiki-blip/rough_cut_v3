@@ -21,13 +21,23 @@
 1. `processing` — состояние последней задачи: `idle|queued|running|completed|failed|interrupted`
    + `job_id`, `finished_at`, `build_id` (если задача создала сборку), `scenario_revision_id`.
 2. `build` — последняя сборка: `build_id`, `mode` (`draft|complete`), `created_at`, `is_current` (bool),
-   `stale_reasons` (список изменившихся входов: `normalization_revision`, `scenario_revision_id`,
-   `sync_matches_fingerprint`, `timeline_sha256`).
+   `stale_reasons` (только изменившиеся входы: `normalization_revision`, `scenario_revision_id`,
+   `sync_matches_fingerprint`, `timeline_sha256`; `build_missing`, если build.json пропал) и
+   `live_timeline_unavailable_reason` (почему входы не с чем сравнить: `timeline_missing`,
+   `timeline_rebuild_required`, `timeline_invalid`, ...; иначе `null`). При недоступном живом таймлайне
+   `is_current=false`, а `stale_reasons` пуст: причина не маскируется под изменившийся вход.
 3. `assembly` — текущая готовность по живому плану (без записи): `level`:
-   - `no_timeline` — нет актуального таймлайна (с причиной, напр. `timeline_rebuild_required`);
+   - `no_timeline` — нет актуального таймлайна; `reason` + `message` (`timeline_missing`,
+     `timeline_rebuild_required`, `normalization_confirmation_required`, `timeline_invalid` — файл не
+     читается/не JSON-объект);
+   - `error` — таймлайн актуален, но построение плана упало: `reason="plan_failed"`, `message`.
+     `processing` и `build` при этом возвращаются как обычно (HTTP 200);
    - `draft` — есть блокеры; `blocker_count`, `blockers_by_reason`, `blockers[]` (segment_id, reason, detail);
    - `complete_ready` — блокеров нет.
    `placeholders` (segments, duration_sec, by_reason) и `open_tasks` из `plan.summary`.
+   Каталог медиа берётся только из кэша ffprobe (`work/stage3_ffprobe_cache.json`): статус не запускает
+   ffprobe и ничего не пишет. Файлы без записи в кэше не попадают в каталог; это отражают
+   `catalog_incomplete` и `uncached_media_files` (план по неполному каталогу может показывать лишние блокеры).
 
 Правило: «Сборка без пропусков» показывается только при `build.mode == complete && build.is_current`.
 Черновая сборка всегда подписана «Черновик: N пропусков». Результат задачи, чей `build_id != latest` или
@@ -36,9 +46,14 @@
 ## API
 
 - Новый `GET /stage3/status?project=` → `{project, active_revision_id, processing, build, assembly}`.
-  Только чтение; `assembly` считается тем же кодом, что `_perform_plan_check`.
-- Job: добавить в запись `build_id` и `scenario_revision_id` (из result при завершении); при чтении job,
-  относящегося не к latest build, отдавать `superseded: true`.
+  Строго только чтение и дёшево: без `mkdir` (несуществующий проект → 404), без ffprobe, без записи кэша,
+  без восстановления прерванной активации редакции (`_confirmed_normalization_read_only`);
+  `assembly` считается тем же `_compute_plan`, что и `_perform_plan_check`.
+- Job: `scenario_revision_id` и `timeline_sha256` пишутся в запись при СТАРТЕ prepare-задачи (до результата,
+  поэтому есть и у failed/interrupted); `build_id` — из result при завершении. При чтении `superseded: true`,
+  если задача относится не к latest build, либо её редакция (`stale_revision`) или таймлайн
+  (`stale_timeline`) не совпадают с текущими. Задача без сборки при тех же редакции и таймлайне не superseded.
+  Для `interrupted` время сравнения с latest build — `started_at` (одинаково на всех путях чтения).
 - `GET /stage3/builds`: добавить `is_current` и `stale_reasons` для latest.
 - `/stage2/export/xml`: вне scope этапа; зафиксировать в отчёте как известный обход (отдельная задача).
 

@@ -784,4 +784,5 @@ def test_builds_history_marks_latest_stale_when_timeline_is_not_current(client) 
     body = http.get("/stage3/builds?project=BRIK").get_json()
 
     assert body["latest"]["is_current"] is False
-    assert body["latest"]["stale_reasons"] == ["timeline_rebuild_required"]
+    assert body["latest"]["stale_reasons"] == []
+    assert body["latest"]["live_timeline_unavailable_reason"] == "timeline_rebuild_required"
