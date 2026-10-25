@@ -352,7 +352,8 @@ export function standupUnits() {
   if (!Array.isArray(blocks)) return [];
   return blocks
     .filter((block) => String(block.type || "").toLowerCase() === "host"
-      && String(block.host_standup || "").trim() && String(block.uid || "") && !block.absorbed_by_uid)
+      && String(block.host_standup || "").trim() && String(block.uid || "") && !block.absorbed_by_uid
+      && !block.label_only)
     .map((block) => ({
       id: String(block.uid),
       standup: String(block.host_standup).trim(),

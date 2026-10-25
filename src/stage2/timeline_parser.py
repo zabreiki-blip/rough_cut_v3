@@ -254,12 +254,25 @@ def is_label_only_sync(block: dict) -> bool:
     )
 
 
+def is_host_standup_label(block: dict) -> bool:
+    """True for a ``ВЕДУЩИЙ № N`` header whose text is the next host block(s).
+
+    Like a ``Синх <Имя>`` header it only announces the stand-up: no segment, no card.
+    """
+    return (
+        str(block.get("type") or "").lower() == "host"
+        and bool(str(block.get("host_standup") or "").strip())
+        and bool(block.get("label_only"))
+    )
+
+
 def is_host_standup(block: dict) -> bool:
     """True for a host block that is only ``ВЕДУЩИЙ № N`` (+ remark): a stub, not a quote."""
     return (
         str(block.get("type") or "").lower() == "host"
         and bool(str(block.get("host_standup") or "").strip())
         and not block.get("absorbed_by_uid")
+        and not block.get("label_only")
     )
 
 
@@ -722,6 +735,10 @@ def parse_normalized_timeline(
         if is_label_only_sync(block):
             # Speaker context for the next quote, not a clip: no segment, no
             # placeholder.
+            continue
+
+        if is_host_standup_label(block):
+            # Header of a stand-up whose text is the following host block(s).
             continue
 
         if is_host_standup(block):

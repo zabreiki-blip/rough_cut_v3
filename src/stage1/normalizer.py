@@ -713,6 +713,8 @@ def _generate_normalization_unlocked(
             ):
                 _extract_block_metadata(block)
         _annotate_scene_context(blocks)
+        # ``ВЕДУЩИЙ № N`` + its text: decided here, so the LLM never guesses voiceover.
+        _apply_host_standup_text(blocks, video_cue_re)
         unresolved = [
             block
             for block in blocks
@@ -898,6 +900,8 @@ def _generate_normalization_unlocked(
             if ABSORBED_LINK_LOST_WARNING not in block.warnings:
                 block.warnings.append(ABSORBED_LINK_LOST_WARNING)
         _flag_changed_scene_openers(scenario.blocks)
+    # Reviewed fields restored above may pin a block: settle the stand-ups again.
+    _apply_host_standup_text(scenario.blocks)
     scenario_payload = scenario.to_dict()
     if previous is not None:
         # The re-parse is a comparable draft: the replaced revision (often a
@@ -1229,6 +1233,8 @@ def _save_normalization_unlocked(
             block.reviewed_warnings = []
             block.manually_edited = False
             block.manual_fields = []
+    # Deterministic, LLM-free: also repairs documents normalized before the rule existed.
+    _apply_host_standup_text(incoming.blocks)
     _flag_changed_scene_openers(incoming.blocks)
     incoming.status = NormalizationStatus.DRAFT.value
     incoming.confirmed_at = ""
@@ -1330,6 +1336,8 @@ def _confirm_normalization_unlocked(
     source_path = Path(source_path_override) if source_path_override else Path(scenario.source)
     if not source_path.exists() or _file_hash(source_path) != scenario.source_hash:
         raise SourceChangedError("Source scenario changed after normalization")
+    # Deterministic, LLM-free: also repairs documents normalized before the rule existed.
+    _apply_host_standup_text(scenario.blocks)
     issues = [
         issue
         for issue in validate_for_confirmation_detailed(scenario)
@@ -3107,6 +3115,98 @@ def _host_standup_parts(text: str) -> tuple[str, str] | None:
         return None
     remark = tail[1:-1].strip() if tail and tail[0] in "([" else tail
     return f"№ {match.group('number')}", remark
+
+
+_HOST_LABELS = frozenset({"ведущий", "ведущая"})
+_STANDUP_TEXT_TYPES = frozenset(
+    {BlockType.VOICEOVER.value, BlockType.UNKNOWN.value, BlockType.HOST.value}
+)
+
+
+def _is_standup_header(block: NormalizedBlock) -> bool:
+    return bool(block.type == BlockType.HOST.value and block.host_standup.strip())
+
+
+def _standup_text_pinned(block: NormalizedBlock) -> bool:
+    """True when a reviewer (or an accepted label) already decided what this block is."""
+    return bool(
+        block.manually_edited
+        or block.manual_fields
+        or block.source == DecisionSource.MANUAL.value
+        or block.label_confirmed
+    )
+
+
+def _standup_text_run(
+    blocks: list[NormalizedBlock],
+    header_index: int,
+    video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+) -> list[NormalizedBlock]:
+    """Text blocks that follow a ``ВЕДУЩИЙ № N`` header up to the next label."""
+    run: list[NormalizedBlock] = []
+    for block in blocks[header_index + 1 :]:
+        if block.absorbed_by_uid:
+            continue
+        label = normalize_marker(block.original_label)
+        if (
+            block.type not in _STANDUP_TEXT_TYPES
+            or block.label_only
+            or _is_standup_header(block)
+            or (label and label not in _HOST_LABELS)
+            or not block.normalized_text.strip()
+        ):
+            break
+        if block.type != BlockType.HOST.value and (
+            _standup_text_pinned(block)
+            or AMBIGUOUS_CAPS_WARNING in block.warnings
+            or block.suggested_type == BlockType.TECHNICAL.value
+            or _looks_like_video_cue(block.original_text, video_cue_re)
+        ):
+            break
+        run.append(block)
+    return run
+
+
+def _apply_host_standup_text(
+    blocks: list[NormalizedBlock],
+    video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE,
+) -> list[str]:
+    """``ВЕДУЩИЙ № N`` followed by text: the header is a label, the text is the host's.
+
+    The stand-up text is a separate block under the header and runs up to the next
+    label (``ЗК1.1``, ``СНХ``, ``ЛАЙФ``, another ``ВЕДУЩИЙ``).  Such blocks become
+    ``host`` (replacing a guessed ``voiceover``/``unknown``, never a reviewer's decision:
+    ``manually_edited`` / ``manual_fields`` / ``label_confirmed`` / manual source stop the
+    run) and the header turns ``label_only``: no timeline segment, no placeholder card.
+    The header's remark moves to ``notes`` of the first text block (unless the reviewer
+    owns its notes; the header keeps it in ``source_description`` either way).  A header
+    without text stays the placeholder card.  Deterministic and idempotent.
+
+    Returns the UIDs of the blocks that changed.
+    """
+    changed: list[str] = []
+    for index, header in enumerate(blocks):
+        if not _is_standup_header(header):
+            continue
+        run = _standup_text_run(blocks, index, video_cue_re)
+        if header.label_only != bool(run):
+            header.label_only = bool(run)
+            changed.append(header.uid)
+        for position, block in enumerate(run):
+            before = (block.type, block.speaker, block.notes)
+            if block.type != BlockType.HOST.value:
+                _apply_type(block, BlockType.HOST.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+                block.continuation_of_type = ""
+            if not block.speaker.strip():
+                block.speaker = "ВЕДУЩИЙ"
+            remark = header.source_description.strip()
+            if position == 0 and "notes" not in block.manual_fields:
+                note = f"ВЕДУЩИЙ {header.host_standup.strip()}" + (f": {remark}" if remark else "")
+                if not block.notes.strip() or block.notes.startswith("ВЕДУЩИЙ №"):
+                    block.notes = note
+            if before != (block.type, block.speaker, block.notes):
+                changed.append(block.uid)
+    return changed
 
 
 def _strip_dub_timecode(block: NormalizedBlock) -> None:

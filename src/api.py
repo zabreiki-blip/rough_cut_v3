@@ -110,6 +110,7 @@ from stage1.validator import validate_stage1
 from stage2.timeline_parser import (
     host_standup_remark,
     is_host_standup,
+    is_host_standup_label,
     is_label_only_sync,
     life_parts,
     normalized_sync_fragments,
@@ -1516,6 +1517,8 @@ def _sync_alignment_units(
             if speaker:
                 last_speaker[block_type] = speaker
         if block_type == "sync" and is_label_only_sync(block):
+            continue
+        if is_host_standup_label(block):
             continue
         if is_host_standup(block):
             if include_host_standup:

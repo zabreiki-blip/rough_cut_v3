@@ -73,6 +73,7 @@ def normalization_unit_texts(
     from stage2.timeline_parser import (
         host_standup_remark,
         is_host_standup,
+        is_host_standup_label,
         is_label_only_sync,
         normalized_sync_fragments,
         sync_fragment_id,
@@ -86,6 +87,8 @@ def normalization_unit_texts(
         block_type = str(block.get("type") or "").lower()
         uid = str(block.get("uid") or "").strip()
         if block_type not in types or not uid:
+            continue
+        if is_host_standup_label(block):
             continue
         if is_host_standup(block):
             texts[uid] = host_standup_remark(block)
