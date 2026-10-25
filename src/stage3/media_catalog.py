@@ -186,11 +186,12 @@ def _fingerprint(relative_path: str, size: int, mtime_ns: int) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _metadata_cache_path(media_root: Path) -> Path:
+def _metadata_cache_path(media_root: Path, *, create: bool = True) -> Path:
     root = media_root.resolve()
     work = root / "work"
     try:
-        work.mkdir(parents=True, exist_ok=True)
+        if create:
+            work.mkdir(parents=True, exist_ok=True)
         resolved_work = work.resolve(strict=True)
     except OSError as exc:
         raise MediaCatalogError("cannot create the Stage 3 metadata cache directory") from exc
@@ -264,14 +265,31 @@ def scan_media_directory(
     recursive: bool = False,
     media_root: Path = DEFAULT_MEDIA_ROOT,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    cache_only: bool = False,
 ) -> dict[str, Any]:
+    """Catalog the media files of ``directory``.
+
+    ``cache_only`` is the read-only mode: it never runs ffprobe, never creates the ``work``
+    directory and never writes the cache.  Files without a valid cache entry are left out of
+    ``sources`` and counted in ``uncached_files``.
+    """
+
     root = media_root.resolve()
     resolved = resolve_media_directory(
         directory,
         media_root=media_root,
     )
-    cache_path = _metadata_cache_path(root)
+    if cache_only:
+        try:
+            cache_path = _metadata_cache_path(root, create=False)
+        except MediaCatalogError:
+            cache_path = root / "work" / CACHE_FILENAME  # absent work/: empty cache
+            if cache_path.parent.exists():
+                raise
+    else:
+        cache_path = _metadata_cache_path(root)
     cached_entries = _load_metadata_cache(cache_path)
+    uncached_files = 0
     # One project cache is shared by both supported review folders. Preserve
     # entries outside this scan; switching folders must not make unchanged
     # media pay for ffprobe again.
@@ -299,6 +317,9 @@ def scan_media_directory(
             extension=extension,
         )
         if metadata is None:
+            if cache_only:
+                uncached_files += 1
+                continue
             metadata = probe_media(safe_path, run=run)
         cache_entry = {
             "size_bytes": stat.st_size,
@@ -339,11 +360,14 @@ def scan_media_directory(
             and cached_path not in scanned_paths
         ):
             del next_entries[cached_path]
-    if next_entries != cached_entries:
+    if next_entries != cached_entries and not cache_only:
         atomic_write_json(cache_path, {"version": CACHE_VERSION, "entries": next_entries})
-    return {
+    catalog: dict[str, Any] = {
         "directory": str(resolved),
         "relative_directory": resolved.relative_to(root).as_posix(),
         "recursive": recursive,
         "sources": [source.to_dict() for source in sources],
     }
+    if cache_only:
+        catalog["uncached_files"] = uncached_files
+    return catalog

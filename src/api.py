@@ -160,7 +160,11 @@ from stage4.revision_assets import (
     revision_speaker_alias_dir,
     save_tts_manifest as save_voiceover_tts_manifest,
 )
-from stage4.versioning import inspect_revision_state, repair_active_revision_metadata
+from stage4.versioning import (
+    _detect_revision_state,
+    inspect_revision_state,
+    repair_active_revision_metadata,
+)
 
 
 _DEFAULT_SYNC_AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024
@@ -573,7 +577,13 @@ def _normalization_source_is_current(document: dict, project_root: Path) -> bool
     return current_hash == expected_hash
 
 
-def _confirmed_normalization(project: str) -> tuple[dict | None, str]:
+def _confirmed_normalization_read_only(project: str) -> tuple[dict | None, str]:
+    """Same answer as ``_confirmed_normalization`` but never finishes an interrupted activation."""
+
+    return _confirmed_normalization(project, recover=False)
+
+
+def _confirmed_normalization(project: str, *, recover: bool = True) -> tuple[dict | None, str]:
     paths = _project_paths(project)
     normalized_path = paths["normalized"]
     if not normalized_path.exists():
@@ -583,7 +593,8 @@ def _confirmed_normalization(project: str) -> tuple[dict | None, str]:
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None, "invalid"
     try:
-        if inspect_revision_state(paths).get("blocking"):
+        revision_state = inspect_revision_state(paths) if recover else _detect_revision_state(paths)
+        if revision_state.get("blocking"):
             return None, "revision_state_conflict"
     except (OSError, ValueError):
         return None, "revision_state_conflict"

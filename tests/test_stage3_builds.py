@@ -709,3 +709,80 @@ def test_build_id_from_real_plan_changes_with_range_and_replaced_recording(tmp_p
     wav.write_bytes(b"b" * 64)
     os.utime(wav, ns=(3_000_000_000, 3_000_000_000))
     assert build_id(40.0) != base
+
+
+# --- is_current / stale_reasons ------------------------------------------------------------
+
+
+def test_build_stale_reasons_lists_every_changed_input() -> None:
+    build = {
+        "inputs": {
+            "timeline_sha256": "t1",
+            "sync_matches_fingerprint": "f1",
+            "scenario_revision_id": "rev_1",
+            "normalization_revision": "n1",
+        }
+    }
+    assert stage3_builds.build_stale_reasons(build, {}) == []
+    changed = {
+        "normalization_revision": "n2",
+        "scenario_revision_id": "rev_2",
+        "sync_matches_fingerprint": "f2",
+        "timeline_sha256": "t2",
+    }
+    assert stage3_builds.build_stale_reasons(build, changed) == [
+        "normalization_revision",
+        "scenario_revision_id",
+        "sync_matches_fingerprint",
+        "timeline_sha256",
+    ]
+    assert stage3_builds.build_stale_reasons(build, {"timeline_sha256": "t2"}) == [
+        "timeline_sha256"
+    ]
+    # legacy empty values are not a mismatch, same as build_is_current
+    assert stage3_builds.build_stale_reasons({"inputs": {}}, {"timeline_sha256": "t2"}) == []
+
+
+def test_builds_history_reports_is_current_and_stale_reasons_for_latest(client) -> None:
+    http, paths = _complete_setup(client)
+    old = _prepare(http).get_json()["result"]
+
+    body = http.get("/stage3/builds?project=BRIK").get_json()
+    assert body["latest"]["build_id"] == old["build_id"]
+    assert body["latest"]["is_current"] is True
+    assert body["latest"]["stale_reasons"] == []
+
+    _append_life(paths, "l9", 10.0)
+    body = http.get("/stage3/builds?project=BRIK").get_json()
+    assert body["latest_build_id"] == old["build_id"]
+    assert body["latest"]["is_current"] is False
+    assert body["latest"]["stale_reasons"] == ["timeline_sha256"]
+    assert body["result"]["latest"]["stale_reasons"] == ["timeline_sha256"]
+
+    new = _prepare(http).get_json()["result"]
+    body = http.get("/stage3/builds?project=BRIK").get_json()
+    assert body["latest"]["build_id"] == new["build_id"]
+    assert body["latest"]["is_current"] is True
+
+
+def test_builds_history_without_builds_has_no_latest(client) -> None:
+    http, _app, _monkeypatch = client
+
+    body = http.get("/stage3/builds?project=BRIK").get_json()
+
+    assert body["latest_build_id"] is None
+    assert body["latest"] is None
+    assert body["builds"] == []
+
+
+def test_builds_history_marks_latest_stale_when_timeline_is_not_current(client) -> None:
+    http, _paths = _complete_setup(client)
+    _prepare(http)
+    services = client[1].config["TEST_STAGE3_SERVICES"]
+    services._confirmed_normalization = lambda _project: ({"revision": "norm-2"}, "")
+
+    body = http.get("/stage3/builds?project=BRIK").get_json()
+
+    assert body["latest"]["is_current"] is False
+    assert body["latest"]["stale_reasons"] == []
+    assert body["latest"]["live_timeline_unavailable_reason"] == "timeline_rebuild_required"

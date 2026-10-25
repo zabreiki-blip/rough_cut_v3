@@ -517,6 +517,7 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 | GET | `/stage3/jobs/status` | `stage3_job_status_alias` |
 | POST | `/stage3/media/scan` | `stage3_media_scan` |
 | GET | `/stage3/plan` | `stage3_plan_check` |
+| GET | `/stage3/status` | `stage3_status` |
 | POST | `/stage3/timeline/prepare` | `stage3_timeline_prepare` |
 | GET | `/stage4/diffs/<diff_id>` | `stage4_diff_get` |
 | GET | `/stage4/inbox` | `stage4_inbox` |

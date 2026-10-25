@@ -285,28 +285,35 @@ def verify_build_xml(builds_dir: Path, build: dict) -> Path:
     return path
 
 
-def build_is_current(build: dict, current: dict) -> bool:
-    """True when the build still matches ``current`` (a subset of the build inputs).
+def build_stale_reasons(build: dict, current: dict) -> list[str]:
+    """Names of the build inputs that no longer match ``current`` (empty list: still current).
 
     Only keys present in ``current`` are compared.  Empty values stored by legacy artifacts do
     not count as a mismatch (same rules as the pre-build download check).
     """
 
     stored = build.get("inputs") if isinstance(build.get("inputs"), dict) else {}
+    reasons: list[str] = []
     if "normalization_revision" in current:
         value = stored.get("normalization_revision")
         if value not in (None, "") and value != current["normalization_revision"]:
-            return False
+            reasons.append("normalization_revision")
     if "scenario_revision_id" in current and not _scenario_revision_matches(
         stored.get("scenario_revision_id"), current["scenario_revision_id"]
     ):
-        return False
+        reasons.append("scenario_revision_id")
     for key in ("sync_matches_fingerprint", "timeline_sha256"):
         if key in current:
             value = str(stored.get(key) or "")
             if value and value != str(current[key] or ""):
-                return False
-    return True
+                reasons.append(key)
+    return reasons
+
+
+def build_is_current(build: dict, current: dict) -> bool:
+    """True when the build still matches ``current`` (a subset of the build inputs)."""
+
+    return not build_stale_reasons(build, current)
 
 
 def list_builds(builds_dir: Path) -> list[dict]:

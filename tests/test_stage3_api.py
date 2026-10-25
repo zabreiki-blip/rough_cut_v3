@@ -1633,3 +1633,42 @@ def test_stage3_plan_endpoint_requires_timeline(client) -> None:
     response = http.get("/stage3/plan?project=BRIK")
 
     assert response.status_code == 404
+
+
+def test_prepare_job_persists_build_id_and_scenario_revision(client) -> None:
+    http, paths = _complete_setup(client)
+    client[2].setattr(api_stage3_routes.threading, "Thread", _ImmediateThread)
+    timeline_path = paths["work"] / "full_timeline.json"
+    data = json.loads(timeline_path.read_text(encoding="utf-8"))
+    data["scenario_revision_id"] = "rev_0003"
+    timeline_path.write_text(json.dumps(data), encoding="utf-8")
+
+    started = http.post("/stage3/jobs/prepare/start", json={"project": "BRIK"}).get_json()["result"]
+    job = http.get(started["status_url"]).get_json()["result"]
+
+    assert job["status"] == "completed"
+    assert job["build_id"] == job["result"]["build_id"]
+    assert job["build_id"]
+    assert job["scenario_revision_id"] == "rev_0003"
+    persisted = json.loads(
+        (paths["work"] / "stage3_prepare_job_status.json").read_text(encoding="utf-8")
+    )
+    assert persisted["build_id"] == job["build_id"]
+    assert persisted["scenario_revision_id"] == "rev_0003"
+    assert "superseded" not in persisted  # computed on read, never stored
+
+
+def test_new_job_has_empty_build_identity_and_keeps_existing_fields(client) -> None:
+    http, _app, monkeypatch = client
+    _HoldingThread.instances.clear()
+    monkeypatch.setattr(api_stage3_routes.threading, "Thread", _HoldingThread)
+
+    started = http.post("/stage3/jobs/scan/start", json={"project": "BRIK"}).get_json()["result"]
+    job = http.get(started["status_url"]).get_json()["result"]
+
+    assert job["status"] == "queued"
+    assert job["build_id"] is None
+    assert job["scenario_revision_id"] is None
+    assert job["superseded"] is False
+    for field in ("id", "project", "kind", "progress", "message", "result", "error", "created_at"):
+        assert field in job
