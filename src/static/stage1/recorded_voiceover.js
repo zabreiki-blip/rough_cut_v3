@@ -8,7 +8,7 @@
 
 import { ids, project } from "./state.js";
 import {
-  toast, appendLog, requestJSON, getJSON, escaped, safely, readyBlocksSummary,
+  toast, appendLog, requestJSON, getJSON, escaped, safely, readyBlocksSummary, openTab,
 } from "./core.js";
 import { refreshStatus } from "./normalization.js";
 
@@ -216,6 +216,16 @@ function renderJob(job) {
   setText(ids.rv_job_status, jobSummaryText(job));
   if (ids.rv_job_status) ids.rv_job_status.dataset.state = job ? job.status : "idle";
   if (ids.btn_rv_cancel) ids.btn_rv_cancel.hidden = !isJobActive(job);
+  if (ids.rv_global_status) {
+    ids.rv_global_status.hidden = !job;
+    ids.rv_global_status.dataset.state = job ? job.status : "idle";
+  }
+  const globalText = !job
+    ? ""
+    : job.status === "completed"
+      ? "Запись диктора: сопоставление завершено — проверьте блоки."
+      : `Запись диктора: ${jobSummaryText(job)}`;
+  setText(ids.rv_global_status_text, globalText);
 }
 
 function renderApply(state) {
@@ -539,6 +549,12 @@ function onBlocksClick(event) {
 }
 
 if (ids.rv_blocks) ids.rv_blocks.addEventListener("click", onBlocksClick);
+if (ids.btn_rv_global_open) {
+  ids.btn_rv_global_open.addEventListener("click", () => {
+    openTab("voiceover");
+    setVoiceMode("recorded", { user: true });
+  });
+}
 if (ids.voice_mode_tts) ids.voice_mode_tts.addEventListener("click", () => setVoiceMode("tts", { user: true }));
 if (ids.voice_mode_recorded) {
   ids.voice_mode_recorded.addEventListener("click", () => {

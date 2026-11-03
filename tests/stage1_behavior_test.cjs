@@ -80,6 +80,7 @@ class Element {
   showModal() { this.open = true; }
   close() { this.open = false; }
   focus() {}
+  scrollIntoView(options) { this.scrollIntoViewCalls = (this.scrollIntoViewCalls || 0) + 1; this.scrollIntoViewOptions = options; }
   querySelector() { return new Element(); }
   querySelectorAll() { return []; }
 }
@@ -1981,7 +1982,7 @@ const cardFor = (ids, uid) => cardsOf(ids).filter((item) => item.dataset.uid ===
 const issueOf = (code, order, message, severity = "error", uid = "a") => ({ code, uid, order, message, severity });
 
 // Plan section 6: preview summary before confirm, blocking issues never reach /confirm.
-async function testConfirmPreviewSummaryAndBlocking({ state, normalization }) {
+async function testConfirmPreviewSummaryAndBlocking({ state, normalization, core }) {
   const { ids, appState } = state;
   const h = normalizationRaceHarness({ state });
   globalThis.requestAnimationFrame = globalThis.requestAnimationFrame || ((fn) => fn());
@@ -2018,6 +2019,11 @@ async function testConfirmPreviewSummaryAndBlocking({ state, normalization }) {
     assert.ok(html.includes('data-goto-uid="a"') && html.includes("Предупреждения (1)"), html);
     assert.ok(html.includes("Начало сцены изменилось"), html);
     assert.ok(ids.norm_issue_position.textContent.includes("из"), "blocked block joins the review queue");
+    ids.normalization_confirm_summary.scrollIntoViewCalls = 0;
+    await core.safely(() => normalization.confirmNormalization());
+    assert.ok(ids.normalization_confirm_summary.scrollIntoViewCalls > 0, "preview blockers scroll the summary into view");
+    assert.ok(ids.log_box.textContent.includes("служебная метка") && ids.log_box.textContent.includes("Блок #1"), ids.log_box.textContent);
+    assert.ok(!ids.log_box.textContent.includes("Начало сцены изменилось"), "warnings are excluded from failure diagnostics");
 
     // Navigation to the reason's block highlights it like the issue navigation does.
     ids.normalization_blocks.children = [];
@@ -2039,7 +2045,7 @@ async function testConfirmPreviewSummaryAndBlocking({ state, normalization }) {
 }
 
 // A rejected confirm (422) shows structured reasons; new codes never fall back to raw text.
-async function testConfirmRejectedShowsRussianReasons({ state, normalization }) {
+async function testConfirmRejectedShowsRussianReasons({ state, normalization, core }) {
   const { ids, appState } = state;
   const h = normalizationRaceHarness({ state });
   try {
@@ -2052,8 +2058,10 @@ async function testConfirmRejectedShowsRussianReasons({ state, normalization }) 
       ["unmatched_speech", "Block 1 lost 5 of 9 spoken words (e.g. 'слово')"],
       ["unknown_type", "Block 1 has unknown type"],
       ["sync_no_speaker", "Sync block 1 has no speaker"],
+      ["speaker_not_a_person", "Block 1 speaker 'Закадр' is not a person"],
     ];
     const issues = messages.map(([code, message]) => issueOf(code, 1, message));
+    issues.push(issueOf("service_label_in_tts", 9, "Block 9 has a service label", "error", "removed"));
     for (const issue of issues) {
       const text = normalization.describeIssue(issue);
       assert.notStrictEqual(text, issue.message, `${issue.code}: raw fallback`);
@@ -2062,6 +2070,7 @@ async function testConfirmRejectedShowsRussianReasons({ state, normalization }) 
     assert.ok(normalization.describeIssue(issues[1]).includes("Роль / должность"));
     assert.ok(normalization.describeIssue(issues[4]).includes("00:10:05"));
     assert.ok(normalization.describeIssue(issues[5]).includes("5 из 9"));
+    assert.ok(normalization.describeIssue(issues[8]).includes("Закадр") && normalization.describeIssue(issues[8]).includes("если это закадровый текст"));
 
     globalThis.fetch = async (url) => {
       const target = String(url);
@@ -2074,7 +2083,16 @@ async function testConfirmRejectedShowsRussianReasons({ state, normalization }) 
     };
     h.reset("original", 5);
     appState.normalization.blocks[0].uid = "a";
-    await assert.rejects(normalization.confirmNormalization(), /Сервер отклонил подтверждение: ошибок 8/);
+    ids.normalization_confirm_summary.scrollIntoViewCalls = 0;
+    ids.log_box.textContent = "";
+    appState.normalization.blocks = [
+      { uid: "b", order: 1, type: "life" },
+      { uid: "a", order: 2, type: "voiceover" },
+    ];
+    await core.safely(() => normalization.confirmNormalization());
+    assert.ok(ids.normalization_confirm_summary.scrollIntoViewCalls > 0, "422 rejection scrolls the summary into view");
+    assert.ok(ids.log_box.textContent.includes("служебная метка") && ids.log_box.textContent.includes("Блок #2"), ids.log_box.textContent);
+    assert.ok(ids.log_box.textContent.includes("Блок #9"), "stale uid falls back to the server issue order");
     const html = ids.normalization_confirm_summary.innerHTML;
     assert.ok(html.includes("сервер отклонил подтверждение") && html.includes('data-goto-uid="a"'), html);
     assert.ok(html.includes("служебная метка") && html.includes("Потерян фрагмент склейки"), html);
@@ -2459,13 +2477,26 @@ async function testRecordedJobRestoredAfterReload({ state }) {
     try {
       await rv.restoreRecordedJob();
       assert.ok(ids.rv_job_status.textContent.includes("идёт сопоставление"), ids.rv_job_status.textContent);
+      assert.strictEqual(ids.rv_global_status.hidden, false, "restored active work is visible globally");
+      assert.ok(ids.rv_global_status_text.textContent.includes("идёт сопоставление (25%)"), ids.rv_global_status_text.textContent);
       assert.strictEqual(rv.canApplyRecording(rv.getRecordedState()), false, "apply is blocked while the job runs");
       assert.strictEqual(scheduled.length, 1, "polling of the restored job must be scheduled");
       jobDone.value = true;
       await scheduled[0]();
       assert.ok(mock.calls.some((call) => call.path === `${RV}/jobs/job1`));
       assert.ok(ids.rv_job_status.textContent.includes("готово"), ids.rv_job_status.textContent);
+      assert.strictEqual(ids.rv_global_status.hidden, false, "completed result remains visible");
+      assert.strictEqual(ids.rv_global_status.dataset.state, "completed");
+      assert.ok(ids.rv_global_status_text.textContent.includes("проверьте блоки"), ids.rv_global_status_text.textContent);
+      assert.ok(ids.rv_global_status_text.textContent.includes("сопоставление завершено"), ids.rv_global_status_text.textContent);
+      ids.btn_rv_global_open.dispatch("click");
+      assert.strictEqual(ids.recorded_panel.hidden, false, "banner action opens recorded voiceover mode");
       assert.strictEqual(scheduled.length, 1, "no further polling after the terminal status");
+      rv.setRecordedState(rvFixture());
+      assert.strictEqual(ids.rv_global_status.hidden, true, "banner is hidden when there is no job");
+      rv.setRecordedState(rvFixture({ job: { id: "job1", status: "completed" } }));
+      assert.strictEqual(ids.rv_global_status.hidden, false, "a terminal job restored after reload remains visible");
+      assert.ok(ids.rv_global_status_text.textContent.includes("сопоставление завершено"), ids.rv_global_status_text.textContent);
     } finally {
       window.setTimeout = originalSetTimeout;
     }

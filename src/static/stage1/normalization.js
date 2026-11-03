@@ -210,6 +210,7 @@ const issueMessages = {
   speech_direction_in_tts: () => "В тексте для TTS осталась ремарка (например «голос за кадром») — удалите её, она не должна озвучиваться",
   editorial_cue_in_voiceover: () => "Закадровый блок содержит монтажную ремарку, а не текст диктора — смените тип на «Технический» или оставьте только текст диктора",
   sync_no_speaker: () => "У синхрона не указан спикер — заполните поле «Спикер»",
+  speaker_not_a_person: () => "Указанный спикер не распознан как человек — проверьте поле «Спикер»; если это закадровый текст, выберите тип «Закадр»",
   sync_direction_as_speaker: () => "В поле «Спикер» записана ремарка («читает», «поёт»), а не имя — укажите имя героя, ремарку перенесите в «Заметку»",
   sync_only_credit: () => "Блок содержит только подпись героя без речи — добавьте текст синхрона или удалите блок",
   sync_speaker_conflict: () => "Спикер не совпадает с подписью в исходнике — сверьте поля «Спикер» и «Исходное обозначение»",
@@ -285,6 +286,17 @@ function renderConfirmationSummary({ ttsCount = null, rejected = false } = {}) {
     ${errors.length ? `<ul class="confirm-issue-list">${errors.map(renderIssueItem).join("")}</ul>` : ""}
     ${warnings.length ? `<details><summary>Предупреждения (${warnings.length})</summary><ul class="confirm-issue-list">${warnings.map(renderIssueItem).join("")}</ul></details>` : ""}
     <small>Список обновляется при каждой попытке подтверждения.</small>`;
+}
+
+function confirmationFailureMessage(prefix) {
+  const errors = confirmationIssues.filter((issue) => issue.severity === "error");
+  const reasons = errors.map((issue) => `${issueBlockLabel(issue)}: ${describeIssue(issue)}`);
+  const count = errors.length;
+  return `${prefix}: блокирующих ошибок ${count}. ${reasons.join("; ")}`;
+}
+
+function scrollConfirmationSummary() {
+  ids.normalization_confirm_summary.scrollIntoView?.({ behavior: "smooth", block: "start" });
 }
 
 function syncBlockFromFragments(block) {
@@ -713,7 +725,8 @@ export async function confirmNormalization() {
   const blockingCount = confirmationIssues.filter((issue) => issue.severity === "error").length;
   if (blockingCount) {
     renderNormalization();
-    throw new Error(`Подтверждение не отправлено: блокирующих ошибок ${blockingCount}. Причины показаны над списком блоков`);
+    scrollConfirmationSummary();
+    throw new Error(confirmationFailureMessage("Подтверждение не отправлено"));
   }
   const candidates = preview.candidates || [];
   const learningDecisions = candidates.length ? await chooseLearningDecisions(candidates) : [];
@@ -729,8 +742,8 @@ export async function confirmNormalization() {
       setConfirmationFeedback(issues);
       renderConfirmationSummary({ ttsCount, rejected: true });
       renderNormalization();
-      const count = confirmationIssues.filter((issue) => issue.severity === "error").length;
-      throw new Error(`Сервер отклонил подтверждение: ошибок ${count}. Причины показаны над списком блоков`);
+      scrollConfirmationSummary();
+      throw new Error(confirmationFailureMessage("Сервер отклонил подтверждение"));
     }
     throw err;
   }

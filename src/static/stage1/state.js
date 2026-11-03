@@ -7,6 +7,22 @@ export const initialStatus = window.__STAGE1_STATUS__ || {};
 
 const el = (id) => document.getElementById(id);
 
+// A running server can retain an older compiled template. Mount the status
+// there too, so updated UI assets work without interrupting background jobs.
+if (!el("rv_global_status")) {
+  const tabs = document.querySelector(".workspace-tabs");
+  if (tabs) {
+    const status = document.createElement("section");
+    status.id = "rv_global_status";
+    status.className = "rv-global-status";
+    status.hidden = true;
+    status.setAttribute("aria-label", "Состояние записи диктора");
+    status.innerHTML = '<p id="rv_global_status_text" role="status" aria-live="polite" aria-atomic="true"></p>'
+      + '<button id="btn_rv_global_open" class="btn btn-sm" type="button">Открыть запись</button>';
+    tabs.before(status);
+  }
+}
+
 export const ids = {
   readiness_panel: el("readiness_panel"),
   readiness_summary_badge: el("readiness_summary_badge"),
@@ -164,6 +180,9 @@ export const ids = {
   btn_rv_apply: el("btn_rv_apply"),
   rv_recordings: el("rv_recordings"),
   rv_job_status: el("rv_job_status"),
+  rv_global_status: el("rv_global_status"),
+  rv_global_status_text: el("rv_global_status_text"),
+  btn_rv_global_open: el("btn_rv_global_open"),
   rv_notice: el("rv_notice"),
   rv_message: el("rv_message"),
   rv_blocks: el("rv_blocks"),

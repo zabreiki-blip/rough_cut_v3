@@ -1135,6 +1135,57 @@ def test_cancelled_sync_checkpoint_blocks_partial_timeline_build(sync_api) -> No
     assert response.get_json()["error"].startswith("sync_job_interrupted:")
 
 
+def test_sync_start_reports_active_voiceover_job(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    with api._VOICEOVER_RUNTIME.lock:
+        api._VOICEOVER_RUNTIME.active_projects.add("demo")
+
+    try:
+        with patch.object(api.threading, "Thread", side_effect=AssertionError("worker launched")):
+            response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    finally:
+        with api._VOICEOVER_RUNTIME.lock:
+            api._VOICEOVER_RUNTIME.active_projects.discard("demo")
+
+    assert response.status_code == 409
+    assert "распознавания закадра" in response.get_json()["error"]
+    assert "дожд" in response.get_json()["error"].lower()
+
+
+def test_sync_start_reports_active_sync_job(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+    with api._SYNC_JOBS_LOCK:
+        api._SYNC_ACTIVE_PROJECTS.add("demo")
+
+    try:
+        with patch.object(api.threading, "Thread", side_effect=AssertionError("worker launched")):
+            response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+    finally:
+        with api._SYNC_JOBS_LOCK:
+            api._SYNC_ACTIVE_PROJECTS.discard("demo")
+
+    assert response.status_code == 409
+    assert "сопоставления СНХ" in response.get_json()["error"]
+
+
+def test_sync_start_reports_generic_conflict_if_owner_finishes_during_lookup(
+    sync_api,
+) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    assert _post_source(client).status_code == 201
+
+    with patch.object(api, "_reserve_sync_project", return_value=False):
+        response = client.post("/stage2/sync-jobs/start", json={"project": "demo"})
+
+    assert response.status_code == 409
+    assert "дожд" in response.get_json()["error"].lower()
+
+
 def test_cancelled_queued_sync_worker_releases_project_without_loading_inputs(
     sync_api,
 ) -> None:

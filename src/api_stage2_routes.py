@@ -522,7 +522,23 @@ def _stage2_sync_job_start(services: ModuleType):
         except InvalidOperation:
             pass
     if not services._reserve_sync_project(project):
-        return services._json_error(f"sync job already active for project {project}", 409)
+        active_owner = None
+        for registry in services.iter_job_registries():
+            with registry.lock:
+                if project in registry.active_projects:
+                    active_owner = registry.label
+                    break
+        if active_owner is None:
+            message = (
+                f"Для проекта {project} уже выполняется задача. "
+                "Дождитесь её завершения и повторите запуск синхронизации СНХ."
+            )
+        else:
+            message = (
+                f"Для проекта {project} уже выполняется задача {active_owner}. "
+                "Дождитесь её завершения и повторите запуск синхронизации СНХ."
+            )
+        return services._json_error(message, 409)
 
     try:
         job = services._create_sync_job(project)
