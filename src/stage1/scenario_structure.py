@@ -63,7 +63,7 @@ from .normalization_memory import normalize_marker
 # Bump whenever the structural parse (labels, author numbers, timecodes,
 # technical cues) changes behaviour.  It is part of the LLM cache fingerprint,
 # so a cached answer produced for an older, wrong parse is never reused.
-STRUCTURE_PARSER_VERSION = 3
+STRUCTURE_PARSER_VERSION = 4
 
 # Core label -> block type candidates.  ``normalizer`` passes its own, wider
 # table (``_BUILTIN_MARKERS`` + ``_TECH_MARKERS``); this one covers the
@@ -677,6 +677,22 @@ def find_timecodes(text: str, *, header_zone: bool = False) -> list[TimecodeSpan
         first = _interpret(match)
         index += 1
         if first is None:
+            continue
+        # A dotted three-component token after an editorial date marker is a
+        # publication date, not a timecode (``Эфир 10.11.26``).  Real dotted
+        # timecodes in credits are either prefixed by a speaker/label or use a
+        # zero hour, and remain covered by the normal rules below.
+        if (
+            first.hours is not None
+            and first.separator == "."
+            and first.raw.count(".") == 2
+            and re.search(
+                r"(?:эфир|выпуск|версия|дата|от)\s*$",
+                text[: match.start()],
+                re.IGNORECASE,
+            )
+            and not text[: match.start()].rstrip().endswith(("(", "["))
+        ):
             continue
         last: Timecode | None = None
         joiner = ""

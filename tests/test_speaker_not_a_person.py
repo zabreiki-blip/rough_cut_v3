@@ -25,6 +25,11 @@ PROSE = {
         "Кстати, в нашей стране подобное попросту не могло случиться. "
         "Ещё в 1947 году, когда первая бомба только создавалась."
     ),
+    "Заметьте": (
+        "Заметьте: «польский след» в этом расследовании всплывает постоянно — "
+        "маршрут яхты, пограничники, документы экипажа. Может быть, ответ на все "
+        "эти вопросы — на поверхности?"
+    ),
 }
 
 
@@ -90,6 +95,37 @@ def test_unknown_surname_with_comma_sentence_is_not_a_speaker(tmp_path: Path) ->
     block = _run(tmp_path, [text])[0]
     assert block["speaker"] != "Иванов"
     assert block["type"] != "sync"
+
+
+def test_discourse_credit_with_comma_is_not_a_speaker(tmp_path: Path) -> None:
+    block = _run(tmp_path, ["Ладно, не обижайтесь: это не обман, а наглядный урок."])[0]
+    assert block["type"] != "sync"
+    assert block["speaker"] == ""
+
+
+def test_experiment_heading_is_not_a_speaker(tmp_path: Path) -> None:
+    block = _run(
+        tmp_path,
+        ["ЭКСПЕРИМЕНТ №1. «Звонок из кол-центра» — реконструкция работы кол-центра."],
+    )[0]
+    assert block["type"] == "technical"
+    assert block["speaker"] == ""
+
+
+def test_editorial_date_is_not_a_timecode_or_sync_credit(tmp_path: Path) -> None:
+    block = _run(
+        tmp_path,
+        ["Название. «Террористы поневоле» Эфир 10.11.26. Выпуск № 397."],
+    )[0]
+    assert block["type"] == "technical"
+    assert block["speaker"] == ""
+    assert block["timecode_start"] == ""
+
+
+def test_dialogue_after_role_cue_is_voiceover(tmp_path: Path) -> None:
+    blocks = _run(tmp_path, ["Жертва:", "— Слушаю вас.", "Мошенник (быстро):", "— Добрый день."])
+    assert [block["type"] for block in blocks] == ["technical", "voiceover", "technical", "voiceover"]
+    assert [block["text_for_tts"] for block in blocks[1::2]] == ["— Слушаю вас.", "— Добрый день."]
 
 
 def test_period_credit_after_zk_is_voiceover(tmp_path: Path) -> None:

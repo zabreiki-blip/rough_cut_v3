@@ -314,6 +314,21 @@ _BARE_SPEAKER_PREFIX = re.compile(
     r"(?:[.:\-–—]?\s+|[.:](?=[А-ЯЁ])|(?=[а-яё]))(?P<content>.+)$",
     re.DOTALL,
 )
+_NON_PERSON_SPEAKER_WORDS = frozenset(
+    {
+        "название", "эксперимент", "выпуск", "эфир", "финал", "пролог", "эпилог",
+        "часть", "глава", "сцена", "вариант", "пример",
+    }
+)
+_ROLE_DIALOGUE_CUE = re.compile(
+    r"^\s*(?:жертва|мошенник|оператор|клиент|голос\s+из\s+динамика)"
+    r"(?:\s*\([^)]{1,80}\))?\s*[:.]\s*$",
+    re.IGNORECASE,
+)
+_EDITORIAL_HEADING_PREFIX = re.compile(
+    r"^\s*(?:название|эксперимент|финал|пролог|эпилог|часть|глава|сцена|вариант|пример)\b",
+    re.IGNORECASE,
+)
 _CLEAR_SPEAKER_CREDIT = re.compile(
     r"^\s*(?P<speaker>[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)"
     r"(?:,\s*(?P<role>[а-яё][а-яё,\s-]{2,80}))?"
@@ -552,7 +567,10 @@ _OPENROUTER_INSTRUCTIONS = (
     "item (a song/film title, a name, a credit), a section heading (e.g. "
     '"Клипы", "Хроника"), or a production note telling the editor what '
     'to insert/show (e.g. "Вставить синхрон", "Показать фото") is '
-    "type=technical, not unknown. Do not rewrite original content. "
+     "type=technical, not unknown. Do not rewrite original content. "
+     "A short dash-led reply immediately following a role cue such as "
+     '"Жертва:", "Мошенник (быстро):" or "Голос из динамика." is spoken '
+     "voiceover, not a technical heading. "
     "A paragraph beginning with ЛАЙФ or LIFE is always type=life, even when "
     "it contains a title, colon, quote text, or timecode; it is source sound "
     "and must never become voiceover or sync. "
@@ -1863,6 +1881,26 @@ def _annotate_continuation_context(
     for block in blocks:
         if (
             previous is not None
+            and previous.type == BlockType.TECHNICAL.value
+            and _ROLE_DIALOGUE_CUE.match(previous.original_text.strip())
+            and not block.original_label
+            and is_dialogue_reply(block.original_text)
+            and block.type
+            in {
+                BlockType.UNKNOWN.value,
+                BlockType.TECHNICAL.value,
+                BlockType.VOICEOVER.value,
+            }
+        ):
+            block.continuation_of_type = BlockType.VOICEOVER.value
+            if not block.suggested_type:
+                block.suggested_type = BlockType.VOICEOVER.value
+            _apply_type(block, BlockType.VOICEOVER.value, DecisionSource.BUILTIN_RULE.value, 0.95)
+            block.text_for_tts = block.normalized_text
+            previous = block
+            continue
+        if (
+            previous is not None
             and block.type == BlockType.UNKNOWN.value
             and not block.original_label
             and previous.type == BlockType.SYNC.value
@@ -2474,6 +2512,9 @@ def _starts_with_unambiguous_timecode(text: str) -> bool:
 
 
 _CREDIT_SOURCE_MARK = re.compile(r"(?:^|\s)ИСХ(?:ОДНИК)?\.?\s+(?P<name>\S.*)$")
+_CREDIT_FILE_MARK = re.compile(
+    r"(?:^|\s)Файл\s+(?P<name>[^\n]+?)\s*\.?\s*$", re.IGNORECASE
+)
 _CREDIT_NAME_WITH_BRACKET = re.compile(
     r"[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*"
     r"(?:\s*\([А-ЯЁа-яёA-Za-z\-\s]{2,40}\))?"
@@ -2573,7 +2614,32 @@ def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
     timecode and is empty for a header-only paragraph), or ``None`` when the
     paragraph is not this form.
     """
-    match = _SNH_DASH_CREDIT.match(_structural_text(text))
+    view = _structural_text(text)
+    file_header = re.match(
+        r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+"
+        r"(?P<credit>.+?)\.\s*Файл\s+(?P<source>[^\n]+?)\s*\.?\s*$",
+        view,
+        re.IGNORECASE,
+    )
+    if file_header and not _TIMECODE.search(file_header.group("source")):
+        credit = file_header.group("credit").strip()
+        speaker, _, role = credit.partition(",")
+        speaker, role = speaker.strip(), role.strip(" \t,;:")
+        if (
+            _is_credit_name(speaker)
+            and _looks_like_plausible_sync_credit(speaker)
+            and (not role or not role_is_prose(role))
+        ):
+            return {
+                "marker": file_header.group("marker"),
+                "speaker": speaker,
+                "role": role,
+                "source": file_header.group("source").strip().rstrip("."),
+                "content": "",
+                "header_only": "1",
+                "dashed": "",
+            }
+    match = _SNH_DASH_CREDIT.match(view)
     if not match:
         return None
     credit = match.group("credit").strip()
@@ -2581,7 +2647,7 @@ def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
         return None
     # ``ИСХ <имя файла>`` names the source recording, never the person or role.
     credit_source = ""
-    source_mark = _CREDIT_SOURCE_MARK.search(credit)
+    source_mark = _CREDIT_SOURCE_MARK.search(credit) or _CREDIT_FILE_MARK.search(credit)
     if source_mark:
         credit_source = source_mark.group("name").strip()
         credit = credit[: source_mark.start()].strip()
@@ -2690,7 +2756,7 @@ def _merge_snh_credit_headers(paragraphs: list[str]) -> list[str]:
             credit
             and credit["header_only"]
             and index + 1 < len(paragraphs)
-            and _starts_with_unambiguous_timecode(paragraphs[index + 1])
+            and _contains_unambiguous_timecode(paragraphs[index + 1])
         ):
             merged.append(f"{current.rstrip()} {paragraphs[index + 1].lstrip()}")
             index += 2
@@ -2698,6 +2764,14 @@ def _merge_snh_credit_headers(paragraphs: list[str]) -> list[str]:
         merged.append(current)
         index += 1
     return merged
+
+
+def _contains_unambiguous_timecode(text: str) -> bool:
+    """True when a paragraph contains a structural timecode anywhere."""
+    for match in _TIMECODE.finditer(_structural_text(text)):
+        if _is_unambiguous_timecode_match(_structural_text(text), match.start(), match.end()):
+            return True
+    return False
 
 
 def _split_label(
@@ -2772,6 +2846,7 @@ def _split_label(
     if (
         clear_speaker
         and not re.match(r"^(?:голос|зк|зтм|титр)\b", clear_speaker.group("speaker"), re.IGNORECASE)
+        and normalize_marker(clear_speaker.group("speaker")) not in _NON_PERSON_SPEAKER_WORDS
         and _looks_like_plausible_sync_credit(clear_speaker.group("speaker"))
     ):
         content = clear_speaker.group("content").strip()
@@ -2812,19 +2887,36 @@ def _split_label(
     generic = re.match(r"^\s*([^:\n]{1,60}?)\s*:\s*(.+)$", text, flags=re.DOTALL)
     if generic:
         candidate = generic.group(1).strip()
+        candidate_words = re.findall(r"[^\W\d_]+", candidate.casefold().replace("ё", "е"))
+        candidate_head, _, candidate_role = candidate.partition(",")
         # A candidate without any letter ("- 00" from "- (00:34:21) ...") is the
         # head of a timecode, never a label.
         if (
             not candidate.startswith("(")
             and len(candidate.split()) <= 3
             and re.search(r"[^\W\d_]", candidate)
+            and not any(word in _NON_PERSON_SPEAKER_WORDS for word in candidate_words)
+            and not (
+                candidate_role
+                and not _is_plausible_clear_speaker(
+                    candidate_head.strip(), candidate_role.strip(), known_speakers or frozenset()
+                )
+            )
+            # The generic colon fallback must not undo the person check above:
+            # ``Заметьте: ...`` is speech, not a new speaker/learned marker.
+            and not any(is_non_person_word(word) for word in candidate_words)
         ):
             return candidate, generic.group(2).strip()
     bare_speaker = _BARE_SPEAKER_PREFIX.match(text)
     if bare_speaker:
         content = bare_speaker.group("content").strip()
         # Avoid turning short all-caps production headings into interviewees.
-        if len(content) >= 40 and re.search(r"[а-яё]", content):
+        speaker_word = normalize_marker(bare_speaker.group("speaker"))
+        if (
+            len(content) >= 40
+            and re.search(r"[а-яё]", content)
+            and speaker_word not in _NON_PERSON_SPEAKER_WORDS
+        ):
             return bare_speaker.group("speaker"), content
     normalized_text = normalize_marker(text)
     if normalized_text in set(_BUILTIN_MARKERS) | _TECH_MARKERS:
@@ -2915,6 +3007,9 @@ def _classify_by_rules(
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
         return
     if _PRESENTER_HEADING_ONLY.match(stripped):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
+        return
+    if _EDITORIAL_HEADING_PREFIX.match(stripped):
         _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 0.95)
         return
     if marker:
@@ -3759,6 +3854,21 @@ def _recover_llm_unresolved_voiceover(
             previous is not None and previous.type in (BlockType.LIFE.value, BlockType.SYNC.value)
         )
         in_scene = after_scene and block.type == BlockType.UNKNOWN.value
+        if (
+            previous is not None
+            and previous.type == BlockType.TECHNICAL.value
+            and _ROLE_DIALOGUE_CUE.match(previous.original_text.strip())
+            and block.type == BlockType.UNKNOWN.value
+            and not block.original_label
+            and is_dialogue_reply(block.original_text)
+        ):
+            block.continuation_of_type = BlockType.VOICEOVER.value
+            if not block.suggested_type:
+                block.suggested_type = BlockType.VOICEOVER.value
+            _apply_type(block, BlockType.VOICEOVER.value, DecisionSource.BUILTIN_RULE.value, 0.95)
+            block.text_for_tts = block.normalized_text
+            previous = block
+            continue
         if (
             not after_scene
             and block.type == BlockType.UNKNOWN.value

@@ -93,6 +93,38 @@ def test_header_paragraph_merges_with_timecoded_quote(tmp_path: Path) -> None:
     assert validate_for_confirmation(result) == []
 
 
+def test_file_header_merges_with_following_quote(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ Андрей Селахов, заместитель руководителя Кунцевского МРСО ГСУ СК России "
+        "по г. Москве. Файл MVIS0055.",
+        "00:01:22 (…) приходит сообщение: «Хочешь заработать большие деньги».",
+    )
+    assert len(result["blocks"]) == 1
+    block = result["blocks"][0]
+    assert block["type"] == "sync"
+    assert block["speaker"] == "Андрей Селахов"
+    assert block["role"] == "заместитель руководителя Кунцевского МРСО ГСУ СК России по г. Москве"
+    assert block["source_description"] == "MVIS0055"
+    assert block["timecode_start"] == "00:01:22"
+    assert not validate_for_confirmation(result)
+
+
+def test_file_header_merges_quote_with_prose_before_first_timecode(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ Давид Осипов, следователь по особо важным делам. Файл MVIS0046.",
+        "Я в тот момент подумал, что быстро всё закрою и откажусь. 00:08:13 - "
+        "И это, наверное, главная ошибка всех людей.",
+    )
+    assert len(result["blocks"]) == 1
+    block = result["blocks"][0]
+    assert block["speaker"] == "Давид Осипов"
+    assert block["source_description"] == "MVIS0046"
+    assert block["sync_fragments"][0]["timecode_start"] == "00:08:13"
+    assert not [issue for issue in validate_for_confirmation(result) if "speaker" in issue.lower()]
+
+
 def test_next_quote_after_merged_header_inherits_speaker(tmp_path: Path) -> None:
     result = _normalize(
         tmp_path,

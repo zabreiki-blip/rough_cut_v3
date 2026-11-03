@@ -101,6 +101,18 @@ _SERVICE_WORDS = frozenset(
         "съемка",
         "съемки",
         "канал",
+        "название",
+        "эксперимент",
+        "выпуск",
+        "эфир",
+        "финал",
+        "пролог",
+        "эпилог",
+        "часть",
+        "глава",
+        "сцена",
+        "вариант",
+        "пример",
     }
 )
 # Service labels that may stand in a speaker field but never name a person.
