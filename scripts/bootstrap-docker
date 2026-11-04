@@ -9,22 +9,14 @@ if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>
   exit 2
 fi
 
-if [[ ! -f .env ]]; then
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo "OpenSSL is required to generate ROUGH_CUT_API_TOKEN." >&2
-    exit 2
-  fi
-  cp .env.example .env
-  GENERATED_TOKEN="$(openssl rand -hex 32)"
-  TEMP_ENV="$(mktemp "${ROOT_DIR}/.env.XXXXXX")"
-  trap 'rm -f "${TEMP_ENV}"' EXIT
-  awk -v token="${GENERATED_TOKEN}" '
-    /^ROUGH_CUT_API_TOKEN=/ {$0 = "ROUGH_CUT_API_TOKEN=" token}
-    {print}
-  ' .env > "${TEMP_ENV}"
-  mv "${TEMP_ENV}" .env
-  trap - EXIT
-  echo "Created .env. Add OPENROUTER_API_KEY/GEMINI_API_KEY when those providers are used."
+# Host Python is optional. Local setup always uses Python secrets; Docker
+# retains the OpenSSL transport for hosts with no Python installation.
+ENV_PYTHON="${PYTHON_BIN:-python3}"
+if command -v "${ENV_PYTHON}" >/dev/null 2>&1; then
+  "${ENV_PYTHON}" "${ROOT_DIR}/scripts/lib/init-env.py" "${ROOT_DIR}" docker
+else
+  source "${ROOT_DIR}/scripts/lib/docker-env.sh"
+  initialize_docker_env
 fi
 
 mkdir -p projects data

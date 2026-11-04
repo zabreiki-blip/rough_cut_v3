@@ -25,17 +25,9 @@ def test_gunicorn_disables_control_socket_in_docker_and_compose() -> None:
 
 def test_apple_silicon_profile_uses_native_mlx() -> None:
     requirements = (ROOT / "requirements-macos-apple-silicon.txt").read_text(encoding="utf-8")
-    setup = (ROOT / "scripts/setup-macos-apple-silicon").read_text(encoding="utf-8")
-    runner = (ROOT / "scripts/run-native-macos").read_text(encoding="utf-8")
-
     assert "mlx-whisper==0.4.3" in requirements
-    assert '"$(uname -m)" != "arm64"' in setup
-    assert "PYTHON_ARCH" in setup
-    assert 'resolve_backend("auto") == "mlx-whisper"' in setup
-    assert ".venv-macos-arm64" in setup
-    assert "gunicorn" in runner
-    assert 'source "${ROOT_DIR}/.env"' not in runner
-    assert "api:app" in runner
+    # Platform selection, wrappers and backend installs are exercised by
+    # test_setup_profiles in an isolated filesystem with external commands stubbed.
 
 
 def test_portable_docker_bootstrap_preserves_host_data() -> None:
@@ -49,8 +41,6 @@ def test_portable_docker_bootstrap_preserves_host_data() -> None:
     assert "docker compose config --quiet" in bootstrap
     assert "docker compose build stage1-api" in bootstrap
     assert "docker compose up -d stage1-api" in bootstrap
-    assert "command -v openssl" in bootstrap
-    assert "openssl rand -hex 32" in bootstrap
 
 
 def test_macos_cep_installer_never_overwrites_existing_target() -> None:

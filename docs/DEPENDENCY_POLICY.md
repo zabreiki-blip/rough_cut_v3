@@ -52,6 +52,37 @@ markers; the image and CI target Python 3.11.
 Do not raise or lower either version without updating the Dockerfile, the CI
 matrix, `scripts/lock-deps` and this section together.
 
+## Local installation profiles
+
+`scripts/setup-local`, `scripts/run-local`, and `scripts/doctor` share
+`ROUGH_CUT_PROFILE=auto|cpu|mlx`. Auto selects MLX on a native macOS arm64
+shell and CPU elsewhere (including Rosetta). MLX also requires an arm64 Python.
+CPU supports Python 3.11; native MLX supports Python 3.11 and 3.12.
+
+The default environments remain `.venv` (CPU) and `.venv-macos-arm64` (MLX).
+`ROUGH_CUT_VENV` overrides either path. Export the same profile and environment
+for setup, run and doctor; a one-command override is not persisted. Existing
+environments are never moved or removed. The native setup/run wrappers select
+MLX explicitly. Linux and Windows/WSL2 should use `scripts/bootstrap-docker`;
+the manual CPU path remains available without claiming a platform smoke test.
+
+Both local profiles install `requirements-dev.txt` and their ASR requirements
+(`requirements-whisper.txt` for CPU, `requirements-macos-apple-silicon.txt` for
+MLX). These local installations use input requirements, not hashed locks.
+`ffmpeg` and `ffprobe` are required; `catdoc`/`antiword` are optional for legacy
+`.doc` documents. Whisper weights download on the first ASR request, requiring
+network access and roughly 1.5 GB for medium in `HF_HOME` (default
+`.cache/huggingface`). Setup does not download models.
+
+Local setup creates `.env` from the example, selects `TTS_PROVIDER=macos` for
+a new macOS environment and generates missing/empty API tokens with Python
+`secrets.token_hex(32)`. Existing nonempty tokens, provider and connector
+settings are preserved. Docker bootstrap uses the same helper when Python is
+available and retains secure OpenSSL generation for hosts without Python.
+Ordinary setup does not install CEP or a LaunchAgent; `bootstrap-macos` remains
+the explicit expanded installation and passes the selected venv to its connector
+installer.
+
 ## Local hygiene
 
 `scripts/clean-pyc` removes `__pycache__` directories and `*.pyc` files under

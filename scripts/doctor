@@ -1,122 +1,57 @@
 #!/usr/bin/env bash
 set -u
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv}"
+source "${ROOT_DIR}/scripts/lib/local-profile.sh"
+select_local_profile || exit 2
 QUICK=0
 [[ "${1:-}" == "--quick" ]] && QUICK=1
 ERRORS=0
 WARNINGS=0
-
 ok() { echo "✅ $*"; }
 warn() { echo "⚠️  $*"; WARNINGS=$((WARNINGS + 1)); }
 fail() { echo "❌ $*"; ERRORS=$((ERRORS + 1)); }
-
-echo "Диагностика rough_cut_v3"
+echo "Диагностика rough_cut_v3: ${ROUGH_CUT_PROFILE}, ${VENV_DIR}"
 if [[ -x "${VENV_DIR}/bin/python" ]]; then
-  ok "Python: $("${VENV_DIR}/bin/python" --version 2>&1)"
+  if validate_local_python "${VENV_DIR}/bin/python"; then
+    ok "Python: $("${VENV_DIR}/bin/python" --version 2>&1)"
+  else
+    fail "Неподдерживаемый Python выбранного окружения"
+  fi
 else
+  missing_local_environment
   fail "Нет ${VENV_DIR}; запустите scripts/setup-local"
 fi
-
-for command in ffmpeg; do
-  command -v "${command}" >/dev/null 2>&1 && ok "${command} найден" || fail "Нет ${command}: brew install ${command}"
+for command in ffmpeg ffprobe; do
+  command -v "${command}" >/dev/null 2>&1 && ok "${command} найден" || fail "Нет ${command}: установите ffmpeg"
 done
 if command -v antiword >/dev/null 2>&1 || command -v catdoc >/dev/null 2>&1; then
   ok "Конвертер .doc найден"
 else
-  warn "Нет antiword/catdoc; старые .doc не прочитаются (brew install catdoc)"
+  warn "Нет antiword/catdoc; только старые .doc требуют brew install catdoc"
 fi
 command -v node >/dev/null 2>&1 && ok "Node.js найден" || warn "Node.js не найден; CEP behavior test будет пропущен"
-
-if [[ -f "${ROOT_DIR}/.env" ]]; then
-  ok ".env найден"
-  if grep -Eq '^ROUGH_CUT_API_TOKEN=.+$' "${ROOT_DIR}/.env"; then
-    ok "API token настроен"
-  else
-    fail "ROUGH_CUT_API_TOKEN пуст в .env"
-  fi
-else
+if [[ ! -f "${ROOT_DIR}/.env" ]]; then
   fail "Нет .env; запустите scripts/setup-local"
+elif [[ -x "${VENV_DIR}/bin/python" ]]; then
+  if ! PYTHONPATH="${ROOT_DIR}/src" "${VENV_DIR}/bin/python" "${ROOT_DIR}/scripts/lib/check-env.py" "${ROOT_DIR}/.env" "${LOCAL_OS}" "${QUICK}"; then
+    fail "Исправьте настройки .env или локального TTS"
+  fi
 fi
-
-if [[ -x "${VENV_DIR}/bin/python" && -f "${ROOT_DIR}/.env" ]]; then
-  ENV_FILE="${ROOT_DIR}/.env" PYTHONPATH="${ROOT_DIR}/src" "${VENV_DIR}/bin/python" - <<'PY'
-import os
-from pathlib import Path
-from dotenv import dotenv_values
-from stage1.config import validate_env
-
-values = {key: str(value or "") for key, value in dotenv_values(Path(os.environ["ENV_FILE"])).items()}
-for warning in validate_env(values):
-    print(f"⚠️  {warning}")
-PY
-fi
-
-# Ключи LLM/TTS-провайдеров: только факт наличия, значения никогда не печатаем.
-HAS_OPENROUTER_KEY=0
-HAS_GEMINI_KEY=0
-if [[ -f "${ROOT_DIR}/.env" ]]; then
-  grep -Eq '^OPENROUTER_API_KEY=.+$' "${ROOT_DIR}/.env" && HAS_OPENROUTER_KEY=1
-  grep -Eq '^GEMINI_API_KEY=.+$' "${ROOT_DIR}/.env" && HAS_GEMINI_KEY=1
-fi
-if [[ "${HAS_OPENROUTER_KEY}" -eq 1 ]]; then
-  ok "OPENROUTER_API_KEY задан"
-else
-  warn "OPENROUTER_API_KEY не задан; LLM-анализ и OpenRouter TTS недоступны"
-fi
-if [[ "${HAS_GEMINI_KEY}" -eq 1 ]]; then
-  ok "GEMINI_API_KEY задан"
-else
-  warn "GEMINI_API_KEY не задан; Gemini TTS недоступен"
-fi
-if [[ "${HAS_OPENROUTER_KEY}" -eq 0 && "${HAS_GEMINI_KEY}" -eq 0 ]]; then
-  warn "Нет облачных ключей; доступен offline-режим: TTS_PROVIDER=macos и --no-llm"
-fi
-
-# Локальный backend распознавания речи Stage 2 (faster-whisper/mlx-whisper).
 if [[ -x "${VENV_DIR}/bin/python" ]]; then
-  HAS_WHISPER_BACKEND=0
-  "${VENV_DIR}/bin/python" -c "import mlx_whisper" >/dev/null 2>&1 && {
-    ok "mlx-whisper установлен"
-    HAS_WHISPER_BACKEND=1
-  }
-  "${VENV_DIR}/bin/python" -c "import faster_whisper" >/dev/null 2>&1 && {
-    ok "faster-whisper установлен"
-    HAS_WHISPER_BACKEND=1
-  }
-  if [[ "${HAS_WHISPER_BACKEND}" -eq 0 ]]; then
-    warn "Нет faster-whisper/mlx-whisper; синхронизация Stage 2 недоступна (pip install -r requirements-whisper.txt, на Apple Silicon — requirements-macos-apple-silicon.txt)"
+  if [[ "${ROUGH_CUT_PROFILE}" == mlx ]]; then BACKEND=mlx_whisper; else BACKEND=faster_whisper; fi
+  if "${VENV_DIR}/bin/python" -c "import ${BACKEND}" >/dev/null 2>&1; then
+    ok "Локальный ASR: ${BACKEND} установлен"
+  else
+    fail "Нет ${BACKEND}; выполните scripts/setup-local с выбранным профилем"
   fi
 fi
-
-# Свободное место на диске (модель Whisper ~1.4 ГБ).
+echo "Whisper: модель загружается при первом ASR, нужен интернет, ~1.5 GB для medium; cache: ${HF_HOME:-${ROOT_DIR}/.cache/huggingface}."
 FREE_KB="$(df -Pk "${ROOT_DIR}" 2>/dev/null | awk 'NR==2 {print $4}')"
-if [[ -n "${FREE_KB}" ]]; then
-  FREE_GB=$((FREE_KB / 1024 / 1024))
-  if [[ "${FREE_KB}" -lt 2097152 ]]; then
-    warn "Свободно ~${FREE_GB} ГБ на диске; модели Whisper (~1.4 ГБ) может не хватить места"
-  else
-    ok "Свободно ~${FREE_GB} ГБ на диске"
-  fi
+if [[ -n "${FREE_KB}" && "${FREE_KB}" -lt 2097152 ]]; then
+  warn "Мало места: модели Whisper может потребоваться ~1.5 GB"
 fi
-
 if [[ "${QUICK}" -eq 0 ]]; then
-  if curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then
-    ok "Backend отвечает на :8000"
-  else
-    warn "Backend на :8000 не отвечает; запустите scripts/run-local или scripts/bootstrap-docker"
-  fi
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    command -v say >/dev/null 2>&1 && ok "macOS say найден" || fail "Команда say не найдена"
-    command -v afconvert >/dev/null 2>&1 && ok "afconvert найден" || fail "Команда afconvert не найдена"
-    if curl -fsS --max-time 3 http://127.0.0.1:8001/health >/dev/null 2>&1; then
-      ok "macOS connector отвечает на :8001"
-    else
-      warn "macOS connector не отвечает; запустите scripts/run-macos-connector"
-    fi
-  fi
+  curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1 && ok "Backend отвечает на :8000" || warn "Backend на :8000 не отвечает; запустите scripts/run-local"
 fi
-
 echo "Итог: ошибок ${ERRORS}, предупреждений ${WARNINGS}"
 [[ "${ERRORS}" -eq 0 ]]

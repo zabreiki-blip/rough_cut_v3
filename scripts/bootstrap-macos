@@ -7,6 +7,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 2
 fi
 
+source "${ROOT_DIR}/scripts/lib/local-profile.sh"
+select_local_profile
 "${ROOT_DIR}/scripts/setup-local"
 "${ROOT_DIR}/scripts/install-macos-connector-launchagent"
 "${ROOT_DIR}/scripts/install-cep-macos"

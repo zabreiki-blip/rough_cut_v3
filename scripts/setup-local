@@ -1,39 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_DIR}/scripts/lib/local-profile.sh"
+select_local_profile
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv}"
-
-if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-  echo "Ошибка: нужен Python 3.11+." >&2
-  exit 2
-fi
-if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  echo "Ошибка: нужен Python 3.11 или новее." >&2
-  exit 2
-fi
-
+validate_local_python "${PYTHON_BIN}"
+for dependency in ffmpeg ffprobe; do
+  if ! command -v "${dependency}" >/dev/null 2>&1; then
+    echo "Missing ${dependency}. Install ffmpeg first (macOS: brew install ffmpeg)." >&2
+    exit 2
+  fi
+done
 "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 "${VENV_DIR}/bin/pip" install -r "${ROOT_DIR}/requirements-dev.txt"
-
-if [[ ! -f "${ROOT_DIR}/.env" ]]; then
-  cp "${ROOT_DIR}/.env.example" "${ROOT_DIR}/.env"
-  if command -v openssl >/dev/null 2>&1; then
-    GENERATED_TOKEN="$(openssl rand -hex 32)"
-    TEMP_ENV="$(mktemp "${ROOT_DIR}/.env.XXXXXX")"
-    trap 'rm -f "${TEMP_ENV}"' EXIT
-    awk -v token="${GENERATED_TOKEN}" '
-      /^ROUGH_CUT_API_TOKEN=/ {$0 = "ROUGH_CUT_API_TOKEN=" token}
-      {print}
-    ' "${ROOT_DIR}/.env" > "${TEMP_ENV}"
-    mv "${TEMP_ENV}" "${ROOT_DIR}/.env"
-    trap - EXIT
-  fi
-  echo "Создан .env. Добавьте ключ выбранного TTS/LLM-провайдера."
+if [[ "${ROUGH_CUT_PROFILE}" == mlx ]]; then
+  "${VENV_DIR}/bin/pip" install -r "${ROOT_DIR}/requirements-macos-apple-silicon.txt"
+else
+  "${VENV_DIR}/bin/pip" install -r "${ROOT_DIR}/requirements-whisper.txt"
 fi
-
+"${VENV_DIR}/bin/python" "${ROOT_DIR}/scripts/lib/init-env.py" "${ROOT_DIR}" "${LOCAL_OS/Darwin/macos}"
 mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data"
 "${ROOT_DIR}/scripts/doctor" --quick
-echo "Готово. Запуск API: scripts/run-local"
+echo "Ready (${ROUGH_CUT_PROFILE}): scripts/run-local (use the same profile/venv overrides)."
+echo "Open http://127.0.0.1:8000/ after starting. Basic Auth: any login; password is ROUGH_CUT_API_TOKEN in ${ROOT_DIR}/.env."
+echo "Whisper model downloads on first ASR use: network required, ~1.5 GB for medium, cache: ${HF_HOME:-${ROOT_DIR}/.cache/huggingface}."

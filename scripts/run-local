@@ -2,16 +2,20 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${ROUGH_CUT_VENV:-${ROOT_DIR}/.venv}"
+source "${ROOT_DIR}/scripts/lib/local-profile.sh"
+select_local_profile
 if [[ ! -x "${VENV_DIR}/bin/gunicorn" ]]; then
-  echo "Локальное окружение не найдено. Выполните scripts/setup-local." >&2
+  missing_local_environment
   exit 2
 fi
+validate_local_python "${VENV_DIR}/bin/python"
 set -a
 # shellcheck disable=SC1091
 source "${ROOT_DIR}/.env"
 set +a
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export HF_HOME="${HF_HOME:-${ROOT_DIR}/.cache/huggingface}"
+mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data" "${HF_HOME}"
 cd "${ROOT_DIR}"
 exec "${VENV_DIR}/bin/gunicorn" \
   -b "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}" \
