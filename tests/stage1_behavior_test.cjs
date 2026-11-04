@@ -2744,6 +2744,204 @@ async function testRecordedPlayerStopsAtOut({ state }) {
   assert.strictEqual(paused, 2);
 }
 
+async function testStage3IndependentReadiness({state, stage3, core}) {
+  const {ids} = state;
+  const base = {
+    processing: {status: "completed", superseded: true},
+    build: {build_id: "b1", mode: "complete", is_current: false, stale_reasons: ["scenario_revision_id"]},
+    assembly: {level: "complete_ready", blocker_count: 0, blockers: []},
+  };
+  stage3.renderStage3Status(base);
+  assert.match(ids.stage3_processing.textContent, /завершена.*устарел/i);
+  assert.match(ids.stage3_build.textContent, /устарел/i);
+  assert.doesNotMatch(ids.stage3_build.textContent, /Сборка без пропусков/);
+  assert.match(ids.stage3_assembly.textContent, /без пропусков/i);
+  assert.doesNotMatch(ids.stage3_source_mapping.innerHTML, /Сначала соберите/);
+  stage3.renderStage3Status({...base, build: {...base.build, is_current: true}});
+  assert.match(ids.stage3_build.textContent, /Сборка без пропусков/);
+  stage3.renderStage3Status({...base, build: {...base.build, mode: "draft", summary: {placeholders: {segments: 2}}}});
+  assert.match(ids.stage3_build.textContent, /Черновик: 2 пропуск/);
+  stage3.renderStage3Status({...base, build: {build_id: null}, assembly: {level: "no_timeline", reason: "timeline_rebuild_required", message: "Таймлайн требует пересборки"}});
+  assert.match(ids.stage3_source_mapping.innerHTML, /пересборки/);
+  assert.match(ids.stage3_build.textContent, /нет/i);
+  stage3.renderStage3Status({...base, assembly: {level: "error", message: "plan failed"}});
+  assert.match(ids.stage3_assembly.textContent, /plan failed/);
+  assert.doesNotMatch(ids.stage3_source_mapping.innerHTML, /Сначала соберите/);
+  stage3.renderStage3Status({...base, assembly: {level: "draft", blocker_count: 1, blockers: [{segment_id: "s1", reason: "missing_wav"}], catalog_incomplete: true, uncached_media_files: 3}});
+  assert.match(ids.stage3_assembly.textContent, /1/);
+  assert.match(ids.stage3_assembly.textContent, /3/);
+  assert.match(ids.stage3_blockers.innerHTML, /s1/);
+  const originalFetch = globalThis.fetch;
+  let resolveOld;
+  try {
+    globalThis.fetch = async () => new Promise(resolve => { resolveOld = resolve; });
+    const oldRequest = stage3.refreshStage3Status();
+    globalThis.fetch = async () => ({ok:true, json: async () => ({ok:true,result:{...base, build:{...base.build, build_id:"new"}}})});
+    await stage3.refreshStage3Status();
+    resolveOld({ok:true,json:async()=>({ok:true,result:base})});
+    await oldRequest;
+    assert.match(ids.stage3_build.textContent, /new/);
+    globalThis.fetch = async url => ({ok:true, status:200,
+      text: async () => JSON.stringify({ok:true,result:{revision:2,items:[]}}),
+      json: async () => ({ok:true,result:{...base,build:{...base.build,build_id:"after_sync"}}}),
+    });
+    await core.optionalRequestJSON("/stage2/sync-matches?project=default");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(ids.stage3_build.textContent, /after_sync/);
+    globalThis.fetch = async () => ({ok:false,status:503,json:async()=>({error:"unavailable"})});
+    await stage3.refreshStage3Status();
+    assert.match(ids.stage3_build.textContent, /недоступна/);
+    assert.doesNotMatch(ids.stage3_build.textContent, /без пропусков/);
+  } finally {globalThis.fetch = originalFetch;}
+}
+
+async function testStage3ProcessingLifecycle({state, stage3}) {
+  const {ids, appState} = state;
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+  const originalMode = ids.stage3_prepare_mode.value;
+  const timers = [];
+  let phase = "running";
+  let resolvePreviousStatus;
+  let firstStatus = true;
+  const previous = {
+    processing: {status:"completed"},
+    build: {build_id:"old-build",mode:"complete",is_current:false},
+    assembly: {level:"complete_ready",blockers:[]},
+  };
+  const ok = result => ({ok:true,status:200,json:async()=>({ok:true,result})});
+  try {
+    window.setTimeout = (callback, delay) => {timers.push({callback,delay});return timers.length;};
+    window.clearTimeout = () => {};
+    globalThis.fetch = async url => {
+      if (String(url).includes("/jobs/prepare/start")) return ok({job_id:"lifecycle-job",kind:"prepare",status:"queued"});
+      if (String(url).includes("/jobs/lifecycle-job")) return ok({id:"lifecycle-job",kind:"prepare",status:phase,result:{source_mapping:[],mapped_source_ids:[],placeholder_segments:0}});
+      if (String(url).includes("/stage3/status?")) {
+        if (firstStatus) {
+          firstStatus = false;
+          return new Promise(resolve => {resolvePreviousStatus = resolve;});
+        }
+        return ok({...previous,processing:{status:phase},build:{build_id:null}});
+      }
+      throw Error(`Unexpected lifecycle URL ${url}`);
+    };
+    stage3.renderStage3Status(previous);
+    const previousStatusRequest = stage3.refreshStage3Status();
+    appState.stage3JobRunning = false;
+    ids.stage3_prepare_mode.value = "complete";
+    await stage3.exportTimelineXml();
+    assert.match(ids.stage3_processing.textContent, /в очереди/);
+    resolvePreviousStatus(ok(previous));
+    await previousStatusRequest;
+    assert.match(ids.stage3_processing.textContent, /в очереди/, "older status must not replace the new active job");
+    assert.match(ids.stage3_build.textContent, /old-build.*устарела/);
+    assert.match(ids.stage3_assembly.textContent, /можно собрать/);
+    await timers.find(timer=>timer.delay===250).callback();
+    assert.match(ids.stage3_processing.textContent, /выполняется/);
+    assert.match(ids.stage3_build.textContent, /old-build.*устарела/);
+    phase = "completed";
+    await timers.find(timer=>timer.delay===1200).callback();
+    assert.match(ids.stage3_processing.textContent, /завершена/);
+    assert.match(ids.stage3_build.textContent, /подтверждённой сборки нет/);
+    assert.match(ids.stage3_media_message.textContent, /Экспортированный XML/);
+    assert.doesNotMatch(ids.stage3_source_mapping.innerHTML, /Сначала соберите/);
+    assert.notEqual(ids.stage3_media_status.dataset.state, "failed");
+  } finally {
+    globalThis.fetch = originalFetch;
+    window.setTimeout = originalSetTimeout;
+    window.clearTimeout = originalClearTimeout;
+    ids.stage3_prepare_mode.value = originalMode;
+    appState.stage3JobRunning = false;
+  }
+}
+
+async function testTtsRejectedStartAction({state, core}) {
+  const {ids, appState, live} = state;
+  const originalFetch = globalThis.fetch;
+  const originalNormalization = appState.normalization;
+  const originalEligible = appState.normalizationEligible;
+  try {
+    ids.prepared_path.value = "projects/test/work/prepared.json";
+    ids.speaker_dir.value = "projects/test/speaker";
+    appState.normalization = {status:"confirmed",blocks:[{uid:"z1",type:"voiceover"}]};
+    appState.normalizationEligible = true;
+    for (const status of [400,409]) {
+      globalThis.fetch = async url => {
+        if (String(url).includes("/tts-jobs/start")) return {ok:false,status,json:async()=>({ok:false,error:"start rejected by guard"})};
+        if (String(url).includes("/tts-jobs/status?")) return {ok:false,status:404};
+        throw Error(`Unexpected rejected-start URL ${url}`);
+      };
+      ids.btn_tts.dispatch("click");
+      for (let i=0; i<10 && core.isBusy();i++) await new Promise(resolve=>setImmediate(resolve));
+      assert.equal(core.isBusy(),false);
+      assert.equal(live.status,"failed");
+      assert.equal(appState.currentTtsJobStatus,"failed");
+      assert.equal(ids.live_job_status.textContent,"failed");
+      assert.equal(ids.btn_tts_cancel.hidden,true);
+      assert.match(ids.live_error.textContent,/start rejected by guard/);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.normalization = originalNormalization;
+    appState.normalizationEligible = originalEligible;
+  }
+}
+
+async function testTtsUncertainStartRecovery({state, core}) {
+  const {ids, appState, live} = state;
+  const originalFetch = globalThis.fetch;
+  const originalNormalization = appState.normalization;
+  const originalEligible = appState.normalizationEligible;
+  const originalDirty = appState.normalizationDirty;
+  try {
+    for (const outcome of ["lost_response", "empty_job_id", "unreachable_status", "older_completed", "recently_completed"]) {
+      let starts = 0;
+      let attemptedAt;
+      ids.prepared_path.value = "projects/test/work/prepared.json";
+      ids.speaker_dir.value = "projects/test/speaker";
+      appState.normalization = {status:"confirmed",blocks:[{uid:"z1",type:"voiceover"}]};
+      appState.normalizationEligible = true;
+      appState.normalizationDirty = false;
+      const accepted = {id:"recovered-job",status:"running",done:0,total:1};
+      const ok = result => ({ok:true,status:200,json:async()=>({ok:true,result}),text:async()=>JSON.stringify({ok:true,result})});
+      globalThis.fetch = async url => {
+        const target = String(url);
+        if (target.includes("/tts-jobs/start")) {
+          starts += 1;
+          attemptedAt = Date.now();
+          if (outcome === "empty_job_id") return ok({});
+          throw new TypeError("response lost");
+        }
+        if (target.includes("/tts-jobs/status?")) {
+          if (outcome === "unreachable_status") throw new TypeError("status offline");
+          if (outcome === "recently_completed") return ok({...accepted,status:"completed",created_at:new Date(attemptedAt - 500).toISOString()});
+          if (outcome === "older_completed") return ok({...accepted,status:"completed",created_at:"2000-01-01T00:00:00Z"});
+          return ok(accepted);
+        }
+        if (target.includes("/tts-jobs/recovered-job")) return ok({...accepted,status:"completed",done:1});
+        if (target.includes("/stage1/status?")) return ok({normalization_confirmed:true});
+        if (target.includes("/stage3/status?")) return ok({processing:{status:"idle"},build:{build_id:null},assembly:{level:"no_timeline"}});
+        throw Error(`Unexpected recovery URL ${target}`);
+      };
+      ids.btn_tts.dispatch("click");
+      for(let i=0;i<15 && core.isBusy();i++) await new Promise(resolve=>setImmediate(resolve));
+      assert.equal(core.isBusy(),false,outcome);
+      const recovered = ["lost_response","empty_job_id"].includes(outcome);
+      assert.equal(live.status,recovered ? "completed" : "interrupted",outcome);
+      assert.equal(appState.currentTtsJobStatus,live.status,outcome);
+      assert.equal(ids.btn_tts_cancel.hidden,true,outcome);
+      assert.equal(starts,1,"uncertain outcome must never re-submit paid work");
+      if (!recovered) assert.match(ids.live_error.textContent,/обновите страницу/);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    appState.normalization = originalNormalization;
+    appState.normalizationEligible = originalEligible;
+    appState.normalizationDirty = originalDirty;
+  }
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
@@ -2772,6 +2970,10 @@ async function main() {
     ["testSyncJobIncompleteAndAsrFailedLabel", () => testSyncJobIncompleteAndAsrFailedLabel(modules)],
     ["testSyncAudioVerifyControl", () => testSyncAudioVerifyControl(modules)],
     ["testSyncAudioVerifyDisplay", () => testSyncAudioVerifyDisplay(modules)],
+    ["testStage3ProcessingLifecycle", () => testStage3ProcessingLifecycle(modules)],
+    ["testTtsUncertainStartRecovery", () => testTtsUncertainStartRecovery(modules)],
+    ["testTtsRejectedStartAction", () => testTtsRejectedStartAction(modules)],
+    ["testStage3IndependentReadiness", () => testStage3IndependentReadiness(modules)],
     ["testStage3PlaceholderDescription", () => testStage3PlaceholderDescription(modules)],
     ["testExportXmlPreExportSummary", () => testExportXmlPreExportSummary(modules)],
     ["testStage3ModesAndBlockers", () => testStage3ModesAndBlockers(modules)],

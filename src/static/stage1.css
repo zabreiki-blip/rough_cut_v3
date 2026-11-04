@@ -1,5 +1,8 @@
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap");
 
+/* Keep native hidden semantics even on flex/grid/button components. */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #0f1117;
   --bg-raised: #181a23;

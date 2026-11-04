@@ -4,7 +4,7 @@ import { ids, appState, project } from "./state.js";
 import {
   toast, appendLog, escaped, formatMediaDuration, formatMediaSize,
   renderEtaCells, updateActionAvailability, isTransientPollingError,
-  pollingBackoffMs, postJSON, getJSON, optionalRequestJSON, confirmDialog, safely,
+  pollingBackoffMs, postJSON, getJSON, optionalRequestJSON, confirmDialog, safely, onProjectInputsChanged,
 } from "./core.js";
 import { loadSyncWorkspace } from "./sync.js";
 
@@ -15,6 +15,8 @@ let currentStage3JobKind = "";
 let stage3JobClientStartedAt = null;
 let stage3PollTimer = null;
 let stage3PollFailures = 0;
+let latestStage3Status = null;
+let stage3StatusRequest = 0;
 
 function stage3MediaItems(result) {
   if (Array.isArray(result)) return result;
@@ -82,8 +84,12 @@ function renderStage3SourceMapping(mapping) {
   const items = Array.isArray(mapping) ? mapping : [];
   appState.stage3SourceMapping = items;
   if (items.length === 0) {
-    ids.stage3_source_mapping.innerHTML =
-      '<div class="empty-state compact">Сначала соберите Stage 2 timeline.</div>';
+    const assembly = latestStage3Status && latestStage3Status.assembly;
+    const message = !assembly ? "Готовность таймлайна проверяется…"
+      : assembly.level === "no_timeline" ? (assembly.message || "Сначала соберите таймлайн.")
+      : assembly.level === "error" ? "Не удалось проверить соответствия: ошибка плана монтажа."
+      : "Таймлайн существует. Соответствия просмотровок не требуются или ещё не рассчитаны; список пуст.";
+    ids.stage3_source_mapping.innerHTML = `<div class="empty-state compact">${escaped(message)}</div>`;
     return;
   }
   ids.stage3_source_mapping.innerHTML = items.map((item) => {
@@ -103,6 +109,62 @@ function renderStage3SourceMapping(mapping) {
   }).join("");
 }
 
+function renderStage3Processing(processing) {
+  const processingLabels = {idle: "нет активной задачи", queued: "в очереди", running: "выполняется", completed: "завершена", failed: "ошибка", interrupted: "прервана", cancelled: "отменена"};
+  if (ids.stage3_processing) ids.stage3_processing.textContent =
+    (processingLabels[processing.status] || "состояние неизвестно")
+    + (processing.superseded || processing.stale_revision || processing.stale_timeline ? " · результат устарел" : "");
+}
+
+// Readiness is independent from the last job and from the downloadable file.
+export function renderStage3Status(status) {
+  latestStage3Status = status;
+  const processing = status.processing || {};
+  const build = status.build || {};
+  const assembly = status.assembly || {};
+  renderStage3Processing(processing);
+  if (ids.stage3_build) {
+    if (!build.build_id) ids.stage3_build.textContent = "подтверждённой сборки нет";
+    else {
+      const gaps = Number(build.summary?.placeholders?.segments || 0);
+      const label = build.mode === "draft" ? `Черновик: ${gaps} пропусков`
+        : build.mode === "complete" && build.is_current === true ? "Сборка без пропусков" : "Сборка";
+      const reasons = [...(build.stale_reasons || []), build.live_timeline_unavailable_reason].filter(Boolean);
+      ids.stage3_build.textContent = `${label} · ${build.build_id} · ${build.is_current === true ? "актуальна" : "устарела"}`
+        + (reasons.length ? ` (${reasons.join(", ")})` : "");
+    }
+  }
+  if (ids.stage3_assembly) {
+    ids.stage3_assembly.textContent = assembly.level === "complete_ready" ? "можно собрать без пропусков"
+      : assembly.level === "draft" ? `Черновик: ${Number(assembly.blocker_count || 0)} блокеров`
+      : assembly.level === "no_timeline" ? (assembly.message || "Сначала соберите таймлайн.")
+      : assembly.level === "error" ? `Ошибка проверки: ${assembly.message || assembly.reason || "план недоступен"}`
+      : "состояние неизвестно";
+    if (assembly.catalog_incomplete) ids.stage3_assembly.textContent += ` · каталог медиа неполный: ${Number(assembly.uncached_media_files || 0)} файлов без проверки`;
+    if (Number(assembly.open_tasks) > 0) ids.stage3_assembly.textContent += ` · открытых задач: ${assembly.open_tasks}`;
+  }
+  renderStage3Blockers(assembly.blockers || []);
+  renderStage3SourceMapping(appState.stage3SourceMapping || []);
+}
+
+export async function refreshStage3Status() {
+  const request = ++stage3StatusRequest;
+  try {
+    const status = await getJSON(`/stage3/status?project=${encodeURIComponent(project)}`);
+    if (request === stage3StatusRequest) renderStage3Status(status);
+    return status;
+  } catch (error) {
+    if (request !== stage3StatusRequest) return;
+    latestStage3Status = null;
+    for (const element of [ids.stage3_processing, ids.stage3_build, ids.stage3_assembly]) {
+      if (element) element.textContent = "проверка недоступна; обновите состояние";
+    }
+    renderStage3Blockers([]);
+    renderStage3SourceMapping(appState.stage3SourceMapping || []);
+    appendLog(`Готовность монтажа: ${error.message || error}`, "warn");
+  }
+}
+
 function stage3JobPayload(value) {
   if (!value || typeof value !== "object") return {};
   return value.job && typeof value.job === "object" ? value.job : value;
@@ -110,6 +172,9 @@ function stage3JobPayload(value) {
 
 function renderStage3Job(value) {
   const job = stage3JobPayload(value);
+  // A response started before this job update must not restore the previous task.
+  stage3StatusRequest += 1;
+  renderStage3Processing(job);
   const status = String(job.status || "queued").toLowerCase();
   const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
   const stage3JobId = String(job.id || job.job_id || currentStage3JobId || "");
@@ -124,7 +189,7 @@ function renderStage3Job(value) {
   }
   ids.stage3_media_status.dataset.state = status;
   ids.stage3_media_status.textContent = status === "completed"
-    ? (currentStage3JobKind === "prepare" ? "XML готов" : "готово")
+    ? (currentStage3JobKind === "prepare" ? "экспорт завершён" : "готово")
     : status === "failed" ? "ошибка"
     : status === "interrupted" ? "прервано"
     : status === "queued" ? "в очереди"
@@ -253,7 +318,7 @@ async function applyCompletedStage3Job(job, download) {
   renderStage3SourceMapping(result.source_mapping || []);
   renderStage3Blockers([]);
   ids.stage3_media_message.textContent =
-    `${stage3BuildLabel(result)}Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
+    `${result.build_id ? stage3BuildLabel(result) : "Экспортированный XML (без подтверждённой сборки): "}Сопоставлено источников: ${(result.mapped_source_ids || []).length}; `
     + `${describeStage3Placeholders(result)}.`;
   appendLog(
     `Timeline XML (${result.format || "nested"}${result.build_id ? `, build ${result.build_id}` : ""}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
@@ -273,6 +338,7 @@ async function pollStage3Job(statusUrl, downloadOnComplete) {
     if (status === "completed") {
       finishStage3Job();
       await applyCompletedStage3Job(job, downloadOnComplete);
+      await refreshStage3Status();
       return;
     }
     if (["failed", "interrupted"].includes(status)) {
@@ -286,6 +352,7 @@ async function pollStage3Job(statusUrl, downloadOnComplete) {
       ids.stage3_media_message.textContent = message;
       toast(message, status === "failed" ? "error" : "warn");
       appendLog(`Stage 3 ${job.kind || "job"}: ${message}`, "error");
+      await refreshStage3Status();
       return;
     }
     stage3PollTimer = window.setTimeout(
@@ -354,6 +421,7 @@ async function restoreStage3Job() {
     renderStage3Blockers(job.blockers);
   }
   finishStage3Job();
+  await refreshStage3Status();
   return false;
 }
 
@@ -429,3 +497,5 @@ export async function exportTimelineXml() {
 
 if (ids.btn_stage3_media_scan) ids.btn_stage3_media_scan.addEventListener("click", () => safely(scanStage3Media));
 ids.btn_export_xml.addEventListener("click", () => safely(exportTimelineXml));
+
+onProjectInputsChanged(refreshStage3Status);

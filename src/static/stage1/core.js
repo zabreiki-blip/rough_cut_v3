@@ -203,7 +203,9 @@ export async function postJSON(url, payload, timeoutMs = FETCH_TIMEOUT_MS) {
   }, timeoutMs);
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok === false) {
-    throw new Error(data.error || JSON.stringify(data));
+    const error = new Error(data.error || JSON.stringify(data));
+    error.status = response.status;
+    throw error;
   }
   return data.result || {};
 }
@@ -245,6 +247,12 @@ export async function requestJSON(url, method, payload) {
   return data.result !== undefined ? data.result : data;
 }
 
+// Subscribers keep read-only readiness in sync without a reverse module import.
+const projectInputsListeners = new Set();
+export function onProjectInputsChanged(listener) {
+  projectInputsListeners.add(listener);
+}
+
 export async function optionalRequestJSON(url, method, payload) {
   const options = { method: method || "GET", headers: { "Content-Type": "application/json" } };
   if (payload !== undefined) options.body = JSON.stringify(payload);
@@ -262,6 +270,10 @@ export async function optionalRequestJSON(url, method, payload) {
     const error = new Error(data.message || data.error || plainText || `HTTP ${response.status}`);
     error.status = response.status;
     throw error;
+  }
+  // Every completed sync edit/job reloads this document, including LIFE assignments.
+  if (String(url).split("?")[0] === "/stage2/sync-matches" && options.method === "GET") {
+    for (const listener of projectInputsListeners) listener();
   }
   return {
     available: true,

@@ -9,6 +9,7 @@ import {
   syncTtsStyleAvailability,
 } from "./core.js";
 import { refreshStatus } from "./normalization.js";
+import { refreshStage3Status } from "./stage3.js";
 
 let currentTtsJobId = "";
 let ttsJobClientStartedAt = null;
@@ -55,6 +56,9 @@ export function styleDegradedMessage(idsList, total) {
 }
 
 export function renderLive() {
+  // The displayed task and shared action controls use the same state.
+  appState.currentTtsJobStatus = String(live.status || "idle").toLowerCase();
+  if (ids.btn_tts_cancel) ids.btn_tts_cancel.hidden = !["queued", "running", "cancelling"].includes(live.status);
   if (!ids.live_job_status) return;
   ids.live_job_status.dataset.state = live.status || "idle";
   ids.live_job_status.textContent = live.status || "idle";
@@ -103,6 +107,7 @@ async function doAnalyze() {
   toast(`Анализ завершён: ${result.blocks_count} блоков`, "success");
   appendLog(`Analyze done: blocks=${result.blocks_count}, llm=${result.used_llm}`);
   await refreshStatus();
+  await refreshStage3Status();
 }
 
 async function doTTS() {
@@ -119,21 +124,52 @@ async function doTTS() {
     current: "—", retries: 0, done: 0, total: 0, error: "", styleDegradedIds: [],
   });
   appendLog(`TTS job: provider=${f.provider}, model=${f.tts_model || "local"}, gender=${f.gender}, speed=${f.speed}x, dry=${f.dry_run}`);
-  const start = await postJSON("/stage1/tts-jobs/start", {
-    project,
-    prepared_path: f.prepared_path,
-    speaker_dir: f.speaker_dir,
-    provider: f.provider,
-    tts_model: f.tts_model || null,
-    tts_style: f.tts_style,
-    gender: f.gender,
-    voice_name: f.voice_name || null,
-    dry_run: f.dry_run,
-    speed: f.speed,
-  });
+  let start;
+  try {
+    start = await postJSON("/stage1/tts-jobs/start", {
+      project,
+      prepared_path: f.prepared_path,
+      speaker_dir: f.speaker_dir,
+      provider: f.provider,
+      tts_model: f.tts_model || null,
+      tts_style: f.tts_style,
+      gender: f.gender,
+      voice_name: f.voice_name || null,
+      dry_run: f.dry_run,
+      speed: f.speed,
+    });
+    if (!String(start.job_id || "").trim()) throw new Error("TTS job start failed: empty job_id");
+  } catch (error) {
+    // A lost response, server error or conflict may still refer to an accepted job.
+    const uncertain = isTransientPollingError(error);
+    if (uncertain || Number(error.status) === 409) {
+      try {
+        const recovered = await optionalRequestJSON(`/stage1/tts-jobs/status?project=${encodeURIComponent(project)}`);
+        const job = recovered.result || {};
+        const active = ["queued", "running", "cancelling"].includes(String(job.status || "").toLowerCase());
+        // Latest terminal jobs cannot be correlated to an unacknowledged start.
+        if (job.id && active) {
+          start = {job_id: job.id, status: job.status};
+          appendLog(`TTS: восстановлено состояние принятой задачи ${job.id}`, "warn");
+        }
+      } catch (lookupError) {
+        appendLog(`TTS: не удалось проверить принятие задачи: ${lookupError.message || lookupError}`, "warn");
+      }
+    }
+    if (!String(start?.job_id || "").trim()) {
+      currentTtsJobId = "";
+      setStepState(ids.step_tts, "error");
+      setLive({
+        status: uncertain ? "interrupted" : "failed",
+        event: uncertain ? "interrupted" : "failed",
+        error: String(error.message || error)
+          + (uncertain ? ". Принятие задачи не подтверждено; обновите страницу для восстановления состояния." : ""),
+      });
+      throw error;
+    }
+  }
 
   const jobId = String(start.job_id || "").trim();
-  if (!jobId) throw new Error("TTS job start failed: empty job_id");
   currentTtsJobId = jobId;
   const statusUrl = String(
     start.status_url || `/stage1/tts-jobs/${encodeURIComponent(jobId)}?project=${encodeURIComponent(project)}`,
@@ -236,6 +272,7 @@ async function doTTS() {
   }
 
   await refreshStatus();
+  await refreshStage3Status();
 }
 
 async function cancelTTSJob() {
@@ -281,6 +318,7 @@ async function clearTTS() {
   toast(`Озвучка очищена: удалено ${result.files_removed || 0} файлов`, "success");
   appendLog(`TTS cleared: files=${result.files_removed || 0}, manifests=${result.manifests_reset || 0}`);
   await refreshStatus();
+  await refreshStage3Status();
 }
 
 export function restoredSpeakerDirectory(value) {
@@ -367,6 +405,7 @@ async function pollRestoredTtsJob() {
         appendLog("TTS остановлен; готовые WAV можно продолжить кнопкой «Продолжить озвучку».", "warn");
       }
       await refreshStatus();
+      await refreshStage3Status();
     }
   } catch (err) {
     if (!isTransientPollingError(err)) {
@@ -428,6 +467,7 @@ async function doPhraseTTS() {
     ids.phrase_player.load();
   }
   await refreshStatus();
+  await refreshStage3Status();
 }
 
 async function doValidate() {
@@ -462,6 +502,7 @@ async function doValidate() {
   }
   appendLog(`Validate done: ok=${result.ok}, items=${result.items_count}, errors=${(result.errors||[]).length}`);
   await refreshStatus();
+  await refreshStage3Status();
 }
 
 export async function doBuildTimeline() {
@@ -513,6 +554,7 @@ export async function doBuildTimeline() {
 
   appState.timelineReady = true;
   ids.btn_export_xml.disabled = false;
+  await refreshStage3Status();
 }
 
 if (ids.btn_analyze) ids.btn_analyze.addEventListener("click", () => safely(doAnalyze));
