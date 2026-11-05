@@ -463,15 +463,15 @@ def _load_route_generator():
     return module
 
 
-def test_readme_api_routes_block_matches_generator() -> None:
+def test_api_document_routes_block_matches_generator() -> None:
     generator = _load_route_generator()
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    readme = (Path(__file__).resolve().parents[1] / "docs" / "API.md").read_text(encoding="utf-8")
 
     assert generator.BEGIN in readme and generator.END in readme
     start = readme.index(generator.BEGIN)
     end = readme.index(generator.END) + len(generator.END)
     assert readme[start:end] == generator.render_block(), (
-        "README.md API routes block drifted; run scripts/gen-api-routes --write"
+        "docs/API.md API routes block drifted; run scripts/gen-api-routes --write"
     )
     assert generator.main(["--check"]) == 0
 

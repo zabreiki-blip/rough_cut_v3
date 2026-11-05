@@ -6,12 +6,19 @@
 
 ## Начало работы
 
-- [`../README.md`](../README.md) — быстрый старт, настройка, API, тесты и Docker.
+- [USER_GUIDE.md](USER_GUIDE.md) — материалы, разметка, закадр, синхроны, редакции и XML.
+- [FIRST_PROJECT_CHECKLIST.md](FIRST_PROJECT_CHECKLIST.md) — демо и ручная проверка результата.
+- [CONFIGURATION.md](CONFIGURATION.md) — настройки и переменные среды.
+- [API.md](API.md) — авторизация, маршруты и контракты задач.
+- [DEPLOYMENT.md](DEPLOYMENT.md) — локальные профили, Docker и Connector.
+- [DEVELOPMENT.md](DEVELOPMENT.md) — CLI, тесты и сопровождение.
+
+- [`../README.md`](../README.md) — браузерный быстрый старт.
 - [`STAGE1_GUIDE.md`](STAGE1_GUIDE.md) — работа со сценарием, нормализация и TTS.
 - [`../cep/README.md`](../cep/README.md) — установка и использование CEP-панели
-  Premiere Pro.
+  Premiere Pro (дополнительный путь, CEP заморожен).
 - [`E2E_PILOT_CHECKLIST.md`](E2E_PILOT_CHECKLIST.md) — ручной сквозной пилот в
-  Premiere Pro.
+  Premiere Pro (дополнительный путь, CEP заморожен).
 
 ## Разработка и сопровождение
 

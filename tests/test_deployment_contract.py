@@ -75,7 +75,7 @@ def test_compose_keeps_image_uid_for_named_cache_volume() -> None:
 
 def test_bootstrap_warns_about_linux_bind_mount_ownership_without_sudo() -> None:
     bootstrap = (ROOT / "scripts/bootstrap-docker").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
 
     assert '"$(uname -s)" == "Linux"' in bootstrap
     assert "chown -R 10001:10001 projects data" in bootstrap
@@ -87,7 +87,7 @@ def test_bootstrap_warns_about_linux_bind_mount_ownership_without_sudo() -> None
 
 def test_asr_concurrency_limit_documented() -> None:
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
     assert "ROUGH_CUT_MAX_ASR_JOBS" in env_example
     assert "ROUGH_CUT_MAX_ASR_JOBS" in readme
 

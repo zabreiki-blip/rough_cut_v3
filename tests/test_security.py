@@ -503,7 +503,7 @@ def test_runtime_smoke_requires_application_faster_whisper_backend(resolved_back
 
 
 def test_final_review_operator_docs_cover_recovery_and_cost_contracts() -> None:
-    readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT_DIR / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
     guide = (ROOT_DIR / "docs/STAGE1_GUIDE.md").read_text(encoding="utf-8")
     for document in (readme, guide):
         for contract in (
