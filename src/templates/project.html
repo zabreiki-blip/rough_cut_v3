@@ -188,8 +188,13 @@
       <div class="normalization-inputs panel">
         <label class="field">
           <span>Исходный сценарий</span>
-          <input id="normalization_input_path" type="text" value="{{ defaults.input_path }}">
+          <select id="normalization_scenario_select"><option value="">Поиск сценариев…</option></select>
         </label>
+        <button id="btn_refresh_scenarios" class="btn" type="button">Обновить список</button>
+        <p id="normalization_scenario_summary" class="section-copy" role="status" aria-live="polite">Положите сценарий в ЗАГРУЗИТЬ/Сценарии. Файлы из прежней папки input/ тоже доступны.</p>
+        <details><summary>Расширенные настройки: ручной путь</summary>
+          <label class="field"><span>Путь к сценарию</span><input id="normalization_input_path" type="text" value=""></label>
+        </details>
         <label class="field normalization-hint-field">
           <span>Подсказка об обозначениях автора (необязательно)</span>
           <textarea id="normalization_hint" rows="2" placeholder="Например: «Голос диктора» — закадр, «ИНТ» — синхрон"></textarea>

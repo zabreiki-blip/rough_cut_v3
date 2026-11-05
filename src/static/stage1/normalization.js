@@ -596,6 +596,19 @@ export async function loadNormalization(quiet) {
 export async function generateNormalization() {
   const inputPath = ids.normalization_input_path.value.trim();
   assertRequiredPath(inputPath, "input_path");
+  const source = String(appState.normalization?.source || "");
+  const projectPrefix = `projects/${project}/`;
+  const sourceIdentity = (raw) => {
+    const value = raw.normalize("NFC");
+    const index = value.indexOf(projectPrefix.normalize("NFC"));
+    return index >= 0 ? value.slice(index) : value;
+  };
+  if (source && sourceIdentity(source) !== sourceIdentity(inputPath)) {
+    throw new Error("Для другого файла используйте вкладку «Редакции»: сохраните и подтвердите текущий сценарий, затем импортируйте новую редакцию. Разметка и несохранённые правки сохранены.");
+  }
+  if (appState.stage3JobRunning || appState.syncJobRunning || ["queued", "running", "cancelling"].includes(appState.currentTtsJobStatus)) {
+    throw new Error("Дождитесь завершения текущей задачи перед разбором сценария.");
+  }
   if (hasUnsavedChanges()) {
     await saveNormalization();
     if (hasUnsavedChanges()) throw new Error("Во время сохранения появились новые правки. Сохраните их перед повторным разбором.");

@@ -68,6 +68,31 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["project"], "Монтаж_01")
 
+    def test_inbox_scenario_starts_normalization_with_repository_relative_path(self) -> None:
+        source = self.projects / "demo" / "ЗАГРУЗИТЬ" / "Сценарии" / "Новый выпуск.txt"
+        source.parent.mkdir(parents=True)
+        source.write_text("ЗК: Первый закадровый блок.\n", encoding="utf-8")
+        inbox = self.client.get("/stage4/inbox?project=demo").get_json()["result"]
+        selected = inbox["scenario_files"][0]["relative_path"]
+        self.assertEqual(selected, "ЗАГРУЗИТЬ/Сценарии/Новый выпуск.txt")
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), kwargs=None, **_options):
+                self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+        with patch.object(api.threading, "Thread", ImmediateThread):
+            response = self.client.post(
+                "/stage1/normalization-jobs/start",
+                json={"project": "demo", "input_path": "projects/demo/" + selected, "use_llm": False},
+            )
+        self.assertEqual(response.status_code, 202)
+        job = self.client.get("/stage1/normalization-jobs/" + response.get_json()["result"]["id"]).get_json()["result"]
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(Path(job["result"]["source"]), source)
+
     def test_normalization_job_accepts_fast_preset_and_rejects_unknown_preset(self) -> None:
         source = self._source()
         with patch.object(api.threading.Thread, "start"):

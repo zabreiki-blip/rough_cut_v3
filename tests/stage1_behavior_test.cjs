@@ -161,6 +161,118 @@ async function testPhraseTtsTimeout({ core, tts }) {
   }
 }
 
+// Catches fabricated paths and refresh silently replacing the selected source or editor draft.
+async function testScenarioPicker({ state, normalization }) {
+  const inbox = await import(moduleUrl("inbox.js"));
+  const { ids, appState } = state;
+  const oldFetch = globalThis.fetch, oldDoc = appState.normalization, oldDirty = appState.normalizationDirty;
+  const oldStatus = state.initialStatus.normalization_status;
+  state.initialStatus.normalization_status = "missing";
+  let files = [];
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), body: JSON.parse(options.body || "{}") });
+    const result = String(url).includes("/inbox") ? { scenario_files: files, review_files: [] } : { id: "job", status: "completed", result: { blocks: [], revision: 1 } };
+    return { ok: true, json: async () => ({ ok: true, result }), text: async () => JSON.stringify({ ok: true, result }) };
+  };
+  try {
+    ids.normalization_input_path.value = ""; ids.normalization_scenario_select.value = "";
+    appState.normalization = null;
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_input_path.value, "");
+    assert.match(ids.normalization_scenario_summary.textContent, /ЗАГРУЗИТЬ.*Сценарии/);
+    files = [{ name: "Новый выпуск.docx", relative_path: "ЗАГРУЗИТЬ/Сценарии/Новый выпуск.docx", fingerprint: "sha256:a" }, { name: "old.txt", relative_path: "input/old.txt", fingerprint: "sha256:b" }];
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_scenario_select.value, "ЗАГРУЗИТЬ/Сценарии/Новый выпуск.docx");
+    assert.strictEqual(ids.normalization_input_path.value, `projects/${state.project}/ЗАГРУЗИТЬ/Сценарии/Новый выпуск.docx`);
+    ids.normalization_scenario_select.value = "input/old.txt";
+    ids.normalization_scenario_select.dispatch("change");
+    assert.strictEqual(requests.filter(x => x.url.includes("jobs/start")).length, 0);
+    await normalization.generateNormalization();
+    assert.strictEqual(requests.find(x => x.url.includes("jobs/start")).body.input_path, `projects/${state.project}/input/old.txt`);
+    const draft = { blocks: [{ normalized_text: "правки" }], revision: 3 };
+    appState.normalization = draft; appState.normalizationDirty = true;
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_scenario_select.value, "input/old.txt");
+    assert.strictEqual(appState.normalization, draft); assert.strictEqual(appState.normalizationDirty, true);
+    ids.normalization_input_path.value = "/custom/Ручной файл.docx";
+    ids.normalization_input_path.dispatch("input");
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_input_path.value, "/custom/Ручной файл.docx");
+    assert.match(ids.normalization_scenario_summary.textContent, /Ручной путь/);
+    assert.ok(!ids.normalization_scenario_summary.textContent.includes("исчез"));
+    ids.normalization_scenario_select.value = "input/old.txt";
+    ids.normalization_scenario_select.dispatch("change");
+    files = files.slice(0, 1);
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_scenario_select.value, ""); assert.strictEqual(ids.normalization_input_path.value, "");
+    assert.match(ids.normalization_scenario_summary.textContent, /исчез|недоступ/);
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_scenario_select.value, "", "missing source requires explicit new choice");
+    globalThis.fetch = async () => { throw new Error("offline"); };
+    await inbox.refreshScenarioInbox(true);
+    assert.match(ids.normalization_scenario_summary.textContent, /offline/);
+    assert.strictEqual(appState.normalization, draft);
+    assert.strictEqual(inbox.normalizationScenarioPath(`projects/${state.project}/input/old.txt`), `projects/${state.project}/input/old.txt`);
+  } finally {
+    globalThis.fetch = oldFetch; appState.normalization = oldDoc; appState.normalizationDirty = oldDirty; ids.normalization_input_path.value = "";
+    state.initialStatus.normalization_status = oldStatus;
+  }
+}
+
+async function testScenarioRestoresUnicodeActiveSource({ state }) {
+  const inbox = await import(moduleUrl("inbox.js") + "?unicode-restore");
+  const { ids, appState, defaults } = state;
+  const oldFetch = globalThis.fetch, oldDoc = appState.normalization, oldDefaults = { ...defaults };
+  const file = { relative_path: "ЗАГРУЗИТЬ/Сценарии/Новый выпуск.txt", name: "Новый выпуск.txt", fingerprint: "sha256:active" };
+  try {
+    defaults.normalization_input_path = `projects/${state.project}/` + file.relative_path.normalize("NFD");
+    defaults.has_normalization = true;
+    ids.normalization_input_path.value = ""; ids.normalization_scenario_select.value = "";
+    appState.normalization = { source: defaults.normalization_input_path, status: "confirmed", blocks: [] };
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result: { scenario_files: [{ relative_path: "input/first.txt", name: "first.txt", fingerprint: "sha256:first" }, file], review_files: [] } }) });
+    await inbox.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_scenario_select.value, file.relative_path, "restore exact active source across Unicode spelling; never first file");
+    defaults.normalization_input_path = "";
+    ids.normalization_input_path.value = ""; ids.normalization_scenario_select.value = "";
+    const missing = await import(moduleUrl("inbox.js") + "?missing-active-source");
+    await missing.refreshScenarioInbox();
+    assert.strictEqual(ids.normalization_scenario_select.value, "");
+    assert.match(ids.normalization_scenario_summary.textContent, /исчез|недоступ/);
+  } finally {
+    globalThis.fetch = oldFetch; appState.normalization = oldDoc;
+    for (const key of Object.keys(defaults)) delete defaults[key]; Object.assign(defaults, oldDefaults);
+    ids.normalization_scenario_select.value = ""; ids.normalization_input_path.value = "";
+  }
+}
+
+async function testScenarioSwitchPreservesDraft({ state, normalization }) {
+  const { ids, appState } = state;
+  const oldFetch = globalThis.fetch, oldDoc = appState.normalization, oldDirty = appState.normalizationDirty;
+  const oldPath = ids.normalization_input_path.value;
+  const oldJobs = { stage3JobRunning: appState.stage3JobRunning, syncJobRunning: appState.syncJobRunning, currentTtsJobStatus: appState.currentTtsJobStatus };
+  try {
+    const draft = { source: `/app/projects/${state.project}/input/active.txt`, blocks: [{ normalized_text: "ручные правки" }], scenario_revision_id: "rev_0001" };
+    appState.normalization = draft; appState.normalizationDirty = true;
+    ids.normalization_input_path.value = `projects/${state.project}/input/new.txt`;
+    let called = false;
+    globalThis.fetch = async () => { called = true; throw new Error("unexpected request"); };
+    await assert.rejects(normalization.generateNormalization(), /Редакции/);
+    assert.strictEqual(called, false, "source switch cannot save or replace the active draft");
+    assert.strictEqual(appState.normalization, draft); assert.strictEqual(appState.normalizationDirty, true);
+    ids.normalization_input_path.value = `projects/${state.project}/input/active.txt`;
+    for (const blocker of [{ stage3JobRunning: true }, { syncJobRunning: true }, ...["queued", "running", "cancelling"].map(currentTtsJobStatus => ({ currentTtsJobStatus }))]) {
+      Object.assign(appState, { stage3JobRunning: false, syncJobRunning: false, currentTtsJobStatus: "idle" }, blocker);
+      await assert.rejects(normalization.generateNormalization(), /Дождитесь завершения/);
+      assert.strictEqual(called, false, "active jobs block normalization before saving dirty edits");
+      assert.strictEqual(appState.normalization, draft); assert.strictEqual(appState.normalizationDirty, true);
+    }
+  } finally {
+    Object.assign(appState, oldJobs);
+    globalThis.fetch = oldFetch; appState.normalization = oldDoc; appState.normalizationDirty = oldDirty; ids.normalization_input_path.value = oldPath;
+  }
+}
+
 async function testRevisionImportTimeout({ state, revisions }) {
   const { ids, appState } = state;
   const originalFetch = globalThis.fetch;
@@ -985,6 +1097,16 @@ async function testRevisionsInbox({ state, revisions }) {
     select.value = "Сценарии/new.docx";
     await rejectsWith("stop-after-import-post");
     assert.strictEqual(inboxCalls.length, 2);
+
+    inboxFiles = [{ relative_path: "input/another.txt", name: "another.txt", fingerprint: "sha256:def" }];
+    await revisions.loadProjectInbox(false);
+    assert.strictEqual(select.value, "", "disappearing revision candidate requires new selection");
+    await revisions.loadProjectInbox(false);
+    assert.strictEqual(select.value, "", "repeated refresh cannot silently select another revision candidate");
+    select.value = "input/another.txt";
+    select.dispatch("change");
+    await revisions.loadProjectInbox(false);
+    assert.strictEqual(select.value, "input/another.txt", "explicit replacement choice survives refresh");
 
     // 5. Return-to-window refresh: only on "versions" tab, debounced.
     let activeTab = "assembly";
@@ -2964,6 +3086,9 @@ async function main() {
     ["testSyncSummaryReasonCounters", () => testSyncSummaryReasonCounters(modules)],
     ["testSyncSourcesEditor", () => testSyncSourcesEditor(modules)],
     ["testRevisionsInbox", () => testRevisionsInbox(modules)],
+    ["testScenarioRestoresUnicodeActiveSource", () => testScenarioRestoresUnicodeActiveSource(modules)],
+    ["testScenarioSwitchPreservesDraft", () => testScenarioSwitchPreservesDraft(modules)],
+    ["testScenarioPicker", () => testScenarioPicker(modules)],
     ["testRevisionImportTimeout", () => testRevisionImportTimeout(modules)],
     ["testBuildTimelineSurfacesWarnings", () => testBuildTimelineSurfacesWarnings(modules)],
     ["testSyncMatchVerificationReasons", () => testSyncMatchVerificationReasons(modules)],

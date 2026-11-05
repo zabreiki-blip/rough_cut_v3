@@ -268,6 +268,29 @@ def _build_readiness(settings: Any) -> dict[str, Any]:
 def _active_revision_input_path(paths: dict[str, Path], input_files: list[str]) -> str:
     """Prefer the scenario file owned by the active revision."""
 
+    # The normalized document retains the exact original path; a revision
+    # manifest only has a basename, which can collide across inbox folders.
+    try:
+        document = json.loads(paths["normalized"].read_text(encoding="utf-8"))
+        source = str(document.get("source") or "")
+    except (OSError, TypeError, ValueError):
+        source = ""
+    if source:
+        root = paths["root"].resolve()
+        source_path = Path(source)
+        if not source_path.is_absolute():
+            source_path = root.parent.parent / source_path
+        for value in input_files:
+            candidate = root.parent.parent / value
+            if candidate.resolve() == source_path.resolve():
+                return value
+            try:
+                if candidate.samefile(source_path):
+                    return value
+            except OSError:
+                pass
+        return ""
+
     active_path = paths["work"] / "active_revision.json"
     try:
         active = json.loads(active_path.read_text(encoding="utf-8"))
@@ -349,6 +372,8 @@ def register_core_routes(app: Flask, services: ModuleType) -> None:
         defaults = {
             "project": project,
             "input_path": (active_input or f"projects/{project}/input/scenario.docx"),
+            "normalization_input_path": active_input,
+            "has_normalization": paths["normalized"].is_file(),
             "output_path": f"projects/{project}/work/scenario_prepared.json",
             "raw_output_path": f"projects/{project}/work/scenario_raw.txt",
             "prepared_path": f"projects/{project}/work/scenario_prepared.json",

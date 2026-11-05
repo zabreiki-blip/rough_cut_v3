@@ -49,6 +49,30 @@ async function main() {
     await command('Network.setExtraHTTPHeaders',{headers:{Authorization:headers.Authorization}});
     await command('Page.navigate',{url:`${baseUrl}/project/browser_fixture`});
     await until(()=>evaluate("!!document.querySelector('#btn_tts_cancel') && !!document.querySelector('#log_box')?.textContent.includes('UI ready')"));
+    // Actual folder → discovery → explicit normalization job → confirmation.
+    await until(()=>evaluate("document.querySelector('#normalization_scenario_summary').textContent.includes('ЗАГРУЗИТЬ')"));
+    assert.equal(await evaluate("document.querySelector('#normalization_input_path').value"),'','empty project has no fabricated source');
+    const scenarioDirectory = path.join(temporary,'app','projects','browser_fixture','ЗАГРУЗИТЬ','Сценарии');
+    fs.mkdirSync(scenarioDirectory,{recursive:true});
+    const scenarioFile = path.join(scenarioDirectory,'Новый выпуск.txt');
+    fs.writeFileSync(scenarioFile,'ЗК: Первый закадровый блок.\n');
+    await evaluate("document.querySelector('#btn_refresh_scenarios').click()");
+    await until(()=>evaluate("document.querySelector('#normalization_scenario_select').value.includes('Новый выпуск.txt')")).catch(async error=>{throw Error(error.message + ': ' + JSON.stringify(await evaluate("({summary:document.querySelector('#normalization_scenario_summary').textContent, options:document.querySelector('#normalization_scenario_select').innerHTML, log:document.querySelector('#log_box').textContent})")));});
+    assert.equal(await evaluate("document.querySelector('#normalization_blocks').children.length"),0,'selection does not normalize');
+    await evaluate("document.querySelector('#normalization_use_llm').checked=false; document.querySelector('#btn_normalize').click()");
+    await until(()=>evaluate("document.querySelector('#normalization_status').dataset.state === 'draft' && !document.querySelector('#btn_confirm_normalization').disabled"));
+    await evaluate("document.querySelector('#btn_confirm_normalization').click()");
+    await until(()=>evaluate("document.querySelector('#normalization_status').dataset.state === 'confirmed' || document.querySelector('#normalization_learning_dialog').open"));
+    await evaluate("if(document.querySelector('#normalization_learning_dialog').open) document.querySelector('#btn_confirm_with_learning').click()");
+    await until(()=>evaluate("document.querySelector('#normalization_status').dataset.state === 'confirmed'"));
+    await command('Page.reload');
+    await until(()=>evaluate("document.querySelector('#normalization_scenario_select')?.value.includes('Новый выпуск.txt') && document.querySelector('#normalization_status').dataset.state === 'confirmed'"));
+    await until(()=>evaluate("(async()=> !!(await import('/static/stage1/state.js')).appState.normalization)()"));
+    const preservedRevision = await evaluate("(async()=> (await import('/static/stage1/state.js')).appState.normalization.revision)()");
+    fs.unlinkSync(scenarioFile);
+    await evaluate("document.querySelector('#btn_refresh_scenarios').click()");
+    await until(()=>evaluate("document.querySelector('#normalization_scenario_select').value === '' && document.querySelector('#normalization_scenario_summary').textContent.includes('исчез')"));
+    assert.equal(await evaluate("(async()=> (await import('/static/stage1/state.js')).appState.normalization.revision)()"),preservedRevision,'missing file preserves normalized document');
     await evaluate("document.querySelector('[data-tab=voiceover]').click()");
     for(const status of ['idle','queued','running','cancelling','completed','failed','cancelled','interrupted']) {
       const visible = await evaluate(`(async()=>{const {live}=await import('/static/stage1/state.js'); const {renderLive}=await import('/static/stage1/tts.js'); live.status=${JSON.stringify(status)};renderLive();const button=document.querySelector('#btn_tts_cancel');return getComputedStyle(button).display !== 'none' && button.getClientRects().length>0;})()`);
@@ -97,7 +121,7 @@ async function main() {
     await command('Page.reload');
     await until(()=>evaluate("document.querySelector('#live_job_status')?.textContent === 'completed'"));
     assert.equal(await evaluate("getComputedStyle(document.querySelector('#btn_tts_cancel')).display"),'none','completed stop stays hidden after reload');
-    console.log('Chrome smoke passed: Stage3 queued → running → completed; rejected TTS click; TTS visibility/polling/reload; hidden tabs/dialogs');
+    console.log('Chrome smoke passed: folder picker → normalization → confirmation/reload/disappearance; Stage3 queued → running → completed; rejected TTS click; TTS visibility/polling/reload; hidden tabs/dialogs');
   } finally {
     if(socket) socket.close();
     await Promise.all(children.reverse().map(child=>new Promise(resolve=> { if(child.exitCode!==null) return resolve();child.once('exit',resolve);child.kill('SIGTERM');setTimeout(()=>{child.kill('SIGKILL');resolve();},2000).unref(); })));

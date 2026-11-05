@@ -10,6 +10,7 @@ import { renderLive, restoreTtsJob } from "./stage1/tts.js";
 import { restoreRecordedJob, restoreVoiceMode, scanRecordedInbox } from "./stage1/recorded_voiceover.js";
 import { loadSyncWorkspace } from "./stage1/sync.js";
 import { scanStage3MediaOnce, refreshStage3Status } from "./stage1/stage3.js";
+import { refreshScenarioInbox } from "./stage1/inbox.js";
 import { loadRevisionsScreen } from "./stage1/revisions.js";
 import { startOpenRouterUsagePolling } from "./stage1/usage.js";
 
@@ -58,6 +59,7 @@ window.addEventListener("focus", () => { refreshStage3Status(); });
 appendLog(`UI ready. project=${project}`);
 loadReadiness().catch((err) => appendLog(`Readiness init: ${err.message || err}`, "warn"));
 Promise.all([loadNormalization(true), loadMemory(true)]).catch((err) => appendLog(`Normalization init: ${err.message}`, "warn"));
+refreshScenarioInbox(true);
 loadRevisionsScreen(true);
 restoreVoiceMode();
 restoreRecordedJob().catch((err) => appendLog(`Recorded voiceover init: ${err.message || err}`, "warn"));

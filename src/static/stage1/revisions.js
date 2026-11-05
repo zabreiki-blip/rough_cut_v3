@@ -6,6 +6,7 @@ import {
   toast, appendLog, escaped, blockTypeLabels, postJSON, getJSON,
   confirmDialog, openTab, safely,
 } from "./core.js";
+import { discoverProjectInbox } from "./inbox.js";
 import { saveNormalization } from "./normalization.js";
 
 // Import runs LLM normalization synchronously on the server and may take minutes.
@@ -129,18 +130,21 @@ function revisionDateShort(revision) {
   return revisionDate(revision).split(",")[0];
 }
 
+let revisionSelectionMissing = false;
+
 export async function loadProjectInbox(quiet) {
   if (!ids.inbox_scenario_select) return;
   try {
-    const result = await getJSON(`/stage4/inbox?project=${encodeURIComponent(project)}`);
+    const result = await discoverProjectInbox();
     const knownHashes = new Set(
       revisionsState.revisions.map((item) => String(item.source_sha256 || ""))
     );
     const scenarios = (Array.isArray(result.scenario_files) ? result.scenario_files : [])
       .filter((item) => !knownHashes.has(String(item.fingerprint || "").replace(/^sha256:/, "")));
     const previous = ids.inbox_scenario_select.value;
+    if (previous && !scenarios.some(item => item.relative_path === previous)) revisionSelectionMissing = true;
     ids.inbox_scenario_select.innerHTML = scenarios.length
-      ? scenarios.map((item) => (
+      ? (revisionSelectionMissing ? '<option value="">Выбранный файл исчез. Выберите сценарий заново</option>' : '') + scenarios.map((item) => (
         `<option value="${escaped(item.relative_path)}">${escaped(item.name)}</option>`
       )).join("")
       : '<option value="">Положите файл в ЗАГРУЗИТЬ/Сценарии</option>';
@@ -1081,6 +1085,8 @@ export function refreshInboxOnReturn() {
 }
 window.addEventListener("focus", () => { refreshInboxOnReturn(); });
 document.addEventListener("visibilitychange", () => { refreshInboxOnReturn(); });
+
+ids.inbox_scenario_select?.addEventListener("change", () => { revisionSelectionMissing = false; });
 
 if (ids.btn_import_revision) ids.btn_import_revision.addEventListener("click", () => safely(importRevision));
 if (ids.revision_list) ids.revision_list.addEventListener("click", (event) => {
