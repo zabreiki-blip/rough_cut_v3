@@ -362,3 +362,62 @@ def test_readiness_ui_contract_in_template_and_script() -> None:
     assert 'readiness_summary_badge: el("readiness_summary_badge")' in state_js
     assert 'readiness_list: el("readiness_list")' in state_js
     assert '"/system/readiness"' in readiness_js
+
+
+def test_readiness_capabilities_support_local_work_without_optional_keys(client, monkeypatch):
+    monkeypatch.setenv("TTS_PROVIDER", "macos")
+    monkeypatch.delenv("MACOS_CONNECTOR_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SYNC_CLOUD_ASR_API_KEY", raising=False)
+    monkeypatch.setattr(api_core_routes.shutil, "which", lambda _: "/usr/bin/tool")
+    monkeypatch.setattr(api_core_routes, "available_backends", lambda: ["faster-whisper"])
+    payload = client.get("/system/readiness").get_json()
+    assert payload["capabilities"] == {
+        "local_tts": True,
+        "local_asr": True,
+        "cloud_llm": False,
+        "cloud_tts": False,
+        "cloud_asr": False,
+    }
+    assert payload["overall"] == "warn"  # legacy checks remain compatible
+
+
+def test_readiness_cloud_configuration_is_not_a_connection_check(client, monkeypatch):
+    monkeypatch.setenv("TTS_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-configured-only")
+    monkeypatch.setattr(api_core_routes, "available_backends", lambda: [])
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: pytest.fail("no cloud probe allowed"))
+    payload = client.get("/system/readiness").get_json()
+    assert payload["capabilities"]["cloud_llm"] is True
+    assert payload["capabilities"]["cloud_tts"] is True
+    assert payload["capabilities"]["cloud_asr"] is True
+    assert payload["capabilities"]["local_asr"] is False
+    assert "не провер" in str(payload["capabilities_note"]).lower()
+
+
+@pytest.mark.parametrize("missing", ["ffmpeg", "asr", "cloud_tts"])
+def test_readiness_capabilities_do_not_hide_missing_requirements(client, monkeypatch, missing):
+    monkeypatch.setenv("TTS_PROVIDER", "openrouter" if missing == "cloud_tts" else "macos")
+    monkeypatch.delenv("MACOS_CONNECTOR_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SYNC_CLOUD_ASR_API_KEY", raising=False)
+    monkeypatch.setattr(
+        api_core_routes.shutil,
+        "which",
+        lambda name: None if missing == "ffmpeg" and name == "ffmpeg" else "/usr/bin/tool",
+    )
+    monkeypatch.setattr(
+        api_core_routes,
+        "available_backends",
+        lambda: [] if missing == "asr" else ["faster-whisper"],
+    )
+    payload = client.get("/system/readiness").get_json()
+    caps = payload["capabilities"]
+    if missing == "ffmpeg":
+        assert caps["local_tts"] is False
+        assert caps["local_asr"] is False
+    elif missing == "asr":
+        assert caps["local_asr"] is False
+    else:
+        assert caps["cloud_tts"] is False
+        assert next(c for c in payload["checks"] if c["id"] == "tts_provider")["status"] != "ok"

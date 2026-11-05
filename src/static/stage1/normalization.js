@@ -594,6 +594,22 @@ export async function loadNormalization(quiet) {
 }
 
 export async function generateNormalization() {
+  try {
+    await generateNormalizationFromSource();
+  } catch (error) {
+    const message = String(error.message || error);
+    // Keep the low-level failure in the log through safely(), close to the file show a useful action.
+    if (ids.normalization_scenario_summary) {
+      const fileError = /input_path|FileNotFoundError|Input file not found|no such file|unsupported (file|format)|не найден|не удалось (прочитать|открыть)/i.test(message);
+      ids.normalization_scenario_summary.textContent = fileError
+        ? "Не удалось прочитать сценарий. Проверьте файл TXT/DOCX в ЗАГРУЗИТЬ/Сценарии и обновите список. Подробности — в журнале."
+        : /[а-яё]/i.test(message) ? message : "Не удалось разобрать сценарий. Проверьте выбранный файл и сообщения ниже; подробности — в журнале.";
+    }
+    throw error;
+  }
+}
+
+async function generateNormalizationFromSource() {
   const inputPath = ids.normalization_input_path.value.trim();
   assertRequiredPath(inputPath, "input_path");
   const source = String(appState.normalization?.source || "");
@@ -1031,6 +1047,7 @@ export function applyStatus(status) {
     ? Math.max(0, voice.total - voice.ready)
     : (Array.isArray(status.missing_ids) ? status.missing_ids.length : 0);
   const voiceTotal = voice.counted ? voice.total : prepared;
+  appState.voiceReady = voiceTotal === 0 || (wav >= voiceTotal && missing === 0);
   const pct = voiceTotal > 0 ? Math.round((wav / voiceTotal) * 100) : 0;
 
   ids.m_prepared.textContent = String(prepared);

@@ -124,7 +124,8 @@ async function loadModules() {
   const revisions = await import(moduleUrl("revisions.js"));
   const usage = await import(moduleUrl("usage.js"));
   const stage3 = await import(moduleUrl("stage3.js"));
-  return { state, core, normalization, sync, tts, revisions, usage, stage3 };
+  const readiness = await import(moduleUrl("readiness.js"));
+  return { state, core, normalization, sync, tts, revisions, usage, stage3, readiness };
 }
 
 function testRestoredSpeakerDirectory({ state, tts }) {
@@ -2967,6 +2968,8 @@ async function testStage3ProcessingLifecycle({state, stage3}) {
     assert.match(ids.stage3_processing.textContent, /завершена/);
     assert.match(ids.stage3_build.textContent, /подтверждённой сборки нет/);
     assert.match(ids.stage3_media_message.textContent, /Экспортированный XML/);
+    assert.equal(document.getElementById("premiere_import_help").hidden,false,"legacy export instruction survives status refresh");
+    assert.match(document.getElementById("premiere_import_help").textContent,/без подтверждённой сборки/);
     assert.doesNotMatch(ids.stage3_source_mapping.innerHTML, /Сначала соберите/);
     assert.notEqual(ids.stage3_media_status.dataset.state, "failed");
   } finally {
@@ -3064,9 +3067,103 @@ async function testTtsUncertainStartRecovery({state, core}) {
   }
 }
 
+// These cases catch optional warnings opening diagnostics and failure masquerading as readiness.
+async function testCapabilityReadiness({state, readiness}) {
+  const {ids, appState} = state;
+  const oldFetch = globalThis.fetch;
+  const checks = [
+    {id:"ffmpeg",status:"ok",label:"FFmpeg",detail:"готов"},
+    {id:"whisper_backend",status:"ok",label:"ASR",detail:"готов"},
+    {id:"tts_provider",status:"ok",label:"TTS",detail:"готов"},
+    {id:"openrouter_key",status:"warn",label:"OpenRouter",detail:"Нет ключа"},
+  ];
+  try {
+    ids.readiness_panel.open=false;
+    ids.normalization_use_llm.checked=true;
+    const local={ok:true,overall:"warn",checks,capabilities:{local_tts:true,local_asr:true,cloud_llm:false,cloud_tts:false,cloud_asr:false}};
+    readiness.renderReadiness(local);
+    assert.equal(ids.readiness_panel.open,false,"optional cloud key must not unfold diagnostics");
+    assert.match(ids.readiness_summary_badge.textContent,/локальн/i);
+    assert.equal(ids.normalization_use_llm.checked,false,"LLM without configured key must switch off");
+    ids.provider.value="microsoft/mai-voice-2";
+    readiness.renderSelectedServiceReadiness();
+    assert.equal(ids.readiness_panel.open,true,"selected unavailable cloud TTS is a visible problem");
+    assert.match(document.getElementById("readiness_selection_warning").textContent,/озвучк.*не настро/i);
+    ids.provider.value="macos";
+    readiness.renderSelectedServiceReadiness();
+    assert.equal(document.getElementById("readiness_selection_warning").hidden,true);
+    for(const id of ["ffmpeg","whisper_backend","tts_provider"]) {
+      ids.readiness_panel.open=false;
+      readiness.renderReadiness({...local,checks:checks.map(c=>c.id===id?{...c,status:"error"}:c)});
+      assert.equal(ids.readiness_panel.open,true,`${id} failure stays visible`);
+    }
+    globalThis.fetch=async()=>({ok:false,status:503,json:async()=>({ok:false,error:"fixture unavailable"})});
+    await readiness.loadReadiness();
+    assert.equal(ids.readiness_panel.dataset.state,"error");
+    assert.equal(ids.readiness_panel.open,true);
+    assert.match(ids.readiness_summary_badge.textContent,/не удалось/i);
+    assert.equal(appState.readinessCapabilities,null,"failed refresh clears formerly ready capabilities");
+    globalThis.fetch=async()=>({ok:true,status:200,json:async()=>({})});
+    await readiness.loadReadiness();
+    assert.equal(ids.readiness_panel.dataset.state,"error","invalid success body is not readiness");
+  } finally {globalThis.fetch=oldFetch;delete appState.readinessCapabilities;}
+}
+
+function testGuardedNextAction({state,core,normalization,stage3}) {
+  const {ids,appState}=state;
+  const original={...appState};
+  const text=()=>document.getElementById("project_next_text").textContent;
+  try {
+    appState.normalization=null;appState.normalizationEligible=false;appState.timelineReady=false;
+    appState.currentTtsJobStatus="idle";appState.stage3JobRunning=false;
+    core.updateActionAvailability();
+    assert.match(text(),/сценарий/i);
+    appState.normalization={status:"draft",blocks:[{uid:"v1",type:"voiceover"}]};
+    core.updateActionAvailability();assert.match(text(),/подтверд/i);
+    assert.equal(ids.btn_tts.disabled,true,"guide preserves confirmation guard");
+    appState.normalization.status="confirmed";appState.normalizationEligible=true;
+    normalization.applyStatus({prepared_items_count:1,speaker_files_count:0,missing_ids:["zk1"],timeline_ready:false});
+    assert.match(text(),/озвуч/i);
+    normalization.applyStatus({prepared_items_count:1,speaker_files_count:1,missing_ids:[],timeline_ready:false,manifest_exists:true});
+    assert.match(text(),/таймлайн/i);
+    appState.timelineReady=true;core.updateActionAvailability();assert.match(text(),/XML/);
+    stage3.renderStage3Status({processing:{status:"completed"},assembly:{level:"complete_ready"},build:{build_id:"old",mode:"complete",is_current:false}});
+    assert.match(text(),/XML/);assert.doesNotMatch(text(),/Импортируйте/);
+    stage3.renderStage3Status({processing:{status:"completed"},assembly:{level:"draft",blocker_count:2},build:{build_id:"new",mode:"draft",is_current:true,summary:{placeholders:{segments:2}}}});
+    assert.match(text(),/Импортируйте/);
+    const help=document.getElementById("premiere_import_help");
+    assert.equal(help.hidden,false);assert.match(help.textContent,/Черновик.*2/);
+    appState.normalizationEligible=false;core.updateActionAvailability();
+    assert.match(text(),/подтверд/i,"stale build cannot bypass invalidated confirmation");
+    assert.equal(ids.btn_export_xml.disabled,true);
+  } finally {Object.assign(appState,original);}
+}
+
+async function testScenarioFailureAtPicker({state,normalization}) {
+  const {ids,appState}=state;
+  const oldFetch=globalThis.fetch, original={...appState};
+  const oldInput=ids.normalization_input_path.value;
+  try {
+    appState.normalization=null;appState.normalizationDirty=false;
+    appState.stage3JobRunning=false;appState.syncJobRunning=false;appState.currentTtsJobStatus="idle";
+    ids.normalization_input_path.value="projects/test/input/missing.txt";
+    globalThis.fetch=async()=>({ok:false,status:404,text:async()=>JSON.stringify({ok:false,error:"FileNotFoundError: missing.txt"})});
+    await assert.rejects(normalization.generateNormalization(),/FileNotFoundError/);
+    assert.match(ids.normalization_scenario_summary.textContent,/Не удалось прочитать сценарий/);
+    assert.doesNotMatch(ids.normalization_scenario_summary.textContent,/FileNotFoundError/);
+    appState.normalization={source:"projects/test/input/other.txt",blocks:[],status:"draft"};
+    await assert.rejects(normalization.generateNormalization(),/Редакции/);
+    assert.match(ids.normalization_scenario_summary.textContent,/Редакции/,"deliberate transition guard must stay useful");
+    assert.doesNotMatch(ids.normalization_scenario_summary.textContent,/Не удалось прочитать/);
+  } finally {globalThis.fetch=oldFetch;Object.assign(appState,original);ids.normalization_input_path.value=oldInput;}
+}
+
 async function main() {
   const modules = await loadModules();
   const tests = [
+    ["testScenarioFailureAtPicker", () => testScenarioFailureAtPicker(modules)],
+    ["testCapabilityReadiness", () => testCapabilityReadiness(modules)],
+    ["testGuardedNextAction", () => testGuardedNextAction(modules)],
     ["testNormalizationWarningReview", () => testNormalizationWarningReview(modules)],
     ["testNormalizationEditDuringGenerate", () => testNormalizationEditDuringGenerate(modules)],
     ["testTypeDecisionKeepsUnrelatedWarnings", () => testTypeDecisionKeepsUnrelatedWarnings(modules)],

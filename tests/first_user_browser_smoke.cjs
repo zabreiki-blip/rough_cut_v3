@@ -45,10 +45,27 @@ async function main() {
       if(result.exceptionDetails) throw Error(JSON.stringify(result.exceptionDetails));
       return result.result.value;
     };
+    const artifacts = path.join(root,'artifacts','first-user');
+    fs.mkdirSync(artifacts,{recursive:true});
+    const captureGuidance = async phase => {
+      for (const [width,height] of [[1440,900],[1280,800]]) {
+        await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+        await evaluate('window.scrollTo(0,0)');
+        await delay(150);
+        const geometry = await evaluate(`(()=>{const el=document.querySelector('#project_next_action');const r=el.getBoundingClientRect();return {top:r.top,bottom:r.bottom,left:r.left,right:r.right,height:innerHeight,width:innerWidth,uncovered:el.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))};})()`);
+        assert.equal(geometry.top>=0 && geometry.bottom<=height && geometry.left>=0 && geometry.right<=width,true,`next action above fold at ${width}×${height}: ${JSON.stringify(geometry)}`);
+        assert.equal(geometry.uncovered,true,'diagnostics must not cover the next action');
+        const shot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+        fs.writeFileSync(path.join(artifacts,`task5-${phase}-${width}x${height}.png`),Buffer.from(shot.data,'base64'));
+      }
+    };
     await command('Network.enable');
     await command('Network.setExtraHTTPHeaders',{headers:{Authorization:headers.Authorization}});
     await command('Page.navigate',{url:`${baseUrl}/project/browser_fixture`});
     await until(()=>evaluate("!!document.querySelector('#btn_tts_cancel') && !!document.querySelector('#log_box')?.textContent.includes('UI ready')"));
+    await until(()=>evaluate("document.querySelector('#readiness_summary_badge').dataset.state !== 'empty'"));
+    assert.equal(await evaluate("document.querySelector('#normalization_use_llm').checked"),false,'cloud LLM defaults off');
+    await captureGuidance('start');
     // Actual folder → discovery → explicit normalization job → confirmation.
     await until(()=>evaluate("document.querySelector('#normalization_scenario_summary').textContent.includes('ЗАГРУЗИТЬ')"));
     assert.equal(await evaluate("document.querySelector('#normalization_input_path').value"),'','empty project has no fabricated source');
@@ -65,6 +82,8 @@ async function main() {
     await until(()=>evaluate("document.querySelector('#normalization_status').dataset.state === 'confirmed' || document.querySelector('#normalization_learning_dialog').open"));
     await evaluate("if(document.querySelector('#normalization_learning_dialog').open) document.querySelector('#btn_confirm_with_learning').click()");
     await until(()=>evaluate("document.querySelector('#normalization_status').dataset.state === 'confirmed'"));
+    assert.match(await evaluate("document.querySelector('#project_next_text').textContent"),/Сценарий подтверждён/);
+    await captureGuidance('confirmed');
     await command('Page.reload');
     await until(()=>evaluate("document.querySelector('#normalization_scenario_select')?.value.includes('Новый выпуск.txt') && document.querySelector('#normalization_status').dataset.state === 'confirmed'"));
     await until(()=>evaluate("(async()=> !!(await import('/static/stage1/state.js')).appState.normalization)()"));
@@ -102,6 +121,8 @@ async function main() {
     await until(()=>evaluate("document.querySelector('#stage3_media_status').textContent === 'экспорт завершён'"));
     await until(()=>evaluate("document.querySelector('#stage3_processing').textContent === 'завершена'"));
     assert.match(await evaluate("document.querySelector('#stage3_media_message').textContent"),/Экспортированный XML/,'legacy export is not a confirmed build');
+    assert.equal(await evaluate("document.querySelector('#premiere_import_help').hidden"),false,'XML import instruction persists after status refresh');
+    await captureGuidance('xml');
     fs.writeFileSync(lifecycleFile,JSON.stringify({tts_start:true}));
     await evaluate(`(async()=>{const {appState}=await import('/static/stage1/state.js');const core=await import('/static/stage1/core.js');core.openTab('voiceover');appState.currentTtsJobStatus='idle';core.updateActionAvailability();document.querySelector('#btn_tts').click();})()`);
     await until(()=>evaluate("document.querySelector('#log_box').textContent.includes('ERROR: start rejected by guard')"));

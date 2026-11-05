@@ -1838,3 +1838,17 @@ ins.word-added {
 .rv-take { padding: 3px 0; }
 .rv-take-selected { color: var(--green); }
 .rv-apply { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; margin-top: 10px; }
+
+/* Keep the route above diagnostics, with room for the next action on laptops. */
+.project-next { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 12px; padding: 16px 20px; border-color: var(--accent); }
+.project-next p { margin-top: 5px; color: var(--muted); line-height: 1.5; max-width: 850px; }
+.project-next .btn { flex-shrink: 0; }
+.readiness-capabilities { margin: 0 0 10px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.readiness-list { max-height: 220px; overflow-y: auto; }
+.normalization-options { grid-column: 1 / -1; }
+.normalization-options > summary, .log-section > summary { cursor: pointer; color: var(--muted); }
+.normalization-options[open] { display: grid; gap: 12px; }
+.premiere-import-help { margin-top: 16px; padding: 16px; border: 1px solid var(--accent); border-radius: 10px; line-height: 1.7; background: var(--surface); }
+@media (max-width: 800px) { .project-next { align-items: flex-start; flex-direction: column; gap: 12px; } }
+
+.readiness-selection-warning { color: var(--orange); line-height: 1.5; padding: 10px 14px; border: 1px solid var(--orange); border-radius: 8px; margin-bottom: 10px; }

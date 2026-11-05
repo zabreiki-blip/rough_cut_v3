@@ -3,7 +3,7 @@
 import { ids, appState, project } from "./state.js";
 import {
   toast, appendLog, escaped, formatMediaDuration, formatMediaSize,
-  renderEtaCells, updateActionAvailability, isTransientPollingError,
+  renderEtaCells, updateActionAvailability, renderNextAction, isTransientPollingError,
   pollingBackoffMs, postJSON, getJSON, optionalRequestJSON, confirmDialog, safely, onProjectInputsChanged,
 } from "./core.js";
 import { loadSyncWorkspace } from "./sync.js";
@@ -119,6 +119,7 @@ function renderStage3Processing(processing) {
 // Readiness is independent from the last job and from the downloadable file.
 export function renderStage3Status(status) {
   latestStage3Status = status;
+  appState.stage3Status = status;
   const processing = status.processing || {};
   const build = status.build || {};
   const assembly = status.assembly || {};
@@ -143,6 +144,16 @@ export function renderStage3Status(status) {
     if (assembly.catalog_incomplete) ids.stage3_assembly.textContent += ` · каталог медиа неполный: ${Number(assembly.uncached_media_files || 0)} файлов без проверки`;
     if (Number(assembly.open_tasks) > 0) ids.stage3_assembly.textContent += ` · открытых задач: ${assembly.open_tasks}`;
   }
+  const help = document.getElementById("premiere_import_help");
+  if (help) {
+    const legacyKnown = help.dataset.legacyExport === "true" || (processing.kind === "prepare" && processing.status === "completed" && !processing.build_id);
+    help.hidden = !build.build_id && !legacyKnown;
+    if (build.build_id) help.dataset.legacyExport = "false";
+    help.textContent = build.build_id
+      ? `В Premiere Pro: Файл → Импорт → выберите скачанный XML. Если медиа не найдены, укажите исходные файлы через «Связать медиа». ${build.mode === "draft" ? "Черновик" : "Сборка без пропусков"}: ${Number(build.summary?.placeholders?.segments || 0)} пропусков. ${build.is_current === true ? "Сборка актуальна." : "Сборка устарела: соберите и скачайте XML заново."}`
+      : legacyKnown ? "В Premiere Pro: Файл → Импорт → выберите скачанный XML. Если медиа не найдены, используйте «Связать медиа». XML без подтверждённой сборки; актуальность не подтверждена. Пропуски проверьте в результатах экспорта; для проверенной актуальной сборки скачайте XML заново." : "";
+  }
+  renderNextAction();
   renderStage3Blockers(assembly.blockers || []);
   renderStage3SourceMapping(appState.stage3SourceMapping || []);
 }
@@ -156,6 +167,10 @@ export async function refreshStage3Status() {
   } catch (error) {
     if (request !== stage3StatusRequest) return;
     latestStage3Status = null;
+    appState.stage3Status = null;
+    const help = document.getElementById("premiere_import_help");
+    if (help && !help.hidden) help.textContent = "Актуальность XML не удалось проверить. Обновите состояние перед импортом в Premiere.";
+    renderNextAction();
     for (const element of [ids.stage3_processing, ids.stage3_build, ids.stage3_assembly]) {
       if (element) element.textContent = "проверка недоступна; обновите состояние";
     }
@@ -216,7 +231,7 @@ function finishStage3Job() {
   stage3PollFailures = 0;
   if (stage3PollTimer) window.clearTimeout(stage3PollTimer);
   stage3PollTimer = null;
-  ids.btn_export_xml.textContent = "Export XML";
+  ids.btn_export_xml.textContent = "Скачать XML для Premiere";
   updateActionAvailability();
 }
 
@@ -324,6 +339,12 @@ async function applyCompletedStage3Job(job, download) {
     `Timeline XML (${result.format || "nested"}${result.build_id ? `, build ${result.build_id}` : ""}): mapped=${(result.mapped_source_ids || []).join(", ") || "—"}; `
     + `unmapped=${(result.unmapped_source_ids || []).join(", ") || "—"}`
   );
+  const help = document.getElementById("premiere_import_help");
+  if (help) {
+    help.hidden = false;
+    help.dataset.legacyExport = result.build_id ? "false" : "true";
+    help.textContent = `В Premiere Pro: Файл → Импорт → выберите скачанный XML. Если медиа не найдены, укажите исходники через «Связать медиа». ${result.mode === "complete" ? "Сборка без пропусков" : "Черновик"}: ${describeStage3Placeholders(result)}. Актуальность проверяется в состоянии сборки.`;
+  }
   if (download && result.download_url) {
     toast(`XML готов${result.build_id ? ` (сборка ${result.build_id})` : ""}. Начинаю загрузку.`, "success");
     window.location.href = stage3DownloadUrl(result);

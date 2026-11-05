@@ -218,7 +218,7 @@ def _check_tts_provider(settings: Any) -> dict[str, str]:
                 item_id="tts_provider",
                 label=label,
                 status="ok",
-                detail="Провайдер openrouter: ключ задан.",
+                detail="Провайдер openrouter: ключ задан; связь с сервисом не проверена.",
             )
         return _readiness_item(
             item_id="tts_provider",
@@ -238,7 +238,12 @@ def _check_tts_provider(settings: Any) -> dict[str, str]:
 
 def _check_api_key(*, item_id: str, label: str, has_key: bool, hint: str) -> dict[str, str]:
     if has_key:
-        return _readiness_item(item_id=item_id, label=label, status="ok", detail="Ключ задан.")
+        return _readiness_item(
+            item_id=item_id,
+            label=label,
+            status="ok",
+            detail="Ключ задан; связь с сервисом не проверена.",
+        )
     return _readiness_item(
         item_id=item_id, label=label, status="warn", detail="Ключ не задан.", hint=hint
     )
@@ -262,7 +267,25 @@ def _build_readiness(settings: Any) -> dict[str, Any]:
         key=lambda status: _READINESS_SEVERITY_ORDER.get(status, 1),
         default="ok",
     )
-    return {"ok": True, "overall": overall, "checks": checks}
+    ffmpeg_ready = checks[0]["status"] == "ok"
+    local_tts = (
+        checks[2]["status"] == "ok"
+        if settings.tts_provider == "macos"
+        else bool(shutil.which("say") and shutil.which("afconvert"))
+    )
+    return {
+        "ok": True,
+        "overall": overall,
+        "checks": checks,
+        "capabilities": {
+            "local_tts": bool(ffmpeg_ready and local_tts),
+            "local_asr": bool(ffmpeg_ready and available_backends()),
+            "cloud_llm": bool(settings.openrouter_api_key),
+            "cloud_tts": bool(settings.openrouter_api_key),
+            "cloud_asr": bool(CloudAudioAsrAdapter().is_available()),
+        },
+        "capabilities_note": "Облачные возможности отражают наличие настроек; связь с сервисами не проверена.",
+    }
 
 
 def _active_revision_input_path(paths: dict[str, Path], input_files: list[str]) -> str:

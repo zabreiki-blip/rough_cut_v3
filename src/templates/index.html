@@ -31,7 +31,7 @@
   <main class="main">
     <header class="topbar">
       <h1>Проекты</h1>
-      <p class="topbar-sub">Управление проектами озвучки</p>
+      <p class="topbar-sub">Сценарий + записи → черновой монтаж для Premiere</p>
     </header>
 
     <section class="create-section">
@@ -41,6 +41,7 @@
         </div>
         <div class="create-body">
           <h2>Новый проект</h2>
+          <p class="product-route">Добавьте сценарий и записи, проверьте разметку, создайте озвучку и скачайте XML для Premiere.</p>
           <p>Латинские буквы, цифры, дефис и подчёркивание</p>
           <div class="create-row">
             <input id="new_project" type="text" placeholder="greenland_ep01" maxlength="64" autocomplete="off" spellcheck="false">
@@ -67,7 +68,7 @@
                 </div>
                 <div class="card-body">
                   <span class="card-name">{{ project }}</span>
-                  <span class="card-meta">Stage 1</span>
+                  <span class="card-meta">Сценарий · озвучка · монтаж</span>
                 </div>
                 <svg class="card-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
               </a>
@@ -86,7 +87,8 @@
       </div>
     </section>
 
-    <section class="log-section">
+    <details class="log-section">
+      <summary>Технический журнал</summary>
       <div class="log-header">
         <h3>Лог</h3>
         <button id="btn_clear_log" class="btn-icon btn-sm" title="Очистить">
@@ -94,7 +96,7 @@
         </button>
       </div>
       <pre id="log"></pre>
-    </section>
+    </details>
   </main>
 
   <div id="toast-container"></div>

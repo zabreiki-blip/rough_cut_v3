@@ -57,6 +57,7 @@ export function setBusy(state) {
     button.disabled = state;
   });
   if (!state) updateActionAvailability();
+  else renderNextAction();
 }
 
 function isNormalizationConfirmed() {
@@ -64,7 +65,7 @@ function isNormalizationConfirmed() {
 }
 
 export function updateActionAvailability() {
-  if (busy) return;
+  if (busy) { renderNextAction(); return; }
   const hasDraft = Boolean(
     appState.normalization && Array.isArray(appState.normalization.blocks) && appState.normalization.blocks.length > 0
   );
@@ -108,7 +109,7 @@ export function updateActionAvailability() {
   if (ids.btn_tts) {
     ids.btn_tts.textContent = ["interrupted", "cancelled", "failed"].includes(appState.currentTtsJobStatus)
       ? "Продолжить озвучку"
-      : "TTS";
+      : "Создать озвучку";
   }
   document.querySelectorAll("[data-action='confirm-sync-match']").forEach((button) => {
     button.disabled = blocked || appState.syncJobRunning;
@@ -124,6 +125,51 @@ export function updateActionAvailability() {
   } else if (ids.btn_export_xml) {
     ids.btn_export_xml.disabled = !appState.timelineReady || appState.stage3JobRunning;
   }
+  renderNextAction();
+}
+
+// Guidance navigates to existing guarded controls; it never starts a job or confirms data.
+export function renderNextAction() {
+  const text = document.getElementById("project_next_text");
+  const button = document.getElementById("project_next_action");
+  if (!text || !button) return;
+  const confirmed = isNormalizationConfirmed();
+  const blocks = appState.normalization?.blocks || [];
+  let tab = "normalization", target = "normalization_scenario_select", label = "Выбрать сценарий";
+  let message = "Выберите сценарий и нажмите «Нормализовать». Записи добавьте в папку проекта. Редакции доступны параллельно.";
+  if (blocks.length && !confirmed) {
+    target = "btn_confirm_normalization"; label = "Проверить сценарий";
+    message = "Проверьте блоки и подтвердите сценарий. Озвучка и сборка откроются после подтверждения.";
+  } else if (confirmed) {
+    const build = appState.stage3Status?.build || {};
+    if (build.build_id && build.is_current === true) {
+      tab = "assembly"; target = "premiere_import_help"; label = "Как открыть в Premiere";
+      message = "Импортируйте XML в Premiere. Перед монтажом проверьте актуальность сборки и пропуски ниже.";
+    } else if (appState.timelineReady) {
+      tab = "assembly"; target = "btn_export_xml"; label = "К скачиванию XML";
+      message = "Таймлайн готов. Выберите режим и скачайте XML для Premiere; черновик может содержать пропуски.";
+    } else if (appState.voiceReady === true || !blocks.some(block => block.type === "voiceover")) {
+      tab = "assembly"; target = "btn_build_timeline"; label = "К сборке таймлайна";
+      message = "Озвучка готова. Проверьте реплики героев и соберите таймлайн; нерешённые фрагменты будут видны в сборке.";
+    } else {
+      tab = "voiceover"; target = "btn_tts"; label = "К озвучке";
+      message = "Сценарий подтверждён. Создайте озвучку или подключите запись диктора, затем проверьте аудиофайлы.";
+    }
+  }
+  const working = busy || appState.stage3JobRunning || appState.syncJobRunning || ["queued", "running", "cancelling"].includes(appState.currentTtsJobStatus);
+  if (working) message = "Задача выполняется. Дождитесь результата; прогресс и ошибки показаны на соответствующем этапе.";
+  text.textContent = message;
+  button.textContent = label;
+  button.disabled = Boolean(working);
+  button.onclick = () => {
+    if (button.disabled) return;
+    // Click the tab so its normal refresh hooks run too.
+    const tabButton = document.querySelector(`[data-tab="${tab}"]`);
+    if (tabButton) tabButton.click(); else openTab(tab);
+    const control = document.getElementById(target);
+    control?.scrollIntoView({block: "center", behavior: "smooth"});
+    control?.focus();
+  };
 }
 
 export function formData() {
