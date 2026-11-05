@@ -223,10 +223,10 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
 # ``СНХ Имя, роль — файл.wav 00:05:42 — реплика``: the marker is followed by
 # whitespace (no comma), the credit by a dash and an optional media file name.
 _SNH_DASH_CREDIT = re.compile(
-    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<credit>[А-ЯЁA-Z][^—–\n]{1,160}?)\s+"
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<credit>[А-ЯЁA-Z][^—–\n]{1,300}?)\s+"
     # The dash is optional when the credit is directly followed by a timecode
     # (``СНХ ПОПОВ 00:12:06 — реплика``); such a credit carries no media file.
-    r"(?:(?P<dash>[—–-])\s+|(?=\[?\d{1,2}[:.\-]))"
+    r"(?:(?P<dash>[—–-])\s+|(?=\[?\d{1,2}[:.\-][0-5]\d))"
     r"(?P<rest>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -311,7 +311,7 @@ _PLAYBACK_LIFE_CUE = re.compile(
 )
 _BARE_SPEAKER_PREFIX = re.compile(
     r"^\s*(?P<speaker>(?:[А-ЯЁ][а-яё]+\s+)?[А-ЯЁ]{3,})"
-    r"(?:[.:\-–—]?\s+|[.:](?=[А-ЯЁ])|(?=[а-яё]))(?P<content>.+)$",
+    r"(?:[.:\-–—]\s*|\s+(?=[А-ЯЁ«\"(\[\d])|(?=[а-яё]))(?P<content>.+)$",
     re.DOTALL,
 )
 _NON_PERSON_SPEAKER_WORDS = frozenset(
@@ -867,9 +867,27 @@ def _generate_normalization_unlocked(
         scenario.revision = previous.revision + 1
         scenario.scenario_revision_id = previous.scenario_revision_id
         scenario.parent_revision_id = previous.parent_revision_id
+        previous_blocks = list(previous.blocks)
+        if not previous_blocks and previous.scenario_revision_id:
+            revision_snapshot = (
+                output_path.parent.parent
+                / "versions"
+                / "scenarios"
+                / f"{previous.scenario_revision_id}.normalized.json"
+            )
+            if revision_snapshot.is_file():
+                try:
+                    snapshot_doc = NormalizedScenario.from_dict(read_json(revision_snapshot))
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    snapshot_doc = None
+                if snapshot_doc is not None and snapshot_doc.source_hash == source_hash:
+                    for snap_block in snapshot_doc.blocks:
+                        snap_block.manually_edited = False
+                        snap_block.manual_fields = []
+                    previous_blocks = snapshot_doc.blocks
         uid_map: dict[str, str] = {}
         previous_by_text: dict[str, deque[NormalizedBlock]] = defaultdict(deque)
-        for block in previous.blocks:
+        for block in previous_blocks:
             previous_by_text[block.original_text].append(block)
         for block in scenario.blocks:
             candidates = previous_by_text.get(block.original_text)
@@ -1878,6 +1896,9 @@ def _annotate_continuation_context(
     previous: NormalizedBlock | None = None
     # Last sync block, kept alive only across bare splice markers.
     splice_donor: NormalizedBlock | None = None
+    # Unconsumed header-only sync block awaiting its timecoded quote across a short bridge.
+    header_donor: NormalizedBlock | None = None
+    header_distance = 0
     for block in blocks:
         if (
             previous is not None
@@ -1998,6 +2019,14 @@ def _annotate_continuation_context(
                 and _starts_with_unambiguous_timecode(block.original_text)
             ):
                 donor = splice_donor
+            elif (
+                not block.speaker
+                and (previous is None or previous.type != BlockType.SYNC.value)
+                and header_donor is not None
+                and header_distance <= 3
+                and _starts_with_unambiguous_timecode(block.original_text)
+            ):
+                donor = header_donor
             if (
                 not block.speaker
                 and SYNC_CREDIT_REJECTED_WARNING not in block.warnings
@@ -2008,10 +2037,29 @@ def _annotate_continuation_context(
                 block.continuation_of_type = BlockType.SYNC.value
                 block.speaker = donor.speaker
                 block.role = donor.role
+                if not block.source_description and donor.source_description:
+                    block.source_description = donor.source_description
+                if donor is header_donor:
+                    header_donor = None
         if block.type == BlockType.SYNC.value:
             splice_donor = block
+            dash_info = _parse_snh_dash_credit(block.original_text)
+            if block.speaker and (
+                (dash_info and dash_info.get("header_only"))
+                or _SYNC_LABEL_ONLY_MARKER.match(block.original_text.strip())
+            ):
+                header_donor = block
+                header_distance = 0
+            elif block.timecode_start:
+                header_donor = None
+            elif header_donor is not None:
+                header_distance += 1
         elif not _is_splice_marker(block.original_text):
             splice_donor = None
+            if header_donor is not None:
+                header_distance += 1
+                if header_distance > 3:
+                    header_donor = None
         previous = block
 
 
@@ -2617,26 +2665,34 @@ def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
     view = _structural_text(text)
     file_header = re.match(
         r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+"
-        r"(?P<credit>.+?)\.\s*Файл\s+(?P<source>[^\n]+?)\s*\.?\s*$",
+        r"(?P<credit>.+?)\.\s*Файл\s+"
+        rf"(?P<source>[^\n.]+?(?:\.{_MEDIA_EXTENSIONS})?)"
+        r"(?:\.\s+(?P<content>.+)|\s+(?P<tc_content>(?=\[?\d{1,2}[:.\-][0-5]\d).+)|\.?\s*)$",
         view,
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     )
     if file_header and not _TIMECODE.search(file_header.group("source")):
         credit = file_header.group("credit").strip()
-        speaker, _, role = credit.partition(",")
-        speaker, role = speaker.strip(), role.strip(" \t,;:")
+        if "," in credit:
+            speaker, _, role = credit.partition(",")
+        else:
+            parts = re.split(r"\s*[–—-]\s+", credit, maxsplit=1)
+            speaker = parts[0]
+            role = parts[1] if len(parts) > 1 else ""
+        speaker, role = speaker.strip(" \t,;:."), role.strip(" \t,;:.")
+        content = (file_header.group("content") or file_header.group("tc_content") or "").strip()
         if (
             _is_credit_name(speaker)
             and _looks_like_plausible_sync_credit(speaker)
-            and (not role or not role_is_prose(role))
+            and not _TIMECODE.search(credit)
         ):
             return {
                 "marker": file_header.group("marker"),
                 "speaker": speaker,
                 "role": role,
                 "source": file_header.group("source").strip().rstrip("."),
-                "content": "",
-                "header_only": "1",
+                "content": content,
+                "header_only": "" if content else "1",
                 "dashed": "",
             }
     match = _SNH_DASH_CREDIT.match(view)
@@ -2652,7 +2708,7 @@ def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
         credit_source = source_mark.group("name").strip()
         credit = credit[: source_mark.start()].strip()
     speaker, _, role = credit.partition(",")
-    speaker, role = speaker.strip(), role.strip(" \t,;:")
+    speaker, role = speaker.strip(" \t,;:."), role.strip(" \t,;:.")
     speaker, name_tail = _split_credit_media_tail(speaker)
     credit_source = credit_source or name_tail
     if "(" in speaker and ")" not in speaker:
@@ -3620,7 +3676,7 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
     fragments: list[SyncFragment] = []
     if boundaries:
         leading = _strip_trailing_media_credit(text[: boundaries[0]["token_start"]]).strip(
-            " \t\r\n–—-"
+            " \t\r\n–—-+"
         )
         leading = re.sub(r"\.\s*,", ",", leading)
         if leading:

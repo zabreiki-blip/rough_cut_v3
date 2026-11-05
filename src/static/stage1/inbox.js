@@ -7,9 +7,15 @@ let requiresSelection = false;
 let selectionMissing = false;
 let restored = false;
 let lastRefresh = 0;
+let scenarioFiles = [];
 export function normalizationScenarioPath(path) {
   const prefix = `projects/${project}/`;
   return path.startsWith(prefix) || path.startsWith("/") ? path : prefix + path;
+}
+export function scenarioFingerprint(path) {
+  const target = normalizationScenarioPath(String(path || "").trim()).normalize("NFC");
+  const item = scenarioFiles.find(file => normalizationScenarioPath(file.relative_path).normalize("NFC") === target);
+  return String(item?.fingerprint || "").replace(/^sha256:/, "");
 }
 
 function selectScenario() {
@@ -25,10 +31,14 @@ function renderScenarios(result) {
   const select = ids.normalization_scenario_select;
   if (!select) return;
   const files = Array.isArray(result.scenario_files) ? result.scenario_files : [];
+  scenarioFiles = files;
   const previous = select.value;
   const manual = ids.normalization_input_path.value.trim();
   const preferred = !restored ? String(defaults.normalization_input_path ?? defaults.input_path ?? "") : "";
-  if (!restored && defaults.has_normalization && !preferred) {
+  const activeHash = String(appState.normalization?.source_hash || "").replace(/^sha256:/, "");
+  const hashMatch = !preferred && activeHash ? files.find(item => String(item.fingerprint || "").replace(/^sha256:/, "") === activeHash)?.relative_path || "" : "";
+  const effectivePreferred = preferred || (hashMatch ? normalizationScenarioPath(hashMatch) : "");
+  if (!restored && defaults.has_normalization && !effectivePreferred) {
     requiresSelection = true;
     selectionMissing = true;
   }
@@ -37,14 +47,14 @@ function renderScenarios(result) {
   const disappeared = Boolean(previous && !selected);
   if (disappeared) { requiresSelection = true; selectionMissing = true; }
   if (!selected && !requiresSelection) {
-    selected = files.find(item => normalizationScenarioPath(item.relative_path).normalize("NFC") === (manual || preferred).normalize("NFC"))?.relative_path || "";
+    selected = files.find(item => normalizationScenarioPath(item.relative_path).normalize("NFC") === (manual || effectivePreferred).normalize("NFC"))?.relative_path || "";
     if (!selected && !manual && !appState.normalization && !["draft", "confirmed"].includes(initialStatus.normalization_status) && !defaults.has_normalization) selected = files[0]?.relative_path || "";
   }
   select.innerHTML = '<option value="">Выберите сценарий</option>' + files.map(item =>
     `<option value="${escaped(item.relative_path)}">${escaped(item.name)} — ${escaped(item.relative_path)}</option>`
   ).join("");
   select.value = selected;
-  if (selected || disappeared || !manual || manual === preferred) selectScenario();
+  if (selected || disappeared || !manual || manual === effectivePreferred) selectScenario();
   if (!selected && manual && !selectionMissing) ids.normalization_scenario_summary.textContent = `Ручной путь: ${manual}`;
   if (selectionMissing) ids.normalization_scenario_summary.textContent = "Выбранный файл исчез или недоступен. Выберите сценарий заново; разметка и правки сохранены.";
 }

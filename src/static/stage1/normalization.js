@@ -8,6 +8,7 @@ import {
   assertRequiredPath, safely, readyBlocksSummary,
 } from "./core.js";
 import { renderOpenRouterUsage } from "./usage.js";
+import { scenarioFingerprint } from "./inbox.js";
 
 let memoryRules = [];
 let normalizationEditGeneration = 0;
@@ -619,7 +620,14 @@ async function generateNormalizationFromSource() {
     const index = value.indexOf(projectPrefix.normalize("NFC"));
     return index >= 0 ? value.slice(index) : value;
   };
-  if (source && sourceIdentity(source) !== sourceIdentity(inputPath)) {
+  const selectedHash = scenarioFingerprint(inputPath);
+  const activeHash = String(appState.normalization?.source_hash || "").replace(/^sha256:/, "");
+  const isSnapshotSource = /\/versions\/scenarios\/rev_\d+\.source\./.test(source.normalize("NFC"));
+  const defaultActivePath = String(ids.normalization_scenario_select?.value || "").trim();
+  const sameSource = (source && sourceIdentity(source) === sourceIdentity(inputPath))
+    || Boolean(activeHash && selectedHash && activeHash === selectedHash)
+    || Boolean(isSnapshotSource && defaultActivePath && !selectedHash && sourceIdentity(defaultActivePath) === sourceIdentity(inputPath));
+  if (source && !sameSource) {
     throw new Error("Для другого файла используйте вкладку «Редакции»: сохраните и подтвердите текущий сценарий, затем импортируйте новую редакцию. Разметка и несохранённые правки сохранены.");
   }
   if (appState.stage3JobRunning || appState.syncJobRunning || ["queued", "running", "cancelling"].includes(appState.currentTtsJobStatus)) {

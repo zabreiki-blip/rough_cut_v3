@@ -1937,6 +1937,53 @@ class LlmPresetTests(unittest.TestCase):
                 generate_normalization(source, output, memory_path=memory_path, llm_preset="fast")
                 self.assertEqual(mocked.call_count, 2)
 
+    def test_snh_file_headers_long_roles_plus_splices_and_acronyms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scenario.txt"
+            output = root / "normalized.json"
+            memory_path = root / "memory.sqlite3"
+            source.write_text(
+                "\n".join(
+                    [
+                        "СНХ Таисия. Файл мошенник 1 снх.",
+                        "(…) со мной связались в Телеграме. 00:01:20 - Оператором SIM-карт.",
+                        "СНХ Роман- фигурант уголовного дела. Файл мошенник 2.",
+                        "00:02:06 - Хочешь вот это сделать, хочешь вот это.",
+                        "СНХ Андрей Селахов – заместитель руководителя Кунцевского МРСО ГСУ СК России по городу Москве. Файл MVIS0054",
+                        "00:00:58 - В том числе и массовых рассылок.",
+                        "+ 00:00:51 То есть, если мы используем одну SIM-карту в одном телефоне.",
+                        "ЗК: НАБУ заподозрило депутата в том, что он предложил своё покровительство одному из центров.",
+                        "НАБУ заподозрило Тищенко в том, что он предложил свою «крышу», то есть покровительство одному из колл-центров.",
+                        "СНХ Алексей Самойлов. Файл тер Алексей Самойлов другая украина.mp3.",
+                        "ЗК: Дальше, как правило, звонок совершается когда на клиента уже собрана информация.",
+                        "00:18:31 - А это как раз подразделение, которое занимается формированием баз данных клиентуры.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            payload = generate_normalization(source, output, memory_path=memory_path, use_llm=False)
+            issues = normalizer_module.validate_for_confirmation_detailed(payload)
+            errors = [item for item in issues if item["severity"] == "error"]
+            self.assertEqual(errors, [])
+            sync_blocks = [b for b in payload["blocks"] if b["type"] == "sync"]
+            self.assertEqual(
+                [b["speaker"] for b in sync_blocks],
+                [
+                    "Таисия",
+                    "Роман",
+                    "Андрей Селахов",
+                    "Андрей Селахов",
+                    "Алексей Самойлов",
+                    "Алексей Самойлов",
+                ],
+            )
+            nabu_block = next(
+                b for b in payload["blocks"] if b["original_text"].startswith("НАБУ заподозрило")
+            )
+            self.assertEqual(nabu_block["type"], "voiceover")
+            self.assertEqual(nabu_block["speaker"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

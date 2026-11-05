@@ -268,6 +268,17 @@ async function testScenarioSwitchPreservesDraft({ state, normalization }) {
       assert.strictEqual(called, false, "active jobs block normalization before saving dirty edits");
       assert.strictEqual(appState.normalization, draft); assert.strictEqual(appState.normalizationDirty, true);
     }
+    const inbox = await import(moduleUrl("inbox.js"));
+    Object.assign(appState, { stage3JobRunning: false, syncJobRunning: false, currentTtsJobStatus: "idle", normalizationDirty: false });
+    appState.normalization = { source: `/app/projects/${state.project}/versions/scenarios/rev_0002.source.docx`, source_hash: "6edd95ab", blocks: [], scenario_revision_id: "rev_0002" };
+    globalThis.fetch = async (url) => ({
+      ok: true,
+      json: async () => ({ ok: true, result: String(url).includes("/inbox") ? { scenario_files: [{ name: "Сценарий.docx", relative_path: "ЗАГРУЗИТЬ/Сценарии/Сценарий.docx", fingerprint: "sha256:6edd95ab" }], review_files: [] } : { id: "job", status: "completed", result: appState.normalization } }),
+      text: async () => JSON.stringify({ ok: true, result: { id: "job", status: "completed", result: appState.normalization } }),
+    });
+    await inbox.refreshScenarioInbox();
+    ids.normalization_input_path.value = `projects/${state.project}/ЗАГРУЗИТЬ/Сценарии/Сценарий.docx`;
+    await normalization.generateNormalization();
   } finally {
     Object.assign(appState, oldJobs);
     globalThis.fetch = oldFetch; appState.normalization = oldDoc; appState.normalizationDirty = oldDirty; ids.normalization_input_path.value = oldPath;

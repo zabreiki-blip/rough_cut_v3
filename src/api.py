@@ -17,7 +17,14 @@ import threading
 import wave
 import time
 from typing import BinaryIO, cast
+import urllib.request
 import uuid
+
+if sys.platform == "darwin":
+    # Avoid calling macOS SystemConfiguration (_scproxy) inside forked Gunicorn
+    # worker threads, which triggers libobjc fork-safety SIGKILL on macOS.
+    setattr(urllib.request, "getproxies_macosx_sysconf", lambda: {})
+    setattr(urllib.request, "proxy_bypass_macosx_sysconf", lambda _host: False)
 
 try:
     from dotenv import load_dotenv

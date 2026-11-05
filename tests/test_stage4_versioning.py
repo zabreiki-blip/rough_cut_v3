@@ -1086,3 +1086,23 @@ def test_active_source_restores_unicode_equivalent_filesystem_path(tmp_path: Pat
         _active_revision_input_path(paths, ["projects/demo/input/Новый.txt"])
         == "projects/demo/input/Новый.txt"
     )
+
+
+def test_active_source_restores_inbox_path_when_normalized_points_to_revision_snapshot(
+    tmp_path: Path,
+) -> None:
+    paths = ensure_project("demo", tmp_path / "projects")
+    snapshot = paths["scenario_versions"] / "rev_0002.source.docx"
+    snapshot.write_bytes(b"docx")
+    atomic_write_json(paths["work"] / "active_revision.json", {"revision_id": "rev_0002"})
+    atomic_write_json(
+        paths["scenario_versions"] / "rev_0002.json",
+        {"revision_id": "rev_0002", "source_file": "Сценарий_v2.docx"},
+    )
+    atomic_write_json(paths["normalized"], {"source": str(snapshot)})
+    candidates = [
+        "projects/demo/ЗАГРУЗИТЬ/Сценарии/Конструктор_v1.docx",
+        "projects/demo/ЗАГРУЗИТЬ/Сценарии/Сценарий_v2.docx",
+    ]
+    assert _active_revision_input_path(paths, candidates) == candidates[1]
+    assert _active_revision_input_path(paths, candidates[:1]) == ""

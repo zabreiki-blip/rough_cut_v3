@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 from types import ModuleType
 from typing import Any
+import unicodedata
 
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
@@ -303,16 +304,25 @@ def _active_revision_input_path(paths: dict[str, Path], input_files: list[str]) 
         source_path = Path(source)
         if not source_path.is_absolute():
             source_path = root.parent.parent / source_path
-        for value in input_files:
-            candidate = root.parent.parent / value
-            if candidate.resolve() == source_path.resolve():
-                return value
-            try:
-                if candidate.samefile(source_path):
+        project_marker = unicodedata.normalize("NFC", f"projects/{paths['root'].name}/")
+        norm_source = unicodedata.normalize("NFC", source)
+        marker_idx = norm_source.find(project_marker)
+        if not source_path.exists() and marker_idx >= 0:
+            source_path = root.parent.parent / norm_source[marker_idx:]
+        is_revision_snapshot = source_path.resolve().is_relative_to(
+            paths["scenario_versions"].resolve()
+        )
+        if not is_revision_snapshot:
+            for value in input_files:
+                candidate = root.parent.parent / value
+                if candidate.resolve() == source_path.resolve():
                     return value
-            except OSError:
-                pass
-        return ""
+                try:
+                    if candidate.samefile(source_path):
+                        return value
+                except OSError:
+                    pass
+            return ""
 
     active_path = paths["work"] / "active_revision.json"
     try:
@@ -324,12 +334,19 @@ def _active_revision_input_path(paths: dict[str, Path], input_files: list[str]) 
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         source_file = ""
     if source_file:
+        nfc_source_file = unicodedata.normalize("NFC", source_file)
         active_input = next(
-            (value for value in input_files if Path(value).name == source_file),
+            (
+                value
+                for value in input_files
+                if unicodedata.normalize("NFC", Path(value).name) == nfc_source_file
+            ),
             "",
         )
         if active_input:
             return active_input
+    if source:
+        return ""
     return input_files[0] if input_files else ""
 
 
