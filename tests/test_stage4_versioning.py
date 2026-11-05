@@ -1058,11 +1058,15 @@ def test_restoring_confirmed_revision_passing_checks_adds_no_warning(tmp_path: P
     assert restored["status"] == "confirmed" and not restored.get("warnings")
 
 
-def test_active_source_restores_exact_normalized_path_with_duplicate_basenames(tmp_path: Path) -> None:
+def test_active_source_restores_exact_normalized_path_with_duplicate_basenames(
+    tmp_path: Path,
+) -> None:
     paths = ensure_project("demo", tmp_path / "projects")
     atomic_write_json(paths["work"] / "active_revision.json", {"revision_id": "rev_0001"})
     atomic_write_json(paths["scenario_versions"] / "rev_0001.json", {"source_file": "same.txt"})
-    atomic_write_json(paths["normalized"], {"source": str(paths["root"] / "ЗАГРУЗИТЬ/Сценарии/same.txt")})
+    atomic_write_json(
+        paths["normalized"], {"source": str(paths["root"] / "ЗАГРУЗИТЬ/Сценарии/same.txt")}
+    )
     candidates = ["projects/demo/input/same.txt", "projects/demo/ЗАГРУЗИТЬ/Сценарии/same.txt"]
     assert _active_revision_input_path(paths, candidates) == candidates[1]
     assert _active_revision_input_path(paths, candidates[:1]) == ""
@@ -1078,4 +1082,7 @@ def test_active_source_restores_unicode_equivalent_filesystem_path(tmp_path: Pat
     if not alternate.exists():
         pytest.skip("filesystem distinguishes Unicode spellings")
     atomic_write_json(paths["normalized"], {"source": str(alternate)})
-    assert _active_revision_input_path(paths, ["projects/demo/input/Новый.txt"]) == "projects/demo/input/Новый.txt"
+    assert (
+        _active_revision_input_path(paths, ["projects/demo/input/Новый.txt"])
+        == "projects/demo/input/Новый.txt"
+    )

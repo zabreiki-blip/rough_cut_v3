@@ -86,10 +86,16 @@ class NormalizationApiTest(unittest.TestCase):
         with patch.object(api.threading, "Thread", ImmediateThread):
             response = self.client.post(
                 "/stage1/normalization-jobs/start",
-                json={"project": "demo", "input_path": "projects/demo/" + selected, "use_llm": False},
+                json={
+                    "project": "demo",
+                    "input_path": "projects/demo/" + selected,
+                    "use_llm": False,
+                },
             )
         self.assertEqual(response.status_code, 202)
-        job = self.client.get("/stage1/normalization-jobs/" + response.get_json()["result"]["id"]).get_json()["result"]
+        job = self.client.get(
+            "/stage1/normalization-jobs/" + response.get_json()["result"]["id"]
+        ).get_json()["result"]
         self.assertEqual(job["status"], "completed")
         self.assertEqual(Path(job["result"]["source"]), source)
 

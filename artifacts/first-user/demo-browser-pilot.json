@@ -1,0 +1,135 @@
+{
+  "date": "2026-11-05T08:55:46.735Z",
+  "project": "demo_2zP4vTI3",
+  "mode": "real offline application pipeline; cached small CPU int8; no paid keys",
+  "timings": {
+    "normalize_and_confirm": 2.412,
+    "recorded_voiceover_asr_and_publish": 7.111,
+    "sync_asr_and_check": 2.548,
+    "timeline_and_xml": 0.914,
+    "reload_and_staleness": 0.71
+  },
+  "total_seconds": 13.696,
+  "blocks": [
+    {
+      "type": "voiceover",
+      "text": "У реки появился новый прогулочный маршрут.",
+      "speaker": ""
+    },
+    {
+      "type": "sync",
+      "text": "Сегодня мы открываем новый маршрут вдоль реки.",
+      "speaker": "Анна Миронова"
+    },
+    {
+      "type": "voiceover",
+      "text": "Первые посетители уже вышли на набережную.",
+      "speaker": ""
+    }
+  ],
+  "recorded_ranges": [
+    {
+      "block_uid": "block-1-d50603bc",
+      "range": {
+        "block_uid": "block-1-d50603bc",
+        "confidence": 0.9999999999999999,
+        "display_text": "У реки появился новый прогулочный маршрут.",
+        "manual_range": true,
+        "note": "",
+        "origin": "manual",
+        "recording_id": "rec_e599f4284fda3864",
+        "selected_take": null,
+        "source_in_sec": 0,
+        "source_out_sec": 3.9,
+        "speech_in_sec": 0,
+        "speech_out_sec": 2.72,
+        "status": "confirmed",
+        "takes": [],
+        "text_sha256": "02cdf6991b3c3aa9785bbcd045dfa90f17da028dd6b63fe68e1ae3da4c625884",
+        "voice_source": "recorded"
+      }
+    },
+    {
+      "block_uid": "block-3-6922e672",
+      "range": {
+        "block_uid": "block-3-6922e672",
+        "confidence": 0.9999999999999999,
+        "display_text": "Первые посетители уже вышли на набережную.",
+        "manual_range": true,
+        "note": "",
+        "origin": "manual",
+        "recording_id": "rec_e599f4284fda3864",
+        "selected_take": null,
+        "source_in_sec": 3.9,
+        "source_out_sec": 8.4,
+        "speech_in_sec": 5.08,
+        "speech_out_sec": 8.02,
+        "status": "confirmed",
+        "takes": [],
+        "text_sha256": "d04e2341a11f020bc52c4d1b3b7b59fbc0cfdc5b8a8c5a9164eb7afdb6ec9a62",
+        "voice_source": "recorded"
+      }
+    }
+  ],
+  "sync_match": {
+    "alternatives": [],
+    "approximate_timecode": "00:00:00",
+    "block_uid": "block-2-4022c7b5",
+    "confidence": 1,
+    "matched_text": "Сегодня мы открываем новый маршрут вдоль реки",
+    "metadata": {
+      "ambiguous": false,
+      "fragment_count": 1,
+      "fragment_index": 0,
+      "gap_flags": [],
+      "head_padding_sec": 2,
+      "matching_fingerprint": "ebaf7902ffec21b9ea8d17cbd197cc6a05938c28d2d264e5ba4ac60cf935c237",
+      "max_internal_gap_sec": 0,
+      "max_internal_gap_threshold_sec": 5,
+      "max_word_duration_sec": 0.76,
+      "normalization_revision": 2,
+      "parent_block_uid": "block-2-4022c7b5",
+      "scenario_revision_id": "",
+      "semantic_flags": [],
+      "speech_in_sec": 0.56,
+      "speech_out_sec": 3.9,
+      "tail_padding_sec": 1.5,
+      "timecode_mode": "relative",
+      "timestamp_precision": "word",
+      "timing_flags": [],
+      "timing_reliable": true
+    },
+    "query_text": "Сегодня мы открываем новый маршрут вдоль реки.",
+    "segment_id": "block-2-4022c7b5",
+    "source_id": "media_fd5ca317c39318227e67",
+    "source_in_sec": 0,
+    "source_out_sec": 5.048188,
+    "speaker": "Анна Миронова",
+    "status": "auto_matched",
+    "strategy": "near_timecode"
+  },
+  "build": {
+    "build_id": "a4f6684703dd158a",
+    "complete": true,
+    "created_at": "2026-11-05T08:55:45.515140+00:00",
+    "is_current": true,
+    "live_timeline_unavailable_reason": null,
+    "mode": "complete",
+    "stale_reasons": [],
+    "summary": {
+      "items": 3,
+      "open_tasks": 0,
+      "placeholders": {
+        "by_reason": {},
+        "duration_sec": 0,
+        "segments": 0
+      },
+      "ready": 3
+    }
+  },
+  "reload_current": true,
+  "stale_after_scenario_edit": true,
+  "premiere_import": "NOT VERIFIED",
+  "human_listening": "NOT VERIFIED",
+  "temporary_media_root": "/Users/mac/Documents/AI/rough_cut_v3/artifacts/first-user/rc-browser-smoke-xlxV1s/app"
+}

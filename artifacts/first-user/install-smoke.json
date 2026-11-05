@@ -1,0 +1,30 @@
+{
+  "root": "/Users/mac/Documents/AI/rough_cut_v3/artifacts/first-user/install-final-ko26imkm",
+  "profile": "cpu",
+  "platform": "macOS Intel",
+  "steps": {
+    "setup_exit": 0,
+    "token_generated": true,
+    "native_tts_default": true,
+    "env_repeat_preserves_bytes": true,
+    "health_ok": true,
+    "auth_projects_ok": true,
+    "readiness": {
+      "ffmpeg": "ok",
+      "whisper_backend": "ok",
+      "tts_provider": "ok",
+      "openrouter_key": "warn"
+    },
+    "capabilities": {
+      "cloud_asr": false,
+      "cloud_llm": false,
+      "cloud_tts": false,
+      "local_asr": true,
+      "local_tts": true
+    },
+    "no_real_projects": true,
+    "demo_page_ok": true
+  },
+  "ok": true,
+  "intervention": "Port 8000 occupied; set ROUGH_CUT_PORT=0 in isolated copy .env only. No user process stopped."
+}

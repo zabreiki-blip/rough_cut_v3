@@ -13,14 +13,20 @@ async function until(fn) {
   throw Error('Timed out waiting for browser/server');
 }
 async function main() {
-  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-browser-smoke-'));
+  const demo = process.argv.includes('--demo');
+  const keepPilot = demo && process.argv.includes('--keep-pilot');
+  const parent = keepPilot ? path.join(root, 'artifacts/first-user') : os.tmpdir();
+  fs.mkdirSync(parent, {recursive:true});
+  const temporary = fs.mkdtempSync(path.join(parent, 'rc-browser-smoke-'));
   const children = [];
   let socket;
   try {
     const python = process.env.BROWSER_TEST_PYTHON || path.join(root, '.venv/bin/python');
-    const server = spawn(python, [path.join(__dirname, 'first_user_browser_server.py'), root, path.join(temporary, 'app'), '0'], {stdio: ['ignore','pipe','pipe']});
+    const serverArgs = [path.join(__dirname, 'first_user_browser_server.py'), root, path.join(temporary, 'app'), '0'];
+    if(demo) serverArgs.push('--offline-demo');
+    const server = spawn(python, serverArgs, {stdio: ['ignore','pipe','pipe']});
     children.push(server);
-    let serverError = ''; server.stderr.on('data', data => { serverError += data; });
+    let serverError = ''; server.stderr.on('data', data => { serverError += data; if(demo) fs.appendFileSync(path.join(temporary,'server.log'),data); });
     let serverOutput = ''; server.stdout.on('data', data => { serverOutput += data; });
     const port = await until(() => {const match = serverOutput.match(/\{"port": (\d+)\}/); return match && match[1];});
     const baseUrl = `http://127.0.0.1:${port}`;
@@ -61,6 +67,10 @@ async function main() {
     };
     await command('Network.enable');
     await command('Network.setExtraHTTPHeaders',{headers:{Authorization:headers.Authorization}});
+    if(demo) {
+      await require('./first_project_browser_flow.cjs')({root, temporary, baseUrl, headers, command, evaluate, keepPilot});
+      return;
+    }
     await command('Page.navigate',{url:`${baseUrl}/project/browser_fixture`});
     await until(()=>evaluate("!!document.querySelector('#btn_tts_cancel') && !!document.querySelector('#log_box')?.textContent.includes('UI ready')"));
     await until(()=>evaluate("document.querySelector('#readiness_summary_badge').dataset.state !== 'empty'"));
@@ -146,7 +156,11 @@ async function main() {
   } finally {
     if(socket) socket.close();
     await Promise.all(children.reverse().map(child=>new Promise(resolve=> { if(child.exitCode!==null) return resolve();child.once('exit',resolve);child.kill('SIGTERM');setTimeout(()=>{child.kill('SIGKILL');resolve();},2000).unref(); })));
-    fs.rmSync(temporary,{recursive:true,force:true});
+    if(keepPilot) console.log(`Isolated pilot files retained at ${temporary}`);
+    else {
+      if(demo) console.log('Transient demo XML and reports will be cleaned with the temporary run; use --keep-pilot to retain them.');
+      fs.rmSync(temporary,{recursive:true,force:true});
+    }
   }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

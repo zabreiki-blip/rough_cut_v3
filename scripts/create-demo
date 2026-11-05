@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Offline file preparation only; never starts recognition or a paid service.
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEMO_ASSETS="${ROOT_DIR}/examples/first-project"
+for asset in scenario.txt narrator.wav review.wav; do
+  if [[ ! -r "${DEMO_ASSETS}/${asset}" ]]; then
+    printf 'Нет демо-файла: %s\n' "${DEMO_ASSETS}/${asset}" >&2
+    exit 1
+  fi
+done
+mkdir -p "${ROOT_DIR}/projects"
+# mktemp reserves a new directory atomically; an existing name is never reused.
+DEMO_DIR="$(mktemp -d "${ROOT_DIR}/projects/demo_XXXXXXXX")"
+DEMO_NAME="${DEMO_DIR##*/}"
+mkdir -p "${DEMO_DIR}/ЗАГРУЗИТЬ/Сценарии" \
+  "${DEMO_DIR}/ЗАГРУЗИТЬ/Просмотровки" "${DEMO_DIR}/ЗАГРУЗИТЬ/Закадр" \
+  "${DEMO_DIR}/input" "${DEMO_DIR}/work/sync_audio" "${DEMO_DIR}/work/transcripts" \
+  "${DEMO_DIR}/speaker/assets" "${DEMO_DIR}/media/reviews" \
+  "${DEMO_DIR}/media/archive" "${DEMO_DIR}/media/films" "${DEMO_DIR}/media/photos" \
+  "${DEMO_DIR}/media/graphics" "${DEMO_DIR}/versions/scenarios" \
+  "${DEMO_DIR}/versions/diffs" "${DEMO_DIR}/versions/timelines"
+cp "${DEMO_ASSETS}/scenario.txt" "${DEMO_DIR}/ЗАГРУЗИТЬ/Сценарии/scenario.txt"
+cp "${DEMO_ASSETS}/review.wav" "${DEMO_DIR}/ЗАГРУЗИТЬ/Просмотровки/review.wav"
+cp "${DEMO_ASSETS}/narrator.wav" "${DEMO_DIR}/ЗАГРУЗИТЬ/Закадр/narrator.wav"
+printf 'Демо создано: %s\n' "${DEMO_NAME}"
+printf 'http://127.0.0.1:%s/project/%s\n' "${ROUGH_CUT_PORT:-8000}" "${DEMO_NAME}"
+cat <<'STEPS'
+1. Запустите приложение по README, откройте URL и выберите scenario.txt.
+2. Проверьте и подтвердите сценарий: ЗК → СНХ → ЗК.
+3. «Озвучка» → «Готовая запись»: сопоставьте narrator.wav локально,
+   прослушайте оба диапазона, подтвердите и примените запись к редакции.
+4. Для review.wav выберите локальный ASR, проверьте реплику и границы СНХ.
+5. Соберите и скачайте XML. Проверьте его в Premiere по чеклисту.
+Выбор модели, первое скачивание и проверка: docs/FIRST_PROJECT_CHECKLIST.md.
+Сейчас скопированы только файлы; распознавание и сборка ещё не запускались.
+STEPS

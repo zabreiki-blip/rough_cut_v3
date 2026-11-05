@@ -1,0 +1,16 @@
+{
+  "audio_clip_order": [
+    "zk1",
+    "RC_SRC_review",
+    "zk2"
+  ],
+  "sequence_duration_frames": 337,
+  "timebase": 25,
+  "all_linked_files_exist": true,
+  "media": [
+    "/Users/mac/Documents/AI/rough_cut_v3/artifacts/first-user/rc-browser-smoke-xlxV1s/app/projects/demo_2zP4vTI3/work/placeholders/stage3_media_fd5ca317c39318227e67.png",
+    "/Users/mac/Documents/AI/rough_cut_v3/artifacts/first-user/rc-browser-smoke-xlxV1s/app/projects/demo_2zP4vTI3/\u0417\u0410\u0413\u0420\u0423\u0417\u0418\u0422\u042c/\u041f\u0440\u043e\u0441\u043c\u043e\u0442\u0440\u043e\u0432\u043a\u0438/review.wav",
+    "/Users/mac/Documents/AI/rough_cut_v3/artifacts/first-user/rc-browser-smoke-xlxV1s/app/projects/demo_2zP4vTI3/speaker/recordings/e599f4284fda386484ce4846f8d5e32964d3e5ba501c1140b29e616b971ff746/original.wav"
+  ],
+  "premiere_import": "NOT VERIFIED"
+}

@@ -146,3 +146,25 @@ confirm → TTS → validate. Для проверки без платного TT
 Для старого `.doc` установите `catdoc`: macOS — `brew install catdoc`,
 Debian/Ubuntu — `sudo apt-get install -y catdoc`. Можно использовать `antiword`;
 для `.docx` и `.txt` эти конвертеры не нужны.
+
+## Проверка в настоящем браузере
+
+`node tests/first_user_browser_smoke.cjs` проверяет интерфейс в отдельном Chrome
+и временном Flask-приложении. Нужны Node 24, установленный Chrome и окружение
+Python; при другом пути задайте `CHROME_BIN` и `BROWSER_TEST_PYTHON`.
+
+Для CPU-пилота с заранее загруженной моделью faster-whisper `small`:
+
+```bash
+BROWSER_TEST_HF_HOME="$PWD/.cache/huggingface" node tests/first_user_browser_smoke.cjs --demo --keep-pilot
+```
+
+Без `BROWSER_TEST_HF_HOME` стенд ищет модель в стандартном домашнем кэше.
+Режим `--demo` запрещает скачивание модели и использует только собственные
+демофайлы: реальный ASR, подтверждение записи, таймлайн, XML и устаревание после
+правки. `--keep-pilot` сохраняет отдельную копию приложения, медиа и XML/JSON-
+отчёты под `artifacts/first-user/`; обычный `--demo` хранит XML/отчёты только во
+временной папке и удаляет их после запуска. Для сохранения результатов используйте
+`--keep-pilot`. Рабочие проекты и
+`.env` стенд не читает. Структурная проверка XML не заменяет импорт в Premiere
+и прослушивание по [чеклисту](FIRST_PROJECT_CHECKLIST.md).

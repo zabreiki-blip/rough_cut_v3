@@ -1,0 +1,16 @@
+{
+  "description": "Reference content for manual checks, not a normalization or sync result",
+  "block_types": [
+    "voiceover",
+    "sync",
+    "voiceover"
+  ],
+  "voiceover_texts": [
+    "У реки появился новый прогулочный маршрут.",
+    "Первые посетители уже вышли на набережную."
+  ],
+  "source_speaker": "Анна Миронова",
+  "reference_quote": "Сегодня мы открываем новый маршрут вдоль реки.",
+  "review_source": "review.wav",
+  "source_role": "координатор проекта"
+}
