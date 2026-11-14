@@ -181,6 +181,7 @@ export const ids = {
   btn_rv_align: el("btn_rv_align"),
   btn_rv_cancel: el("btn_rv_cancel"),
   btn_rv_apply: el("btn_rv_apply"),
+  btn_rv_confirm_all: el("btn_rv_confirm_all"),
   rv_recordings: el("rv_recordings"),
   rv_job_status: el("rv_job_status"),
   rv_global_status: el("rv_global_status"),

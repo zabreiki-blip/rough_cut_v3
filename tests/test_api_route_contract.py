@@ -58,6 +58,7 @@ def test_public_route_and_http_method_contract() -> None:
         "/stage1/recorded-voiceover/jobs/<job_id>/cancel": {"POST"},
         "/stage1/recorded-voiceover/jobs/start": {"POST"},
         "/stage1/recorded-voiceover/ranges/<block_uid>": {"PATCH"},
+        "/stage1/recorded-voiceover/ranges/confirm-all": {"POST"},
         "/stage1/recorded-voiceover/scan": {"POST"},
         "/stage1/recorded-voiceover/source": {"POST"},
         "/stage1/status": {"GET"},

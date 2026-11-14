@@ -27,6 +27,7 @@ from .confirmation_checks import (
     check_speaker_not_a_person,
     has_speaker_name,
     is_non_person_word,
+    is_prose_speaker_label,
     looks_like_caps_source_note,
     role_is_prose,
     structural_checks,
@@ -44,6 +45,7 @@ from .normalization_models import (
     SyncFragment,
 )
 from .presenter_cues import parse_presenter_parts
+from .scenario_metadata import PRODUCTION_METADATA_VERSION, detect_production_metadata
 from .scenario_context import (
     AMBIGUOUS_CAPS_WARNING,
     SCENE_CONTEXT_VERSION,
@@ -66,6 +68,7 @@ from .scenario_structure import (
     ParagraphStructure,
     canonicalize_timecodes,
     find_repeated_author_numbers,
+    is_editorial_date,
     parse_paragraph,
     parse_timecode,
     split_inline_sync_label,
@@ -91,6 +94,7 @@ _REVIEWED_BLOCK_FIELDS = (
     "timecode_start",
     "timecode_end",
     "sync_fragments",
+    "label_only",
     "notes",
     "continuation_of_type",
     "absorbed_by_uid",
@@ -221,9 +225,10 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 # ``СНХ Имя, роль — файл.wav 00:05:42 — реплика``: the marker is followed by
-# whitespace (no comma), the credit by a dash and an optional media file name.
+# whitespace or a hyphen separator, the credit by a dash and an optional media file name.
 _SNH_DASH_CREDIT = re.compile(
-    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+(?P<credit>[А-ЯЁA-Z][^—–\n]{1,300}?)\s+"
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)(?:\s*[-–—]\s*|\s+)"
+    r"(?P<credit>[А-ЯЁA-Z][^—–\n]{1,300}?)\s+"
     # The dash is optional when the credit is directly followed by a timecode
     # (``СНХ ПОПОВ 00:12:06 — реплика``); such a credit carries no media file.
     r"(?:(?P<dash>[—–-])\s+|(?=\[?\d{1,2}[:.\-][0-5]\d))"
@@ -316,8 +321,18 @@ _BARE_SPEAKER_PREFIX = re.compile(
 )
 _NON_PERSON_SPEAKER_WORDS = frozenset(
     {
-        "название", "эксперимент", "выпуск", "эфир", "финал", "пролог", "эпилог",
-        "часть", "глава", "сцена", "вариант", "пример",
+        "название",
+        "эксперимент",
+        "выпуск",
+        "эфир",
+        "финал",
+        "пролог",
+        "эпилог",
+        "часть",
+        "глава",
+        "сцена",
+        "вариант",
+        "пример",
     }
 )
 _ROLE_DIALOGUE_CUE = re.compile(
@@ -567,10 +582,10 @@ _OPENROUTER_INSTRUCTIONS = (
     "item (a song/film title, a name, a credit), a section heading (e.g. "
     '"Клипы", "Хроника"), or a production note telling the editor what '
     'to insert/show (e.g. "Вставить синхрон", "Показать фото") is '
-     "type=technical, not unknown. Do not rewrite original content. "
-     "A short dash-led reply immediately following a role cue such as "
-     '"Жертва:", "Мошенник (быстро):" or "Голос из динамика." is spoken '
-     "voiceover, not a technical heading. "
+    "type=technical, not unknown. Do not rewrite original content. "
+    "A short dash-led reply immediately following a role cue such as "
+    '"Жертва:", "Мошенник (быстро):" or "Голос из динамика." is spoken '
+    "voiceover, not a technical heading. "
     "A paragraph beginning with ЛАЙФ or LIFE is always type=life, even when "
     "it contains a title, colon, quote text, or timecode; it is source sound "
     "and must never become voiceover or sync. "
@@ -906,9 +921,27 @@ def _generate_normalization_unlocked(
             fields_to_restore = set(old.manual_fields)
             if legacy_manual:
                 fields_to_restore = set(_REVIEWED_BLOCK_FIELDS)
+            generated_normalized_text = block.normalized_text
             for field_name in fields_to_restore:
                 if field_name in _REVIEWED_BLOCK_FIELDS:
                     setattr(block, field_name, getattr(old, field_name))
+            # Repair drafts saved before label_only became a reviewed field:
+            # an actual quote may have been restored while its stale context
+            # flag was not. Metadata-only edits leave the parsed text intact.
+            if (
+                block.type == BlockType.SYNC.value
+                and block.label_only
+                and (
+                    block.sync_fragments
+                    or block.timecode_start.strip()
+                    or block.timecode_end.strip()
+                    or (
+                        "normalized_text" in fields_to_restore
+                        and block.normalized_text.strip() != generated_normalized_text.strip()
+                    )
+                )
+            ):
+                block.label_only = False
             classification_pinned = legacy_manual or bool(
                 fields_to_restore & {"type", "original_label", "label_confirmed"}
             )
@@ -938,6 +971,8 @@ def _generate_normalization_unlocked(
         _flag_changed_scene_openers(scenario.blocks)
     # Reviewed fields restored above may pin a block: settle the stand-ups again.
     _apply_host_standup_text(scenario.blocks)
+    for block in scenario.blocks:
+        _refresh_sync_source_warning(block)
     scenario_payload = scenario.to_dict()
     if previous is not None:
         # The re-parse is a comparable draft: the replaced revision (often a
@@ -1224,6 +1259,26 @@ def _save_normalization_unlocked(
                     for field_name in _REVIEWED_BLOCK_FIELDS
                     if getattr(block, field_name) != getattr(old, field_name)
                 }
+                # A label-only flag is reviewable, but it cannot suppress an
+                # actual timed quote. Some reviews represent a quote with the
+                # block timecode and normalized text before fragments exist.
+                has_reviewed_sync_speech = block.type == BlockType.SYNC.value and (
+                    block.sync_fragments
+                    or block.timecode_start.strip()
+                    or block.timecode_end.strip()
+                    or block.normalized_text.strip() != old.normalized_text.strip()
+                )
+                # Only preserve a true flag when it came from the saved
+                # normalization's genuine context header. Client data alone
+                # cannot hide a quote or make an ordinary sync block context.
+                if block.label_only and (
+                    not old.label_only
+                    or has_reviewed_sync_speech
+                    or block.type not in {BlockType.SYNC.value, BlockType.HOST.value}
+                ):
+                    block.label_only = False
+                    if old.label_only:
+                        changed_names.add("label_only")
                 reviewed = set(old.reviewed_warnings)
                 removed_warnings = [w for w in old.warnings if w not in block.warnings]
                 reviewed.update(removed_warnings)
@@ -1271,6 +1326,8 @@ def _save_normalization_unlocked(
             block.manual_fields = []
     # Deterministic, LLM-free: also repairs documents normalized before the rule existed.
     _apply_host_standup_text(incoming.blocks)
+    for block in incoming.blocks:
+        _refresh_sync_source_warning(block)
     _flag_changed_scene_openers(incoming.blocks)
     incoming.status = NormalizationStatus.DRAFT.value
     incoming.confirmed_at = ""
@@ -1574,8 +1631,15 @@ def validate_for_confirmation_detailed(
                     block,
                     f"Sync block {block.order} has a direction instead of a speaker",
                 )
-            if block.original_text.strip().endswith(":") and not _TIMECODE.search(
-                block.original_text
+            if (
+                not block.label_only
+                and block.original_text.strip().endswith(":")
+                and not _TIMECODE.search(block.original_text)
+                and not (
+                    "normalized_text" in block.manual_fields
+                    and block.normalized_text.strip() != block.original_text.strip()
+                )
+                and not block.sync_fragments
             ):
                 add(
                     "sync_only_credit",
@@ -1936,7 +2000,10 @@ def _annotate_continuation_context(
                 # its text, after an unrelated sync, is not swept in too.
                 or (
                     previous.speaker
-                    and _SYNC_LABEL_ONLY_MARKER.match(previous.original_text.strip())
+                    and (
+                        previous.label_only
+                        or _SYNC_LABEL_ONLY_MARKER.match(previous.original_text.strip())
+                    )
                     and _TIMECODE.search(block.original_text)
                 )
             )
@@ -1952,6 +2019,8 @@ def _annotate_continuation_context(
             )
             block.speaker = previous.speaker
             block.role = previous.role
+            if not block.source_description:
+                block.source_description = previous.source_description
         elif (
             previous is not None
             and block.type == BlockType.UNKNOWN.value
@@ -2046,6 +2115,7 @@ def _annotate_continuation_context(
             dash_info = _parse_snh_dash_credit(block.original_text)
             if block.speaker and (
                 (dash_info and dash_info.get("header_only"))
+                or block.label_only
                 or _SYNC_LABEL_ONLY_MARKER.match(block.original_text.strip())
             ):
                 header_donor = block
@@ -2057,9 +2127,14 @@ def _annotate_continuation_context(
         elif not _is_splice_marker(block.original_text):
             splice_donor = None
             if header_donor is not None:
-                header_distance += 1
-                if header_distance > 3:
+                if block.type == BlockType.VOICEOVER.value and _parse_unmarked_file_header(
+                    header_donor.original_text
+                ):
                     header_donor = None
+                else:
+                    header_distance += 1
+                    if header_distance > 3:
+                        header_donor = None
         previous = block
 
 
@@ -2560,8 +2635,10 @@ def _starts_with_unambiguous_timecode(text: str) -> bool:
 
 
 _CREDIT_SOURCE_MARK = re.compile(r"(?:^|\s)ИСХ(?:ОДНИК)?\.?\s+(?P<name>\S.*)$")
-_CREDIT_FILE_MARK = re.compile(
-    r"(?:^|\s)Файл\s+(?P<name>[^\n]+?)\s*\.?\s*$", re.IGNORECASE
+_CREDIT_FILE_MARK = re.compile(r"(?:^|\s)Файл\s+(?P<name>[^\n]+?)\s*\.?\s*$", re.IGNORECASE)
+_UNMARKED_FILE_HEADER = re.compile(
+    r"^\s*(?P<credit>[^\n:]{2,400}?)\.\s*(?i:Файл)\s+"
+    r"(?P<source>[^\n:]{1,240}):\s*$",
 )
 _CREDIT_NAME_WITH_BRACKET = re.compile(
     r"[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+(?:\s+[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+)*"
@@ -2572,6 +2649,34 @@ _CREDIT_NAME_WITH_BRACKET = re.compile(
 def _is_credit_name(speaker: str) -> bool:
     """A name, optionally with a surname in brackets: ``ИГУМЕН НИКИТА (ВИХЛЯЕВ)``."""
     return bool(_CREDIT_NAME_WITH_BRACKET.fullmatch(speaker))
+
+
+def _parse_unmarked_file_header(text: str) -> dict[str, str] | None:
+    """Parse a person credit with a ``Файл`` marker and optional repeated first name."""
+    match = _UNMARKED_FILE_HEADER.match(text)
+    if not match:
+        return None
+    credit = match.group("credit").strip()
+    first_name = credit.split()[0].strip(",")
+    credit = re.sub(rf"\.\s*{re.escape(first_name)}$", "", credit, flags=re.IGNORECASE)
+    speaker, _, role = credit.partition(",")
+    speaker = speaker.strip()
+    # Some exports repeat the first name between the role and the file cue.
+    # Strip that shorthand only when it actually repeats this person's name.
+    role = role.strip(" \t,;:.—–-")
+    words = speaker.split()
+    if (
+        not 2 <= len(words) <= 4
+        or not all(word[:1].isupper() for word in words)
+        or not _is_credit_name(speaker)
+        or not _looks_like_plausible_sync_credit(speaker)
+        or not _is_plausible_clear_speaker(speaker, role, frozenset())
+    ):
+        return None
+    source = match.group("source").strip()
+    if not source or _TIMECODE.search(source):
+        return None
+    return {"speaker": speaker, "role": role, "source": source}
 
 
 _CREDIT_FILE_TOKEN = re.compile(r"(?:\d{1,3}|[^\s_]*_\S*|(?=\S*\d)(?=\S*[A-Za-z])\S+)")
@@ -2655,6 +2760,26 @@ def _parse_snh_dash_credit(text: str) -> dict[str, str] | None:
     return _parse_snh_timed_credit(text) or _parse_snh_spoken_credit(text)
 
 
+def _refresh_sync_source_warning(block: NormalizedBlock) -> None:
+    """Reconcile the missing-source hint with current, possibly reviewed metadata."""
+    warning = "Sync credit has no source media file"
+    block.warnings = [item for item in block.warnings if item != warning]
+    if (
+        block.type != BlockType.SYNC.value
+        or block.label_only
+        or block.source_description.strip()
+        or warning in block.reviewed_warnings
+    ):
+        return
+    credit = _parse_snh_dash_credit(block.original_text)
+    if (
+        credit
+        and credit["content"]
+        and (credit["dashed"] or re.match(rf"{_TIMECODE_TOKEN}\s*[—–]", credit["content"]))
+    ):
+        block.warnings.append(warning)
+
+
 def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
     """Parse ``СНХ Имя[, роль] — [файл] 00:05:42 — реплика``.
 
@@ -2664,7 +2789,7 @@ def _parse_snh_timed_credit(text: str) -> dict[str, str] | None:
     """
     view = _structural_text(text)
     file_header = re.match(
-        r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)\s+"
+        r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)(?:\s*[-–—]\s*|\s+)"
         r"(?P<credit>.+?)\.\s*Файл\s+"
         rf"(?P<source>[^\n.]+?(?:\.{_MEDIA_EXTENSIONS})?)"
         r"(?:\.\s+(?P<content>.+)|\s+(?P<tc_content>(?=\[?\d{1,2}[:.\-][0-5]\d).+)|\.?\s*)$",
@@ -2846,6 +2971,8 @@ def _split_label(
     # Timecodes are located first: a colon inside ``(00:42:32)`` must never be
     # taken for a label/description separator.
     text = _structural_text(text)
+    if detect_production_metadata(text):
+        return "", text.strip()
     # Generic labels are deliberately limited: prose containing an ordinary colon
     # should not accidentally become a learned marker.
     if _TIMECODE.match(text.strip()):
@@ -2961,6 +3088,7 @@ def _split_label(
             # The generic colon fallback must not undo the person check above:
             # ``Заметьте: ...`` is speech, not a new speaker/learned marker.
             and not any(is_non_person_word(word) for word in candidate_words)
+            and not is_prose_speaker_label(candidate)
         ):
             return candidate, generic.group(2).strip()
     bare_speaker = _BARE_SPEAKER_PREFIX.match(text)
@@ -3015,6 +3143,20 @@ def _classify_by_rules(
 ) -> None:
     marker = normalize_marker(block.original_label)
     stripped = _structural_text(block.original_text).strip()
+    if detect_production_metadata(stripped, first_block=block.order == 1):
+        _apply_type(block, BlockType.TECHNICAL.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+        block.original_label = ""
+        block.text_for_tts = ""
+        return
+    unmarked_file_header = _parse_unmarked_file_header(stripped)
+    if unmarked_file_header:
+        _apply_type(block, BlockType.SYNC.value, DecisionSource.BUILTIN_RULE.value, 1.0)
+        block.speaker = unmarked_file_header["speaker"]
+        block.role = unmarked_file_header["role"]
+        block.source_description = unmarked_file_header["source"]
+        block.text_for_tts = ""
+        block.label_only = True
+        return
     label_only_sync = _SYNC_LABEL_ONLY_MARKER.match(stripped)
     if label_only_sync:
         # A label-only paragraph ("Синх Сторожевой") carries no quote of its
@@ -3221,8 +3363,17 @@ def _apply_type(block: NormalizedBlock, target_type: str, source: str, confidenc
 
 def _assign_first_timecodes(block: NormalizedBlock) -> None:
     """Take the first (and, for non-sync, second) timecode of the paragraph."""
+    if detect_production_metadata(block.original_text, first_block=block.order == 1):
+        return
     view = _structural_text(block.original_text)
-    timecodes = _TIMECODE.findall(view)
+    # Use the same date/speech policy as label parsing and canonicalization.
+    # A raw regex would turn an editorial date such as "Эфир 10.11.26"
+    # back into a clock even though the shared parser correctly rejected it.
+    timecodes = [
+        match.group(0)
+        for match in _TIMECODE.finditer(view)
+        if not is_editorial_date(view, match.start(), match.group(0))
+    ]
     if not timecodes:
         return
     block.timecode_start = _canonicalize_timecode(timecodes[0])
@@ -3260,9 +3411,7 @@ def _host_standup_parts(text: str) -> tuple[str, str] | None:
         return None
     rest = match.group("rest").strip()
     tail = rest.lstrip(":.–—- \t").strip()
-    if tail and not (
-        (tail[0] in "([" and tail[-1] in ")]") or _HOST_STANDUP_REMARK.match(tail)
-    ):
+    if tail and not ((tail[0] in "([" and tail[-1] in ")]") or _HOST_STANDUP_REMARK.match(tail)):
         return None
     remark = tail[1:-1].strip() if tail and tail[0] in "([" else tail
     return f"№ {match.group('number')}", remark
@@ -4290,6 +4439,8 @@ def _llm_rules_signature(memory: NormalizationMemory) -> str:
         "sync_label_metadata": _SYNC_LABEL_METADATA.pattern,
         "sync_name_only": _SYNC_NAME_ONLY_LABEL.pattern,
         "editorial_timecode_prefix": _EDITORIAL_TIMECODE_PREFIX.pattern,
+        "unmarked_file_header": _UNMARKED_FILE_HEADER.pattern,
+        "production_metadata_version": PRODUCTION_METADATA_VERSION,
         "confidence_threshold": _LLM_CONFIDENCE_THRESHOLD,
         "memory_rules": memory_rules,
     }

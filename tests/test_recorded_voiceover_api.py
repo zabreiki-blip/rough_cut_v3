@@ -289,6 +289,123 @@ def test_manual_range_and_take_selection_are_manual_decisions(env: Env) -> None:
     assert outside.status_code == 400
 
 
+def test_confirm_all_commits_pending_ranges_once_and_preserves_choices(env: Env) -> None:
+    env.words = asr_payload(SENTENCES[0], SENTENCES[1], SENTENCES[1], SENTENCES[2])
+    env.register()
+    env.run_job()
+    env.edit("PATCH", "/blocks/b2/voice-source", voice_source="tts")
+    original = ranges_by_uid(env)["b2"]
+    before = env.state()["generation"]
+    response = env.edit(
+        "POST",
+        "/ranges/confirm-all",
+        ranges=[
+            {"block_uid": "b1"},
+            {"block_uid": "b2", "source_in_sec": 25.0, "source_out_sec": 28.0},
+            {"block_uid": "b3"},
+        ],
+    )
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["result"]["confirmed_count"] == 3
+    assert env.state()["generation"] == before + 1
+    rows = ranges_by_uid(env)
+    assert all(rows[uid]["status"] == "confirmed" for uid in ("b1", "b2", "b3"))
+    assert rows["b2"]["voice_source"] == "tts"
+    assert rows["b2"]["source_in_sec"] == 25.0
+    assert rows["b2"]["takes"] == original["takes"]
+    assert rows["b2"]["selected_take"] is None
+    assert rows["b2"]["manual_range"] is True and rows["b2"]["origin"] == "manual"
+    assert rows["b2"]["note"] == original["note"]
+
+
+def test_confirm_all_rejects_stale_missing_or_overlapping_ranges_atomically(env: Env) -> None:
+    env.register()
+    env.run_job()
+    before = env.state()["generation"]
+    first = ranges_by_uid(env)["b1"]
+    overlap = env.edit(
+        "POST",
+        "/ranges/confirm-all",
+        ranges=[
+            {"block_uid": "b1"},
+            {
+                "block_uid": "b2",
+                "source_in_sec": first["source_in_sec"],
+                "source_out_sec": first["source_out_sec"],
+            },
+        ],
+    )
+    assert overlap.status_code == 409
+    assert env.state()["generation"] == before
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {"source_in_sec": None, "source_out_sec": 30.0},
+        {"source_in_sec": 30.0, "source_out_sec": None},
+        {"source_in_sec": 30.0, "source_out_sec": 29.0},
+        {"source_in_sec": 60.0, "source_out_sec": 61.0},
+    ],
+)
+def test_confirm_all_rejects_invalid_bounds_without_writing(env: Env, bounds: dict) -> None:
+    env.register()
+    env.run_job()
+    before = load_recorded_voiceover(env.paths)
+    response = env.edit("POST", "/ranges/confirm-all", ranges=[{"block_uid": "b1", **bounds}])
+    assert response.status_code == 400, response.get_json()
+    after = load_recorded_voiceover(env.paths)
+    assert after == before
+
+
+def test_confirm_all_rejects_active_job_without_writing(env: Env) -> None:
+    env.register()
+    env.run_job()
+    before = load_recorded_voiceover(env.paths)
+    runtime = api._VOICEOVER_RUNTIME
+    with runtime.lock:
+        runtime.active_projects.add("demo")
+    try:
+        response = env.edit("POST", "/ranges/confirm-all", ranges=[{"block_uid": "b1"}])
+    finally:
+        with runtime.lock:
+            runtime.active_projects.discard("demo")
+    assert response.status_code == 409
+    assert load_recorded_voiceover(env.paths) == before
+
+
+def test_confirm_all_rejects_stale_revision_and_text_hash_without_writing(env: Env) -> None:
+    env.register()
+    env.run_job()
+    before = load_recorded_voiceover(env.paths)
+    wrong_revision = env.call(
+        "POST",
+        "/ranges/confirm-all",
+        expected_revision_id="rev_old",
+        expected_generation=before["generation"],
+        ranges=[{"block_uid": "b1"}],
+    )
+    assert wrong_revision.status_code == 409
+    env.doc["blocks"][0]["normalized_text"] = "Изменённый текст блока"
+    env.doc["blocks"][0]["text_for_tts"] = "Изменённый текст блока"
+    stale_hash = env.edit("POST", "/ranges/confirm-all", ranges=[{"block_uid": "b1"}])
+    assert stale_hash.status_code == 409
+    assert load_recorded_voiceover(env.paths) == before
+    unchanged = ranges_by_uid(env)
+    assert all(unchanged[uid]["status"] == "needs_review" for uid in ("b1", "b2", "b3"))
+    stale = env.call(
+        "POST",
+        "/ranges/confirm-all",
+        expected_revision_id="rev_1",
+        expected_generation=before["generation"] - 1,
+        ranges=[{"block_uid": "b1"}],
+    )
+    assert stale.status_code == 409
+    missing = env.edit("POST", "/ranges/confirm-all", ranges=[{"block_uid": "b4"}])
+    assert missing.status_code == 409
+    assert env.state()["generation"] == before["generation"]
+
+
 def test_partial_publication_mixes_recorded_tts_and_none(env: Env) -> None:
     env.register()
     env.add_tts("b2", "b3")
