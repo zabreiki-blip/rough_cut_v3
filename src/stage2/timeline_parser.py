@@ -240,17 +240,29 @@ def sync_fragment_id(block_uid: str, index: int, count: int) -> str:
 def is_label_only_sync(block: dict) -> bool:
     """True for a ``Синх <Имя>`` header: speaker context that has no quote of its own.
 
-    Honours the explicit ``label_only`` flag and, for normalizations saved before
-    the flag existed, recognises the same bare header (no fragments, no timecode).
+    A reviewed flag or actual edited quote is authoritative. For normalizations saved
+    before the flag existed (including model-canonicalized records), recognises the
+    same bare header (no fragments, no timecode).
     """
     if str(block.get("type") or "").lower() != "sync" or block.get("sync_fragments"):
         return False
+    original_text = str(block.get("original_text") or "").strip()
     if block.get("label_only"):
         return True
+    if "label_only" in block:
+        if "label_only" in (block.get("manual_fields") or []):
+            return False
+        header = SYNC_LABEL_ONLY_RE.match(original_text)
+        if header:
+            normalized_text = str(block.get("normalized_text") or "").strip()
+            speaker = str(block.get("speaker") or "").strip()
+            label_texts = {original_text, header.group(1).strip(), speaker}
+            if normalized_text and normalized_text not in label_texts:
+                return False
     return (
         not str(block.get("timecode_start") or "").strip()
         and not str(block.get("original_label") or "").strip()
-        and bool(SYNC_LABEL_ONLY_RE.match(str(block.get("original_text") or "").strip()))
+        and bool(SYNC_LABEL_ONLY_RE.match(original_text))
     )
 
 

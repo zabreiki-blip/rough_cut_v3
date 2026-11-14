@@ -63,7 +63,7 @@ from .normalization_memory import normalize_marker
 # Bump whenever the structural parse (labels, author numbers, timecodes,
 # technical cues) changes behaviour.  It is part of the LLM cache fingerprint,
 # so a cached answer produced for an older, wrong parse is never reused.
-STRUCTURE_PARSER_VERSION = 4
+STRUCTURE_PARSER_VERSION = 8
 
 # Core label -> block type candidates.  ``normalizer`` passes its own, wider
 # table (``_BUILTIN_MARKERS`` + ``_TECH_MARKERS``); this one covers the
@@ -164,7 +164,8 @@ _GLUED_COMPOUND_NUMBER = re.compile(
     rf"(?!\s+[-–—]\s+(?![А-ЯЁA-Z«]))(?={_AFTER_GLUED_NUMBER})"
 )
 _SPACED_NUMBER = re.compile(
-    rf"\s+(?P<n>{_NUM})(?=\s*:(?!\d)|\.(?=\s|$)|\s*[-–—]\s*(?=[А-ЯЁA-Z«])|\s*$)"
+    rf"\s+(?P<n>{_NUM})(?=\s*:(?!\d)|\.(?=\s|$)|\s*[-–—]\s*(?=[А-ЯЁA-Z«])"
+    rf"|\s*[-‐‑‒–][А-Яа-яЁё](?=\s*(?:[:;,.!?…]|$))|\s+[А-ЯЁ](?=\s|$)|\s*$)"
 )
 _SEPARATOR = re.compile(r"\s*[,.:\-–—]\s*|\s+|$")
 # ``З.К.`` / ``З.к`` / ``ЗК`` / ``З К``.
@@ -238,13 +239,38 @@ def match_author_number(text: str, pos: int) -> tuple[str, int] | None:
     See the module docstring for the rule.  ``end`` is the offset right after the
     number; a separator (if any) is not consumed.
     """
-    glued = _GLUED_NUMBER.match(text, pos) or _GLUED_COMPOUND_NUMBER.match(text, pos)
+    # Treat typographic hyphens as ASCII hyphens in this metadata-only view.
+    # Translation preserves codepoint count, so match offsets still address the
+    # original source. Em dash is intentionally excluded.
+    matching_text = text.translate(str.maketrans("‐‑‒", "---"))
+    glued = _GLUED_NUMBER.match(matching_text, pos) or _GLUED_COMPOUND_NUMBER.match(
+        matching_text, pos
+    )
     if glued:
-        return glued.group("n"), glued.end("n")
-    spaced = _SPACED_NUMBER.match(text, pos)
+        number, end = glued.group("n"), glued.end("n")
+        suffix = _AUTHOR_LETTER_SUFFIX.match(matching_text, end)
+        if suffix:
+            letter = next(group for group in suffix.groups() if group is not None)
+            return number + letter.upper(), suffix.end()
+        return number.upper(), end
+    spaced = _SPACED_NUMBER.match(matching_text, pos)
     if spaced:
-        return spaced.group("n"), spaced.end("n")
+        number, end = spaced.group("n"), spaced.end("n")
+        suffix = _AUTHOR_LETTER_SUFFIX.match(matching_text, end)
+        if suffix:
+            letter = next(group for group in suffix.groups() if group is not None)
+            return number + letter.upper(), suffix.end()
+        return number.upper(), end
     return None
+
+
+# A standalone Cyrillic letter after an author number is a sub-block suffix.
+# The em dash form remains speech.
+_AUTHOR_LETTER_SUFFIX = re.compile(
+    r"(?:\s*[-‐‑‒–](?P<attached_letter>[А-Яа-яЁё])(?![А-Яа-яЁё])(?=\s|[:;,.!?…]|$)"
+    r"|\s*[-–]\s+(?P<dash_letter>[А-ЯЁ])(?![А-Яа-яЁё])(?=\s*(?:[:;,.!?…]|$))"
+    r"|\s+(?P<spaced_letter>[А-ЯЁ])(?![А-Яа-яЁё])(?=\s*(?:[:;,.!?…]|$)))"
+)
 
 
 def parse_paragraph(text: str, marker_types: Mapping[str, str] | None = None) -> ParagraphStructure:
@@ -663,6 +689,26 @@ def _context_ok(text: str, pos: int, *, header_zone: bool, first: bool) -> bool:
     )
 
 
+_EDITORIAL_DATE = re.compile(
+    r"(?<!\w)(?:эфира?|выпуск|версия|дата|от)\s*[:№#-]?\s*"
+    r"(?P<date>\d{1,2}[./-]\d{1,2}[./-](?:\d{4}|\d{2})"
+    r"|\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def is_editorial_date(text: str, start: int, raw: str) -> bool:
+    """Reject clock-like tokens contained inside an explicitly labelled date.
+
+    Legacy clock patterns may match only a part of a date (``17.11`` in
+    ``17.11.2026`` or ``26-11`` in ``2026-11-17``), so compare source spans.
+    """
+    return any(
+        match.start("date") <= start and start + len(raw) <= match.end("date")
+        for match in _EDITORIAL_DATE.finditer(text)
+    )
+
+
 def find_timecodes(text: str, *, header_zone: bool = False) -> list[TimecodeSpan]:
     """Locate structural timecodes, ranges and their brackets in ``text``.
 
@@ -682,17 +728,7 @@ def find_timecodes(text: str, *, header_zone: bool = False) -> list[TimecodeSpan
         # publication date, not a timecode (``Эфир 10.11.26``).  Real dotted
         # timecodes in credits are either prefixed by a speaker/label or use a
         # zero hour, and remain covered by the normal rules below.
-        if (
-            first.hours is not None
-            and first.separator == "."
-            and first.raw.count(".") == 2
-            and re.search(
-                r"(?:эфир|выпуск|версия|дата|от)\s*$",
-                text[: match.start()],
-                re.IGNORECASE,
-            )
-            and not text[: match.start()].rstrip().endswith(("(", "["))
-        ):
+        if is_editorial_date(text, match.start(), first.raw):
             continue
         last: Timecode | None = None
         joiner = ""

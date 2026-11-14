@@ -56,6 +56,7 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 | POST | `/stage1/recorded-voiceover/jobs/<job_id>/cancel` | `recorded_voiceover_job_cancel` |
 | POST | `/stage1/recorded-voiceover/jobs/start` | `recorded_voiceover_job_start` |
 | PATCH | `/stage1/recorded-voiceover/ranges/<block_uid>` | `recorded_voiceover_range_patch` |
+| POST | `/stage1/recorded-voiceover/ranges/confirm-all` | `recorded_voiceover_range_confirm_all` |
 | POST | `/stage1/recorded-voiceover/scan` | `recorded_voiceover_scan` |
 | POST | `/stage1/recorded-voiceover/source` | `recorded_voiceover_source` |
 | GET | `/stage1/status` | `stage1_status` |
@@ -127,6 +128,32 @@ LLM-нормализация сохраняет успешные batch-реше�
 `work/normalization_llm_cache.json`. Повторный запуск после сбоя запрашивает
 только недостающие batch; изменение текста, правил, модели или prompt инвалидирует
 соответствующий кеш.
+
+## Массовое подтверждение записи диктора
+
+`POST /stage1/recorded-voiceover/ranges/confirm-all` подтверждает переданный пакет
+найденных фрагментов. Тело содержит `project`, `expected_revision_id`,
+`expected_generation` и непустой массив `ranges`:
+
+```json
+{
+  "project": "demo",
+  "expected_revision_id": "rev_1",
+  "expected_generation": 7,
+  "ranges": [
+    {"block_uid": "block-a"},
+    {"block_uid": "block-b", "source_in_sec": 12.5, "source_out_sec": 18.75}
+  ]
+}
+```
+
+Без границ сохраняются исходная точность и выбранный дубль. Если границы изменены,
+нужно передать обе; диапазон становится ручным. Выбор источника звука сохраняется.
+Все фрагменты должны иметь актуальный текст и статус `needs_review`. Некорректные
+границы отклоняются с `400`, устаревшие данные, активная задача или пересечения —
+с `409`. Проверка выполняется для всего пакета до единственного сохранения:
+при ошибке частичного подтверждения нет. Ответ содержит `confirmed_count` и новую
+`generation`. Применение записи к редакции остаётся отдельным `POST /apply`.
 
 ## Финальная проверка
 

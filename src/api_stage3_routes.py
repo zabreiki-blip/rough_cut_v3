@@ -436,13 +436,18 @@ def _scan_project_media(
     ):
         directories.insert(0, inbox_path)
 
-    scan_kwargs = {"cache_only": True} if cache_only else {}
-    catalogs = [
-        scan_media_directory(
-            str(directory), recursive=recursive, media_root=project_root, **scan_kwargs
-        )
-        for directory in directories
-    ]
+    if cache_only:
+        catalogs = [
+            scan_media_directory(
+                str(directory), recursive=recursive, media_root=project_root, cache_only=True
+            )
+            for directory in directories
+        ]
+    else:
+        catalogs = [
+            scan_media_directory(str(directory), recursive=recursive, media_root=project_root)
+            for directory in directories
+        ]
     sources_by_path: dict[str, dict] = {}
     for catalog in catalogs:
         for source in catalog.get("sources", []):
@@ -830,7 +835,10 @@ def _parse_iso(value: object) -> datetime | None:
 
 
 def _job_build_id(job: dict) -> str:
-    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    result: dict = {}
+    result_value = job.get("result")
+    if isinstance(result_value, dict):
+        result = result_value
     return str(job.get("build_id") or result.get("build_id") or "")
 
 

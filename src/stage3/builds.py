@@ -137,7 +137,10 @@ def wav_inputs(
         if item["wav"].get("kind") == "recorded":
             # A range of a shared recording: the block's voice source, the immutable source
             # identity and the range itself belong to the build (TTS entries stay as before).
-            edit_range = item.get("edit_range") if isinstance(item.get("edit_range"), dict) else {}
+            edit_range: dict = {}
+            edit_value = item.get("edit_range")
+            if isinstance(edit_value, dict):
+                edit_range = edit_value
             entry.update(
                 {
                     "kind": "recorded",
@@ -292,7 +295,10 @@ def build_stale_reasons(build: dict, current: dict) -> list[str]:
     not count as a mismatch (same rules as the pre-build download check).
     """
 
-    stored = build.get("inputs") if isinstance(build.get("inputs"), dict) else {}
+    stored: dict = {}
+    stored_value = build.get("inputs")
+    if isinstance(stored_value, dict):
+        stored = stored_value
     reasons: list[str] = []
     if "normalization_revision" in current:
         value = stored.get("normalization_revision")

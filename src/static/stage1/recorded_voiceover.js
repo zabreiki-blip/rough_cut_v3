@@ -40,6 +40,7 @@ let pollTimer = null;
 let lastScanAt = -Infinity;
 let stopHandler = null;
 let modeChosen = false; // the user picked the mode explicitly: do not auto-switch
+let confirmingAll = false;
 
 export function getRecordedState() {
   return rvState;
@@ -106,6 +107,15 @@ function confirmedRecordedBlocks(state) {
 export function canApplyRecording(state) {
   if (!state || !state.scenario_confirmed || state.draft_stale || isJobActive(state.job)) return false;
   return confirmedRecordedBlocks(state).length > 0;
+}
+
+export function pendingRecordedBlocks(state) {
+  if (!state || !state.scenario_confirmed || state.draft_stale || isJobActive(state.job)) return [];
+  return ((state && state.blocks) || []).filter((block) => (
+    block.range && block.range.status === "needs_review" && !block.text_changed
+    && Number.isFinite(Number(block.range.source_in_sec))
+    && Number.isFinite(Number(block.range.source_out_sec))
+  ));
 }
 
 export function mixedVolumeWarning(state) {
@@ -255,6 +265,12 @@ function renderAll() {
   );
   if (ids.btn_rv_align) ids.btn_rv_align.disabled = !recordings.length || isJobActive(state.job) || !state.scenario_confirmed;
   if (ids.rv_blocks) ids.rv_blocks.innerHTML = renderBlocksHtml(state);
+  const pending = pendingRecordedBlocks(state);
+  if (ids.btn_rv_confirm_all) {
+    ids.btn_rv_confirm_all.disabled = confirmingAll || pending.length === 0;
+    ids.btn_rv_confirm_all.textContent = pending.length
+      ? `Подтвердить все (${pending.length})` : "Подтвердить все";
+  }
   if (state.draft_stale) {
     setText(ids.rv_notice, "Разметка относится к другой редакции сценария — запустите сопоставление заново.");
     if (ids.rv_notice) ids.rv_notice.hidden = false;
@@ -388,6 +404,48 @@ export function confirmBlock(uid, { inSec, outSec } = {}) {
   });
 }
 
+export async function confirmAllBlocks() {
+  const state = requireState();
+  if (confirmingAll) return false;
+  const eligible = pendingRecordedBlocks(state);
+  if (!eligible.length) return false;
+  const ranges = eligible.map((block) => {
+    const row = ids.rv_blocks && [...ids.rv_blocks.querySelectorAll(".rv-row")]
+      .find((item) => item.dataset.uid === block.block_uid);
+    const values = row ? rowInputs(row) : {
+      inSec: Number(block.range.source_in_sec), outSec: Number(block.range.source_out_sec),
+    };
+    if (!Number.isFinite(values.inSec) || !Number.isFinite(values.outSec)
+        || values.inSec < 0 || values.outSec <= values.inSec) {
+      throw new Error(`Некорректные границы диапазона: ${block.block_uid}`);
+    }
+    const range = { block_uid: block.block_uid };
+    const inputsUnchanged = row && ["in", "out"].every((field) => {
+      const input = row.querySelector(`[data-rv-field="${field}"]`);
+      return input && String(input.value) === String(input.defaultValue);
+    });
+    if (!inputsUnchanged) {
+      range.source_in_sec = values.inSec;
+      range.source_out_sec = values.outSec;
+    }
+    return range;
+  });
+  confirmingAll = true;
+  if (ids.btn_rv_confirm_all) ids.btn_rv_confirm_all.disabled = true;
+  try {
+    const ok = await mutate(async () => {
+      await requestJSON(`${BASE}/ranges/confirm-all`, "POST", { ...guard(), ranges });
+    });
+    if (ok) showMessage(`Подтверждено блоков: ${ranges.length}.`, "success");
+    return ok;
+  } finally {
+    confirmingAll = false;
+    if (ids.btn_rv_confirm_all) {
+      ids.btn_rv_confirm_all.disabled = pendingRecordedBlocks(rvState).length === 0;
+    }
+  }
+}
+
 export function selectTake(uid, index) {
   return mutate(async () => {
     await requestJSON(`${BASE}/ranges/${encodeURIComponent(uid)}`, "PATCH", { ...guard(), selected_take: index });
@@ -515,7 +573,7 @@ export function restoreVoiceMode() {
 function rowInputs(row) {
   const read = (field) => {
     const input = row.querySelector(`[data-rv-field="${field}"]`);
-    return input && input.value !== "" ? Number(input.value) : NaN;
+    return input && String(input.value).trim() !== "" ? Number(input.value) : NaN;
   };
   return { inSec: read("in"), outSec: read("out") };
 }
@@ -578,3 +636,4 @@ if (ids.btn_rv_scan) {
 if (ids.btn_rv_align) ids.btn_rv_align.addEventListener("click", () => safely(startAlignment));
 if (ids.btn_rv_cancel) ids.btn_rv_cancel.addEventListener("click", () => safely(cancelAlignment));
 if (ids.btn_rv_apply) ids.btn_rv_apply.addEventListener("click", () => safely(applyRecording));
+if (ids.btn_rv_confirm_all) ids.btn_rv_confirm_all.addEventListener("click", () => safely(confirmAllBlocks));

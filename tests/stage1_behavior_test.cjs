@@ -2005,6 +2005,7 @@ function testNormalizationWarningLocations({ state, normalization }) {
     state.appState.normalization = { status: "draft", blocks: [
       { uid: "a", order: 6, type: "unknown", warnings: ["LLM returned an unknown type"] },
       { uid: "b", order: 94, type: "unknown", warnings: ["LLM returned an unknown type"] },
+      { uid: "punctuation", order: 86, type: "technical", warnings: ["punctuation-only paragraph treated as technical: check manually"] },
       ...Array.from({ length: 9 }, (_, i) => ({
         uid: `extra-${i}`, order: 100 + i, type: "technical", warnings: [`Additional warning ${i}`],
       })),
@@ -2015,6 +2016,8 @@ function testNormalizationWarningLocations({ state, normalization }) {
     assert.ok(html.includes("6, 94"), "warning must locate affected blocks");
     assert.ok(html.includes("Additional warning 8"), "last warning must remain visible");
     assert.ok(!html.includes("LLM returned an unknown type"), "known warnings must be translated");
+    assert.ok(html.includes("Строка содержит только знаки препинания"), html);
+    assert.ok(!html.includes("punctuation-only paragraph"), "punctuation warning must be translated");
   } finally {
     state.appState.normalization = previous;
   }
@@ -2192,6 +2195,8 @@ async function testConfirmRejectedShowsRussianReasons({ state, normalization, co
       ["unmatched_speech", "Block 1 lost 5 of 9 spoken words (e.g. 'слово')"],
       ["unknown_type", "Block 1 has unknown type"],
       ["sync_no_speaker", "Sync block 1 has no speaker"],
+      ["sync_source_note", "Sync block 1 has a source note in its speech text: 'пауза'"],
+      ["montage_note_in_tts", "Block 1 montage note in TTS text: 'крупный план'"],
       ["speaker_not_a_person", "Block 1 speaker 'Закадр' is not a person"],
     ];
     const issues = messages.map(([code, message]) => issueOf(code, 1, message));
@@ -2204,7 +2209,10 @@ async function testConfirmRejectedShowsRussianReasons({ state, normalization, co
     assert.ok(normalization.describeIssue(issues[1]).includes("Роль / должность"));
     assert.ok(normalization.describeIssue(issues[4]).includes("00:10:05"));
     assert.ok(normalization.describeIssue(issues[5]).includes("5 из 9"));
-    assert.ok(normalization.describeIssue(issues[8]).includes("Закадр") && normalization.describeIssue(issues[8]).includes("если это закадровый текст"));
+    const reasonFor = (code) => normalization.describeIssue(issues.find((issue) => issue.code === code));
+    assert.ok(reasonFor("speaker_not_a_person").includes("Закадр") && reasonFor("speaker_not_a_person").includes("если это закадровый текст"));
+    assert.ok(reasonFor("sync_source_note").includes("Технический") && reasonFor("sync_source_note").includes("речь"));
+    assert.ok(reasonFor("montage_note_in_tts").includes("Технический") && reasonFor("montage_note_in_tts").includes("текст для TTS"));
 
     globalThis.fetch = async (url) => {
       const target = String(url);
@@ -2710,6 +2718,85 @@ async function testRecordedConfirmPatchesBounds() {
   });
 }
 
+async function testRecordedConfirmAllRequestAndBusyGuard() {
+  await withRvFetch({
+    [`POST ${RV}/ranges/confirm-all`]: () => new Promise((resolve) => {
+      globalThis.finishConfirmAll = () => resolve({ result: { confirmed_count: 1 } });
+    }),
+    [`GET ${RV}`]: { result: rvFixture({ generation: 8 }) },
+  }, async (rv, mock) => {
+    const { ids } = await import(moduleUrl("state.js"));
+    const row = {
+      dataset: { uid: "b2" },
+      querySelector: (selector) => ({ value: selector.includes('"in"') ? "31.5" : "39.5" }),
+    };
+    ids.rv_blocks.querySelectorAll = () => [row];
+    rv.setRecordedState(rvFixture());
+    const first = rv.confirmAllBlocks();
+    assert.strictEqual(ids.btn_rv_confirm_all.disabled, true);
+    assert.strictEqual(await rv.confirmAllBlocks(), false, "a second call while pending is ignored");
+    globalThis.finishConfirmAll();
+    delete globalThis.finishConfirmAll;
+    assert.strictEqual(await first, true);
+    const posts = mock.calls.filter((call) => call.path === `${RV}/ranges/confirm-all`);
+    assert.strictEqual(posts.length, 1);
+    assert.deepStrictEqual(posts[0].body.ranges, [{ block_uid: "b2", source_in_sec: 31.5, source_out_sec: 39.5 }]);
+    assert.strictEqual(posts[0].body.expected_revision_id, "rev_0003");
+    assert.strictEqual(posts[0].body.expected_generation, 7);
+  });
+}
+
+async function testRecordedConfirmAllPreservesUneditedPrecision() {
+  await withRvFetch({
+    [`POST ${RV}/ranges/confirm-all`]: { result: { confirmed_count: 1 } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 8 }) },
+  }, async (rv, mock) => {
+    const { ids } = await import(moduleUrl("state.js"));
+    const range = rvRange("b2", { source_in_sec: 31.234, source_out_sec: 39.876, selected_take: 1 });
+    const state = rvFixture({ blocks: [rvBlock("b2", "Второй блок", range, { voice_source: "recorded" })] });
+    const row = {
+      dataset: { uid: "b2" },
+      querySelector: (selector) => {
+        const input = { value: selector.includes('"in"') ? "31.23" : "39.88" };
+        input.defaultValue = input.value;
+        return input;
+      },
+    };
+    ids.rv_blocks.querySelectorAll = () => [row];
+    rv.setRecordedState(state);
+    assert.strictEqual(await rv.confirmAllBlocks(), true);
+    const post = mock.calls.find((call) => call.path === `${RV}/ranges/confirm-all`);
+    assert.deepStrictEqual(post.body.ranges, [{ block_uid: "b2" }],
+      "rounded but untouched fields must not become manual edits");
+  });
+}
+
+async function testRecordedConfirmAllRejectsBlankAndReloadsConflict() {
+  await withRvFetch({
+    [`POST ${RV}/ranges/confirm-all`]: { status: 409, payload: { ok: false, error: "generation mismatch" } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 9 }) },
+  }, async (rv, mock) => {
+    const { ids } = await import(moduleUrl("state.js"));
+    const row = { dataset: { uid: "b2" }, querySelector: (selector) => ({ value: selector.includes('"in"') ? "" : "39.5" }) };
+    ids.rv_blocks.querySelectorAll = () => [row];
+    rv.setRecordedState(rvFixture());
+    await assert.rejects(rv.confirmAllBlocks(), /Некорректные границы/);
+    assert.strictEqual(mock.calls.filter((call) => call.path === `${RV}/ranges/confirm-all`).length, 0,
+      "blank DOM boundary must not become zero");
+  });
+  await withRvFetch({
+    [`POST ${RV}/ranges/confirm-all`]: { status: 409, payload: { ok: false, error: "generation mismatch" } },
+    [`GET ${RV}`]: { result: rvFixture({ generation: 9 }) },
+  }, async (rv, mock) => {
+    const { ids } = await import(moduleUrl("state.js"));
+    ids.rv_blocks.querySelectorAll = () => [];
+    rv.setRecordedState(rvFixture());
+    assert.strictEqual(await rv.confirmAllBlocks(), false);
+    assert.strictEqual(rv.getRecordedState().generation, 9);
+    assert.ok(mock.calls.some((call) => call.method === "GET" && call.path === RV));
+  });
+}
+
 async function testRecordedTakeSelection() {
   await withRvFetch({
     [`PATCH ${RV}/ranges/b2`]: { result: { range: {}, generation: 8 } },
@@ -2763,11 +2850,14 @@ async function testRecordedApplyButton({ state }) {
   assert.strictEqual(rv.canApplyRecording(rvFixture()), true, "one confirmed block is enough");
   assert.strictEqual(rv.canApplyRecording(rvFixture({ job: { status: "running" } })), false);
   assert.strictEqual(rv.canApplyRecording(rvFixture({ draft_stale: true })), false);
+  assert.strictEqual(rv.pendingRecordedBlocks(rvFixture()).length, 1);
+  assert.strictEqual(rv.pendingRecordedBlocks(rvFixture({ job: { status: "running" } })).length, 0);
   const stale = rvFixture();
   stale.blocks[0].text_changed = true;
   assert.strictEqual(rv.canApplyRecording(stale), false, "confirmed block with changed text does not count");
   rv.setRecordedState(none);
   assert.strictEqual(ids.btn_rv_apply.disabled, true);
+  assert.strictEqual(ids.btn_rv_confirm_all.disabled, false);
   rv.setRecordedState(rvFixture());
   assert.strictEqual(ids.btn_rv_apply.disabled, false);
   assert.ok(/TTS/.test(ids.rv_apply_hint.textContent) && ids.rv_apply_hint.textContent.includes("остальные"), ids.rv_apply_hint.textContent);
@@ -3226,6 +3316,9 @@ async function main() {
     ["testRecordedAutodetectNotice", () => testRecordedAutodetectNotice(modules)],
     ["testRecordedSourceColumnAndBadges", () => testRecordedSourceColumnAndBadges(modules)],
     ["testRecordedConfirmPatchesBounds", () => testRecordedConfirmPatchesBounds(modules)],
+    ["testRecordedConfirmAllRequestAndBusyGuard", () => testRecordedConfirmAllRequestAndBusyGuard()],
+    ["testRecordedConfirmAllPreservesUneditedPrecision", () => testRecordedConfirmAllPreservesUneditedPrecision()],
+    ["testRecordedConfirmAllRejectsBlankAndReloadsConflict", () => testRecordedConfirmAllRejectsBlankAndReloadsConflict()],
     ["testRecordedTakeSelection", () => testRecordedTakeSelection(modules)],
     ["testRecordedTtsOverride", () => testRecordedTtsOverride(modules)],
     ["testRecordedStaleConflict", () => testRecordedStaleConflict(modules)],

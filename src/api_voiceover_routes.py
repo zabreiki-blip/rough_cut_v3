@@ -537,7 +537,11 @@ def _patch_range(services: ModuleType, block_uid: str):
             )
             if not recording_id:
                 raise _fail(services, "recording_id is required", 400)
-            base = dict(existing) if fresh else {"takes": [], "confidence": 0.0}
+            base = (
+                dict(existing)
+                if fresh and existing is not None
+                else {"takes": [], "confidence": 0.0}
+            )
             if base.get("status") == "missing":
                 base["takes"] = []
             candidate = {
@@ -572,7 +576,7 @@ def _patch_range(services: ModuleType, block_uid: str):
                 candidate["speech_in_sec"] = old["speech_in_sec"] if inside else None
                 candidate["speech_out_sec"] = old["speech_out_sec"] if inside else None
         else:
-            if not fresh or existing["status"] == "missing":
+            if existing is None or not fresh or existing["status"] == "missing":
                 raise _fail(services, "block has no current range", 409)
             candidate = dict(existing)
             if has_take:
@@ -604,6 +608,112 @@ def _patch_range(services: ModuleType, block_uid: str):
     return jsonify({"ok": True, "result": {"project": project, **result}})
 
 
+def _confirm_all(services: ModuleType):
+    payload = _payload(services)
+    submitted = payload.get("ranges")
+    if not isinstance(submitted, list) or not submitted:
+        raise _fail(services, "ranges must be a non-empty array", 400)
+    parsed_input: list[tuple[str, Mapping[str, Any]]] = []
+    seen: set[str] = set()
+    for item in submitted:
+        if not isinstance(item, dict) or not isinstance(item.get("block_uid"), str):
+            raise _fail(services, "each range must include block_uid", 400)
+        uid = item["block_uid"]
+        if not uid or uid in seen:
+            raise _fail(services, "ranges contain an empty or duplicate block_uid", 400)
+        seen.add(uid)
+        if set(item) - {"block_uid", "source_in_sec", "source_out_sec"}:
+            raise _fail(services, "range contains unsupported fields", 400)
+        parsed_input.append((uid, item))
+
+    project, paths, document = _prepare_edit(services, payload)
+    with services._project_transition_lock(project):
+        document = _confirmed_document(services, project)
+        _check_revision(services, payload, document)
+        data = _locked_edit(services, project, paths, document, payload)
+        active = _blocks_by_uid(document)
+        proposed: dict[str, dict[str, Any]] = {}
+        recordings = {item["id"]: item for item in data["recordings"]}
+        for uid, item in parsed_input:
+            block = active.get(uid)
+            if block is None:
+                raise _fail(services, "block is no longer active", 409)
+            existing = next((row for row in data["ranges"] if row["block_uid"] == uid), None)
+            if (
+                not existing
+                or existing.get("text_sha256") != block.sha256
+                or existing.get("status") != "needs_review"
+            ):
+                raise _fail(services, "block has no current pending range", 409)
+            candidate = dict(existing)
+            if "source_in_sec" in item or "source_out_sec" in item:
+                if "source_in_sec" not in item or "source_out_sec" not in item:
+                    raise _fail(services, "both source bounds are required", 400)
+                start = _number(services, item, "source_in_sec")
+                end = _number(services, item, "source_out_sec")
+                if start is None or end is None:
+                    raise _fail(services, "source bounds must be numbers", 400)
+                changed = start != existing.get("source_in_sec") or end != existing.get(
+                    "source_out_sec"
+                )
+                candidate.update(source_in_sec=start, source_out_sec=end)
+                if changed:
+                    candidate.update(manual_range=True, selected_take=None, origin="manual")
+                speech_start = candidate.get("speech_in_sec")
+                speech_end = candidate.get("speech_out_sec")
+                if (
+                    speech_start is not None
+                    and speech_end is not None
+                    and not (start <= speech_start <= speech_end <= end)
+                ):
+                    candidate.update(speech_in_sec=None, speech_out_sec=None)
+            candidate["status"] = "confirmed"
+            recording = recordings.get(candidate.get("recording_id"))
+            try:
+                if recording is None:
+                    raise ValueError("unknown recording")
+                checked = VoiceoverRange.from_dict(
+                    candidate, duration_sec=recording["duration_sec"]
+                )
+            except (ValueError, TypeError, KeyError) as exc:
+                raise _fail(services, f"invalid range: {exc}", 400) from exc
+            proposed[uid] = checked.to_dict()
+
+        final_ranges = [proposed.get(row["block_uid"], row) for row in data["ranges"]]
+        confirmed = [row for row in final_ranges if row.get("status") == "confirmed"]
+        for i, row in enumerate(confirmed):
+            for other in confirmed[i + 1 :]:
+                if (
+                    row["recording_id"] == other["recording_id"]
+                    and row["source_in_sec"] < other["source_out_sec"]
+                    and other["source_in_sec"] < row["source_out_sec"]
+                ):
+                    raise _fail(
+                        services,
+                        f"confirmed ranges overlap ({row['block_uid']}, {other['block_uid']})",
+                        409,
+                    )
+        data["ranges"] = final_ranges
+        if not data.get("scenario_revision_id"):
+            data["scenario_revision_id"] = str(document.get("scenario_revision_id") or "")
+        try:
+            saved = save_recorded_voiceover(paths, data, expected_generation=data["generation"])
+        except StaleMapError as exc:
+            raise _fail(
+                services, "markup changed since it was loaded (generation mismatch)", 409
+            ) from exc
+    return jsonify(
+        {
+            "ok": True,
+            "result": {
+                "project": project,
+                "confirmed_count": len(proposed),
+                "generation": saved["generation"],
+            },
+        }
+    )
+
+
 def _patch_voice_source(services: ModuleType, block_uid: str):
     payload = _payload(services)
     project, paths, document = _prepare_edit(services, payload)
@@ -617,9 +727,11 @@ def _patch_voice_source(services: ModuleType, block_uid: str):
             raise _fail(services, "block not found among active voiceover blocks", 404)
         existing = next((i for i in data["ranges"] if i["block_uid"] == block_uid), None)
         fresh = existing is not None and existing["text_sha256"] == block.sha256
-        if wanted == "recorded" and (not fresh or existing["status"] == "missing"):
+        if wanted == "recorded" and (
+            existing is None or not fresh or existing["status"] == "missing"
+        ):
             raise _fail(services, "block has no recorded range to use", 409)
-        if fresh:
+        if fresh and existing is not None:
             candidate = {**existing, "voice_source": wanted, "origin": "manual"}
         else:
             candidate = {
@@ -723,6 +835,7 @@ def register_voiceover_routes(app: Flask, services: ModuleType) -> None:
     add("/jobs/<job_id>", "GET", _job_status, "recorded_voiceover_job_status")
     add("/jobs/<job_id>/cancel", "POST", _job_cancel, "recorded_voiceover_job_cancel")
     add("/ranges/<block_uid>", "PATCH", _patch_range, "recorded_voiceover_range_patch")
+    add("/ranges/confirm-all", "POST", _confirm_all, "recorded_voiceover_range_confirm_all")
     add(
         "/blocks/<block_uid>/voice-source",
         "PATCH",

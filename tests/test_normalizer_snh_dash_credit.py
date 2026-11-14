@@ -110,7 +110,7 @@ def test_file_header_merges_with_following_quote(tmp_path: Path) -> None:
     assert not validate_for_confirmation(result)
 
 
-def test_file_header_merges_quote_with_prose_before_first_timecode(tmp_path: Path) -> None:
+def test_file_header_merges_quote_preserving_prose_before_first_timecode(tmp_path: Path) -> None:
     result = _normalize(
         tmp_path,
         "СНХ Давид Осипов, следователь по особо важным делам. Файл MVIS0046.",
@@ -121,7 +121,17 @@ def test_file_header_merges_quote_with_prose_before_first_timecode(tmp_path: Pat
     block = result["blocks"][0]
     assert block["speaker"] == "Давид Осипов"
     assert block["source_description"] == "MVIS0046"
-    assert block["sync_fragments"][0]["timecode_start"] == "00:08:13"
+    assert block["sync_fragments"] == [
+        {
+            "text": "Я в тот момент подумал, что быстро всё закрою и откажусь.",
+            "timecode_start": "",
+        },
+        {
+            "text": "И это, наверное, главная ошибка всех людей.",
+            "timecode_start": "00:08:13",
+        },
+    ]
+    assert block["timecode_start"] == "00:08:13"
     assert not [issue for issue in validate_for_confirmation(result) if "speaker" in issue.lower()]
 
 

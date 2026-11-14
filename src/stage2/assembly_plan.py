@@ -268,7 +268,10 @@ def _recorded_voiceover_problems(
     """Recorded ZK: the shared recording exists and its range lies inside the recording."""
     if not wav_path or not path_exists(wav_path):
         return [("missing_voiceover", f"recording file not found: {wav_path}")]
-    edit = item.get("edit_range") if isinstance(item.get("edit_range"), dict) else {}
+    edit: dict = {}
+    edit_value = item.get("edit_range")
+    if isinstance(edit_value, dict):
+        edit = edit_value
     edit_in, edit_out = edit.get("in_sec"), edit.get("out_sec")
     if edit_in is None or edit_out is None or not 0 <= edit_in < edit_out:
         return [("missing_voiceover", f"recorded range={edit_in}..{edit_out}")]
@@ -291,7 +294,10 @@ def _ready_item_problems(
 ) -> list[tuple[str, str]]:
     problems: list[tuple[str, str]] = []
     if item_type == "zk":
-        wav = item.get("wav") if isinstance(item.get("wav"), dict) else {}
+        wav: dict = {}
+        wav_value = item.get("wav")
+        if isinstance(wav_value, dict):
+            wav = wav_value
         wav_path = str(wav.get("path") or "")
         if wav.get("kind") == "recorded":
             return _recorded_voiceover_problems(item, wav, wav_path, path_exists)
@@ -302,14 +308,20 @@ def _ready_item_problems(
         return problems
     if item_type not in {"snh", "host", "life"}:
         return problems
-    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    source: dict = {}
+    source_value = item.get("source")
+    if isinstance(source_value, dict):
+        source = source_value
     source_id = str(source.get("source_id") or "")
     entry = catalog.get(source_id) if catalog is not None and source_id else None
     duration = _num(_catalog_value(entry, "duration", "duration_sec"))
     media_path = _catalog_value(entry, "path", "container_path", "media_path")
     if media_path is not None and not path_exists(str(media_path)):
         problems.append(("source_missing", f"source file not found: {media_path}"))
-    edit = item.get("edit_range") if isinstance(item.get("edit_range"), dict) else {}
+    edit: dict = {}
+    edit_value = item.get("edit_range")
+    if isinstance(edit_value, dict):
+        edit = edit_value
     edit_in, edit_out = edit.get("in_sec"), edit.get("out_sec")
     if edit_in is None or edit_out is None or not 0 <= edit_in < edit_out:
         problems.append(("invalid_edit_range", f"edit_range={edit_in}..{edit_out}"))
@@ -318,7 +330,10 @@ def _ready_item_problems(
         problems.append(
             ("edit_beyond_source", f"edit out {edit_out} exceeds source duration {duration}")
         )
-    speech = item.get("speech_range") if isinstance(item.get("speech_range"), dict) else {}
+    speech: dict = {}
+    speech_value = item.get("speech_range")
+    if isinstance(speech_value, dict):
+        speech = speech_value
     speech_in, speech_out = speech.get("in_sec"), speech.get("out_sec")
     if (
         speech_in is not None

@@ -265,6 +265,52 @@ def is_non_person_word(word: str) -> bool:
     return bool(folded) and (folded in _DISCOURSE_WORDS or bool(_NON_NAME_VERB_RE.match(folded)))
 
 
+_POSSESSIVE_PREFIXES = frozenset(
+    _fold(word)
+    for word in {
+        "мой",
+        "моя",
+        "моё",
+        "мои",
+        "наш",
+        "наша",
+        "наше",
+        "наши",
+        "твой",
+        "твоя",
+        "твоё",
+        "твои",
+        "ваш",
+        "ваша",
+        "ваше",
+        "ваши",
+        "свой",
+        "своя",
+        "своё",
+        "свои",
+    }
+)
+_SHORT_COPULAS = frozenset({"был", "была", "было", "были", "будет", "будут", "есть"})
+
+
+def is_prose_speaker_label(text: str) -> bool:
+    """Reject sentence phrases before a colon without banning single-word names.
+
+    A possessive plus a lower-case noun (``Наша гипотеза``), or a short
+    predicate (``План был прост``), belongs to narration. Capitalized name
+    tokens and lone words retain the existing speaker checks.
+    """
+    words = re.findall(r"[^\W\d_]+", str(text or ""))
+    if len(words) < 2:
+        return False
+    capitals = str(text).isupper()
+    if _fold(words[0]) in _POSSESSIVE_PREFIXES and (words[1][:1].islower() or capitals):
+        return True
+    return any(
+        _fold(word) in _SHORT_COPULAS and (word.islower() or capitals) for word in words[1:-1]
+    )
+
+
 def role_is_prose(role: str) -> bool:
     """True if the text after ``Слово,`` continues a sentence instead of naming a role.
 

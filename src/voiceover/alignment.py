@@ -734,7 +734,9 @@ def align_voiceover(
         if not hits:
             continue
         for position in hits:
-            found[position] = (part_number, results[position])  # type: ignore[arg-type]
+            result = results[position]
+            if result is not None:
+                found[position] = (part_number, result)
         # Blocks after the last hit were not read in this part: try them in the next.
         next_block = max(hits) + 1
 
