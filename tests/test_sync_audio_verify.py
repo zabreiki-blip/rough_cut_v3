@@ -341,7 +341,9 @@ def test_dry_run_counts_duration_and_cost_without_network(tmp_path, monkeypatch,
     monkeypatch.setattr(sav, "verify_clip", boom)
     monkeypatch.setattr(sav, "make_default_request_fn", boom)
     monkeypatch.setattr(evalmod, "SyncMatchStore", lambda _p: SimpleNamespace(list=lambda: matches))
-    monkeypatch.setattr(evalmod, "SyncSourceStore", lambda _p: SimpleNamespace(list=lambda: list(sources.values())))
+    monkeypatch.setattr(
+        evalmod, "SyncSourceStore", lambda _p: SimpleNamespace(list=lambda: list(sources.values()))
+    )
     monkeypatch.setattr(evalmod, "load_normalization", lambda _p: {})
     monkeypatch.setattr(evalmod, "current_sync_matches", lambda m, _n: (m, []))
     full_paths = {**paths, "normalized": None, "sync_matches": None, "sync_sources": None}

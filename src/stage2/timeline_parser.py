@@ -108,6 +108,8 @@ def _merge_adjacent_sync_fragments(segments: list[TimelineSegment]) -> list[Time
         previous = merged[-1] if merged else None
         if (
             previous is not None
+            and not previous.translation_audio
+            and not segment.translation_audio
             and previous.type == segment.type == "snh"
             and previous.parent_block_uid
             and previous.parent_block_uid == segment.parent_block_uid
@@ -654,6 +656,9 @@ def parse_normalized_timeline(
     maps its recording ids to the shared montage WAVs.  Without a map every ZK is TTS
     (``speaker_dir/zkN.wav``) exactly as before.
     """
+    from translated_sync.audio import resolve_translation_audio
+    import math
+
     from voiceover.readiness import (
         active_published_map,
         published_fingerprint,
@@ -887,6 +892,18 @@ def parse_normalized_timeline(
                         unmatched_reason=str(match_metadata.get("unmatched_reason") or ""),
                         match_strategy=str(field(match, "strategy", "") or ""),
                         manual_range=bool(match_metadata.get("manual_updated_at")),
+                        translation_query_text=str(field(match, "query_text", "") or "")
+                        if "translation_audio" in match_metadata
+                        else "",
+                        translation_audio=(
+                            resolve_translation_audio(
+                                match_metadata["translation_audio"],
+                                str(field(match, "query_text", "") or ""),
+                            )
+                            if "translation_audio" in match_metadata
+                            and match_metadata["translation_audio"].get("enabled", True)
+                            else None
+                        ),
                         placeholder_path=str(placeholder_dir / f"{seg_id}_placeholder.png"),
                         spoken_text=_spoken_text(
                             fragment["text"],
@@ -1004,6 +1021,20 @@ def parse_normalized_timeline(
     _trim_adjacent_padding(segments, fps)
     cursor = 0.0
     for segment in segments:
+        audio = segment.translation_audio
+        if audio:
+            offset = max(0.0, segment.speech_in_sec - segment.source_in_sec) + audio["delay_sec"]
+            audio["timeline_offset_sec"] = offset
+            required = offset + audio["source_out_sec"] - audio["source_in_sec"]
+            # Source in/out and the timeline start are rounded independently in XML.
+            # Reserve any extra frame that independent rounding needs.
+            clip_end = (
+                math.ceil((cursor + offset) * fps)
+                + math.ceil(round(audio["source_out_sec"] * fps, 6))
+                - math.ceil(round(audio["source_in_sec"] * fps, 6))
+            )
+            required = max(required, clip_end / fps - cursor)
+            segment.duration_sec = max(segment.duration_sec, math.ceil(required * fps - 1e-9) / fps)
         segment.start_sec = cursor
         if segment.type != "tech":
             cursor += segment.duration_sec

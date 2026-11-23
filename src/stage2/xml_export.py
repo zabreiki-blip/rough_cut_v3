@@ -128,6 +128,8 @@ def _video_file_el(
 
 
 def build_xml(timeline: FullTimeline) -> str:
+    if any(segment.translation_audio for segment in timeline.segments):
+        raise ValueError("Translated audio requires final Stage 3 export")
     _validate_placeholder_identities(timeline)
     fps = timeline.fps
     total_frames = _frames(timeline.total_duration_sec, fps)

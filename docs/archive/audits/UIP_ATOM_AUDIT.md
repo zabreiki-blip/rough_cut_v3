@@ -1,5 +1,8 @@
 # Проверка UIP_ATOM_001: нормализация и сборка
 
+> Исторический документ: выводы относятся к указанной дате и ревизии.
+> Текущие открытые задачи — в [реестре технического долга](../../TECH_DEBT.md).
+
 Ниже сохранён первый срез аудита. Последующее состояние после завершения sync
 и ручных подтверждений описано в разделе «Обновление 22.10.2026» в конце.
 
@@ -16,12 +19,16 @@ Stage 2 timeline → Stage 3 XML; веб-интерфейс на JavaScript.
 ASR не запускались. Уже запущенная пользователем задача sync продолжала работать.
 Создан только этот отчёт. Имевшиеся изменения других документов сохранены.
 
+Артефакты `projects/UIP_ATOM_001/work/`, упомянутые ниже, — локальные данные
+исторической проверки. Часть файлов сейчас отсутствует; пути сохранены как
+свидетельства исходного отчёта, а не ссылки на доступные файлы репозитория.
+
 ## Подтверждённые ошибки
 
 ### P1 — части меток ЗК попадают в текст озвучки: 52 из 68 блоков
 
 Исходник содержит составные номера вроде `ЗК0.1` и `ЗК1.10`.
-В [normalizer.py](../src/stage1/normalizer.py), `_split_label`, строки 1594–1612,
+В [normalizer.py](../../../src/stage1/normalizer.py), `_split_label`, строки 1594–1612,
 регулярное выражение распознаёт только первую числовую часть; точка съедается
 как разделитель, а оставшаяся часть номера становится началом реплики.
 
@@ -33,7 +40,7 @@ ASR не запускались. Уже запущенная пользоват�
 | `ЗК 25 марта 2025 года.` | `25 марта 2025 года.` — корректно |
 
 В реальном проекте первый пример есть в блоке №2, UID `block-2-6ec82832`,
-prepared ID `zk1`: [scenario_prepared.json](../projects/UIP_ATOM_001/work/scenario_prepared.json),
+prepared ID `zk1`: `projects/UIP_ATOM_001/work/scenario_prepared.json`,
 строки 11–14. Второй реальный пример — `zk3`, начало `2 21 июня 2025 года…`.
 
 Все затронутые prepared IDs: **zk1, zk3–zk10, zk17–zk26, zk32–zk59, zk64–zk68**.
@@ -56,14 +63,14 @@ TTS-задача для этой редакции уже завершена, WAV
 
 Блок №5, UID `block-10-47fe0295`, Виктор Литовкин: первый canonical fragment
 заканчивается `…Дональд Трамп. ZOOM0007_Tr1 (1).WAV`.
-См. [scenario_normalized.json](../projects/UIP_ATOM_001/work/scenario_normalized.json):163.
+См. `projects/UIP_ATOM_001/work/scenario_normalized.json`:163.
 
 Начальный credit корректно разбирается `_parse_snh_dash_credit`, но повторное
 имя файла перед таймкодом второй реплики остаётся хвостом первой.
 `_extract_sync_fragments` (normalizer.py:1907–1960) режет текст по таймкодам,
 не отделяя этот повторный media credit. `_sync_alignment_units`
-([api.py](../src/api.py):1359–1382) использует готовый fragment text напрямую.
-`SyncMatcher.match` ([sync_matcher.py](../src/stage2/sync_matcher.py):1503)
+([api.py](../../../src/api.py):1359–1382) использует готовый fragment text напрямую.
+`SyncMatcher.match` ([sync_matcher.py](../../../src/stage2/sync_matcher.py):1503)
 сохраняет лишние токены `zoom0007`, `tr1`, `1`, `wav` в поисковом запросе.
 
 Подтверждено загрязнение запроса служебными данными. Ухудшение конкретного
@@ -75,8 +82,8 @@ TTS-задача для этой редакции уже завершена, WAV
 
 `_stage2_build` возвращает `warnings`, в том числе отсутствие WAV, пропущенные
 устаревшие sync matches и ошибки создания карточек
-([api_stage2_routes.py](../src/api_stage2_routes.py):939–950).
-`doBuildTimeline` в [tts.js](../src/static/stage1/tts.js):467–487 использует только
+([api_stage2_routes.py](../../../src/api_stage2_routes.py):939–950).
+`doBuildTimeline` в [tts.js](../../../src/static/stage1/tts.js):467–487 использует только
 число ЗК, число СНХ и длительность, затем включает экспорт. `warnings`,
 `matched`, `review`, `unmatched` не выводятся.
 
@@ -255,14 +262,14 @@ Python-тесты проходят, однако обязательные про
 
 | Исторический пункт | Состояние исходников на `9f3a790` |
 | --- | --- |
-| Остаток составного номера ЗК попадает в реплику | Исправлено в `066a999`: `_split_label`, [normalizer.py](../src/stage1/normalizer.py), строки 1617–1627. `ЗК0.1 25 марта 2025 года.` теперь даёт `25 марта 2025 года.`; добавлены регрессии. |
+| Остаток составного номера ЗК попадает в реплику | Исправлено в `066a999`: `_split_label`, [normalizer.py](../../../src/stage1/normalizer.py), строки 1617–1627. `ЗК0.1 25 марта 2025 года.` теперь даёт `25 марта 2025 года.`; добавлены регрессии. |
 | Повторное имя медиафайла входит в текст СНХ | Для проверенного случая исправлено: `_strip_trailing_media_credit`, normalizer.py:1924–1943, вызывается при выделении фрагментов. |
-| UI скрывает предупреждения сборки | Исправлено: [tts.js](../src/static/stage1/tts.js):477–503 показывает warnings, счётчики и признак черновика. |
-| Нет резервного поиска и проверки схлопнутых/обрезанных диапазонов | Реализовано в `114e0a5`: [sync_matcher.py](../src/stage2/sync_matcher.py):1586–1735. Есть local-index fallback, проверки плотности слов и сверка границ с local transcript. Это не доказательство правильности всех результатов на реальном аудио. |
-| Экспорт не предупреждает о непроверенных СНХ | В `9f3a790` добавлена сводка перед экспортом и подтверждение экспорта с заглушками: [stage3.js](../src/static/stage1/stage3.js):281–330. |
+| UI скрывает предупреждения сборки | Исправлено: [tts.js](../../../src/static/stage1/tts.js):477–503 показывает warnings, счётчики и признак черновика. |
+| Нет резервного поиска и проверки схлопнутых/обрезанных диапазонов | Реализовано в `114e0a5`: [sync_matcher.py](../../../src/stage2/sync_matcher.py):1586–1735. Есть local-index fallback, проверки плотности слов и сверка границ с local transcript. Это не доказательство правильности всех результатов на реальном аудио. |
+| Экспорт не предупреждает о непроверенных СНХ | В `9f3a790` добавлена сводка перед экспортом и подтверждение экспорта с заглушками: [stage3.js](../../../src/static/stage1/stage3.js):281–330. |
 
 Fingerprint сопоставления **уже повышен с 4 до 5** вместе с новыми проверками
-и включает хеши local indexes: [api.py](../src/api.py):1490–1533,
+и включает хеши local indexes: [api.py](../../../src/api.py):1490–1533,
 коммит `114e0a5`. Это обеспечивает инвалидацию прежнего кэша при повторном
 сопоставлении. Повторный запуск может пересчитать неподтверждённые результаты;
 сам аудит такой запуск не выполнял.
@@ -277,7 +284,7 @@ Fingerprint сопоставления **уже повышен с 4 до 5** в�
   Например, `zk1`: `1 25 марта 2025 года…`. SHA256 normalized и prepared
   совпадают с приведёнными в первом срезе: оба файла после него не изменились.
 - В первом фрагменте `block-10-47fe0295` остаётся `ZOOM0007_Tr1 (1).WAV`:
-  [scenario_normalized.json](../projects/UIP_ATOM_001/work/scenario_normalized.json):163.
+  `projects/UIP_ATOM_001/work/scenario_normalized.json`:163.
 - Сохранены прежние 125 matches: **93 auto_matched, 21 confirmed,
   2 needs_review, 9 not_found**. У двух фрагментов Попова speech ranges
   по-прежнему 235.27–235.69 и 235.79–236.19 с. Результат Винника
@@ -301,10 +308,10 @@ Fingerprint сопоставления **уже повышен с 4 до 5** в�
 **Воспроизведено на настоящих JS-функциях с задержанным mock-ответом API.**
 
 `setBusy(true)` блокирует кнопки действий, но оставляет поля блоков доступными
-для ввода: [core.js](../src/static/stage1/core.js):47–59.
+для ввода: [core.js](../../../src/static/stage1/core.js):47–59.
 `confirmNormalization` после ответа безусловно заменяет документ, выставляет
 `confirmed` и очищает `normalizationDirty`:
-[normalization.js](../src/static/stage1/normalization.js):392–409.
+[normalization.js](../../../src/static/stage1/normalization.js):392–409.
 
 Воспроизведение: начать подтверждение текста `original`; до ответа POST изменить
 текст для TTS на `new edit during confirm`; вернуть успешный ответ с исходным
@@ -328,11 +335,11 @@ Fingerprint сопоставления **уже повышен с 4 до 5** в�
 
 **Воспроизведено отдельно от потери правок при подтверждении.**
 
-В [normalization.js](../src/static/stage1/normalization.js):322–328 уже есть
+В [normalization.js](../../../src/static/stage1/normalization.js):322–328 уже есть
 защита от перезаписи нового текста: если изменился `normalizationEditGeneration`,
 ответ PUT отбрасывается. Вместе с текстом теряется и новая серверная revision.
 Backend увеличивает её при сохранении и проверяет при следующем запросе:
-[normalizer.py](../src/stage1/normalizer.py):725–732, 766–767.
+[normalizer.py](../../../src/stage1/normalizer.py):725–732, 766–767.
 
 ```text
 PUT отправлен с revision=5; во время ожидания внесена новая правка.
@@ -353,9 +360,9 @@ PUT отправлен с revision=5; во время ожидания внес�
 
 `appState.timelineReady` инициализируется из начального HTML и устанавливается
 в `true` после локальной сборки. `applyStatus` игнорирует присланный
-`timeline_ready`: [normalization.js](../src/static/stage1/normalization.js):527–565;
-[state.js](../src/static/stage1/state.js):199;
-[tts.js](../src/static/stage1/tts.js):514.
+`timeline_ready`: [normalization.js](../../../src/static/stage1/normalization.js):527–565;
+[state.js](../../../src/static/stage1/state.js):199;
+[tts.js](../../../src/static/stage1/tts.js):514.
 
 Сценарий: таймлайн был готов, затем другой клиент изменил matches; обновление
 статуса возвращает `timeline_ready=false`. После `applyStatus` получено:
@@ -367,7 +374,7 @@ server timeline_ready=false; UI timelineReady=true; exportDisabled=false
 Обратный переход тоже пропущен: сборка другим клиентом не включит экспорт
 после обычного обновления статуса. Требуется полная перезагрузка или новая
 локальная сборка. Сервер проверяет редакцию и fingerprint matches и отвергает
-устаревший экспорт с 409: [api_stage3_routes.py](../src/api_stage3_routes.py):923–931.
+устаревший экспорт с 409: [api_stage3_routes.py](../../../src/api_stage3_routes.py):923–931.
 Это рассогласование UI, а не доказательство выдачи устаревшего XML.
 
 **Исправление:** при наличии булевого `timeline_ready` обновлять поле состояния
@@ -379,14 +386,14 @@ server timeline_ready=false; UI timelineReady=true; exportDisabled=false
 На `9f3a790`, Python 3.11.16:
 
 - `mypy src`: **1 ошибка в 1 файле**, проверено 70 модулей.
-  [stage_common.py](../src/stage_common.py):116 — `float()` получает `object`
+  [stage_common.py](../../../src/stage_common.py):116 — `float()` получает `object`
   в `is_exportable_match`. Runtime-падение этим сообщением не доказано:
   `TypeError`/`ValueError` перехватываются, но типы аргументов не сужены.
 - `ruff format --check src tests`: **4 файла требуют форматирования** —
   `src/stage2/sync_matcher.py`, `tests/test_normalizer_numbered_markers.py`,
   `tests/test_stage3_api.py`, `tests/test_sync_match_verification.py`.
 
-Оба шага обязательны в [ci.yml](../.github/workflows/ci.yml):98–102.
+Оба шага обязательны в [ci.yml](../../../.github/workflows/ci.yml):98–102.
 **Исправление:** сузить типы перед числовым преобразованием с сохранением
 обработки невалидных значений, отформатировать четыре файла и повторить гейты.
 Успешный pytest не компенсирует их отказ. Удалённый запуск GitHub Actions
@@ -425,13 +432,13 @@ server timeline_ready=false; UI timelineReady=true; exportDisabled=false
    блоках, включая длительность отрисовки и сохранение фокуса/позиции ввода.
 5. **Не ускорять backend простым увеличением числа Gunicorn workers.**
    Project locks, реестры задач и дедупликация reconciliation находятся в
-   памяти процесса: [api.py](../src/api.py):256–280, 411–459;
-   [versioning.py](../src/stage4/versioning.py):66–80. Штатный deployment
+   памяти процесса: [api.py](../../../src/api.py):256–280, 411–459;
+   [versioning.py](../../../src/stage4/versioning.py):66–80. Штатный deployment
    использует один worker. Для нескольких процессов сначала нужны общие
    блокировки/атомарное резервирование задач; это условный риск масштабирования,
-   уже частично учтённый в D31 [TECH_DEBT.md](TECH_DEBT.md).
+   уже частично учтённый в D31 [TECH_DEBT.md](../../TECH_DEBT.md).
 6. **Проверить ASR-функции совместно на фиксированной короткой записи.**
-   Общие фикстуры [conftest.py](../tests/conftest.py):31–65 отключают local repair,
+   Общие фикстуры [conftest.py](../../../tests/conftest.py):31–65 отключают local repair,
    hole VAD и retiming; специализированные тесты включают их с подменами.
    Нужен отдельный интеграционный прогон с эталонными фразами и границами,
    включая fallback, повторный запуск из кэша и сохранность ручных подтверждений.

@@ -49,6 +49,7 @@ from api_service_contracts import (
 )
 from api_stage1_routes import register_stage1_routes
 from api_stage2_routes import register_stage2_routes
+from api_translated_sync_routes import register_translated_sync_routes
 from api_final_review_routes import register_final_review_routes
 from api_voiceover_routes import register_voiceover_routes
 from api_stage3_routes import register_stage3_routes
@@ -2152,6 +2153,7 @@ def _record_final_review_iteration(
 
 
 register_stage2_routes(app, sys.modules[__name__])
+register_translated_sync_routes(app, sys.modules[__name__])
 register_final_review_routes(app, sys.modules[__name__])
 register_voiceover_routes(app, sys.modules[__name__])
 _expose_registered_views(

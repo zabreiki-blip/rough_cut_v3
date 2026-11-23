@@ -787,16 +787,19 @@ def repair_active_revision_metadata(
 
 
 def _inherit_blocks(old_blocks: list[dict], new_blocks: list[dict], diff: dict[str, Any]) -> None:
+    uid_map: dict[str, str] = {}
     for change in diff["changes"]:
         if change["old_index"] is None or change["new_index"] is None:
             continue
         old = old_blocks[change["old_index"]]
         new = new_blocks[change["new_index"]]
         import_uid = _block_uid(new)
-        new["uid"] = _block_uid(old)
+        inherited_uid = _block_uid(old)
+        uid_map[import_uid] = inherited_uid
+        new["uid"] = inherited_uid
         new["versioning"] = {
             "import_uid": import_uid,
-            "parent_block_uid": _block_uid(old),
+            "parent_block_uid": inherited_uid,
             "change_status": change["status"],
         }
         if change["status"] not in {"type_changed", "speaker_changed"} and (
@@ -808,6 +811,11 @@ def _inherit_blocks(old_blocks: list[dict], new_blocks: list[dict], diff: dict[s
                     new[field] = old[field]
             if change["text_similarity"] != 1.0 and new.get("type") == "voiceover":
                 new["text_for_tts"] = new.get("normalized_text", "")
+    for block in new_blocks:
+        for field in ("scene_uid", "absorbed_by_uid"):
+            referenced_uid = str(block.get(field) or "")
+            if referenced_uid in uid_map:
+                block[field] = uid_map[referenced_uid]
     for change in diff["changes"]:
         if change["status"] != "added" or change["new_index"] is None:
             continue

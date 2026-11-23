@@ -214,7 +214,42 @@ def test_all_caps_text_without_montage_word_is_only_warning(tts: str) -> None:
     assert "montage_note_in_tts" not in _error_codes(block)
 
 
-@pytest.mark.parametrize("tts", ["КАДРЫ ИЗ ФИЛЬМА, СТАКАН ПАДАЕТ", "РЕКОНСТРУКЦИЯ ПИСЬМА"])
+@pytest.mark.parametrize(
+    "tts",
+    [
+        "УДАРЫ ПО МОСТАМ ЧЕРЕЗ ДНЕПР СЕГОДНЯ",
+        "А НА ДНЕПРЕ? ЭКСПЕРТ СОМНЕВАЕТСЯ",
+        "ВОЗДУШНЫЙ ДЕСАНТ НА ПРАВЫЙ БЕРЕГ",
+        "ПОЧЕМУ МОСТ НЕ ВИДЕЛИ С ВОЗДУХА",
+        "ЧТО ОСТАЛОСЬ В АРМИИ ОТ ОПЫТА 1943 ГОДА (ВЫХОД НА ФИНАЛЬНУЮ ПОДВОДКУ)",
+    ],
+)
+@pytest.mark.parametrize("label", ["", "ЗК."])
+def test_caps_narration_needs_directive_evidence_to_block(tts: str, label: str) -> None:
+    block = _block(
+        original_label=label,
+        original_text=f"{label} {tts}".strip(),
+        normalized_text=tts,
+        text_for_tts=tts,
+    )
+    codes = {i["code"]: i["severity"] for i in _issues(block)}
+    assert codes.get("montage_note_in_tts") == "warning"
+    assert not _error_codes(block)
+
+
+@pytest.mark.parametrize(
+    "tts",
+    [
+        "КАДРЫ ИЗ ФИЛЬМА, СТАКАН ПАДАЕТ",
+        "РЕКОНСТРУКЦИЯ ПИСЬМА",
+        "НА БЭКСТЕЙДЖЕ",
+        "БЫСТРАЯ НАРЕЗКА КАДРОВ",
+        "ПЕРЕБИВКА НА ГЕРОЯ",
+        "ВОЗВРАЩАЕМСЯ В МОСКВУ ПО КАРТИНКЕ",
+        "СЮДА НУЖНО ИНТЕРВЬЮ",
+        "ВСТАВИТЬ ФОТО ГЕРОЯ",
+    ],
+)
 def test_all_caps_montage_word_without_zk_label_blocks(tts: str) -> None:
     block = _block(original_text=tts, normalized_text=tts, text_for_tts=tts)
     assert "montage_note_in_tts" in _error_codes(block)
@@ -362,7 +397,9 @@ def test_synh_is_a_canonical_sync_marker() -> None:
     assert DEFAULT_MARKER_TYPES["синх"] == "sync"
 
 
-@pytest.mark.parametrize("tts", ["СИНХРОН Иванов сказал это в кадре.", "Синхрон Иванов сказал это."])
+@pytest.mark.parametrize(
+    "tts", ["СИНХРОН Иванов сказал это в кадре.", "Синхрон Иванов сказал это."]
+)
 def test_synhron_name_in_voiceover_tts_blocks(tts: str) -> None:
     block = _block(original_text=tts, normalized_text=tts, text_for_tts=tts)
     assert "service_label_in_tts" in _error_codes(block)

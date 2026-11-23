@@ -127,6 +127,16 @@ _SYNC_LABEL_IN_TEXT = re.compile(
     r"(?<![А-Яа-яЁёA-Za-z])(?:(?i:синх|снх|скл)(?![А-Яа-яЁёA-Za-z])|(?i:синхрон)\s+[А-ЯЁ])"
 )
 _MONTAGE_NOTE_MAX_WORDS = 12
+# Blocking needs a directive in the text itself.  The speaker/service lexicon
+# is too broad here: its stems conflate "эксперт" with "эксперимент" and
+# "воздушный" with "воздух".  A ЗК label is evidence of narration, not a cue.
+_MONTAGE_DIRECTIVE = re.compile(
+    r"^(?:на\s+б[эе]кстейдже\b|кадры?\s+из\b|реконструкция\b|"
+    r"(?:быстрая\s+)?нарезка\b|перебивк[аи]\b|монтаж\b|заставка\b|"
+    r"возвращаемся\s+.*\bпо\s+картинке\b|"
+    r"(?:сюда\s+)?(?:нужно\s+)?вставить\b|сюда\s+нужно\b)",
+    re.IGNORECASE,
+)
 _TEXT_REMNANT = re.compile(r"^\s*(?:\)|\d{1,2}[:.][0-5]\d(?:[:.][0-5]\d)?\s*\))")
 _WORD = re.compile(r"[^\W\d_]{4,}")
 _MIN_MISSING_WORDS = 4
@@ -200,15 +210,6 @@ def _has_montage_word(text: str) -> bool:
         if len(folded) >= _MONTAGE_STEM_LEN and folded[:_MONTAGE_STEM_LEN] in _MONTAGE_STEMS:
             return True
     return False
-
-
-def _from_zk_label(block: Any) -> bool:
-    """True if the block came from a ``ЗК.`` voiceover label (command block)."""
-    label = str(getattr(block, "original_label", "") or "").strip()
-    if not label:
-        words = str(getattr(block, "original_text", "") or "").split()
-        label = words[0].rstrip(".:") if words else ""
-    return bool(label) and is_zk_label(label)
 
 
 def has_speaker_name(speaker: str) -> bool:
@@ -438,8 +439,8 @@ def check_montage_note_in_tts(block: Any) -> list[tuple[str, str, str]]:
 
     ``НА БЭКСТЕЙДЖЕ``, ``КАДРЫ ИЗ ФИЛЬМА...``, ``РЕКОНСТРУКЦИЯ ПИСЬМА`` are
     instructions for the editor, not narration.  The block is blocking only if
-    it contains a montage/service word or comes from a ``ЗК.`` label; a plain
-    capitals line (``ФСБ РФ``, ``НАТО США``) is only a warning.  A reviewer who
+    it starts with an explicit montage directive; capitals and a ``ЗК.`` label
+    alone are only a warning, including spoken headings.  A reviewer who
     deliberately authored the text or the block type also gets only a warning.
     """
     if block.type != "voiceover" or block.absorbed_by_uid:
@@ -456,7 +457,7 @@ def check_montage_note_in_tts(block: Any) -> list[tuple[str, str, str]]:
         return []
     fields = set(getattr(block, "manual_fields", None) or [])
     manual = _speech_edited_by_human(block) or "type" in fields
-    blocking = _has_montage_word(tts) or _from_zk_label(block)
+    blocking = bool(_MONTAGE_DIRECTIVE.match(tts))
     return [
         (
             MONTAGE_NOTE_IN_TTS,

@@ -1,5 +1,8 @@
 # BRIK V7: почему материал пропадает и как исправить сборку для всех проектов
 
+> Исторический документ: выводы относятся к указанной дате и ревизии.
+> Текущие открытые задачи — в [реестре технического долга](../../TECH_DEBT.md).
+
 Проверено 23.10.2026 по текущим файлам проекта и рабочему дереву на базе
 `9d729c3`. Симптом пользователя: часть материала отсутствует или заменяется
 заглушками. Это диагностический отчёт и предложение изменений; исправления
@@ -14,11 +17,11 @@
 ## 1. Какая версия проверена
 
 - Сценарий: `22.10 СЦЕНАРИЙ БРИК - ПРАВКА без цвета.doc`, сохранённый как
-  [rev_0007.source.doc](../projects/BRIK/versions/scenarios/rev_0007.source.doc).
+  [rev_0007.source.doc](../../../projects/BRIK/versions/scenarios/rev_0007.source.doc).
 - Активная редакция: `rev_0007`, версия нормализации: `8`.
-- Последний XML: [BRIK_V7_20261023_114612.xml](../projects/BRIK/work/BRIK_V7_20261023_114612.xml),
+- Последний XML: [BRIK_V7_20261023_114612.xml](../../../projects/BRIK/work/BRIK_V7_20261023_114612.xml),
   подготовлен **23 октября в 14:46 по Москве**. В имени файла время UTC.
-- Актуальный статус: [stage3_prepare_job_status.json](../projects/BRIK/work/stage3_prepare_job_status.json).
+- Актуальный статус: [stage3_prepare_job_status.json](../../../projects/BRIK/work/stage3_prepare_job_status.json).
   Старый `stage3_job_status.json` относится к прежнему формату хранения статуса;
   его дата сама по себе не доказывает ошибку последней сборки.
 
@@ -56,27 +59,27 @@ Fingerprint текущих совпадений совпадает с fingerprin
 | `Говорят, талант притягивает талант.` внутри вводного ЗК | `life` | Фраза отсутствует в TTS и заменяется 10-секундной заглушкой; классификация требует редакторской проверки |
 | `СЮДА НУЖНО СНХ…`, `КАДРЫ ИЗ ФИЛЬМА…` | Поиск говорящих `СЮДА` и `КАДРЫ` | Поиск заведомо неподходящих источников вместо исполнения монтажной пометки |
 
-Первые два текста присутствуют в [scenario_prepared.json](../projects/BRIK/work/scenario_prepared.json)
+Первые два текста присутствуют в [scenario_prepared.json](../../../projects/BRIK/work/scenario_prepared.json)
 (строки 45–46 и 77–78); соответствующие WAV существуют. Это доказывает
 неверный вход TTS и включение файлов в сборку. Прослушивание в этой проверке
 не выполнялось.
 
-**Уточнение ревью (23.10.2026):** в таблице не упомянута слитая метка `zk25` в [scenario_prepared.json](../projects/BRIK/work/scenario_prepared.json) (строки 205–206): «Синх Сторожева СКЛ Эльза привела Маяковского СКЛ к Лиле…». Метка `Синх` и `СКЛ` остаются в `text_for_tts`; это тот же класс дефекта, что `zk5`.
+**Уточнение ревью (23.10.2026):** в таблице не упомянута слитая метка `zk25` в [scenario_prepared.json](../../../projects/BRIK/work/scenario_prepared.json) (строки 205–206): «Синх Сторожева СКЛ Эльза привела Маяковского СКЛ к Лиле…». Метка `Синх` и `СКЛ` остаются в `text_for_tts`; это тот же класс дефекта, что `zk5`.
 
 **Существенный пробел:** вызов `validate_for_confirmation_detailed` на текущем
-[scenario_normalized.json](../projects/BRIK/work/scenario_normalized.json)
+[scenario_normalized.json](../../../projects/BRIK/work/scenario_normalized.json)
 вернул `[]`: эти случаи проходят подтверждение без замечаний.
 
 Причины в общем коде:
 
-- [normalizer.py](../src/stage1/normalizer.py), строки 268–272, 2724–2734 (на момент аудита: регэксп `_SYNC_LABEL_ONLY_MARKER` в normalizer.py; сейчас: `SYNC_LABEL_ONLY_RE` в [scenario_structure.py](../src/stage1/scenario_structure.py), строка 428; алиас в normalizer.py, строка 270; использование 2722–2734):
+- [normalizer.py](../../../src/stage1/normalizer.py), строки 268–272, 2724–2734 (на момент аудита: регэксп `_SYNC_LABEL_ONLY_MARKER` в normalizer.py; сейчас: `SYNC_LABEL_ONLY_RE` в [scenario_structure.py](../../../src/stage1/scenario_structure.py), строка 428; алиас в normalizer.py, строка 270; использование 2722–2734):
   заголовок `Синх <имя>` намеренно сохраняется как sync-контекст, но не
   получает признака «контекст без самостоятельного клипа».
-- [timeline_parser.py](../src/stage2/timeline_parser.py), строки 539–591:
+- [timeline_parser.py](../../../src/stage2/timeline_parser.py), строки 539–591:
   такой контекст обрабатывается как обычная цитата.
-- [normalizer.py](../src/stage1/normalizer.py), строки 303–312, 1462–1472:
+- [normalizer.py](../../../src/stage1/normalizer.py), строки 303–312, 1462–1472:
   распознавание монтажных команд зависит от ограниченного набора выражений.
-- [confirmation_checks.py](../src/stage1/confirmation_checks.py), строки
+- [confirmation_checks.py](../../../src/stage1/confirmation_checks.py), строки
   92–122 (на момент аудита; сейчас: 120–168, `check_service_label_in_tts`): проверка служебных меток в TTS не охватывает все варианты написания.
   У проблемной реплики Сторожевой источник решения — `llm`, не ручная правка.
 
@@ -91,13 +94,13 @@ Fingerprint текущих совпадений совпадает с fingerprin
 разобрать ссылки на Краснощёкову/Луэллу, не объединяя разных людей наугад.
 **Уточнение ревью (23.10.2026):** причина — несимметричный стемминг на момент аудита (c651ea5, `_RUSSIAN_ENDINGS`): `МАКСИМОВА`→`максимов`, `Максимов`→`максим`. На HEAD `speaker_name_tokens` даёт для `СИНХ МАКСИМОВА` и `29-626 Максимов` один токен `максимов` (проверено вызовом); исправлено в c1e734b.
 
-См. [sync_matches.json](../projects/BRIK/work/sync_matches.json),
+См. [sync_matches.json](../../../projects/BRIK/work/sync_matches.json),
 `block-22-03777b46::fragment:1..3`, и
-[sync_matcher.py](../src/stage2/sync_matcher.py), строки 1446–1586.
+[sync_matcher.py](../../../src/stage2/sync_matcher.py), строки 1446–1586.
 
 ### 2.3. Ошибки распознавания маскируются под отсутствие источника — P0
 
-[sync_job_status.json](../projects/BRIK/work/sync_job_status.json) содержит
+[sync_job_status.json](../../../projects/BRIK/work/sync_job_status.json) содержит
 два отказа при общем `status=completed`:
 
 - Воденников: на части **4 из 9** модель вернула JSON `splits`, тогда как
@@ -109,7 +112,7 @@ Fingerprint текущих совпадений совпадает с fingerprin
 поиска источник доступен только при наличии пригодного индекса.
 Уже сохранённые распознанные части нельзя терять при повторном запуске.
 
-Общий путь: [api_sync_worker.py](../src/api_sync_worker.py), строки 183–232,
+Общий путь: [api_sync_worker.py](../../../src/api_sync_worker.py), строки 183–232,
 и фильтрация доступных индексов в `SyncMatcher._eligible_sources`.
 Завершение задачи нужно отделить от качества и полноты её результата.
 
@@ -121,7 +124,7 @@ Fingerprint текущих совпадений совпадает с fingerprin
 расхождение с локальной расшифровкой и обрезанная речь.
 
 Каждая такая часть, каждая ненайденная часть и каждый LIFE получают ровно
-10 секунд: [timeline_parser.py](../src/stage2/timeline_parser.py), строки
+10 секунд: [timeline_parser.py](../../../src/stage2/timeline_parser.py), строки
 52, 589–591, 650. LIFE сейчас вообще не проходит тот же путь выбора исходника,
 что sync, и остаётся заглушкой независимо от наличия подходящего медиа.
 Самая длинная непрерывная цепочка заглушек BRIK — **50 секунд**, примерно
@@ -137,9 +140,9 @@ Fingerprint текущих совпадений совпадает с fingerprin
 
 Причина: `_placeholder_unmapped_sources` считает только новые подмены при
 неудачной привязке медиа. Этот узкий счётчик выдаётся как общий
-`placeholder_segments` ([api_stage3_routes.py](../src/api_stage3_routes.py),
+`placeholder_segments` ([api_stage3_routes.py](../../../src/api_stage3_routes.py),
 строки 97–120, 509–556). Веб-интерфейс непосредственно показывает его как
-«плейсхолдеров: 0» ([stage3.js](../src/static/stage1/stage3.js), строки 168–172).
+«плейсхолдеров: 0» ([stage3.js](../../../src/static/stage1/stage3.js), строки 168–172).
 Предупреждение перед экспортом уже есть, но результат ему противоречит.
 
 ## 3. Дополнительные общие дефекты
@@ -149,7 +152,7 @@ Fingerprint текущих совпадений совпадает с fingerprin
 с новым fingerprint → снова 200, но скачивается прежний XML.
 Stage 3 сохраняет только версии сценария/нормализации и имя XML, без hash
 таймлайна. После пересборки в той же редакции этих проверок недостаточно.
-Код: [api_stage3_routes.py](../src/api_stage3_routes.py), строки 532–536,
+Код: [api_stage3_routes.py](../../../src/api_stage3_routes.py), строки 532–536,
 923–956. Это подтверждённый общий дефект; не установлено, что именно он
 повлиял на исследуемый BRIK V7.
 
@@ -162,9 +165,9 @@ Stage 3 сохраняет только версии сценария/норма
 условиях, поэтому не устраняет все пересечения. Четыре перехода также
 идут назад по исходнику; это может соответствовать авторскому порядку и
 само по себе не доказывает ошибку.
-Код: [sync_matcher.py](../src/stage2/sync_matcher.py), строки 515–516,
-1261–1262 (на момент аудита; сейчас: 612–613 — `MatcherConfig.head/tail_padding_sec`, 1358–1359 — `_padded_range`); [timeline_parser.py](../src/stage2/timeline_parser.py), 97–127 (на момент аудита; сейчас: `_merge_adjacent_sync_fragments`, 104–129);
-[nested_xml.py](../src/stage3/nested_xml.py), 423–434 (на момент аудита: тело `_nested_clip` с кадрами in/out; сейчас: `_nested_clip` 434–465, in/out 456–457; заглушки рендерит `build_nested_xml`, ветка `status == "placeholder"`, 671–681, через `_placeholder_clip` 466–500).
+Код: [sync_matcher.py](../../../src/stage2/sync_matcher.py), строки 515–516,
+1261–1262 (на момент аудита; сейчас: 612–613 — `MatcherConfig.head/tail_padding_sec`, 1358–1359 — `_padded_range`); [timeline_parser.py](../../../src/stage2/timeline_parser.py), 97–127 (на момент аудита; сейчас: `_merge_adjacent_sync_fragments`, 104–129);
+[nested_xml.py](../../../src/stage3/nested_xml.py), 423–434 (на момент аудита: тело `_nested_clip` с кадрами in/out; сейчас: `_nested_clip` 434–465, in/out 456–457; заглушки рендерит `build_nested_xml`, ветка `status == "placeholder"`, 671–681, через `_placeholder_clip` 466–500).
 
 ## 4. Общее решение для всех проектов
 

@@ -51,9 +51,7 @@ def make_window_transcriber(
         with asr_slot(
             asr_semaphore,
             check_stop=ensure_not_cancelled,
-            on_wait=lambda: update_job(
-                job_id, message="Waiting for an ASR slot", asr_waiting=True
-            ),
+            on_wait=lambda: update_job(job_id, message="Waiting for an ASR slot", asr_waiting=True),
             on_acquired=lambda: update_job(
                 job_id, message="Уточнение границ по окну", asr_waiting=False
             ),
@@ -326,9 +324,7 @@ def run_sync_job(
             # A source whose guide file is missing keeps ``no_eligible_source``.
             failed_ids = set(asr_result.asr_failed_source_ids)
             changed = set(
-                mark_asr_failed_matches(
-                    match_result.matches, sources, failed_ids, normalize_text
-                )
+                mark_asr_failed_matches(match_result.matches, sources, failed_ids, normalize_text)
             )
             if changed:
                 with _SYNC_DATA_LOCK:

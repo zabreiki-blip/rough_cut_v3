@@ -124,7 +124,12 @@ def test_editorial_date_is_not_a_timecode_or_sync_credit(tmp_path: Path) -> None
 
 def test_dialogue_after_role_cue_is_voiceover(tmp_path: Path) -> None:
     blocks = _run(tmp_path, ["Жертва:", "— Слушаю вас.", "Мошенник (быстро):", "— Добрый день."])
-    assert [block["type"] for block in blocks] == ["technical", "voiceover", "technical", "voiceover"]
+    assert [block["type"] for block in blocks] == [
+        "technical",
+        "voiceover",
+        "technical",
+        "voiceover",
+    ]
     assert [block["text_for_tts"] for block in blocks[1::2]] == ["— Слушаю вас.", "— Добрый день."]
 
 

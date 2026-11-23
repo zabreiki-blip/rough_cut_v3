@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import wave
 from typing import Any, Callable, Mapping
 
 from stage_common import placeholder_reason
@@ -118,6 +119,14 @@ def _item(index: int, segment: dict, media_mapping: set[str] | None) -> dict[str
             else None,
             "source_sha256": str(segment.get("audio_source_sha256") or "") if recorded else None,
         },
+        **(
+            {
+                "translation_audio": dict(segment["translation_audio"]),
+                "translation_query_text": str(segment.get("translation_query_text") or ""),
+            }
+            if isinstance(segment.get("translation_audio"), dict)
+            else {}
+        ),
         "placeholder": {"path": str(segment.get("placeholder_path") or "")},
         **(
             {"voiceover_problem": str(segment["voiceover_problem"])}
@@ -214,6 +223,7 @@ def validate_plan_complete(
     *,
     catalog: Mapping[str, object] | None = None,
     path_exists: Callable[[str], bool] = os.path.exists,
+    path_resolver: Callable[[str], str] | None = None,
 ) -> list[dict[str, Any]]:
     """Blockers that prevent a gap-free ("complete") assembly; empty list means complete.
 
@@ -239,6 +249,8 @@ def validate_plan_complete(
             found.append((reason, f"status={item.get('status')}"))
         elif item.get("status") == "ready":
             found.extend(_ready_item_problems(item, item_type, catalog, path_exists))
+        if item.get("translation_audio"):
+            found.extend(_translation_problems(item, path_exists, path_resolver))
         if item.get("status") == "ready":
             # A not-ready item is already blocked by its own reason; its tasks only restate it.
             for task in item.get("tasks") or []:
@@ -260,6 +272,34 @@ def validate_plan_complete(
                 }
             )
     return blockers
+
+
+def _translation_problems(item: dict, path_exists, path_resolver) -> list[tuple[str, str]]:
+    from translated_sync.audio import resolve_translation_audio
+
+    audio = item["translation_audio"]
+    try:
+        variant = dict(audio, duration_sec=audio["source_duration_sec"])
+        config = dict(audio, active=audio["kind"], variants={audio["kind"]: variant})
+        resolve_translation_audio(config, item.get("translation_query_text", ""))
+        path = audio["path"]
+        if not path_exists(path):
+            raise ValueError("WAV file not found")
+        local_path = path_resolver(path) if path_resolver else path
+        with open(local_path, "rb") as f:
+            digest = hashlib.file_digest(f, "sha256").hexdigest()
+        if digest != audio["sha256"]:
+            raise ValueError("WAV hash differs")
+        with wave.open(local_path, "rb") as wav:
+            duration = wav.getnframes() / wav.getframerate()
+        if (
+            abs(duration - audio["source_duration_sec"]) > 0.001
+            or audio["source_out_sec"] > duration + 0.001
+        ):
+            raise ValueError("WAV duration or range differs")
+    except (ValueError, KeyError, TypeError, OSError, EOFError, wave.Error) as exc:
+        return [("translation_audio_invalid", str(exc))]
+    return []
 
 
 def _recorded_voiceover_problems(

@@ -615,6 +615,39 @@ class NormalizationApiTest(unittest.TestCase):
         self.assertEqual(normalized_path.read_bytes(), before, "preview must stay read-only")
         self.assertFalse((self.projects / "demo" / "work" / "scenario_prepared.json").exists())
 
+    def test_preview_cleans_legacy_splice_markers_without_writing_draft(self) -> None:
+        source = self._source()
+        generated = self.client.post(
+            "/stage1/normalization/generate",
+            json={"project": "demo", "input_path": str(source), "use_llm": False},
+        ).get_json()["result"]
+        block = generated["blocks"][0]
+        block["normalized_text"] = block["text_for_tts"] = "Первый СКЛ закадровый блок."
+        normalized_path = self.projects / "demo" / "work" / "scenario_normalized.json"
+        normalized_path.write_text(json.dumps(generated, ensure_ascii=False), encoding="utf-8")
+        before = normalized_path.read_bytes()
+
+        response = self.client.post(
+            "/stage1/normalization/confirm/preview",
+            json={"project": "demo", "revision": generated["revision"]},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        preview = response.get_json()["result"]
+        self.assertFalse([i for i in preview["validation"] if i["severity"] == "error"])
+        self.assertEqual(preview["tts_preview"][0]["text_for_tts"], "Первый закадровый блок.")
+        self.assertEqual(normalized_path.read_bytes(), before)
+
+        response = self.client.post(
+            "/stage1/normalization/confirm",
+            json={"project": "demo", "revision": generated["revision"]},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        confirmed = response.get_json()["result"]
+        self.assertEqual(
+            confirmed["blocks"][0]["text_for_tts"], preview["tts_preview"][0]["text_for_tts"]
+        )
+        self.assertEqual(confirmed["blocks"][0]["original_text"], block["original_text"])
+
     def test_defective_block_cannot_be_confirmed_by_any_request(self) -> None:
         source = self._source()
         generated = self.client.post(

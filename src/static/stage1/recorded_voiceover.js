@@ -271,9 +271,12 @@ function renderAll() {
     ids.btn_rv_confirm_all.textContent = pending.length
       ? `Подтвердить все (${pending.length})` : "Подтвердить все";
   }
-  if (state.draft_stale) {
+  if (state.draft_stale && !isJobActive(state.job)) {
     setText(ids.rv_notice, "Разметка относится к другой редакции сценария — запустите сопоставление заново.");
     if (ids.rv_notice) ids.rv_notice.hidden = false;
+  } else {
+    setText(ids.rv_notice, "");
+    if (ids.rv_notice) ids.rv_notice.hidden = true;
   }
   renderJob(state.job);
   renderApply(state);
@@ -336,7 +339,16 @@ export async function scanRecordedInbox({ now = Date.now } = {}) {
   lastScanAt = stamp;
   const payload = { project };
   if (rvState && rvState.scenario_revision_id) payload.expected_revision_id = rvState.scenario_revision_id;
-  const result = await requestJSON(`${BASE}/scan`, "POST", payload);
+  let result;
+  try {
+    result = await requestJSON(`${BASE}/scan`, "POST", payload);
+  } catch (err) {
+    if (err && err.status === 409) {
+      await loadRecordedState().catch((reloadError) => appendLog(`Запись диктора: ${reloadError.message || reloadError}`, true));
+      return null;
+    }
+    throw err;
+  }
   if (result.state) setRecordedState(result.state);
   if (result.job && isJobActive(result.job)) {
     setText(ids.rv_notice, "Найдена запись диктора — идёт сопоставление");
@@ -488,9 +500,17 @@ export async function applyRecording() {
 
 export async function startAlignment() {
   const state = requireState();
-  return mutate(async () => {
-    await requestJSON(`${BASE}/jobs/start`, "POST", { project, expected_revision_id: state.scenario_revision_id });
+  let started = null;
+  const ok = await mutate(async () => {
+    started = await requestJSON(`${BASE}/jobs/start`, "POST", { project, expected_revision_id: state.scenario_revision_id });
   });
+  const job = rvState && rvState.job;
+  if (ok && job && (!started || !started.job_id || job.id === started.job_id) && !isJobActive(job)) {
+    refreshStatus().catch((err) => appendLog(`Status refresh: ${err.message || err}`, true));
+    if (job.status === "completed") showMessage("Сопоставление записи со сценарием завершено — проверьте блоки.", "success");
+    else if (job.status === "failed") showMessage(`Сопоставление не удалось: ${job.error || job.message || "ошибка"}`, "error");
+  }
+  return ok;
 }
 
 export async function cancelAlignment() {

@@ -47,7 +47,10 @@ class _Transcriber:
 
     def __call__(self, clip: Path, model: str) -> list[dict[str, Any]]:
         self.calls += 1
-        words = [{"word": "совсем", "start": 1.0, "end": 1.4}, {"word": "другое", "start": 1.5, "end": 2}]
+        words = [
+            {"word": "совсем", "start": 1.0, "end": 1.4},
+            {"word": "другое", "start": 1.5, "end": 2},
+        ]
         if self.spoken_at is not None:
             origin = self.spoken_at - self.window_start
             words += [
@@ -78,8 +81,12 @@ def test_refine_candidate_window_fixes_17_second_shift(tmp_path: Path) -> None:
 def test_refine_candidate_window_quote_absent_returns_none(tmp_path: Path) -> None:
     assert (
         refine_candidate_window(
-            _audio(tmp_path), QUOTE, 100, 110,
-            transcribe_fn=_Transcriber(None), extract_fn=_extract(),
+            _audio(tmp_path),
+            QUOTE,
+            100,
+            110,
+            transcribe_fn=_Transcriber(None),
+            extract_fn=_extract(),
         )  # fmt: skip
         is None
     )
@@ -120,7 +127,10 @@ def test_default_extract_cuts_the_window(tmp_path: Path) -> None:
             seen["duration"] = handle.getnframes() / handle.getframerate()
         return []
 
-    assert refine_candidate_window(audio, QUOTE, 4, 5, window_pad_sec=1, transcribe_fn=transcribe) is None
+    assert (
+        refine_candidate_window(audio, QUOTE, 4, 5, window_pad_sec=1, transcribe_fn=transcribe)
+        is None
+    )
     assert seen["duration"] == pytest.approx(3.0, abs=0.1)
     subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
 
@@ -128,9 +138,7 @@ def test_default_extract_cuts_the_window(tmp_path: Path) -> None:
 # ---- pass over matches ---------------------------------------------------------------
 
 
-def _match(
-    segment_id: str = "seg", *, status: str = "auto_matched", **metadata: Any
-) -> SyncMatch:
+def _match(segment_id: str = "seg", *, status: str = "auto_matched", **metadata: Any) -> SyncMatch:
     base = {
         "speech_in_sec": 116.7,
         "speech_out_sec": 125.8,
@@ -262,14 +270,18 @@ def test_disabled_does_nothing(tmp_path: Path) -> None:
     report = _run([match], tmp_path, transcriber, settings=WindowRefineSettings(enabled=False))
 
     assert report.candidates == 0 and transcriber.calls == 0
-    assert match.status == "auto_matched" and match.metadata["timestamp_precision"] == "interpolated"
+    assert (
+        match.status == "auto_matched" and match.metadata["timestamp_precision"] == "interpolated"
+    )
 
 
 def test_window_limit_demotes_the_rest(tmp_path: Path) -> None:
     first, second = _match("a"), _match("b", speech_in_sec=300.0, speech_out_sec=309.0)
     transcriber = _Transcriber(None)
 
-    report = _run([first, second], tmp_path, transcriber, settings=WindowRefineSettings(max_windows=1))
+    report = _run(
+        [first, second], tmp_path, transcriber, settings=WindowRefineSettings(max_windows=1)
+    )
 
     assert transcriber.calls == 1 and report.skipped_limit == 1
     assert second.metadata["window_refine"]["status"] == "limit"
@@ -336,7 +348,9 @@ def test_refined_range_is_clamped_to_source_duration(tmp_path: Path) -> None:
 
 def test_review_reason_is_replaced_not_dropped_when_still_needs_review(tmp_path: Path) -> None:
     flagged = _match(
-        "flagged", status="needs_review", review_reason="timing_unrefined",
+        "flagged",
+        status="needs_review",
+        review_reason="timing_unrefined",
         plausibility_flags=["implausible_word_rate"],
     )
     low = _match("low", status="needs_review", review_reason="timing_unrefined")
@@ -351,7 +365,10 @@ def test_checkpoint_callback_runs_every_n_windows(tmp_path: Path) -> None:
     matches = [_match(f"s{i}", status="needs_review") for i in range(5)]
     seen: list[list[str]] = []
     _run(
-        matches, tmp_path, _Transcriber(None),
-        on_checkpoint=lambda ids: seen.append(list(ids)), checkpoint_every=2,
+        matches,
+        tmp_path,
+        _Transcriber(None),
+        on_checkpoint=lambda ids: seen.append(list(ids)),
+        checkpoint_every=2,
     )
     assert [len(ids) for ids in seen] == [2, 4]

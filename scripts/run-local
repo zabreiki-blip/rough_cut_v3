@@ -16,8 +16,12 @@ set +a
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HOME="${HF_HOME:-${ROOT_DIR}/.cache/huggingface}"
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY="${OBJC_DISABLE_INITIALIZE_FORK_SAFETY:-YES}"
-mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data" "${HF_HOME}"
+mkdir -p "${ROOT_DIR}/projects" "${ROOT_DIR}/data" "${ROOT_DIR}/logs" "${HF_HOME}"
 cd "${ROOT_DIR}"
+printf 'Запуск Rough Cut: http://%s:%s/\n' "${ROUGH_CUT_BIND:-127.0.0.1}" "${ROUGH_CUT_PORT:-8000}"
+printf 'Журнал сервера: %s/logs/server.log\n' "${ROOT_DIR}"
+printf 'Оставьте терминал открытым. Для остановки нажмите Ctrl+C.\n'
 exec "${VENV_DIR}/bin/gunicorn" \
   -b "${ROUGH_CUT_BIND:-127.0.0.1}:${ROUGH_CUT_PORT:-8000}" \
-  --workers 1 --threads 4 --timeout 3600 api:app
+  --workers 1 --threads 4 --timeout 3600 \
+  --error-logfile "${ROOT_DIR}/logs/server.log" --capture-output api:app

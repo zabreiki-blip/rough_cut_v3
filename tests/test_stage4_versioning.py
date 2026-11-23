@@ -176,6 +176,83 @@ def test_import_snapshots_baseline_and_inherits_stable_uid(tmp_path: Path) -> No
     assert rolled_back["reused_sync_matches"] == 1
 
 
+def test_import_remaps_scene_and_absorption_links_when_inheriting_uids(tmp_path: Path) -> None:
+    paths = ensure_project("demo", tmp_path / "projects")
+    source_v1 = paths["input"] / "scenario.docx"
+    source_v2 = paths["input"] / "v002.docx"
+    source_v1.write_bytes(b"v1")
+    source_v2.write_bytes(b"v2")
+    old_opener = _block("stable-opener", "Старая сцена")
+    old_continuation = _block("stable-continuation", "Продолжение сцены")
+    old_donor = _block("stable-donor", "Текст до поглощения", "voiceover", "")
+    old_donor["text_for_tts"] = "Текст до поглощения. Поглощённый блок."
+    old_absorbed = _block("stable-absorbed", "Поглощённый блок", "voiceover", "")
+    old_absorbed["text_for_tts"] = ""
+    old_continuation["scene_uid"] = old_opener["uid"]
+    old_absorbed["absorbed_by_uid"] = old_donor["uid"]
+    atomic_write_json(
+        paths["normalized"],
+        {
+            "source": str(source_v1),
+            "source_hash": hashlib.sha256(b"v1").hexdigest(),
+            "status": "confirmed",
+            "blocks": [old_opener, old_continuation, old_donor, old_absorbed],
+        },
+    )
+
+    def fake_generate(input_path, output_path, **_kwargs):
+        generated_opener = _block("import-opener", "Старая сцена")
+        generated_continuation = _block("import-continuation", "Продолжение сцены")
+        generated_donor = _block("import-donor", "Текст до поглощения", "voiceover", "")
+        generated_donor["text_for_tts"] = "Текст до поглощения. Поглощённый блок."
+        generated_absorbed = _block("import-absorbed", "Поглощённый блок", "voiceover", "")
+        generated_absorbed["text_for_tts"] = ""
+        generated_continuation["scene_uid"] = generated_opener["uid"]
+        generated_absorbed["absorbed_by_uid"] = generated_donor["uid"]
+        new_opener = _block("new-opener", "Новая сцена")
+        new_continuation = _block("new-continuation", "Новая реплика")
+        new_continuation["scene_uid"] = new_opener["uid"]
+        value = {
+            "source": str(input_path),
+            "source_hash": hashlib.sha256(b"v2").hexdigest(),
+            "status": "draft",
+            "blocks": [
+                generated_opener,
+                generated_continuation,
+                generated_donor,
+                generated_absorbed,
+                new_opener,
+                new_continuation,
+            ],
+        }
+        atomic_write_json(output_path, value)
+        return value
+
+    import_revision(
+        "demo",
+        paths,
+        generate_normalization=fake_generate,
+        memory_path=tmp_path / "memory.sqlite3",
+        input_path=source_v2,
+    )
+
+    normalized = json.loads((paths["scenario_versions"] / "rev_0002.normalized.json").read_text())
+    blocks = {block["normalized_text"]: block for block in normalized["blocks"]}
+    assert blocks["Старая сцена"]["uid"] == "stable-opener"
+    assert blocks["Продолжение сцены"]["uid"] == "stable-continuation"
+    assert blocks["Продолжение сцены"]["scene_uid"] == "stable-opener"
+    assert blocks["Текст до поглощения"]["uid"] == "stable-donor"
+    assert blocks["Текст до поглощения"]["type"] == "voiceover"
+    assert blocks["Текст до поглощения"]["text_for_tts"] == "Текст до поглощения. Поглощённый блок."
+    assert blocks["Поглощённый блок"]["uid"] == "stable-absorbed"
+    assert blocks["Поглощённый блок"]["type"] == "voiceover"
+    assert blocks["Поглощённый блок"]["speaker"] == ""
+    assert blocks["Поглощённый блок"]["text_for_tts"] == ""
+    assert blocks["Поглощённый блок"]["absorbed_by_uid"] == "stable-donor"
+    assert blocks["Новая сцена"]["uid"] == "new-opener"
+    assert blocks["Новая реплика"]["scene_uid"] == "new-opener"
+
+
 def test_active_revision_selects_its_scenario_instead_of_first_input(tmp_path: Path) -> None:
     paths = ensure_project("demo", tmp_path / "projects")
     input_files = [

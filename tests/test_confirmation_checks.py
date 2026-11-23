@@ -48,6 +48,29 @@ def _codes(block: dict[str, Any], severity: str = "error") -> set[str]:
     return {i["code"] for i in _issues(block) if i["severity"] == severity}
 
 
+@pytest.mark.parametrize(
+    ("label", "speaker"),
+    [
+        ("НОВЫЙ СНХ КАЗАКИ", "КАЗАКИ"),
+        ("НОВЫЙ ЛАЙФ БАЖУТИНА", "БАЖУТИНА"),
+        ("НОВЫЙ СНХ", "КАЗАКИ"),
+        ("НОВЫЙ СНХ НИНА", "НИНА"),
+        ("НОВЫЙ СНХ ДМИТРИЙ", "ДМИТРИЙ"),
+        ("СНХ НИНА", "НИНА"),
+        ("новый снх Нина", "НИНА"),
+    ],
+)
+def test_sync_credit_service_prefix_is_not_part_of_speaker(label: str, speaker: str) -> None:
+    block = _block(type="sync", original_label=label, speaker=speaker, text_for_tts="")
+    assert "sync_speaker_conflict" not in _codes(block)
+
+
+@pytest.mark.parametrize("label", ["НИНА", "НОВЫЙ СНХ НИНА", "НОВЫЙ ЛАЙФ НИНА"])
+def test_sync_credit_different_name_still_blocks_confirmation(label: str) -> None:
+    block = _block(type="sync", original_label=label, speaker="ДМИТРИЙ", text_for_tts="")
+    assert "sync_speaker_conflict" in _codes(block)
+
+
 def test_silent_technical_block_with_service_label_in_tts_is_not_flagged() -> None:
     # UIP_ATOM_001 block 138: a technical cue keeps original_text as TTS but is never voiced.
     block = _block(

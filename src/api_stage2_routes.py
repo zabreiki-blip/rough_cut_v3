@@ -750,6 +750,7 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
             for update in updates:
                 values = dict(update)
                 values.pop("project", None)
+                selected_cue_id = values.pop("document_cue_id", None)
                 segment_id = str(
                     block_uid or values.get("block_uid") or values.get("segment_id") or ""
                 ).strip()
@@ -803,6 +804,78 @@ def _stage2_sync_matches(services: ModuleType, block_uid: str | None = None):
                 source_id = str(merged.get("source_id") or "")
                 if source_id and source_id not in source_ids:
                     raise ValueError(f"unknown sync source: {source_id}")
+                if (
+                    current
+                    and current.strategy in {"translated_docx", "translated_semantic"}
+                    and merged.get("status") == "confirmed"
+                ):
+                    from translated_sync.service import load_transcript
+
+                    candidates = [
+                        (
+                            current.source_id,
+                            current.source_in_sec,
+                            current.source_out_sec,
+                            current.metadata.get("document_cue_id"),
+                        )
+                    ]
+                    candidates += [
+                        (a.source_id, a.source_in_sec, a.source_out_sec, a.document_cue_id)
+                        for a in current.alternatives
+                    ]
+                    imported_cues = (load_transcript(paths, source_id) or {}).get("cues", [])
+                    current_cue_ids = {cue["id"] for cue in imported_cues}
+                    eligible = [
+                        (sid, start, end, cid)
+                        for sid, start, end, cid in candidates
+                        if sid == source_id and cid in current_cue_ids
+                    ]
+                    if selected_cue_id is None:
+                        exact = [
+                            item
+                            for item in eligible
+                            if item[1] == merged.get("source_in_sec")
+                            and item[2] == merged.get("source_out_sec")
+                        ]
+                        selected_cue_id = exact[0][3] if len(exact) == 1 else None
+                    elif not isinstance(selected_cue_id, str) or not any(
+                        item[3] == selected_cue_id for item in eligible
+                    ):
+                        raise ValueError("invalid or stale document cue id")
+                    cue = (
+                        next((c for c in imported_cues if c.get("id") == selected_cue_id), None)
+                        if selected_cue_id
+                        else None
+                    )
+                    if selected_cue_id and not cue:
+                        raise ValueError("invalid or stale document cue id")
+                    for key in (
+                        "document_cue_id",
+                        "origin_index",
+                        "approximate",
+                        "original_text",
+                        "cue_speaker",
+                        "raw_start_tc",
+                        "raw_end_tc",
+                        "explicit_end",
+                    ):
+                        metadata.pop(key, None)
+                    if cue:
+                        metadata.update(
+                            document_cue_id=cue["id"],
+                            origin_index=cue["origin_index"],
+                            approximate=cue["approximate"],
+                            original_text=cue["original_text"],
+                            cue_speaker=cue["speaker"],
+                            raw_start_tc=cue.get("raw_start_tc"),
+                            raw_end_tc=cue.get("raw_end_tc"),
+                            explicit_end=cue.get("explicit_end"),
+                        )
+                        metadata.pop("document_cue_unbound", None)
+                        merged["matched_text"] = cue["russian_text"]
+                    else:
+                        metadata["document_cue_unbound"] = True
+                    merged["metadata"] = metadata
                 match = services.SyncMatch.from_dict(merged)
                 if unassign_life:
                     stored_by_id.pop(segment_id, None)
@@ -1104,6 +1177,9 @@ def _stage2_export_xml(services: ModuleType):
         tl = FullTimeline.from_dict(data)
     except (TypeError, ValueError) as exc:
         return services._json_error(f"invalid full_timeline.json: {exc}", 500)
+
+    if any(segment.translation_audio for segment in tl.segments):
+        return services._json_error("Translated audio requires final Stage 3 export", 409)
 
     try:
         xml_str = services.build_xml(tl)

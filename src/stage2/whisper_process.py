@@ -220,6 +220,26 @@ def _retire_worker(worker: _Worker, *, graceful: bool = False) -> None:
         worker.process.join(timeout=0.1)
 
 
+def _ensure_spawn_stdin() -> None:
+    """Keep stdin usable so spawn IPC descriptors cannot inherit/reuse a bad fd 0."""
+    # Worker creation already holds _worker_lock, which is reset after a fork.
+    try:
+        os.fstat(0)
+        # A zero-byte read does not consume input, and catches write-only or
+        # revoked descriptors that fstat alone considers open.
+        os.read(0, 0)
+    except OSError:
+        replacement = os.open(os.devnull, os.O_RDONLY)
+        try:
+            if replacement != 0:
+                os.dup2(replacement, 0)
+        finally:
+            if replacement != 0:
+                os.close(replacement)
+    if not os.get_inheritable(0):
+        os.set_inheritable(0, True)
+
+
 def _discard_worker_locked(worker: _Worker, *, graceful: bool = False) -> None:
     global _worker, _worker_last_active
     if _worker is worker:
@@ -290,6 +310,8 @@ def _ensure_watchdog_started_locked() -> None:
 def _start_worker_locked(
     key: tuple[str, ...],
 ) -> _Worker:
+    if key[-1] == "spawn":
+        _ensure_spawn_stdin()
     context = multiprocessing.get_context(key[-1])
     parent_connection, child_connection = context.Pipe(duplex=True)
     # typeshed's get_context(str) return type is BaseContext, which omits the

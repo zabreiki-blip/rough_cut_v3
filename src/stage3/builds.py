@@ -33,7 +33,7 @@ from stage3.nested_xml import MediaSource
 from stage_common import _scenario_revision_matches
 
 BUILD_SCHEMA_VERSION = 1
-EXPORTER_VERSION = 1
+EXPORTER_VERSION = 2
 BUILDS_KEEP = 20
 BUILD_ID_RE = re.compile(r"[0-9a-f]{16}")
 LATEST_FILENAME = "latest.json"
@@ -120,6 +120,16 @@ def wav_inputs(
         if isinstance(item, dict) and isinstance(item.get("wav"), dict)
     ]
     wav_items = [(item, path) for item, path in wav_items if path]
+    for item in plan.get("items") or []:
+        if isinstance(item, dict) and isinstance(item.get("translation_audio"), dict):
+            translation = item["translation_audio"]
+            if translation.get("path"):
+                wav_items.append(
+                    (
+                        {"uid": item.get("uid"), "wav": {"kind": "translation"}},
+                        str(translation["path"]),
+                    )
+                )
     result: list[dict] = []
     for index, (item, path) in enumerate(wav_items, start=1):
         size, mtime_ns = _stat(path, path_resolver)
