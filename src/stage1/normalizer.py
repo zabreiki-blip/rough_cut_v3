@@ -243,7 +243,7 @@ _TRAILING_MEDIA_CREDIT = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_BOUNDARY = re.compile(r"[.!?…»\"”]\s+")
-_MEDIA_FILE_NAME = re.compile(r"^(?:.{1,118}\.[A-Za-z0-9]{2,5}|\S{1,120})$")
+_MEDIA_FILE_NAME = re.compile(r"^(?:.{1,118}\.[A-Za-z0-9]{2,5}\)?|\S{1,120}|[^\n!?…]{1,120})$")
 _EXPLICIT_SYNC_LABEL = re.compile(r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE)
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.][0-5]\d(?:\s+|[:.])[0-5]\d\]?|"
@@ -302,10 +302,11 @@ _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"{_TIMECODE_TOKEN}",
     re.DOTALL,
 )
-# ``ПОДВОДКА № 6`` / ``СТЕНДАП 3`` / ``ПОДВОДКА``: a numbered heading with no
-# speech after it.
+# ``ПОДВОДКА № 6`` / ``ПОДВОДКА 6. ФИНАЛ`` / ``СТЕНДАП 3`` / ``ПОДВОДКА``:
+# a numbered heading with no speech after it.
 _PRESENTER_HEADING_ONLY = re.compile(
-    r"^\s*(?:СНХ\s+)?(?:СТЕНДАП|(?-i:ПОДВОДКА))\s*(?:№|N|#|No\.?)?\s*\d*\s*[.:]?\s*$",
+    r"^\s*(?:СНХ\s+)?(?:СТЕНДАП|(?-i:ПОДВОДКА))\s*(?:№|N|#|No\.?)?\s*\d*\s*"
+    r"(?:[.:–—-]\s*(?:финал|конец|пролог|эпилог|вступление|анонс|итог\w*)\s*)?[.:]?\s*$",
     re.IGNORECASE,
 )
 TIMECODE_NOTE_WARNING = "timecode note without label: check manually"
@@ -3735,6 +3736,8 @@ def _extract_block_metadata_fields(block: NormalizedBlock) -> None:
             # imply a media file; the author format ``СНХ ИМЯ ТАЙМКОД текст`` has
             # none (Stage 2 binds media).
             block.warnings.append("Sync credit has no source media file")
+        if dash_credit.get("header_only"):
+            block.label_only = True
         fragment_source = dash_credit["content"]
         has_sync_metadata = True
     elif unlabeled_credit and normalize_marker(block.original_label) == normalize_marker(
