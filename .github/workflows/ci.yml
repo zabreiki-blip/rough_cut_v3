@@ -120,6 +120,9 @@ jobs:
       - name: Stage 1 UI behavior test
         run: node tests/stage1_behavior_test.cjs
 
+      - name: Translated sync UI behavior test
+        run: npm run test:translated-sync
+
       - name: Scroll jump behavior test
         run: node tests/scroll_jump_test.cjs
 

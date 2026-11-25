@@ -414,8 +414,7 @@ def run_audio_verification(
 def snapshot_matches(matches: Iterable[Any]) -> dict[str, tuple[Any, ...]]:
     """State of stored matches the verification started from (to detect later edits)."""
     return {
-        item.segment_id: (item.status, item.source_in_sec, item.source_out_sec)
-        for item in matches
+        item.segment_id: (item.status, item.source_in_sec, item.source_out_sec) for item in matches
     }
 
 

@@ -295,7 +295,9 @@ def _validate(
         if segment.source_out_sec > matched_source.duration + tolerance:
             raise ValueError(f"segment {segment.id} source range exceeds media duration")
         range_duration = segment.source_out_sec - segment.source_in_sec
-        if abs(range_duration - segment.duration_sec) > tolerance:
+        if (
+            not segment.translation_audio and abs(range_duration - segment.duration_sec) > tolerance
+        ) or (segment.translation_audio and segment.duration_sec + tolerance < range_duration):
             raise ValueError(f"segment {segment.id} duration does not match its source range")
 
 
@@ -442,6 +444,60 @@ def _revision_label(parent: ET.Element, segment: TimelineSegment) -> None:
         _sub(labels, "label2", "Rose")
 
 
+def _volume_filter(clip: ET.Element, keys: list[tuple[float, float]], fps: int) -> None:
+    effect = _sub(_sub(clip, "filter"), "effect")
+    for tag, value in (
+        ("name", "Audio Levels"),
+        ("effectid", "audiolevels"),
+        ("effectcategory", "audio"),
+        ("effecttype", "audio"),
+        ("mediatype", "audio"),
+    ):
+        _sub(effect, tag, value)
+    parameter = _sub(effect, "parameter")
+    _sub(parameter, "parameterid", "level")
+    _sub(parameter, "name", "Level")
+    if len(keys) == 1:
+        _sub(parameter, "value", keys[0][1])
+    else:
+        for when, gain in keys:
+            keyframe = _sub(parameter, "keyframe")
+            _sub(keyframe, "when", max(0, _frames(when, fps)))
+            _sub(keyframe, "value", gain)
+
+
+def _translation_clip(track: ET.Element, segment: TimelineSegment, fps: int, path_resolver) -> None:
+    audio = segment.translation_audio
+    if audio is None:
+        raise ValueError(f"segment {segment.id} has no translation audio")
+    start = _frames(segment.start_sec + audio["timeline_offset_sec"], fps)
+    source_in = _source_frames(audio["source_in_sec"], fps)
+    source_out = _source_frames(audio["source_out_sec"], fps)
+    clip = ET.SubElement(track, "clipitem", {"id": f"clip-translation-{segment.id}"})
+    _sub(clip, "name", f"{segment.id} translation")
+    _sub(clip, "duration", _source_frames(audio["source_duration_sec"], fps))
+    _rate(clip, fps)
+    _sub(clip, "start", start)
+    _sub(clip, "end", start + source_out - source_in)
+    _sub(clip, "in", source_in)
+    _sub(clip, "out", source_out)
+    file_el = ET.SubElement(clip, "file", {"id": f"file-translation-{segment.id}"})
+    _sub(file_el, "name", Path(audio["path"]).name)
+    _sub(file_el, "pathurl", _path_url(audio["path"]))
+    _rate(file_el, fps)
+    _sub(file_el, "duration", _source_frames(audio["source_duration_sec"], fps))
+    rate, depth, channels = _wav_params(audio["path"], path_resolver)
+    audio_el = _sub(_sub(file_el, "media"), "audio")
+    characteristics = _sub(audio_el, "samplecharacteristics")
+    _sub(characteristics, "depth", depth)
+    _sub(characteristics, "samplerate", rate)
+    _sub(audio_el, "channelcount", channels)
+    _volume_filter(clip, [(0, 10 ** (audio["gain_db"] / 20))], fps)
+    source_track = _sub(clip, "sourcetrack")
+    _sub(source_track, "mediatype", "audio")
+    _sub(source_track, "trackindex", 1)
+
+
 def _nested_clip(
     track: ET.Element,
     segment: TimelineSegment,
@@ -455,7 +511,12 @@ def _nested_clip(
 ) -> None:
     source_fps = int(source.fps)
     start = _frames(segment.start_sec, timeline_fps)
-    end = max(_frames(segment.end_sec, timeline_fps), start + 1)
+    clip_end = (
+        segment.start_sec + segment.source_out_sec - segment.source_in_sec
+        if segment.translation_audio
+        else segment.end_sec
+    )
+    end = max(_frames(clip_end, timeline_fps), start + 1)
     source_in = _frames(segment.source_in_sec, source_fps)
     source_out = _frames(segment.source_out_sec, source_fps)
     clip = ET.SubElement(track, "clipitem", {"id": clip_id})
@@ -468,6 +529,21 @@ def _nested_clip(
     _sub(clip, "out", source_out)
     _marker(clip, segment, segment.id)
     _revision_label(clip, segment)
+    if media_type == "audio" and segment.translation_audio:
+        audio = segment.translation_audio
+        onset = segment.source_in_sec + audio["timeline_offset_sec"]
+        finish = min(
+            segment.source_out_sec, onset + audio["source_out_sec"] - audio["source_in_sec"]
+        )
+        if onset < finish:
+            fade = min(audio["fade_sec"], (finish - onset) / 2)
+            duck = 10 ** (audio["duck_db"] / 20)
+            keys = [(onset - fade, 1.0), (onset, duck)]
+            if onset + audio["source_out_sec"] - audio["source_in_sec"] >= segment.source_out_sec:
+                keys.append((finish, duck))
+            else:
+                keys.extend([(finish - fade, duck), (finish, 1.0)])
+            _volume_filter(clip, keys, timeline_fps)
     ET.SubElement(clip, "sequence", {"id": sequence_id})
     source_track = _sub(clip, "sourcetrack")
     _sub(source_track, "mediatype", media_type)
@@ -675,6 +751,9 @@ def build_nested_xml(
     _audio_format(audio)
     source_audio_track = _sub(audio, "track")
     voiceover_track = _sub(audio, "track")
+    translation_track = (
+        _sub(audio, "track") if any(s.translation_audio for s in full_timeline.segments) else None
+    )
 
     clip_number = 0
     recorded_files: dict[str, str] = {}
@@ -711,6 +790,8 @@ def build_nested_xml(
                 media_type="audio",
                 timeline_fps=full_timeline.fps,
             )
+            if segment.translation_audio and translation_track is not None:
+                _translation_clip(translation_track, segment, full_timeline.fps, path_resolver)
         elif status == "placeholder" and segment.type in {"snh", "host", "life"}:
             if not segment.placeholder_path:
                 raise ValueError(
@@ -723,6 +804,8 @@ def build_nested_xml(
                 clip_id=f"clip-final-{clip_number}-placeholder",
                 timeline=full_timeline,
             )
+            if segment.translation_audio and translation_track is not None:
+                _translation_clip(translation_track, segment, full_timeline.fps, path_resolver)
         elif status == "ready" and segment.type == "zk" and segment.wav_path:
             clip_number += 1
             _voiceover_clip(

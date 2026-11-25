@@ -1169,8 +1169,14 @@ def test_carried_confirmed_match_is_still_retimed_or_flagged_for_review(tmp_path
 # ---- window refine of interpolated-source candidates --------------------------------------
 
 
-def _window_phase(tmp_path: Any, h: _Harness, *, precision: str, env: dict[str, str] | None = None,
-                  existing: list[Any] | None = None) -> tuple[SyncMatchResult, list[int]]:
+def _window_phase(
+    tmp_path: Any,
+    h: _Harness,
+    *,
+    precision: str,
+    env: dict[str, str] | None = None,
+    existing: list[Any] | None = None,
+) -> tuple[SyncMatchResult, list[int]]:
     from stage2.sync_models import SyncMatch, WordIndex, WordTimestamp
 
     quote = "Лиля Брик познакомила Маяковского с композитором Щедриным в Москве"
@@ -1188,11 +1194,21 @@ def _window_phase(tmp_path: Any, h: _Harness, *, precision: str, env: dict[str, 
     def match_segment(request: Any) -> Any:
         h.matched.append(request.segment_id)
         return SyncMatch(
-            segment_id=request.segment_id, query_text=quote, source_id="s",
-            source_in_sec=114.7, source_out_sec=127.3, confidence=0.95, status="auto_matched",
-            metadata={"speech_in_sec": 116.7, "speech_out_sec": 125.8, "head_padding_sec": 2.0,
-                      "tail_padding_sec": 1.5, "timestamp_precision": "interpolated",
-                      "timing_flags": ["timing_unrefined"]},
+            segment_id=request.segment_id,
+            query_text=quote,
+            source_id="s",
+            source_in_sec=114.7,
+            source_out_sec=127.3,
+            confidence=0.95,
+            status="auto_matched",
+            metadata={
+                "speech_in_sec": 116.7,
+                "speech_out_sec": 125.8,
+                "head_padding_sec": 2.0,
+                "tail_padding_sec": 1.5,
+                "timestamp_precision": "interpolated",
+                "timing_flags": ["timing_unrefined"],
+            },
         )
 
     h._match_segment = match_segment  # type: ignore[method-assign]
@@ -1210,8 +1226,13 @@ def _window_phase(tmp_path: Any, h: _Harness, *, precision: str, env: dict[str, 
     original = swr._extract_window
     swr._extract_window = lambda a, s, d, out: out.write_bytes(b"RIFF" + b"\0" * 100)
     try:
-        result = run_match_phase(ctx, [source], [index], cost_tracker=h.tracker,  # type: ignore[arg-type]
-                                 checkpoint=h.checkpoint)
+        result = run_match_phase(
+            ctx,
+            [source],
+            [index],
+            cost_tracker=h.tracker,  # type: ignore[arg-type]
+            checkpoint=h.checkpoint,
+        )
     finally:
         swr._extract_window = original
     return result, calls
@@ -1226,7 +1247,9 @@ def test_phase_refines_interpolated_candidate_and_persists(tmp_path: Any) -> Non
     assert calls == [1]
     assert match.metadata["timestamp_precision"] == "window_refined"
     assert match.metadata["window_refined"]["from"] == [116.7, 125.8]
-    assert match.source_in_sec == pytest.approx(71.7, abs=0.01)  # window 71.7 + 2.0 speech - 2.0 head
+    assert match.source_in_sec == pytest.approx(
+        71.7, abs=0.01
+    )  # window 71.7 + 2.0 speech - 2.0 head
     assert h.store.items[0].metadata["timestamp_precision"] == "window_refined"
     progress = [kw for _a, kw in h.updates if "window_refine_done" in kw]
     assert progress and progress[-1]["window_refine_total"] == 1

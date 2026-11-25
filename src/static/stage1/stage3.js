@@ -461,7 +461,7 @@ async function scanStage3Media() {
   return startStage3Job("scan");
 }
 
-// Pre-export gate (docs/UIP_ATOM_AUDIT.md item 4): show what is about to be exported
+// Pre-export gate (docs/archive/audits/UIP_ATOM_AUDIT.md item 4): show what is about to be exported
 // and require an explicit confirmation while unchecked fragments or placeholders remain.
 async function confirmExportSummary() {
   let summary;

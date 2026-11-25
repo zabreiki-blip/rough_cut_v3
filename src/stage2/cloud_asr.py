@@ -1403,7 +1403,12 @@ class _ChunkCache:
         self.path: Path | None = None
         self._chunks: dict[str, dict[str, Any]] = {}
         self._key = ""
-        if os.getenv("SYNC_CLOUD_ASR_CHUNK_CACHE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        if os.getenv("SYNC_CLOUD_ASR_CHUNK_CACHE", "1").strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
             return
         audio_digest = hashlib.sha256()
         try:
@@ -1416,7 +1421,9 @@ class _ChunkCache:
             json.dumps([audio_digest.hexdigest(), *key_parts], ensure_ascii=False).encode()
         ).hexdigest()
         directory = cache_dir or os.getenv("SYNC_CLOUD_ASR_CHUNK_CACHE_DIR", "").strip()
-        base = Path(directory) if directory else Path(tempfile.gettempdir()) / "rough_cut_asr_chunks"
+        base = (
+            Path(directory) if directory else Path(tempfile.gettempdir()) / "rough_cut_asr_chunks"
+        )
         self.path = base / f"{self._key[:32]}.json"
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -1451,7 +1458,9 @@ class _ChunkCache:
         if self._chunks.pop(str(idx), None) is not None:
             self._write()
 
-    def store(self, idx: int, part_start: float, part_end: float, prompt: str, content: str) -> None:
+    def store(
+        self, idx: int, part_start: float, part_end: float, prompt: str, content: str
+    ) -> None:
         self._chunks[str(idx)] = {
             "start": part_start,
             "end": part_end,

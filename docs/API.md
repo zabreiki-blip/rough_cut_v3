@@ -84,8 +84,14 @@ curl -H "Authorization: Bearer $ROUGH_CUT_API_TOKEN" http://localhost:8000/stage
 | PATCH | `/stage2/sync-matches/<block_uid>` | `stage2_sync_matches` |
 | DELETE, GET, POST | `/stage2/sync-sources` | `stage2_sync_sources` |
 | GET, PUT | `/stage2/sync-sources/<source_id>/audio` | `stage2_sync_source_audio` |
+| GET, POST | `/stage2/sync-sources/<source_id>/transcript-docx` | `translated_transcript` |
 | PUT | `/stage2/sync-sources/<source_id>/words` | `stage2_sync_source_words` |
 | GET | `/stage2/timeline` | `stage2_timeline` |
+| GET, PATCH | `/stage2/translated-sync/<segment_id>/audio` | `translated_audio` |
+| GET | `/stage2/translated-sync/<segment_id>/audio-file` | `translated_audio_file` |
+| POST | `/stage2/translated-sync/<segment_id>/recording` | `translated_recording` |
+| POST | `/stage2/translated-sync/<segment_id>/tts` | `translated_tts` |
+| POST | `/stage2/translated-sync/match` | `translated_match` |
 | GET | `/stage3/builds` | `stage3_builds_history` |
 | GET | `/stage3/export/xml` | `stage3_export_xml` |
 | GET | `/stage3/jobs/<job_id>` | `stage3_job_status` |
@@ -159,3 +165,5 @@ LLM-нормализация сохраняет успешные batch-реше�
 
 Контракты оценки, отмены, восстановления и применения приведены в
 [настройках финальной проверки](CONFIGURATION.md#финальная-проверка-стоимость-и-восстановление).
+
+Word transcript timecodes in relative mode are measured from the start of the viewing file; the server adds the registered guide offset to store sequence-relative ranges. Camera/display marks use the registered sequence start timecode. The optional `semantic` boolean on `POST /stage2/translated-sync/match` defaults to false. When enabled, the configured LLM receives the scenario quote and Russian candidate translations; search is bounded to 24 candidates per unit, 8 calls per request and 45 seconds per call. The response includes semantic statuses and limits; narrow the source or time if the search was limited.

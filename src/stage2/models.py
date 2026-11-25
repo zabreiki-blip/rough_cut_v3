@@ -71,6 +71,8 @@ class TimelineSegment:
     # ``{with_segment_id, rule, trimmed_head_sec, trimmed_tail_sec, reverse_jump,
     # speech_overlap, overlap_kept_manual}``; ``None`` when nothing was compared.
     trim: dict[str, Any] | None = None
+    translation_audio: dict[str, Any] | None = None
+    translation_query_text: str = ""
 
     @property
     def end_sec(self) -> float:

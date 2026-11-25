@@ -7,7 +7,7 @@ import { appendLog, openTab, safely, syncTtsStyleAvailability } from "./stage1/c
 import { applyStatus, loadNormalization, loadMemory, hasUnsavedChanges, refreshStatus } from "./stage1/normalization.js";
 import { loadReadiness } from "./stage1/readiness.js";
 import { renderLive, restoreTtsJob } from "./stage1/tts.js";
-import { restoreRecordedJob, restoreVoiceMode, scanRecordedInbox } from "./stage1/recorded_voiceover.js";
+import { loadRecordedState, restoreRecordedJob, restoreVoiceMode, scanRecordedInbox } from "./stage1/recorded_voiceover.js";
 import { loadSyncWorkspace } from "./stage1/sync.js";
 import { scanStage3MediaOnce, refreshStage3Status } from "./stage1/stage3.js";
 import { refreshScenarioInbox } from "./stage1/inbox.js";
@@ -24,7 +24,7 @@ document.querySelectorAll(".workspace-tab").forEach((tab) => {
         appendLog(`Stage 2 sync: ${err.message || err}`, "warn");
       });
     } else if (tab.dataset.tab === "voiceover") {
-      scanRecordedInbox().catch((err) => {
+      scanRecordedInbox().then((res) => (res === null ? loadRecordedState() : res)).catch((err) => {
         appendLog(`Запись диктора: ${err.message || err}`, "warn");
       });
     } else if (tab.dataset.tab === "versions") {

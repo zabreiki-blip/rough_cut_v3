@@ -4206,3 +4206,17 @@ def test_life_assignment_flows_into_timeline_plan_and_fingerprint(sync_api) -> N
     assert (life["speech_in_sec"], life["speech_out_sec"]) == (5.0, 9.5)
     assert life["duration_sec"] == 4.5
     assert life["match_status"] == "confirmed"
+
+
+def test_legacy_xml_endpoint_reports_translation_requires_stage3(sync_api) -> None:
+    client, projects = sync_api
+    _write_confirmed_normalization(projects)
+    with patch.object(api, "generate_placeholder", return_value=None):
+        assert client.post("/stage2/build", json={"project": "demo"}).status_code == 200
+    path = projects / "demo" / "work" / "full_timeline.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["segments"][0]["translation_audio"] = {"path": "/tmp/translated.wav"}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    response = client.get("/stage2/export/xml?project=demo")
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "Translated audio requires final Stage 3 export"

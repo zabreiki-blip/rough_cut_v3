@@ -142,7 +142,9 @@ def _run_ffmpeg(args: list[str], data: bytes | None = None) -> bytes:
     return proc.stdout
 
 
-def extract_pcm(audio_path: Path, start_sec: float, end_sec: float, *, ffmpeg: str = "ffmpeg") -> bytes:
+def extract_pcm(
+    audio_path: Path, start_sec: float, end_sec: float, *, ffmpeg: str = "ffmpeg"
+) -> bytes:
     """Фрагмент как сырой PCM s16le mono 16 кГц (для хэша кэша и кодирования)."""
     duration = max(0.01, end_sec - start_sec)
     return _run_ffmpeg(
@@ -278,9 +280,7 @@ def verify_clip(
         env = os.environ if settings is None else settings
         retry_parse_errors = str(env.get(RETRY_PARSE_ENV) or "").strip().lower() in _TRUE_VALUES
     try:
-        pcm = extract_pcm(
-            Path(audio_path), max(0.0, start_sec - margin_sec), end_sec + margin_sec
-        )
+        pcm = extract_pcm(Path(audio_path), max(0.0, start_sec - margin_sec), end_sec + margin_sec)
         if not pcm:
             raise CloudAudioAsrError("пустой аудио-фрагмент")
     except CloudAudioAsrError as exc:

@@ -11,6 +11,7 @@ from cost_budget import CostBudget, CostBudgetExceeded
 from stage1.normalization_models import NormalizedScenario
 from stage1.normalizer import (
     _prepared_projection,
+    clean_voiceover_splice_markers,
     diff_normalization_snapshot,
     list_normalization_history,
     restore_normalization_snapshot,
@@ -415,9 +416,10 @@ def _confirmation_preview(document: dict) -> dict:
 
     ``validation`` is the detailed confirmation check
     (``{code, uid, order, message, severity}``); ``tts_preview`` lists the blocks
-    that would be voiced, exactly as the prepared projection would publish them.
+    that would be voiced after automatic splice-marker cleanup on confirmation.
     """
     scenario = NormalizedScenario.from_dict(document)
+    clean_voiceover_splice_markers(scenario.blocks)
     orders = {block.uid: block.order for block in scenario.blocks}
     return {
         "validation": validate_for_confirmation_detailed(scenario),

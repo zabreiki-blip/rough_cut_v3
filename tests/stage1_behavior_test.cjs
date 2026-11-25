@@ -2213,6 +2213,9 @@ async function testConfirmRejectedShowsRussianReasons({ state, normalization, co
     assert.ok(reasonFor("speaker_not_a_person").includes("Закадр") && reasonFor("speaker_not_a_person").includes("если это закадровый текст"));
     assert.ok(reasonFor("sync_source_note").includes("Технический") && reasonFor("sync_source_note").includes("речь"));
     assert.ok(reasonFor("montage_note_in_tts").includes("Технический") && reasonFor("montage_note_in_tts").includes("текст для TTS"));
+    const capsWarning = normalization.describeIssue(issueOf("montage_note_in_tts", 1, "caps narration", "warning"));
+    assert.ok(capsWarning.includes("прописными") && capsWarning.includes("проверьте"), capsWarning);
+    assert.ok(!capsWarning.includes("смените тип"), capsWarning);
 
     globalThis.fetch = async (url) => {
       const target = String(url);
@@ -2668,9 +2671,28 @@ async function testRecordedAutodetectNotice({ state }) {
       now += 60000;
       await rv.scanRecordedInbox({ now: () => now });
       assert.strictEqual(scans(), 2);
+
+      // Stale-draft banner appears when draft_stale=true and disappears after re-alignment.
+      rv.setRecordedState(rvFixture({ draft_stale: true, draft_revision_id: "rev_0002" }));
+      assert.strictEqual(ids.rv_notice.hidden, false);
+      assert.ok(ids.rv_notice.textContent.includes("Разметка относится к другой редакции сценария"), ids.rv_notice.textContent);
+      rv.setRecordedState(rvFixture({ draft_stale: false }));
+      assert.strictEqual(ids.rv_notice.hidden, true);
+      assert.strictEqual(ids.rv_notice.textContent, "");
     } finally {
       window.setTimeout = originalSetTimeout;
     }
+  });
+  await withRvFetch({
+    [`POST ${RV}/jobs/start`]: () => ({ result: { job_id: "job_fast", status: "queued" } }),
+    [`GET ${RV}`]: () => ({ result: rvFixture({ draft_stale: false, job: { id: "job_fast", status: "completed", summary: {} } }) }),
+    "GET /stage1/status": { result: {} },
+  }, async (rv) => {
+    rv.setRecordedState(rvFixture({ draft_stale: true, draft_revision_id: "rev_0002" }));
+    assert.strictEqual(ids.rv_notice.hidden, false);
+    assert.strictEqual(await rv.startAlignment(), true);
+    assert.strictEqual(ids.rv_notice.hidden, true, "stale notice must clear once alignment updates the draft");
+    assert.ok(ids.rv_message.textContent.includes("Сопоставление записи со сценарием завершено"), ids.rv_message.textContent);
   });
 }
 

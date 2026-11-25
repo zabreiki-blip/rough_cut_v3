@@ -227,9 +227,13 @@ class SyncAlternative:
     source_out_sec: float
     confidence: float
     matched_text: str = ""
+    document_cue_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        if not self.document_cue_id:
+            value.pop("document_cue_id")
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SyncAlternative":
@@ -239,6 +243,7 @@ class SyncAlternative:
             source_out_sec=_number(value.get("source_out_sec")),
             confidence=_number(value.get("confidence")),
             matched_text=str(value.get("matched_text") or ""),
+            document_cue_id=str(value.get("document_cue_id") or ""),
         )
 
 

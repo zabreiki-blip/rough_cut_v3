@@ -526,8 +526,14 @@ def _zk_recorded(seg_id: str = "zk1", **overrides) -> dict:
         (_zk_recorded(source_out_sec=10.0), "missing_voiceover"),
         (_zk_recorded(source_in_sec=-1.0), "missing_voiceover"),
         (_zk_recorded(source_out_sec=130.0, duration_sec=120.0), None),  # validate checks it
-        ({"type": "zk", "voiceover_kind": "none", "wav_path": "", "duration_sec": 0.0}, "missing_voiceover"),
-        ({"type": "zk", "voiceover_kind": "tts", "wav_path": "", "duration_sec": 0.0}, "missing_wav"),
+        (
+            {"type": "zk", "voiceover_kind": "none", "wav_path": "", "duration_sec": 0.0},
+            "missing_voiceover",
+        ),
+        (
+            {"type": "zk", "voiceover_kind": "tts", "wav_path": "", "duration_sec": 0.0},
+            "missing_wav",
+        ),
         ({"type": "zk", "voiceover_kind": "tts", "wav_path": "/a.wav", "duration_sec": 2.0}, None),
     ],
 )
@@ -536,7 +542,12 @@ def test_placeholder_reason_for_recorded_voiceover(segment: dict, expected) -> N
 
 
 def test_recorded_zk_plan_item_has_range_and_ignores_media_mapping() -> None:
-    timeline = {"segments": [_zk_recorded(), {**_zk_recorded("zk2"), "voiceover_kind": "none", "wav_path": "", "duration_sec": 0.0}]}
+    timeline = {
+        "segments": [
+            _zk_recorded(),
+            {**_zk_recorded("zk2"), "voiceover_kind": "none", "wav_path": "", "duration_sec": 0.0},
+        ]
+    }
     plan = build_assembly_plan(timeline, media_mapping={"ivan_01"})
     first, second = plan["items"]
     assert (first["status"], first["reason"]) == ("ready", None)
@@ -551,21 +562,45 @@ def test_recorded_zk_plan_item_has_range_and_ignores_media_mapping() -> None:
 def test_validate_complete_recorded_voiceover_file_and_range() -> None:
     def blockers(**overrides) -> list[str]:
         plan = build_assembly_plan({"segments": [_zk_recorded(**overrides)]})
-        return [item["reason"] for item in validate_plan_complete(plan, path_exists=lambda p: p == "/p/montage.wav")]
+        return [
+            item["reason"]
+            for item in validate_plan_complete(plan, path_exists=lambda p: p == "/p/montage.wav")
+        ]
 
     assert blockers() == []
     assert blockers(wav_path="/gone.wav") == ["missing_voiceover"]
     assert blockers(source_out_sec=130.0, duration_sec=130.0) == ["recorded_beyond_source"]
     assert blockers(source_in_sec=-1.0, duration_sec=16.0) == ["missing_voiceover"]
-    plan = build_assembly_plan({"segments": [{"id": "zk1", "type": "zk", "voiceover_kind": "none", "duration_sec": 0.0, "block_uid": "u"}]})
-    assert [b["reason"] for b in validate_plan_complete(plan, path_exists=lambda _p: True)] == ["missing_voiceover"]
+    plan = build_assembly_plan(
+        {
+            "segments": [
+                {
+                    "id": "zk1",
+                    "type": "zk",
+                    "voiceover_kind": "none",
+                    "duration_sec": 0.0,
+                    "block_uid": "u",
+                }
+            ]
+        }
+    )
+    assert [b["reason"] for b in validate_plan_complete(plan, path_exists=lambda _p: True)] == [
+        "missing_voiceover"
+    ]
 
 
 def test_validate_complete_mixed_voiceover_keeps_tts_blocks() -> None:
     timeline = {
         "segments": [
             _zk_recorded("zk1"),
-            {"id": "zk2", "type": "zk", "voiceover_kind": "tts", "wav_path": "/p/zk2.wav", "duration_sec": 2.0, "block_uid": "u2"},
+            {
+                "id": "zk2",
+                "type": "zk",
+                "voiceover_kind": "tts",
+                "wav_path": "/p/zk2.wav",
+                "duration_sec": 2.0,
+                "block_uid": "u2",
+            },
         ]
     }
     plan = build_assembly_plan(timeline)

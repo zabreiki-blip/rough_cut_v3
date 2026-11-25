@@ -389,6 +389,18 @@ def _synthesize_openrouter_wav(
                 err = {"status": response.status_code, "body": response.text[:500]}
             error = RuntimeError(f"OpenRouter TTS failed ({response.status_code}): {err}")
             error.status_code = response.status_code  # type: ignore[attr-defined]
+            detail = err.get("error") if isinstance(err, dict) else None
+            metadata = detail.get("metadata") if isinstance(detail, dict) else None
+            metadata = metadata if isinstance(metadata, dict) else {}
+            error.limit_source = metadata.get("limit_source")  # type: ignore[attr-defined]
+            metadata_headers = metadata.get("headers")
+            metadata_headers = metadata_headers if isinstance(metadata_headers, dict) else {}
+            retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After")
+            if retry_after is None:
+                retry_after = metadata_headers.get("Retry-After")
+            retry_after_text = str(retry_after or "").strip()
+            if re.fullmatch(r"\d{1,9}", retry_after_text):
+                error.retry_after_seconds = int(retry_after_text)  # type: ignore[attr-defined]
             raise error
 
         if budget is not None and reservation_id is not None:
@@ -503,6 +515,12 @@ def _is_retryable_tts_error(provider: str, exc: Exception) -> bool:
     if status_code is None:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status_code, int):
+        if status_code == 402:
+            return (
+                provider == "openrouter"
+                and getattr(exc, "limit_source", None) == "openrouter_in_flight_budget"
+                and getattr(exc, "retry_after_seconds", None) is not None
+            )
         return status_code == 429 or 500 <= status_code < 600
 
     status_match = re.search(r"(?:status(?:_code)?[=:\s]+|failed\s*\()([45]\d\d)", msg)
@@ -893,6 +911,19 @@ def _publish_local_item(
 _SynthesisResult = tuple[bytes | None, int, list[str], Exception | None, bool]
 
 
+def _wait_for_tts_retry(
+    exc: Exception, attempts: int, cancel_check: Callable[[], bool] | None = None
+) -> None:
+    delay = max(min(60, 8 * attempts), getattr(exc, "retry_after_seconds", 0))
+    logger.warning("TTS request deferred; retrying in %s seconds", delay)
+    # Keep cancellation responsive even when the provider asks us to wait minutes.
+    while delay > 0:
+        _raise_if_cancelled(cancel_check)
+        interval = min(1, delay) if cancel_check is not None else delay
+        time.sleep(interval)
+        delay -= interval
+
+
 def _synthesize_with_retry(
     provider: str,
     text: str,
@@ -944,7 +975,7 @@ def _synthesize_with_retry(
                     "OpenRouter Gemini returned an empty audio stream; retrying plain transcript"
                 )
             retry_errors.append(str(exc))
-            time.sleep(min(60, 8 * attempts))
+            _wait_for_tts_retry(exc, attempts, cancel_check)
 
 
 def _publish_synthesized_item(
@@ -1347,7 +1378,7 @@ def synthesize_phrase(
                 logger.warning(
                     "OpenRouter Gemini returned an empty audio stream; retrying plain transcript"
                 )
-            time.sleep(min(60, 8 * attempts))
+            _wait_for_tts_retry(exc, attempts)
 
     style_degraded = retry_without_style and bool(resolved_style)
     return {

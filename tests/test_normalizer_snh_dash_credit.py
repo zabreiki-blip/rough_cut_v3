@@ -1,6 +1,7 @@
 """``СНХ Имя, роль — файл.wav 00:05:42 — текст`` credits (no comma after the marker)."""
 
 from pathlib import Path
+import pytest
 
 from stage1.normalizer import generate_normalization, validate_for_confirmation
 
@@ -282,6 +283,102 @@ def test_name_surname_credit_without_dash_or_media(tmp_path: Path) -> None:
     assert block["sync_fragments"][0]["text"] == "Это текст цитаты."
     assert [f["timecode_start"] for f in block["sync_fragments"]] == ["00:01:00"]
     assert not [e for e in validate_for_confirmation(result) if "has no speaker" in e]
+
+
+def test_colon_marker_credit_with_source_and_quoted_splice_fragments(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ: Алексей ИСАЕВ, военный историк — Isaev_Dnepr — 00:04:53: "
+        "«Первый фрагмент». СКЛЕЙКА 00:05:10: «Второй фрагмент».",
+    )
+    block = result["blocks"][0]
+    assert block["type"] == "sync"
+    assert block["speaker"] == "Алексей ИСАЕВ"
+    assert block["role"] == "военный историк"
+    assert block["source_description"] == "Isaev_Dnepr"
+    assert [fragment["timecode_start"] for fragment in block["sync_fragments"]] == [
+        "00:04:53",
+        "00:05:10",
+    ]
+    assert [fragment["text"] for fragment in block["sync_fragments"]] == [
+        "«Первый фрагмент».",
+        "«Второй фрагмент».",
+    ]
+    assert "Isaev_Dnepr" not in block["normalized_text"]
+    assert "Алексей ИСАЕВ" not in block["normalized_text"]
+    assert validate_for_confirmation(result) == []
+
+
+def test_colon_marker_credit_without_role_parses_surname_and_source(tmp_path: Path) -> None:
+    result = _normalize(tmp_path, "СНХ: ШАЛАНДИН — C0003_1 — 00:01:43: «У нас ничего не забыто».")
+    block = result["blocks"][0]
+    assert block["speaker"] == "ШАЛАНДИН"
+    assert block["role"] == ""
+    assert block["source_description"] == "C0003_1"
+    assert block["sync_fragments"][0]["text"] == "«У нас ничего не забыто»."
+    assert validate_for_confirmation(result) == []
+
+
+def test_consecutive_colon_marker_credits_keep_their_own_speakers(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ: Алексей ИСАЕВ — Isaev_Dnepr — 00:04:53: «Первая реплика».",
+        "СНХ: Виктор ТЫДЕНЬ — Tyden_dnepr — 00:02:15: «Вторая реплика».",
+    )
+    assert [block["speaker"] for block in result["blocks"]] == [
+        "Алексей ИСАЕВ",
+        "Виктор ТЫДЕНЬ",
+    ]
+    assert [block["sync_fragments"][0]["text"] for block in result["blocks"]] == [
+        "«Первая реплика».",
+        "«Вторая реплика».",
+    ]
+
+
+def test_capital_i_after_a_complete_quoted_sync_does_not_inherit_speaker(
+    tmp_path: Path,
+) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ ТЫДЕНЬ — Tyden_dnepr 00:27:22 — «Может, притопили какой-то парк? Вот загадка».",
+        "И кому выгодно превращать одну из самых сложных операций в бессмысленную толчею.",
+    )
+    continuation = result["blocks"][1]
+    assert continuation["speaker"] == ""
+    assert continuation["type"] != "sync"
+
+
+def test_capital_i_after_an_unfinished_sync_quote_still_inherits(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ ТЫДЕНЬ — Tyden_dnepr 00:27:22 — «Он объяснял, что",
+        "И это важно для понимания.",
+    )
+    assert result["blocks"][1]["speaker"] == "ТЫДЕНЬ"
+    assert result["blocks"][1]["type"] == "sync"
+
+
+@pytest.mark.parametrize("continuation", ["и это важно.", "... и это важно.", "… и это важно."])
+def test_lowercase_and_ellipsis_sync_continuations_are_preserved(
+    tmp_path: Path, continuation: str
+) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ ТЫДЕНЬ — Tyden_dnepr 00:27:22 — «Полная законченная реплика».",
+        continuation,
+    )
+    assert result["blocks"][1]["speaker"] == "ТЫДЕНЬ"
+    assert result["blocks"][1]["type"] == "sync"
+
+
+def test_capital_i_after_ellipsis_ended_quote_still_inherits(tmp_path: Path) -> None:
+    result = _normalize(
+        tmp_path,
+        "СНХ ТЫДЕНЬ — Tyden_dnepr 00:27:22 — «Реплика оборвалась…»",
+        "И это важно для понимания.",
+    )
+    assert result["blocks"][1]["speaker"] == "ТЫДЕНЬ"
+    assert result["blocks"][1]["type"] == "sync"
 
 
 def test_credit_without_dash_or_media_warns_non_blocking(tmp_path: Path) -> None:

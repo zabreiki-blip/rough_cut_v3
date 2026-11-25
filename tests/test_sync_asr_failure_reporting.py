@@ -169,3 +169,15 @@ def test_asr_failed_relabel_all_speakers_source_covers_everyone() -> None:
     )
 
     assert changed == ["seg"]
+
+
+def test_failed_unnamed_review_source_is_asr_failed_not_missing_recording() -> None:
+    from sync_asr_failures import mark_asr_failed_matches
+
+    match = _unit_match("Исаев")
+    source = _unit_source("", source_kind="review_media", media_path="Просмотровки/исаев.mp3")
+    changed = mark_asr_failed_matches([match], [source], {"src"})
+
+    assert changed == ["seg"]
+    assert match.metadata["unmatched_reason"] == "asr_failed"
+    assert match.metadata["asr_failed_source_ids"] == ["src"]

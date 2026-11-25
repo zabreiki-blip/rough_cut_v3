@@ -286,11 +286,16 @@ def test_clip_count_is_capped_per_run() -> None:
     matches = [_match(f"m{i}", "needs_review", 0.5, **_distinct(i)) for i in range(5)]
     verify = FakeVerify(_verdict("match", 0.3, 0.3))
     result = _run(
-        matches, verify, environ={"SYNC_AUDIO_VERIFY_MAX_CLIPS": "2", "SYNC_AUDIO_VERIFY_WORKERS": "1"}
+        matches,
+        verify,
+        environ={"SYNC_AUDIO_VERIFY_MAX_CLIPS": "2", "SYNC_AUDIO_VERIFY_WORKERS": "1"},
     )
     assert len(verify.calls) == 2 and result.clips_limited and result.skipped == 3
     assert "SYNC_AUDIO_VERIFY_MAX_CLIPS" in result.warnings[0]
-    assert phase.audio_max_clips({}) == 200 and phase.audio_max_clips({"SYNC_AUDIO_VERIFY_MAX_CLIPS": "x"}) == 200
+    assert (
+        phase.audio_max_clips({}) == 200
+        and phase.audio_max_clips({"SYNC_AUDIO_VERIFY_MAX_CLIPS": "x"}) == 200
+    )
 
 
 def test_identical_clips_are_verified_once_and_paid_once() -> None:
@@ -325,7 +330,10 @@ def test_cancel_in_the_middle_keeps_paid_verdicts() -> None:
     snapshot = phase.snapshot_matches(stored)
     assert phase.persist_audio_results(stored, matches, partial.changed_ids, snapshot)
     assert [m.metadata.get("review_reason") for m in stored] == [
-        "audio_mismatch", "audio_mismatch", None, None,
+        "audio_mismatch",
+        "audio_mismatch",
+        None,
+        None,
     ]
 
 
@@ -339,7 +347,9 @@ def test_selection_skips_manual_matches() -> None:
 
 def test_unrefined_unreliable_match_is_not_promoted_and_keeps_its_reason() -> None:
     match = _match("m", "needs_review", 0.7, metadata={"review_reason": "timing_unrefined"})
-    result = _run([match], FakeVerify(_verdict("match", 0.97, 0.93)), [_index("src", "interpolated")])
+    result = _run(
+        [match], FakeVerify(_verdict("match", 0.97, 0.93)), [_index("src", "interpolated")]
+    )
     assert match.status == "needs_review" and result.promoted == 0
     assert match.metadata["review_reason"] == "timing_unrefined"
     assert match.metadata["audio_verified"]["verdict"] == "match"
@@ -347,14 +357,20 @@ def test_unrefined_unreliable_match_is_not_promoted_and_keeps_its_reason() -> No
 
 def test_window_refined_match_may_be_promoted_on_interpolated_source() -> None:
     match = _match("m", "needs_review", 0.7, metadata={"window_refined": {"to": [1, 4]}})
-    result = _run([match], FakeVerify(_verdict("match", 0.97, 0.93)), [_index("src", "interpolated")])
+    result = _run(
+        [match], FakeVerify(_verdict("match", 0.97, 0.93)), [_index("src", "interpolated")]
+    )
     assert match.status == "auto_matched" and result.promoted == 1
 
 
 def test_wide_range_is_not_promoted_even_when_the_sound_matches() -> None:
     # 2 words: speech estimate 3 s; 30 s of range is far above 2 * 3 + 4.
     match = _match(
-        "m", "needs_review", 0.7, source_out_sec=31.0, metadata={"review_reason": "range_disagrees_with_local"}
+        "m",
+        "needs_review",
+        0.7,
+        source_out_sec=31.0,
+        metadata={"review_reason": "range_disagrees_with_local"},
     )
     result = _run([match], FakeVerify(_verdict("match", 0.97, 0.93)))
     assert match.status == "needs_review" and result.promoted == 0
@@ -372,7 +388,9 @@ def test_persist_writes_only_this_runs_matches_and_skips_manual() -> None:
     stored_old = _match("old", "needs_review", 0.8)
     stored_fresh = _match("fresh", "auto_matched", 0.8)
     stored_manual = _match("manual", "needs_review", 0.8, metadata={"manual_updated_at": "x"})
-    mem_manual = _match("manual", "needs_review", 0.8, metadata={"audio_verified": {"verdict": "x"}})
+    mem_manual = _match(
+        "manual", "needs_review", 0.8, metadata={"audio_verified": {"verdict": "x"}}
+    )
     assert phase.persist_audio_results(
         [stored_old, stored_fresh, stored_manual], [old, fresh, mem_manual], ["fresh", "manual"]
     )

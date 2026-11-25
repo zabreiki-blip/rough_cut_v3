@@ -223,6 +223,11 @@ def sync_matches_fingerprint(matches: list) -> str:
                 metadata.get("speech_in_sec"),
                 metadata.get("speech_out_sec"),
                 bool(metadata.get("retime_pending_review")),
+                *(
+                    [metadata["translation_audio"], getattr(match, "query_text", "")]
+                    if "translation_audio" in metadata
+                    else []
+                ),
             ]
         )
     return hashlib.sha256(json.dumps(rows, sort_keys=True).encode("utf-8")).hexdigest()
@@ -356,9 +361,11 @@ def placeholder_reason(segment: dict, *, mapped: set[str] | None = None) -> str 
             # Recorded: a range of the shared recording. File existence and the range
             # against the recording duration are checked by validate_plan_complete.
             try:
-                has_range = _as_float(segment.get("source_out_sec") or 0) > _as_float(
-                    segment.get("source_in_sec") or 0
-                ) >= 0
+                has_range = (
+                    _as_float(segment.get("source_out_sec") or 0)
+                    > _as_float(segment.get("source_in_sec") or 0)
+                    >= 0
+                )
             except (TypeError, ValueError):
                 has_range = False
             return (

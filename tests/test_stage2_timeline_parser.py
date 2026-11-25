@@ -1009,8 +1009,12 @@ class RecordedVoiceoverTimelineTest(unittest.TestCase):
         published = _published(
             _recorded_entry("b1", self.TEXTS[0]),
             _recorded_entry(
-                "b2", self.TEXTS[1], source_in_sec=40.0, source_out_sec=47.0,
-                speech_in_sec=40.5, speech_out_sec=46.5,
+                "b2",
+                self.TEXTS[1],
+                source_in_sec=40.0,
+                source_out_sec=47.0,
+                speech_in_sec=40.5,
+                speech_out_sec=46.5,
             ),
         )
         with TemporaryDirectory() as tmp:
@@ -1050,7 +1054,10 @@ class RecordedVoiceoverTimelineTest(unittest.TestCase):
             _write_silence_wav(speaker_dir / "zk2.wav", duration_ms=2000)
             (Path(tmp) / "montage.wav").write_bytes(b"RIFF")
             tl = parse_normalized_timeline(
-                normalization, speaker_dir, Path(tmp) / "ph", "TEST",
+                normalization,
+                speaker_dir,
+                Path(tmp) / "ph",
+                "TEST",
                 recorded_voiceover=published,
                 recording_files={"rec1": Path(tmp) / "montage.wav"},
             )
@@ -1099,7 +1106,10 @@ class RecordedVoiceoverTimelineTest(unittest.TestCase):
         self.assertEqual((seg.source_id, seg.wav_path), ("", ""))
 
     def test_foreign_revision_map_is_ignored(self) -> None:
-        published = {**_published(_recorded_entry("b1", self.TEXTS[0])), "scenario_revision_id": "rev_9"}
+        published = {
+            **_published(_recorded_entry("b1", self.TEXTS[0])),
+            "scenario_revision_id": "rev_9",
+        }
         with TemporaryDirectory() as tmp:
             tl = self._parse(tmp, _vo_normalization(self.TEXTS[0]), published)
         self.assertEqual(tl.segments[0].voiceover_kind, "tts")

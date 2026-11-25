@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import patch
@@ -40,6 +43,38 @@ def test_spawn_worker_reports_real_preflight_error(tmp_path) -> None:
             timeout_seconds=5.0,
             _start_method="spawn",
         )
+
+
+@pytest.mark.parametrize(
+    "stdin_setup",
+    ["os.close(0)", 'os.close(0); assert os.open("/dev/null", os.O_WRONLY) == 0'],
+    ids=["closed", "write-only"],
+)
+def test_spawn_repairs_non_readable_stdin_before_allocating_pipe(tmp_path, stdin_setup) -> None:
+    result_path = tmp_path / "worker-result.txt"
+    source_dir = Path(__file__).resolve().parents[1] / "src"
+    driver = f"""\
+import fcntl, os, sys
+sys.path.insert(0, {str(source_dir)!r})
+{stdin_setup}
+from stage2.whisper_process import transcribe_audio_in_process, WhisperProcessError
+try:
+    transcribe_audio_in_process("/definitely/missing.wav", timeout_seconds=2, _start_method="spawn")
+except WhisperProcessError as exc:
+    result = str(exc)
+else:
+    result = "unexpected success"
+flags = fcntl.fcntl(0, fcntl.F_GETFL)
+open({str(result_path)!r}, "w").write(result + "\\nfd0_access=" + str(flags & os.O_ACCMODE))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", driver], capture_output=True, text=True, timeout=15
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = result_path.read_text()
+    assert "FileNotFoundError: audio guide not found" in result
+    assert f"fd0_access={os.O_RDONLY}" in result
 
 
 def test_process_forwards_progress_and_returns_result() -> None:

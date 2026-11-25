@@ -78,3 +78,36 @@ def test_hyphenated_snh_file_header_extracts_speaker(tmp_path: Path) -> None:
     )
 
     assert result["blocks"][0]["speaker"] == "МАРКОВ"
+
+
+@pytest.mark.parametrize(
+    "recording",
+    ["Иванов (ZOOM0001_Tr1 (6).WAV)", "Иванов 1", "Иван Иванов военный эксперт"],
+)
+def test_dash_credit_joins_recording_header_with_timed_quote(
+    tmp_path: Path, recording: str
+) -> None:
+    source = tmp_path / "scenario.txt"
+    source.write_text(
+        f"СНХ Иван ИВАНОВ — {recording}\n00:00:22 — Первый ответ.\n",
+        encoding="utf-8",
+    )
+
+    result = generate_normalization(
+        source,
+        tmp_path / "normalized.json",
+        memory_path=tmp_path / "memory.sqlite3",
+        use_llm=False,
+    )
+
+    (block,) = result["blocks"]
+    assert block["type"] == "sync"
+    assert block["speaker"] == "Иван ИВАНОВ"
+    assert block["source_description"] == recording
+    assert not block["label_only"]
+    (fragment,) = block["sync_fragments"]
+    assert fragment["timecode_start"] == "00:00:22"
+    assert fragment["text"] == "Первый ответ."
+    assert not any(
+        issue["severity"] == "error" for issue in validate_for_confirmation_detailed(result)
+    )

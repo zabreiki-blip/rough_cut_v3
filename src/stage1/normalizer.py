@@ -227,7 +227,7 @@ _EXPLICIT_SYNC_CREDIT = re.compile(
 # ``СНХ Имя, роль — файл.wav 00:05:42 — реплика``: the marker is followed by
 # whitespace or a hyphen separator, the credit by a dash and an optional media file name.
 _SNH_DASH_CREDIT = re.compile(
-    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)(?:\s*[-–—]\s*|\s+)"
+    r"^\s*(?P<marker>СНХ|СИНХРОН|SYNC)(?:\s*[-–—]\s*|\s*:\s*|\s+)"
     r"(?P<credit>[А-ЯЁA-Z][^—–\n]{1,300}?)\s+"
     # The dash is optional when the credit is directly followed by a timecode
     # (``СНХ ПОПОВ 00:12:06 — реплика``); such a credit carries no media file.
@@ -243,7 +243,7 @@ _TRAILING_MEDIA_CREDIT = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_BOUNDARY = re.compile(r"[.!?…»\"”]\s+")
-_MEDIA_FILE_NAME = re.compile(r"^(?:.{1,118}\.[A-Za-z0-9]{2,5}|\S{1,120})$")
+_MEDIA_FILE_NAME = re.compile(r"^(?:.{1,118}\.[A-Za-z0-9]{2,5}\)?|\S{1,120}|[^\n!?…]{1,120})$")
 _EXPLICIT_SYNC_LABEL = re.compile(r"^(?:СНХ|СИНХРОН|SYNC)\s*,\s*(.+)$", re.IGNORECASE)
 _TIMECODE_TOKEN = (
     r"(?:\[?\d{1,2}[:.][0-5]\d(?:\s+|[:.])[0-5]\d\]?|"
@@ -302,10 +302,11 @@ _EDITORIAL_TIMECODE_PREFIX = re.compile(
     rf"{_TIMECODE_TOKEN}",
     re.DOTALL,
 )
-# ``ПОДВОДКА № 6`` / ``СТЕНДАП 3`` / ``ПОДВОДКА``: a numbered heading with no
-# speech after it.
+# ``ПОДВОДКА № 6`` / ``ПОДВОДКА 6. ФИНАЛ`` / ``СТЕНДАП 3`` / ``ПОДВОДКА``:
+# a numbered heading with no speech after it.
 _PRESENTER_HEADING_ONLY = re.compile(
-    r"^\s*(?:СНХ\s+)?(?:СТЕНДАП|(?-i:ПОДВОДКА))\s*(?:№|N|#|No\.?)?\s*\d*\s*[.:]?\s*$",
+    r"^\s*(?:СНХ\s+)?(?:СТЕНДАП|(?-i:ПОДВОДКА))\s*(?:№|N|#|No\.?)?\s*\d*\s*"
+    r"(?:[.:–—-]\s*(?:финал|конец|пролог|эпилог|вступление|анонс|итог\w*)\s*)?[.:]?\s*$",
     re.IGNORECASE,
 )
 TIMECODE_NOTE_WARNING = "timecode note without label: check manually"
@@ -375,6 +376,36 @@ _TTS_EDITORIAL_PARENTHESES = re.compile(
 
 ZK_LABEL_REMOVED_WARNING = "ЗК label removed from TTS text"
 ABSORBED_LINK_LOST_WARNING = "Absorbed-by link dropped: target block was not found after re-parse"
+_TTS_SPLICE_MARKER = re.compile(r"(?<!\w)СКЛ(?!\w)")
+
+
+def strip_tts_splice_markers(text: str) -> str:
+    """Remove standalone uppercase ``СКЛ`` splice markers from speech text."""
+    pieces: list[str] = []
+    cursor = 0
+    for match in _TTS_SPLICE_MARKER.finditer(text):
+        start, end = match.span()
+        left = text[cursor:start]
+        before = left.rstrip(" \t")
+        right_start = end
+        while right_start < len(text) and text[right_start] in " \t":
+            right_start += 1
+        pieces.append(before)
+        previous = before[-1:] if before else ""
+        following = text[right_start : right_start + 1]
+        if (
+            previous
+            and following
+            and not previous.isspace()
+            and not following.isspace()
+            and following not in ",.!?;:)]}»”"
+        ):
+            # Avoid joining neighboring words; punctuation after the marker stays
+            # attached to what preceded it (``word СКЛ,`` -> ``word,``).
+            pieces.append(" ")
+        cursor = right_start
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def strip_zk_label(text: str) -> str:
@@ -391,7 +422,7 @@ def clean_voiceover_tts_text(text: str, *, strip_zk: bool = True) -> str:
     that receive text whose label was already split off (rule/LLM parsing,
     saved drafts) pass ``strip_zk=False``.
     """
-    value = text.strip()
+    value = strip_tts_splice_markers(text).strip()
     if strip_zk:
         value = strip_zk_label(value).strip()
     value = _TTS_VOICE_CREDIT.sub("", value)
@@ -868,6 +899,7 @@ def _generate_normalization_unlocked(
             # (``_split_label`` / LLM boundary); never strip a second time, or
             # speech such as ``ЗК РФ запрещает это.`` loses its first word.
             block.text_for_tts = clean_voiceover_tts_text(block.text_for_tts, strip_zk=False)
+            block.normalized_text = strip_tts_splice_markers(block.normalized_text)
             _strip_dub_timecode(block)
     _snapshot_proposals(blocks)
     scenario = NormalizedScenario(
@@ -1339,7 +1371,7 @@ def _save_normalization_unlocked(
 
 
 def _sanitize_saved_voiceover(block: NormalizedBlock, old: NormalizedBlock | None = None) -> None:
-    """Remove a leading ``ЗК`` label a user typed into a voiced block; warn, never block.
+    """Remove splice markers and a newly typed leading ``ЗК`` label from voiced text.
 
     Only a field the user changed against the stored block can carry a typed
     label: stored text was already sanitized once when it was written, so an
@@ -1349,18 +1381,32 @@ def _sanitize_saved_voiceover(block: NormalizedBlock, old: NormalizedBlock | Non
         return
     tts_typed = old is None or block.text_for_tts != old.text_for_tts
     normalized_typed = old is None or block.normalized_text != old.normalized_text
-    text = block.text_for_tts
+    text = strip_tts_splice_markers(block.text_for_tts)
+    zk_removed = False
     if tts_typed and text.strip():
-        text = strip_zk_label(text)
-    normalized = (
-        strip_zk_label(block.normalized_text) if normalized_typed else block.normalized_text
-    )
+        cleaned = strip_zk_label(text)
+        zk_removed = cleaned != text
+        text = cleaned
+    normalized = strip_tts_splice_markers(block.normalized_text)
+    if normalized_typed:
+        cleaned = strip_zk_label(normalized)
+        zk_removed = zk_removed or cleaned != normalized
+        normalized = cleaned
     if text == block.text_for_tts and normalized == block.normalized_text:
         return
     block.text_for_tts = text
     block.normalized_text = normalized
-    if ZK_LABEL_REMOVED_WARNING not in block.warnings:
+    if zk_removed and ZK_LABEL_REMOVED_WARNING not in block.warnings:
         block.warnings.append(ZK_LABEL_REMOVED_WARNING)
+
+
+def clean_voiceover_splice_markers(blocks: list[NormalizedBlock]) -> None:
+    """Clean legacy splice markers from voiced TTS and display text in place."""
+    for block in blocks:
+        if block.type != BlockType.VOICEOVER.value or block.absorbed_by_uid:
+            continue
+        block.text_for_tts = strip_tts_splice_markers(block.text_for_tts)
+        block.normalized_text = strip_tts_splice_markers(block.normalized_text)
 
 
 def _flag_changed_scene_openers(blocks: list[NormalizedBlock]) -> None:
@@ -1430,6 +1476,7 @@ def _confirm_normalization_unlocked(
     if not source_path.exists() or _file_hash(source_path) != scenario.source_hash:
         raise SourceChangedError("Source scenario changed after normalization")
     # Deterministic, LLM-free: also repairs documents normalized before the rule existed.
+    clean_voiceover_splice_markers(scenario.blocks)
     _apply_host_standup_text(scenario.blocks)
     issues = [
         issue
@@ -1646,13 +1693,22 @@ def validate_for_confirmation_detailed(
                     block,
                     f"Sync block {block.order} contains only a speaker credit",
                 )
+            # Compound service labels can include a name ("НОВЫЙ СНХ НИНА")
+            # or no credit at all ("НОВЫЙ СНХ"). Only compare the name suffix.
+            credit = re.sub(
+                r"^(?:НОВЫЙ\s+)?(?:СНХ|СИНХ|СИНХР|СИНХРОН|SYNC|ЛАЙФЫ?|LIFE)\b[\s,.:–—-]*",
+                "",
+                block.original_label.strip(),
+                count=1,
+                flags=re.IGNORECASE,
+            )
             if (
-                block.original_label
-                and _SYNC_NAME_ONLY_LABEL.fullmatch(block.original_label.strip())
-                and normalize_marker(block.original_label) not in _BUILTIN_MARKERS
-                and normalize_marker(block.original_label) not in _SYNC_INLINE_LABEL_MARKERS
+                credit
+                and _SYNC_NAME_ONLY_LABEL.fullmatch(credit)
+                and normalize_marker(credit) not in _BUILTIN_MARKERS
+                and normalize_marker(credit) not in _SYNC_INLINE_LABEL_MARKERS
                 and block.speaker
-                and normalize_marker(block.original_label) != normalize_marker(block.speaker)
+                and normalize_marker(credit) != normalize_marker(block.speaker)
             ):
                 add(
                     "sync_speaker_conflict",
@@ -1990,7 +2046,7 @@ def _annotate_continuation_context(
             and not block.original_label
             and previous.type == BlockType.SYNC.value
             and (
-                _looks_like_sync_continuation(block.original_text)
+                _looks_like_sync_continuation(block.original_text, previous.original_text)
                 # A label-only carrier ("Синх Сторожевой") is immediately
                 # followed by the actual quote, whose timecode is often
                 # buried mid-sentence rather than leading the paragraph.
@@ -2145,8 +2201,14 @@ def _is_splice_marker(text: str) -> bool:
     return bool(_SPLICE_MARKER_RE.match(text))
 
 
-def _looks_like_sync_continuation(text: str) -> bool:
-    return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё]|И(?:\s|$))", text.lstrip()))
+def _looks_like_sync_continuation(text: str, previous_text: str = "") -> bool:
+    stripped = text.lstrip()
+    if re.match(r"^И(?:\s|$)", stripped):
+        previous = previous_text.rstrip()
+        complete_quote = bool(re.search(r"[»”\"](?:[.!?])?$", previous))
+        quote_ends_ellipsis = bool(re.search(r"(?:…|\.{3})[»”\"](?:[.!?])?$", previous))
+        return not (complete_quote and not quote_ends_ellipsis)
+    return bool(re.match(r"^(?:\.{3}|…|[a-zа-яё])", stripped))
 
 
 def _looks_like_video_cue(text: str, video_cue_re: re.Pattern[str] = _VIDEO_CUE_KEYWORD_RE) -> bool:
@@ -3674,6 +3736,8 @@ def _extract_block_metadata_fields(block: NormalizedBlock) -> None:
             # imply a media file; the author format ``СНХ ИМЯ ТАЙМКОД текст`` has
             # none (Stage 2 binds media).
             block.warnings.append("Sync credit has no source media file")
+        if dash_credit.get("header_only"):
+            block.label_only = True
         fragment_source = dash_credit["content"]
         has_sync_metadata = True
     elif unlabeled_credit and normalize_marker(block.original_label) == normalize_marker(
@@ -3809,7 +3873,7 @@ def _extract_sync_fragments(text: str) -> list[SyncFragment]:
             content_start += range_match.end()
         # The punctuation belongs to the quote; only structural whitespace and
         # separators right after the boundary/range are discarded.
-        separator = re.match(r"[.,\s]*", text[content_start:])
+        separator = re.match(r"[.,:\s]*", text[content_start:])
         assert separator is not None
         content_start += separator.end()
         boundaries.append(

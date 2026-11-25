@@ -2,6 +2,7 @@
 // СНХ-matching jobs, and the manual review/confirm UI for matches.
 
 import { ids, appState, project } from "./state.js";
+import { renderSourceControls, renderTranslatedControls, bindTranslatedSync, stopTranslatedPreview } from "./translated_sync.js";
 import {
   toast, appendLog, formatMediaDuration, escaped, updateActionAvailability,
   isTransientPollingError, pollingBackoffMs, optionalRequestJSON, safely,
@@ -51,6 +52,8 @@ function matchCandidate(match) {
       value[key] = match[key];
     }
   });
+  value.document_cue_id = match.metadata?.retime_pending_review
+    ? undefined : (match.metadata?.document_cue_id || undefined);
   return value;
 }
 
@@ -79,6 +82,11 @@ function candidateSource(candidate) {
 function syncAudioUrl(sourceId) {
   if (!sourceId) return "";
   return `/stage2/sync-sources/${encodeURIComponent(sourceId)}/audio?project=${encodeURIComponent(project)}`;
+}
+
+function guidePlaybackSecond(sourceId, sequenceSecond) {
+  const source = candidateSource({ source_id: sourceId });
+  return Math.max(0, Number(sequenceSecond) - Number(source.guide_offset_sec || 0));
 }
 
 function matchBlock(match) {
@@ -157,6 +165,7 @@ function renderSyncSourcesList() {
           </label>
           <button type="button" class="btn btn-sm btn-accent" data-action="save-sync-source">Сохранить</button>
         </div>
+        ${renderSourceControls(source)}
       </article>`;
   }).join("");
 }
@@ -456,12 +465,11 @@ function renderSyncMatches(document) {
       '<div class="empty-state compact">Сопоставление появится после обновления backend.</div>';
     return;
   }
-  if (reviewItems.length === 0) {
-    ids.sync_review_list.innerHTML = (syncMatches.length > 0
+  const noReviewMessage = reviewItems.length === 0
+    ? (syncMatches.length > 0
       ? '<div class="empty-state compact">Все найденные фрагменты готовы к сборке.</div>'
-      : '<div class="empty-state compact">Результатов сопоставления пока нет.</div>') + lifeHtml;
-    return;
-  }
+      : '<div class="empty-state compact">Результатов сопоставления пока нет.</div>')
+    : "";
 
   const reviewHtml = reviewItems.map((match) => {
     const status = normalizedMatchStatus(match.status);
@@ -595,7 +603,7 @@ function renderSyncMatches(document) {
          </div>
          <audio data-sync-audio controls preload="none"
            src="${escaped(syncAudioUrl(candidate.source_id))}"
-           data-range-in="${escaped(sourceIn)}" data-range-out="${escaped(sourceOut)}"></audio>`
+           data-range-in="${escaped(guidePlaybackSecond(candidate.source_id, sourceIn))}" data-range-out="${escaped(guidePlaybackSecond(candidate.source_id, sourceOut))}"></audio>`
       : "";
     return `
       <article class="sync-match-card" data-status="${escaped(status)}"
@@ -621,14 +629,22 @@ function renderSyncMatches(document) {
           · уверенность ${confidenceText}
         </div>
         ${reviewControls}
+        ${renderTranslatedControls(match)}
         <div class="sync-match-actions">${action}</div>
       </article>`;
   }).join("");
-  ids.sync_review_list.innerHTML = reviewHtml + lifeHtml;
+  const reviewedIds = new Set(reviewItems.map((match) => String(match.segment_id || match.block_uid || "")));
+  const confirmedHtml = syncMatches.filter((match) => normalizedMatchStatus(match.status) === "confirmed"
+    && !retimePendingReview(match) && !reviewedIds.has(String(match.segment_id || match.block_uid || "")))
+    .map((match) => `<article class="translated-sync-confirmed-card">
+      <div class="sync-match-head"><div class="sync-match-title">${escaped(match.speaker || match.segment_id || "СНХ")}</div><span class="sync-match-status">подтверждено</span></div>
+      <p class="sync-match-text">${escaped(match.query_text || match.normalized_text || "")}</p>${renderTranslatedControls(match)}</article>`).join("");
+  ids.sync_review_list.innerHTML = noReviewMessage + reviewHtml + confirmedHtml + lifeHtml;
   updateActionAvailability();
 }
 
 export async function loadSyncWorkspace(quiet) {
+  stopTranslatedPreview();
   const [sourcesResponse, matchesResponse, jobResponse] = await Promise.all([
     optionalRequestJSON(`/stage2/sync-sources?project=${encodeURIComponent(project)}`),
     optionalRequestJSON(`/stage2/sync-matches?project=${encodeURIComponent(project)}`),
@@ -974,8 +990,8 @@ async function confirmSyncMatch(matchId, card) {
     source_in_sec: sourceIn,
     source_out_sec: sourceOut,
   };
-  ["speech_in_sec", "speech_out_sec", "matched_text", "confidence"].forEach((key) => {
-    if (candidate[key] !== undefined) payload[key] = candidate[key];
+  ["speech_in_sec", "speech_out_sec", "matched_text", "confidence", "document_cue_id"].forEach((key) => {
+    if (candidate[key] !== undefined && (key !== "document_cue_id" || candidate[key])) payload[key] = candidate[key];
   });
   const response = await optionalRequestJSON(
     `/stage2/sync-matches/${encodeURIComponent(matchId)}`,
@@ -1062,6 +1078,12 @@ if (ids.sync_sources_list) {
     ));
   });
 }
+bindTranslatedSync({
+  sourceList: ids.sync_sources_list,
+  reviewList: ids.sync_review_list,
+  getSources: () => appState.syncSources,
+  onRefresh: () => loadSyncWorkspace(true),
+});
 ids.sync_review_list.addEventListener("click", (event) => {
   const unassignButton = event.target.closest("[data-action='unassign-life-material']");
   if (unassignButton) {
@@ -1104,8 +1126,8 @@ ids.sync_review_list.addEventListener("change", (event) => {
     const audio = card.querySelector("[data-sync-audio]");
     if (audio) {
       audio.src = syncAudioUrl(candidate.source_id);
-      audio.dataset.rangeIn = candidate.source_in_sec;
-      audio.dataset.rangeOut = candidate.source_out_sec;
+      audio.dataset.rangeIn = guidePlaybackSecond(candidate.source_id, candidate.source_in_sec);
+      audio.dataset.rangeOut = guidePlaybackSecond(candidate.source_id, candidate.source_out_sec);
       audio.load();
     }
   }
@@ -1113,8 +1135,8 @@ ids.sync_review_list.addEventListener("change", (event) => {
     // A LIFE card has no preview player.
     const audio = card.querySelector("[data-sync-audio]");
     if (audio) {
-      audio.dataset.rangeIn = card.querySelector("[data-sync-in]").value;
-      audio.dataset.rangeOut = card.querySelector("[data-sync-out]").value;
+      audio.dataset.rangeIn = guidePlaybackSecond(card.dataset.sourceId, card.querySelector("[data-sync-in]").value);
+      audio.dataset.rangeOut = guidePlaybackSecond(card.dataset.sourceId, card.querySelector("[data-sync-out]").value);
     }
   }
 });

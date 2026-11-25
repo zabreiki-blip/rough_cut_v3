@@ -199,6 +199,33 @@ def test_override_shared_by_setup_runner_and_doctor(sandbox):
     assert "connector не отвечает" not in doctor.stdout
 
 
+def test_run_local_redirects_gunicorn_output_to_stable_log(sandbox):
+    root, _env = sandbox
+    venv_bin = root / ".venv-macos-arm64/bin"
+    venv_bin.mkdir(parents=True)
+    shutil.copy2(root / "bin/python3", venv_bin / "python")
+    (root / ".env").write_text("\n")
+    gunicorn = venv_bin / "gunicorn"
+    args_log = root / "gunicorn-args"
+    log_path = root / "logs/server.log"
+    executable(
+        gunicorn,
+        "#!/bin/bash\n"
+        f"printf '%s\\n' \"$@\" > {str(args_log)!r}\n"
+        f"test -d {str(log_path.parent)!r} || exit 71\n"
+        f"touch {str(log_path)!r}\n",
+    )
+
+    result = run(sandbox, "run-local")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    arguments = args_log.read_text().splitlines()
+    assert "--capture-output" in arguments
+    log_option = arguments.index("--error-logfile")
+    assert arguments[log_option + 1] == str(log_path)
+    assert log_path.is_file()
+
+
 def test_auto_never_migrates_existing_cpu_environment(sandbox):
     assert run(sandbox, ROUGH_CUT_PROFILE="cpu").returncode == 0
     result = run(sandbox, "run-local")

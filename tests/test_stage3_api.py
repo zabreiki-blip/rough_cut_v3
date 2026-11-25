@@ -1187,16 +1187,28 @@ def _segment(seg_id, kind, start, duration, **extra):
 def test_prepare_placeholder_count_matches_generated_xml(client) -> None:
     segments = [
         _segment(
-            "m1", "snh", 0.0, 2.0,
-            match_status="confirmed", source_id="v1", source_in_sec=1.0, source_out_sec=3.0,
+            "m1",
+            "snh",
+            0.0,
+            2.0,
+            match_status="confirmed",
+            source_id="v1",
+            source_in_sec=1.0,
+            source_out_sec=3.0,
         ),
         _segment("r1", "snh", 2.0, 3.0, match_status="needs_review"),
         _segment("n1", "host", 5.0, 2.0, match_status="not_found"),
         _segment("l1", "life", 7.0, 4.0),
         _segment("l2", "life", 11.0, 1.0),
         _segment(
-            "u1", "snh", 12.0, 2.0,
-            match_status="auto_matched", source_id="v2", source_in_sec=1.0, source_out_sec=3.0,
+            "u1",
+            "snh",
+            12.0,
+            2.0,
+            match_status="auto_matched",
+            source_id="v2",
+            source_in_sec=1.0,
+            source_out_sec=3.0,
         ),
         _segment("z1", "zk", 14.0, 2.0, wav_path="/tmp/zk.wav"),
     ]
@@ -1223,7 +1235,11 @@ def test_prepare_placeholder_count_matches_generated_xml(client) -> None:
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     assert plan["summary"] == result["plan_summary"]
     assert [item["segment_id"] for item in plan["items"] if item["status"] == "placeholder"] == [
-        "r1", "n1", "l1", "l2", "u1",
+        "r1",
+        "n1",
+        "l1",
+        "l2",
+        "u1",
     ]
     canonical = json.dumps(plan, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     stored = json.loads((paths["work"] / "stage3_source_mapping.json").read_text(encoding="utf-8"))
@@ -1280,9 +1296,14 @@ def test_stage3_download_is_refused_after_timeline_fingerprint_changes(client) -
         store.replace_all([current])
         segments = [
             _segment(
-                "uid-1", "snh", 0.0, current.source_out_sec - 1.0,
-                match_status="confirmed", source_id="v1",
-                source_in_sec=1.0, source_out_sec=current.source_out_sec,
+                "uid-1",
+                "snh",
+                0.0,
+                current.source_out_sec - 1.0,
+                match_status="confirmed",
+                source_id="v1",
+                source_in_sec=1.0,
+                source_out_sec=current.source_out_sec,
             )
         ]
         (paths["work"] / "full_timeline.json").write_text(
@@ -1357,9 +1378,16 @@ def _complete_setup(client, *, wav: bool = True, source: bool = True, extra=(), 
     segments = [
         _segment("z1", "zk", 0.0, 2.0, wav_path=str(wav_file)),
         _segment(
-            "m1", "snh", 2.0, 2.0,
-            match_status="confirmed", source_id="v1", source_in_sec=1.0, source_out_sec=3.0,
-            speech_in_sec=1.2, speech_out_sec=2.8,
+            "m1",
+            "snh",
+            2.0,
+            2.0,
+            match_status="confirmed",
+            source_id="v1",
+            source_in_sec=1.0,
+            source_out_sec=3.0,
+            speech_in_sec=1.2,
+            speech_out_sec=2.8,
         ),
         *extra,
     ]
@@ -1380,7 +1408,8 @@ def _published(paths) -> list[str]:
     return sorted(
         item.name
         for item in work.iterdir()
-        if item.suffix == ".xml" or item.name in {"assembly_plan.json", "stage3_source_mapping.json"}
+        if item.suffix == ".xml"
+        or item.name in {"assembly_plan.json", "stage3_source_mapping.json"}
     )
 
 
@@ -1456,8 +1485,15 @@ def test_prepare_complete_with_placeholders_returns_409_and_publishes_nothing(cl
             _segment("n1", "host", 7.0, 2.0, match_status="not_found", block_uid="uid-n1"),
             _segment("l1", "life", 9.0, 2.0, block_uid="uid-l1"),
             _segment(
-                "u1", "snh", 11.0, 2.0, block_uid="uid-u1",
-                match_status="auto_matched", source_id="v2", source_in_sec=1.0, source_out_sec=3.0,
+                "u1",
+                "snh",
+                11.0,
+                2.0,
+                block_uid="uid-u1",
+                match_status="auto_matched",
+                source_id="v2",
+                source_in_sec=1.0,
+                source_out_sec=3.0,
             ),
         ],
     )
@@ -1516,9 +1552,17 @@ def test_prepare_complete_blocks_on_open_speech_overlap(client) -> None:
         client,
         extra=[
             _segment(
-                "o1", "snh", 4.0, 2.0, block_uid="uid-o1",
-                match_status="confirmed", source_id="v1", source_in_sec=10.0, source_out_sec=12.0,
-                speech_in_sec=10.2, speech_out_sec=11.8,
+                "o1",
+                "snh",
+                4.0,
+                2.0,
+                block_uid="uid-o1",
+                match_status="confirmed",
+                source_id="v1",
+                source_in_sec=10.0,
+                source_out_sec=12.0,
+                speech_in_sec=10.2,
+                speech_out_sec=11.8,
                 trim={"speech_overlap": True},
             )
         ],
@@ -1544,8 +1588,14 @@ def test_prepare_complete_without_viewings_is_blocked(client) -> None:
                 "normalization_revision": "norm-1",
                 "segments": [
                     _segment(
-                        "m1", "snh", 0.0, 2.0, match_status="confirmed", source_id="v1",
-                        source_in_sec=1.0, source_out_sec=3.0,
+                        "m1",
+                        "snh",
+                        0.0,
+                        2.0,
+                        match_status="confirmed",
+                        source_id="v1",
+                        source_in_sec=1.0,
+                        source_out_sec=3.0,
                     )
                 ],
             }

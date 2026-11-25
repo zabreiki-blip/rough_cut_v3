@@ -145,6 +145,11 @@ def _host_timeline_paths(data: dict, *, project: str, project_root: Path) -> dic
                 segment[key] = _host_path(
                     str(segment[key]), project=project, project_root=project_root
                 )
+        translation = segment.get("translation_audio")
+        if isinstance(translation, dict) and translation.get("path"):
+            translation["path"] = _host_path(
+                str(translation["path"]), project=project, project_root=project_root
+            )
     return result
 
 
@@ -576,7 +581,7 @@ def _perform_prepare(
         unmapped_plan = build_assembly_plan(host_timeline, media_mapping=set())
         resolve = _container_resolver(project, paths["root"])
         blockers = validate_plan_complete(
-            unmapped_plan, path_exists=lambda p: os.path.exists(resolve(p))
+            unmapped_plan, path_exists=lambda p: os.path.exists(resolve(p)), path_resolver=resolve
         )
         if mode == "complete" and blockers:
             raise AssemblyIncompleteError(blockers, unmapped_plan["summary"])
@@ -612,7 +617,10 @@ def _perform_prepare(
     )
     resolve = _container_resolver(project, paths["root"])
     blockers = validate_plan_complete(
-        plan, catalog=mapping.catalog, path_exists=lambda p: os.path.exists(resolve(p))
+        plan,
+        catalog=mapping.catalog,
+        path_exists=lambda p: os.path.exists(resolve(p)),
+        path_resolver=resolve,
     )
     if mode == "complete" and blockers:
         # Fail closed before anything is published: no XML, no mapping and no assembly_plan.json,
@@ -733,7 +741,10 @@ def _compute_plan(
         )
         resolve = _container_resolver(project, paths["root"])
         blockers = validate_plan_complete(
-            plan, catalog=mapping.catalog, path_exists=lambda p: os.path.exists(resolve(p))
+            plan,
+            catalog=mapping.catalog,
+            path_exists=lambda p: os.path.exists(resolve(p)),
+            path_resolver=resolve,
         )
     else:
         host_timeline = _host_timeline_paths(
@@ -741,7 +752,9 @@ def _compute_plan(
         )
         plan = build_assembly_plan(host_timeline, media_mapping=set())
         resolve = _container_resolver(project, paths["root"])
-        blockers = validate_plan_complete(plan, path_exists=lambda p: os.path.exists(resolve(p)))
+        blockers = validate_plan_complete(
+            plan, path_exists=lambda p: os.path.exists(resolve(p)), path_resolver=resolve
+        )
     return plan, blockers
 
 

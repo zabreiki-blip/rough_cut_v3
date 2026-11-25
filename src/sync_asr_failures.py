@@ -52,11 +52,17 @@ def _could_serve(source: Any, speaker: str) -> bool:
         str(getattr(source, "speaker", "") or ""),
         *(str(name or "") for name in getattr(source, "speakers", ()) or ()),
     ]
-    for name in names:
-        if _alias_matches(speaker_name_tokens(name), speaker_tokens):
+    name_tokens = [tokens for name in names if (tokens := speaker_name_tokens(name))]
+    # The matcher searches unnamed sources as a fallback. Scanned review media
+    # deliberately starts without speaker metadata, so a failed transcription
+    # of such a source is not evidence that the recording is missing.
+    if not name_tokens:
+        return True
+    for tokens in name_tokens:
+        if _alias_matches(tokens, speaker_tokens):
             return True
         # A registered short alias (given name only) of a full-name speaker.
-        if len(speaker_tokens) > 1 and speaker_name_tokens(name) == speaker_tokens[:1]:
+        if len(speaker_tokens) > 1 and tokens == speaker_tokens[:1]:
             return True
     return False
 
@@ -80,12 +86,13 @@ def mark_asr_failed_matches(
     if not failed_sources:
         return changed
     for match in matches:
-        if match.status != "not_found" or match.metadata.get("unmatched_reason") != _NO_SOURCE_REASON:
+        if (
+            match.status != "not_found"
+            or match.metadata.get("unmatched_reason") != _NO_SOURCE_REASON
+        ):
             continue
         culprits = sorted(
-            source.id
-            for source in failed_sources
-            if _could_serve(source, str(match.speaker or ""))
+            source.id for source in failed_sources if _could_serve(source, str(match.speaker or ""))
         )
         if not culprits:
             continue

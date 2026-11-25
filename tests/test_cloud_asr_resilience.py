@@ -25,6 +25,7 @@ from test_stage2_cloud_asr import (  # noqa: F401
     _patch_async_client,
 )
 
+
 @pytest.fixture(autouse=True)
 def _isolated_chunk_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Кэш частей каждого теста - в своём каталоге (не общий temp)."""
@@ -34,7 +35,12 @@ def _isolated_chunk_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
 SPLITS = {
     "splits": [
         {"start": "00:00.0", "end": "00:07.1", "speaker": "ГОЛОС 1", "text": "Первая реплика"},
-        {"start": "00:07.5", "end": "00:12.0", "speaker": "ГОЛОС 2", "text": "Вторая: с двоеточием"},
+        {
+            "start": "00:07.5",
+            "end": "00:12.0",
+            "speaker": "ГОЛОС 2",
+            "text": "Вторая: с двоеточием",
+        },
     ]
 }
 
@@ -323,7 +329,9 @@ def test_chunk_cache_lives_in_given_dir_not_beside_media(
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        return _none_response(request) if calls["n"] == 3 else _model_response(_chunk_text(calls["n"]))
+        return (
+            _none_response(request) if calls["n"] == 3 else _model_response(_chunk_text(calls["n"]))
+        )
 
     _patch_async_client(monkeypatch, handler)
 
@@ -353,7 +361,9 @@ def test_changed_model_invalidates_saved_parts(
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        return _none_response(request) if calls["n"] == 3 else _model_response(_chunk_text(calls["n"]))
+        return (
+            _none_response(request) if calls["n"] == 3 else _model_response(_chunk_text(calls["n"]))
+        )
 
     _patch_async_client(monkeypatch, handler)
     with pytest.raises(cloud_asr.CloudAudioAsrError):
